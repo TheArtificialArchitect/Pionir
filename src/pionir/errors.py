@@ -19,3 +19,19 @@ class ResourceUnavailable(PionirError):
 
 class NamespaceAccessDenied(PionirError):
     pass
+
+
+class AdapterError(PionirError):
+    """Base class for failures at a specialist process boundary."""
+
+
+class AdapterUnavailable(AdapterError):
+    pass
+
+
+class AdapterAuthenticationError(AdapterError):
+    pass
+
+
+class AdapterProtocolError(AdapterError):
+    pass

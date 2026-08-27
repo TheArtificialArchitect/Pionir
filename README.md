@@ -39,7 +39,9 @@ python -m unittest discover -s tests -v
 ```
 
 See [docs/FUSION_PLAN.md](docs/FUSION_PLAN.md) for the staged integration plan and
-[docs/ADAPTER_CHECKLIST.md](docs/ADAPTER_CHECKLIST.md) for the source audit template.
+[docs/ADAPTER_CHECKLIST.md](docs/ADAPTER_CHECKLIST.md) for the source audit template. Confirmed
+source interfaces and deferred boundaries are recorded in
+[docs/SOURCE_AUDIT.md](docs/SOURCE_AUDIT.md).
 
 ## Security
 
