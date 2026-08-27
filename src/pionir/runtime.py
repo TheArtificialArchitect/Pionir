@@ -10,7 +10,7 @@ from typing import Protocol
 from uuid import UUID
 
 from .contracts import AgentManifest, Task, TaskResult
-from .errors import ResourceUnavailable
+from .errors import CircuitOpen, ResourceUnavailable
 from .registry import CapabilityRegistry
 from .reliability import CircuitBreaker
 from .scheduler import ModelLeaseScheduler
@@ -96,7 +96,7 @@ class Executive:
             if result.agent_id != route.agent_id:
                 raise ValueError("adapter result agent_id does not match the routed agent")
         except Exception as error:
-            if not isinstance(error, ResourceUnavailable):
+            if not isinstance(error, (CircuitOpen, ResourceUnavailable)):
                 circuit.record_failure()
             self._record("task.failed", task, route.agent_id, type(error).__name__)
             raise

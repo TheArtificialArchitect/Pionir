@@ -31,6 +31,7 @@ $env:PIONIR_STATE_ROOT = "$env:USERPROFILE\.pionir"
 $env:PIONIR_THEO_URL = "http://127.0.0.1:8765"
 $env:PIONIR_THEO_TOKEN = (Get-Content "$env:USERPROFILE\.techsupport_agent\bridge_token.txt" -Raw).Trim()
 $env:PIONIR_ATANI_COMMAND_JSON = '["C:\\src\\Atani\\.venv\\Scripts\\atani.exe"]'
+$env:PIONIR_BRYO_STATUS_COMMAND_JSON = '["C:\\src\\terrarium\\.venv\\Scripts\\python.exe","-m","bryo.status"]'
 ```
 
 If Atani's environment uses a different path, change only
@@ -51,6 +52,7 @@ specialist does not corrupt or erase another specialist's state.
 ```powershell
 .\.venv\Scripts\pionir.exe ask-atani "Explain the evidence for this decision"
 .\.venv\Scripts\pionir.exe ask-theo-peer "Give Atani your actual view of this design"
+.\.venv\Scripts\pionir.exe bryo-status
 ```
 
 The Theo peer command uses his conversation-only route. It cannot call his tools or read Ian's

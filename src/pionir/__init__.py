@@ -11,6 +11,15 @@ from .contracts import (
 from .audit import JsonlAuditSink
 from .config import PionirSettings
 from .memory import InMemoryNamespaceStore
+from .improvement import (
+    EvaluationReport,
+    ImprovementCandidate,
+    ImprovementRisk,
+    PromotionApproval,
+    PromotionDecision,
+    PromotionGate,
+    PromotionPolicy,
+)
 from .registry import CapabilityRegistry
 from .reliability import CircuitBreaker, CircuitSnapshot, CircuitState
 from .runtime import AuditEvent, Executive, InMemoryAuditSink, SpecialistAdapter
@@ -28,11 +37,18 @@ __all__ = [
     "InMemoryNamespaceStore",
     "InMemoryAuditSink",
     "JsonlAuditSink",
+    "EvaluationReport",
+    "ImprovementCandidate",
+    "ImprovementRisk",
     "MemoryNamespace",
     "ModelLease",
     "ModelLeaseScheduler",
     "ModelRequirement",
     "PionirSettings",
+    "PromotionApproval",
+    "PromotionDecision",
+    "PromotionGate",
+    "PromotionPolicy",
     "ResourceBudget",
     "SpecialistAdapter",
     "Task",

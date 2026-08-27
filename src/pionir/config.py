@@ -20,15 +20,17 @@ def _positive_int(name: str, default: int) -> int:
     return value
 
 
-def _atani_command() -> tuple[str, ...]:
-    raw = os.environ.get("PIONIR_ATANI_COMMAND_JSON")
+def _command_from_json(
+    name: str, default: tuple[str, ...] | None
+) -> tuple[str, ...] | None:
+    raw = os.environ.get(name)
     if raw is None:
-        return ("atani",)
+        return default
     document = json.loads(raw)
     if not isinstance(document, list) or not document or not all(
         isinstance(item, str) and item for item in document
     ):
-        raise ValueError("PIONIR_ATANI_COMMAND_JSON must be a non-empty JSON string list")
+        raise ValueError(f"{name} must be a non-empty JSON string list")
     return tuple(document)
 
 
@@ -42,6 +44,8 @@ class PionirSettings:
     theo_url: str = "http://127.0.0.1:8765"
     theo_token: str = field(default="", repr=False)
     atani_command: tuple[str, ...] = ("atani",)
+    bryo_status_command: tuple[str, ...] | None = None
+    specialists_file: Path | None = None
 
     def __post_init__(self) -> None:
         if self.circuit_failure_threshold < 1:
@@ -50,6 +54,11 @@ class PionirSettings:
             raise ValueError("circuit recovery seconds cannot be negative")
         if not self.atani_command or any(not part for part in self.atani_command):
             raise ValueError("Atani command cannot be empty")
+        if self.bryo_status_command is not None and (
+            not self.bryo_status_command
+            or any(not part for part in self.bryo_status_command)
+        ):
+            raise ValueError("Bryo status command cannot be empty")
         # Reuse the scheduler's complete budget validation.
         _ = self.resource_budget
 
@@ -99,5 +108,16 @@ class PionirSettings:
                 os.environ.get("PIONIR_THEO_TOKEN", "").strip()
                 or os.environ.get("BRIDGE_TOKEN", "").strip()
             ),
-            atani_command=_atani_command(),
+            atani_command=_command_from_json(
+                "PIONIR_ATANI_COMMAND_JSON", defaults.atani_command
+            )
+            or defaults.atani_command,
+            bryo_status_command=_command_from_json(
+                "PIONIR_BRYO_STATUS_COMMAND_JSON", None
+            ),
+            specialists_file=(
+                Path(os.environ["PIONIR_SPECIALISTS_FILE"])
+                if os.environ.get("PIONIR_SPECIALISTS_FILE")
+                else None
+            ),
         )

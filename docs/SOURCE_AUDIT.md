@@ -43,8 +43,36 @@ mode that separates voice/conversation from tool execution.
 - Its existing `TheoPeerClient` already implements the same authenticated `/health` and
   `/peer/chat` contract selected above.
 
-### Next boundary
+### Accepted first boundary
 
-Do not duplicate Atani's executive in Pionir. Add a thin in-process adapter after defining a
-versioned mapping between Pionir tasks and Atani goals/actions. Because Atani requires Python
-3.12, the integrated runtime baseline must be Python 3.12 even though Theo supports 3.10.
+Pionir invokes Atani's existing JSON CLI through its configured Python 3.12 environment. Normal
+and depth reasoning are separate capabilities with separate model-resource declarations, and
+both require Pionir's `atani.chat` permission. The subprocess boundary lets Pionir itself remain
+compatible with Python 3.11 and avoids importing or duplicating Atani's persistent state.
+
+Atani's general `BoundedExecutive` is not yet exposed through a stable CLI command. A future
+goal/action adapter must map Pionir tasks to that exact interface rather than reimplement its
+approval and verification logic inside Pionir.
+
+## Bryo / Terrarium
+
+- Source: `PreShotCome/terrarium`, branch `build`, package version 0.1.0.
+- Python support: 3.12 or newer.
+- Bryo's `Governor` owns its process RSS ladder, pagefile tripwire, host-load torpor,
+  pre-flight allocation sizing, control files, and revocable opportunistic GPU leases.
+- A missing or unreadable GPU is intentionally treated as busy, so Bryo never scavenges blind.
+- `python -m bryo.status` is intentionally read-only: it opens Bryo's database read-only and
+  never constructs the mind.
+
+### Accepted first boundary
+
+Pionir exposes `organism.bryo_status` by calling Bryo's existing read-only status module in
+Bryo's own Python environment. It does not import Bryo, mutate its genome, create control files,
+or take over its watchdog.
+
+### Resource-governor relationship
+
+Bryo remains the authority over its own CPU, memory, and scavenger GPU work. Pionir remains the
+authority over heavyweight specialist model scheduling. A later cross-process lease protocol
+must be implemented by both sides before Pionir may assume it can revoke Bryo's GPU work; a
+Pionir-only lock would provide false safety because Bryo would not observe it.

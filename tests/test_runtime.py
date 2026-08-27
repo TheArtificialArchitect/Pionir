@@ -1,12 +1,15 @@
 import unittest
 
 from pionir.contracts import AgentManifest, Capability, ModelRequirement, Task, TaskResult
+from pionir.errors import CircuitOpen
+from pionir.reliability import CircuitBreaker
 from pionir.runtime import Executive, InMemoryAuditSink
 
 
 class FakeAdapter:
     def __init__(self, *, fail: bool = False) -> None:
         self._fail = fail
+        self.calls = 0
         self._manifest = AgentManifest(
             "theo",
             "test",
@@ -24,6 +27,7 @@ class FakeAdapter:
         return self._manifest
 
     def execute(self, task: Task) -> TaskResult:
+        self.calls += 1
         if self._fail:
             raise RuntimeError("adapter offline")
         return TaskResult(task.task_id, "theo", {"reply": "hello"}, ("fake:test",))
@@ -52,6 +56,22 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(executive.scheduler.active_requirements, ())
         self.assertEqual(audit.events[-1].event_type, "task.failed")
         self.assertEqual(audit.events[-1].detail, "RuntimeError")
+
+    def test_repeated_adapter_failure_opens_circuit_without_another_call(self) -> None:
+        adapter = FakeAdapter(fail=True)
+        executive = Executive(
+            circuit_factory=lambda: CircuitBreaker(
+                failure_threshold=2,
+                recovery_seconds=60,
+            )
+        )
+        executive.register(adapter)
+        for _ in range(2):
+            with self.assertRaises(RuntimeError):
+                executive.execute(Task("conversation.reply", {}))
+        with self.assertRaises(CircuitOpen):
+            executive.execute(Task("conversation.reply", {}))
+        self.assertEqual(adapter.calls, 2)
 
 
 if __name__ == "__main__":

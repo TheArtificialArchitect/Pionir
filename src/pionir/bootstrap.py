@@ -4,7 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .adapters import AtaniCliAdapter, AtaniCliSettings, TheoPeerAdapter, TheoPeerSettings
+from .adapters import (
+    AtaniCliAdapter,
+    AtaniCliSettings,
+    BryoStatusAdapter,
+    BryoStatusSettings,
+    TheoPeerAdapter,
+    TheoPeerSettings,
+    load_stdio_adapters,
+)
 from .audit import JsonlAuditSink
 from .config import PionirSettings
 from .reliability import CircuitBreaker
@@ -47,4 +55,13 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
                 )
             )
         )
+    if configured.bryo_status_command is not None:
+        runtime.register(
+            BryoStatusAdapter(
+                BryoStatusSettings(command=configured.bryo_status_command)
+            )
+        )
+    if configured.specialists_file is not None:
+        for adapter in load_stdio_adapters(configured.specialists_file):
+            runtime.register(adapter)
     return runtime

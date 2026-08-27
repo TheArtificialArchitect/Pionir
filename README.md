@@ -45,8 +45,14 @@ See [docs/FUSION_PLAN.md](docs/FUSION_PLAN.md) for the staged integration plan a
 source interfaces and deferred boundaries are recorded in
 [docs/SOURCE_AUDIT.md](docs/SOURCE_AUDIT.md).
 
+Self-improvement candidates are governed by the deterministic, human-approved contract in
+[docs/IMPROVEMENT_GATE.md](docs/IMPROVEMENT_GATE.md).
+
 Windows installation and environment setup are documented in
 [docs/SETUP_WINDOWS.md](docs/SETUP_WINDOWS.md).
+
+Additional local agents can implement the dependency-isolated
+[JSON stdio adapter protocol](docs/ADAPTER_PROTOCOL.md).
 
 ## Security
 

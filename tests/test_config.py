@@ -19,11 +19,23 @@ class ConfigTests(unittest.TestCase):
             "PIONIR_STATE_ROOT": str(Path(os.getcwd()).resolve() / "state"),
             "PIONIR_THEO_TOKEN": "secret",
             "PIONIR_ATANI_COMMAND_JSON": '["C:\\\\src\\\\Atani\\\\atani.exe"]',
+            "PIONIR_BRYO_STATUS_COMMAND_JSON": '["python","-m","bryo.status"]',
+            "PIONIR_SPECIALISTS_FILE": str(
+                Path(os.getcwd()).resolve() / "specialists.toml"
+            ),
         }
         with patch.dict(os.environ, environment, clear=True):
             settings = PionirSettings.from_environment()
         self.assertEqual(settings.theo_token, "secret")
         self.assertEqual(settings.atani_command, (r"C:\src\Atani\atani.exe",))
+        self.assertEqual(
+            settings.bryo_status_command,
+            ("python", "-m", "bryo.status"),
+        )
+        self.assertEqual(
+            settings.specialists_file,
+            Path(os.getcwd()).resolve() / "specialists.toml",
+        )
         self.assertNotIn("secret", repr(settings))
 
 

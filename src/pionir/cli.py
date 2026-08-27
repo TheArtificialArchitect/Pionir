@@ -54,6 +54,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     theo.add_argument("text", nargs="+")
     theo.add_argument("--conversation")
+    commands.add_parser("bryo-status", help="read Bryo's non-mutating status snapshot")
     return parser
 
 
@@ -77,6 +78,11 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
         specialists["theo-peer"] = {
             "status": "not_configured",
             "message": "set PIONIR_THEO_TOKEN or BRIDGE_TOKEN",
+        }
+    if "bryo" not in runtime.adapters:
+        specialists["bryo"] = {
+            "status": "not_configured",
+            "message": "set PIONIR_BRYO_STATUS_COMMAND_JSON",
         }
     return {
         "runtime": "ok",
@@ -156,6 +162,14 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
         if args.conversation:
             payload["conversation_id"] = args.conversation
         result = runtime.executive.execute(Task("conversation.theo_peer_reply", payload))
+        _print(result.output)
+        return 0
+    if args.command == "bryo-status":
+        if "bryo" not in runtime.adapters:
+            raise ValueError(
+                "Bryo is not configured; set PIONIR_BRYO_STATUS_COMMAND_JSON"
+            )
+        result = runtime.executive.execute(Task("organism.bryo_status", {}))
         _print(result.output)
         return 0
     return 2

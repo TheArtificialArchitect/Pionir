@@ -1,0 +1,22 @@
+# Copy to an untracked specialists.toml only after auditing the local entry point.
+# The example command is illustrative; do not enable it until the named module exists.
+
+[[specialists]]
+agent_id = "probability"
+version = "local-audit-required"
+command = ["C:\\src\\Probability\\.venv\\Scripts\\python.exe", "-m", "probability.pionir_adapter"]
+timeout_seconds = 120
+memory_access = ["skills/probability"]
+
+[[specialists.capabilities]]
+name = "forecast.probability"
+description = "Produce a calibrated forecast with explicit uncertainty"
+risk = "read_only"
+required_permissions = []
+priority = 100
+
+[specialists.capabilities.model]
+id = "probability-local"
+estimated_vram_mb = 0
+context_vram_mb = 0
+requires_gpu = false
