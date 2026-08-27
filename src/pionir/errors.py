@@ -35,3 +35,11 @@ class AdapterAuthenticationError(AdapterError):
 
 class AdapterProtocolError(AdapterError):
     pass
+
+
+class AuditIntegrityError(PionirError):
+    pass
+
+
+class CircuitOpen(PionirError):
+    pass

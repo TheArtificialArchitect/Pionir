@@ -28,7 +28,7 @@ User or client
         -> specialist adapter
 ```
 
-The first implementation is deliberately dependency-free. It establishes the contracts that
+The implementation is deliberately dependency-free. It establishes the contracts that
 Atani, Theo, Bryo/Terrarium, Probability, Autogenesis, Genesis, and EvolutionaryAI can implement
 without requiring their codebases to be copied into Pionir.
 
@@ -36,12 +36,17 @@ without requiring their codebases to be copied into Pionir.
 
 ```bash
 python -m unittest discover -s tests -v
+python -m pionir doctor
+python -m pionir capabilities
 ```
 
 See [docs/FUSION_PLAN.md](docs/FUSION_PLAN.md) for the staged integration plan and
 [docs/ADAPTER_CHECKLIST.md](docs/ADAPTER_CHECKLIST.md) for the source audit template. Confirmed
 source interfaces and deferred boundaries are recorded in
 [docs/SOURCE_AUDIT.md](docs/SOURCE_AUDIT.md).
+
+Windows installation and environment setup are documented in
+[docs/SETUP_WINDOWS.md](docs/SETUP_WINDOWS.md).
 
 ## Security
 
