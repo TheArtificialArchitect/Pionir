@@ -10,7 +10,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Sequence
 
-from .adapters import AtaniCliAdapter, TheoPeerAdapter
+from .adapters import TheoPeerAdapter
 from .bootstrap import PionirRuntime, build_runtime
 from .contracts import Task
 from .errors import PionirError

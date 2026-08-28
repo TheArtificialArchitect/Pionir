@@ -4,10 +4,37 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
+from typing import Any
 
 from .scheduler import ResourceBudget
+
+
+def _default_state_root() -> Path:
+    """Resolve the private state directory, or say exactly how to configure it."""
+
+    try:
+        home = Path.home()
+    except RuntimeError as error:
+        raise ValueError(
+            "Pionir cannot determine a home directory; set PIONIR_STATE_ROOT to an "
+            "absolute path for Pionir's private runtime state"
+        ) from error
+    return home / ".pionir"
+
+
+def _declared(name: str) -> Any:
+    """Read a declared default without constructing PionirSettings.
+
+    Constructing one would resolve the state-root default even when
+    PIONIR_STATE_ROOT already says where private state belongs.
+    """
+
+    for item in fields(PionirSettings):
+        if item.name == name:
+            return item.default
+    raise KeyError(name)
 
 
 def _positive_int(name: str, default: int) -> int:
@@ -36,7 +63,7 @@ def _command_from_json(
 
 @dataclass(frozen=True, slots=True)
 class PionirSettings:
-    state_root: Path = field(default_factory=lambda: Path.home() / ".pionir")
+    state_root: Path = field(default_factory=_default_state_root)
     total_vram_mb: int = 12_288
     reserved_vram_mb: int = 1_024
     circuit_failure_threshold: int = 3
@@ -103,32 +130,38 @@ class PionirSettings:
 
     @classmethod
     def from_environment(cls) -> "PionirSettings":
-        defaults = cls()
+        configured_state_root = os.environ.get("PIONIR_STATE_ROOT", "").strip()
         return cls(
-            state_root=Path(os.environ.get("PIONIR_STATE_ROOT", str(defaults.state_root))),
-            total_vram_mb=_positive_int("PIONIR_TOTAL_VRAM_MB", defaults.total_vram_mb),
+            state_root=(
+                Path(configured_state_root)
+                if configured_state_root
+                else _default_state_root()
+            ),
+            total_vram_mb=_positive_int(
+                "PIONIR_TOTAL_VRAM_MB", _declared("total_vram_mb")
+            ),
             reserved_vram_mb=_positive_int(
-                "PIONIR_RESERVED_VRAM_MB", defaults.reserved_vram_mb
+                "PIONIR_RESERVED_VRAM_MB", _declared("reserved_vram_mb")
             ),
             circuit_failure_threshold=_positive_int(
                 "PIONIR_CIRCUIT_FAILURE_THRESHOLD",
-                defaults.circuit_failure_threshold,
+                _declared("circuit_failure_threshold"),
             ),
             circuit_recovery_seconds=float(
                 os.environ.get(
                     "PIONIR_CIRCUIT_RECOVERY_SECONDS",
-                    defaults.circuit_recovery_seconds,
+                    _declared("circuit_recovery_seconds"),
                 )
             ),
-            theo_url=os.environ.get("PIONIR_THEO_URL", defaults.theo_url),
+            theo_url=os.environ.get("PIONIR_THEO_URL", _declared("theo_url")),
             theo_token=(
                 os.environ.get("PIONIR_THEO_TOKEN", "").strip()
                 or os.environ.get("BRIDGE_TOKEN", "").strip()
             ),
             atani_command=_command_from_json(
-                "PIONIR_ATANI_COMMAND_JSON", defaults.atani_command
+                "PIONIR_ATANI_COMMAND_JSON", _declared("atani_command")
             )
-            or defaults.atani_command,
+            or _declared("atani_command"),
             bryo_status_command=_command_from_json(
                 "PIONIR_BRYO_STATUS_COMMAND_JSON", None
             ),
