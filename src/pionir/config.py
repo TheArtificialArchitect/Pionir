@@ -45,6 +45,7 @@ class PionirSettings:
     theo_token: str = field(default="", repr=False)
     atani_command: tuple[str, ...] = ("atani",)
     bryo_status_command: tuple[str, ...] | None = None
+    autogenesis_status_command: tuple[str, ...] | None = None
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
 
@@ -60,6 +61,11 @@ class PionirSettings:
             or any(not part for part in self.bryo_status_command)
         ):
             raise ValueError("Bryo status command cannot be empty")
+        if self.autogenesis_status_command is not None and (
+            not self.autogenesis_status_command
+            or any(not part for part in self.autogenesis_status_command)
+        ):
+            raise ValueError("Autogenesis status command cannot be empty")
         # Reuse the scheduler's complete budget validation.
         _ = self.resource_budget
 
@@ -123,6 +129,9 @@ class PionirSettings:
             or defaults.atani_command,
             bryo_status_command=_command_from_json(
                 "PIONIR_BRYO_STATUS_COMMAND_JSON", None
+            ),
+            autogenesis_status_command=_command_from_json(
+                "PIONIR_AUTOGENESIS_STATUS_COMMAND_JSON", None
             ),
             specialists_file=(
                 Path(os.environ["PIONIR_SPECIALISTS_FILE"])

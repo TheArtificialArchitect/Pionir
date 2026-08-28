@@ -59,11 +59,12 @@ To add a `Pionir` shortcut to the current user's Windows desktop:
 .\scripts\install-desktop-shortcut.ps1
 ```
 
-The launcher supplies the standard `C:\src\Atani` and `C:\src\terrarium` executable paths and
-reads Theo's existing bridge token from his private state file for that process only. Override
-the launcher parameters if those checkouts live elsewhere. The first shell exposes explicit
-Atani normal/depth and Theo safe-peer routes plus doctor, capabilities, and Bryo status.
-Automatic intent routing is deliberately not implied yet.
+The launcher supplies the standard `C:\src\Atani`, `C:\src\terrarium`, and
+`C:\src\autogenesis` paths and reads Theo's existing bridge token from his private state file
+for that process only. Override the launcher parameters if those checkouts live elsewhere. The
+first shell exposes explicit Atani normal/depth and Theo safe-peer routes plus doctor,
+capabilities, Bryo status, and Autogenesis status. Automatic intent routing is deliberately
+not implied yet.
 
 ## First bounded calls
 

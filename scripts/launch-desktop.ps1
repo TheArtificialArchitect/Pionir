@@ -3,6 +3,7 @@ param(
     [string] $Repo = (Split-Path -Parent $PSScriptRoot),
     [string] $AtaniExe = 'C:\src\Atani\.venv\Scripts\atani.exe',
     [string] $BryoPython = 'C:\src\terrarium\.venv\Scripts\python.exe',
+    [string] $AutogenesisPython = 'C:\src\autogenesis\.venv\Scripts\python.exe',
     [string] $SpecialistsFile = (Join-Path $Repo 'specialists.toml')
 )
 
@@ -21,6 +22,17 @@ if (Test-Path $BryoPython) {
         $BryoPython,
         '-m',
         'bryo.status'
+    )
+}
+$AutogenesisState = 'C:\src\autogenesis\state-live\autogenesis.sqlite3'
+if ((Test-Path $AutogenesisPython) -and (Test-Path $AutogenesisState)) {
+    $env:PIONIR_AUTOGENESIS_STATUS_COMMAND_JSON = ConvertTo-Json -Compress -InputObject @(
+        $AutogenesisPython,
+        '-m',
+        'autogenesis',
+        '--state-dir',
+        'C:\src\autogenesis\state-live',
+        'status'
     )
 }
 if (Test-Path $SpecialistsFile) {

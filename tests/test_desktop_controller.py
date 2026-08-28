@@ -19,7 +19,12 @@ class DesktopControllerTests(unittest.TestCase):
         self.executive = FakeExecutive()
         self.runtime = SimpleNamespace(
             executive=self.executive,
-            adapters={"atani": object(), "theo-peer": object(), "bryo": object()},
+            adapters={
+                "atani": object(),
+                "theo-peer": object(),
+                "bryo": object(),
+                "autogenesis": object(),
+            },
         )
         self.controller = DesktopController(self.runtime)
 
@@ -43,6 +48,13 @@ class DesktopControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not configured"):
             self.controller.ask("Theo · safe peer", "Hello")
         self.assertEqual(self.executive.tasks, [])
+
+    def test_autogenesis_status_is_read_only_capability(self) -> None:
+        self.controller.autogenesis_status()
+        self.assertEqual(
+            self.executive.tasks[0].capability,
+            "organism.autogenesis_status",
+        )
 
 
 if __name__ == "__main__":

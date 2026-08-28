@@ -61,6 +61,10 @@ def _parser() -> argparse.ArgumentParser:
     theo.add_argument("text", nargs="+")
     theo.add_argument("--conversation")
     commands.add_parser("bryo-status", help="read Bryo's non-mutating status snapshot")
+    commands.add_parser(
+        "autogenesis-status",
+        help="read Autogenesis controls and recent ledger events",
+    )
     return parser
 
 
@@ -89,6 +93,11 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
         specialists["bryo"] = {
             "status": "not_configured",
             "message": "set PIONIR_BRYO_STATUS_COMMAND_JSON",
+        }
+    if "autogenesis" not in runtime.adapters:
+        specialists["autogenesis"] = {
+            "status": "not_configured",
+            "message": "set PIONIR_AUTOGENESIS_STATUS_COMMAND_JSON",
         }
     return {
         "runtime": "ok",
@@ -189,6 +198,17 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
                 "Bryo is not configured; set PIONIR_BRYO_STATUS_COMMAND_JSON"
             )
         result = runtime.executive.execute(Task("organism.bryo_status", {}))
+        _print(result.output)
+        return 0
+    if args.command == "autogenesis-status":
+        if "autogenesis" not in runtime.adapters:
+            raise ValueError(
+                "Autogenesis is not configured; set "
+                "PIONIR_AUTOGENESIS_STATUS_COMMAND_JSON"
+            )
+        result = runtime.executive.execute(
+            Task("organism.autogenesis_status", {})
+        )
         _print(result.output)
         return 0
     return 2

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from .adapters import (
     AtaniCliAdapter,
     AtaniCliSettings,
+    AutogenesisStatusAdapter,
+    AutogenesisStatusSettings,
     BryoStatusAdapter,
     BryoStatusSettings,
     TheoPeerAdapter,
@@ -63,6 +65,14 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         runtime.register(
             BryoStatusAdapter(
                 BryoStatusSettings(command=configured.bryo_status_command)
+            )
+        )
+    if configured.autogenesis_status_command is not None:
+        runtime.register(
+            AutogenesisStatusAdapter(
+                AutogenesisStatusSettings(
+                    command=configured.autogenesis_status_command
+                )
             )
         )
     if configured.specialists_file is not None:
