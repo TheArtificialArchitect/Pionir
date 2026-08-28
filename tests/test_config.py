@@ -13,6 +13,7 @@ class ConfigTests(unittest.TestCase):
             settings = PionirSettings(state_root=Path(directory) / "state")
             settings.initialize_runtime()
             self.assertTrue(settings.audit_path.parent.is_dir())
+            self.assertTrue(settings.gpu_lock_path.parent.is_dir())
 
     def test_reads_token_and_command_from_environment(self) -> None:
         environment = {
@@ -22,6 +23,9 @@ class ConfigTests(unittest.TestCase):
             "PIONIR_BRYO_STATUS_COMMAND_JSON": '["python","-m","bryo.status"]',
             "PIONIR_SPECIALISTS_FILE": str(
                 Path(os.getcwd()).resolve() / "specialists.toml"
+            ),
+            "PIONIR_GPU_LOCK_FILE": str(
+                Path(os.getcwd()).resolve() / "gpu.lock"
             ),
         }
         with patch.dict(os.environ, environment, clear=True):
@@ -37,6 +41,19 @@ class ConfigTests(unittest.TestCase):
             Path(os.getcwd()).resolve() / "specialists.toml",
         )
         self.assertNotIn("secret", repr(settings))
+        self.assertEqual(
+            settings.gpu_lock_path,
+            Path(os.getcwd()).resolve() / "gpu.lock",
+        )
+
+    def test_rejects_relative_shared_gpu_lock_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = PionirSettings(
+                state_root=Path(directory).resolve(),
+                shared_gpu_lock_file=Path("relative-gpu.lock"),
+            )
+            with self.assertRaisesRegex(ValueError, "GPU lock path"):
+                settings.initialize_runtime()
 
 
 if __name__ == "__main__":

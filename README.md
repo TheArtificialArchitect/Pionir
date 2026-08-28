@@ -40,6 +40,10 @@ python -m pionir doctor
 python -m pionir capabilities
 ```
 
+The initial dependency-free Windows desktop shell is available after installation as
+`pionir-desktop`; see [Windows setup](docs/SETUP_WINDOWS.md). It presents explicit specialist
+routes until the evaluated automatic router is ready.
+
 See [docs/FUSION_PLAN.md](docs/FUSION_PLAN.md) for the staged integration plan and
 [docs/ADAPTER_CHECKLIST.md](docs/ADAPTER_CHECKLIST.md) for the source audit template. Confirmed
 source interfaces and deferred boundaries are recorded in
@@ -48,11 +52,18 @@ source interfaces and deferred boundaries are recorded in
 Self-improvement candidates are governed by the deterministic, human-approved contract in
 [docs/IMPROVEMENT_GATE.md](docs/IMPROVEMENT_GATE.md).
 
+Typed action plans cross the [Atani bounded-executive contract](docs/ATANI_EXECUTIVE.md)
+without giving Pionir arbitrary process or filesystem authority.
+
 Windows installation and environment setup are documented in
 [docs/SETUP_WINDOWS.md](docs/SETUP_WINDOWS.md).
 
 Additional local agents can implement the dependency-isolated
 [JSON stdio adapter protocol](docs/ADAPTER_PROTOCOL.md).
+
+Existing specialist Discord integrations are preserved under the
+[notification ownership rules](docs/NOTIFICATIONS.md); Pionir does not copy webhook secrets or
+duplicate source-owned lifecycle messages.
 
 ## Security
 

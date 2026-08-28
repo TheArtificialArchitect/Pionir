@@ -73,6 +73,21 @@ or take over its watchdog.
 ### Resource-governor relationship
 
 Bryo remains the authority over its own CPU, memory, and scavenger GPU work. Pionir remains the
-authority over heavyweight specialist model scheduling. A later cross-process lease protocol
-must be implemented by both sides before Pionir may assume it can revoke Bryo's GPU work; a
-Pionir-only lock would provide false safety because Bryo would not observe it.
+authority over heavyweight specialist model scheduling. Pionir now holds an OS-owned,
+non-blocking lock at `~/.pionir/resource/gpu.lock` for every heavyweight GPU call. Bryo must
+hold that same lock for the complete lifetime of each opportunistic GPU lease. Process exit
+releases the OS lock automatically; metadata in the file is diagnostic only.
+
+## Autogenesis
+
+- Source: `PreShotCome/autogenesis`, branch `main`, package version 0.1.0.
+- Python support: 3.11 or newer, with no runtime dependencies.
+- Autogenesis is a clean-room evolutionary organism with a deterministic curriculum,
+  transactional SQLite ledger, hash-chained events, loopback observatory, and its own
+  deny-by-default extension gate.
+- Its persistent online process uses `state-live`, checkpoints every generation, and owns its
+  own pause/control surface.
+
+Autogenesis should enter Pionir as an evaluation and candidate-generation specialist through
+the JSON stdio protocol. Pionir must not import its live organism state or replace its
+supervisor. A read-only status adapter should precede any mutation/evolution command.

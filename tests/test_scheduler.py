@@ -1,8 +1,11 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 from pionir.contracts import ModelRequirement
 from pionir.errors import ResourceUnavailable
 from pionir.scheduler import ModelLeaseScheduler, ResourceBudget
+from pionir.shared_gpu import SharedGpuLock
 
 
 class SchedulerTests(unittest.TestCase):
@@ -34,6 +37,17 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(len(self.scheduler.active_requirements), 2)
         cpu.release()
         gpu.release()
+
+    def test_shared_lock_excludes_another_scheduler(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            shared_lock = SharedGpuLock(Path(directory) / "gpu.lock")
+            first = ModelLeaseScheduler(self.scheduler.budget, shared_lock)
+            second = ModelLeaseScheduler(self.scheduler.budget, shared_lock)
+            lease = first.acquire(ModelRequirement("atani", 4_700))
+            with self.assertRaises(ResourceUnavailable):
+                second.acquire(ModelRequirement("theo", 4_700))
+            lease.release()
+            second.acquire(ModelRequirement("theo", 4_700)).release()
 
 
 if __name__ == "__main__":

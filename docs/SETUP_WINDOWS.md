@@ -47,12 +47,28 @@ If Atani's environment uses a different path, change only
 `doctor` verifies Pionir's audit chain and checks Atani and Theo independently. One unavailable
 specialist does not corrupt or erase another specialist's state.
 
+## Launch the desktop shell
+
+```powershell
+.\.venv\Scripts\pionir-desktop.exe
+```
+
+To add a `Pionir` shortcut to the current user's Windows desktop:
+
+```powershell
+.\scripts\install-desktop-shortcut.ps1
+```
+
+The first shell exposes explicit Atani normal/depth and Theo safe-peer routes plus doctor,
+capabilities, and Bryo status. Automatic intent routing is deliberately not implied yet.
+
 ## First bounded calls
 
 ```powershell
 .\.venv\Scripts\pionir.exe ask-atani "Explain the evidence for this decision"
 .\.venv\Scripts\pionir.exe ask-theo-peer "Give Atani your actual view of this design"
 .\.venv\Scripts\pionir.exe bryo-status
+.\.venv\Scripts\pionir.exe run-atani-plan .\examples\atani-plan.json
 ```
 
 The Theo peer command uses his conversation-only route. It cannot call his tools or read Ian's

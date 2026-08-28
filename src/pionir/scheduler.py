@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 from .contracts import ModelRequirement
 from .errors import ResourceUnavailable
+from .shared_gpu import SharedGpuLease, SharedGpuLock
 
 
 @dataclass(frozen=True, slots=True)
@@ -35,16 +36,22 @@ class ModelLease(AbstractContextManager["ModelLease"]):
         self,
         scheduler: "ModelLeaseScheduler",
         requirement: ModelRequirement,
+        shared_gpu_lease: SharedGpuLease | None = None,
     ) -> None:
         self.lease_id: UUID = uuid4()
         self.requirement = requirement
         self._scheduler = scheduler
+        self._shared_gpu_lease = shared_gpu_lease
         self._released = False
 
     def release(self) -> None:
         if not self._released:
-            self._scheduler.release(self.lease_id)
-            self._released = True
+            try:
+                if self._shared_gpu_lease is not None:
+                    self._shared_gpu_lease.release()
+            finally:
+                self._scheduler.release(self.lease_id)
+                self._released = True
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         self.release()
@@ -53,8 +60,13 @@ class ModelLease(AbstractContextManager["ModelLease"]):
 class ModelLeaseScheduler:
     """Fail-fast scheduler that prevents accidental simultaneous model residency."""
 
-    def __init__(self, budget: ResourceBudget | None = None) -> None:
+    def __init__(
+        self,
+        budget: ResourceBudget | None = None,
+        shared_gpu_lock: SharedGpuLock | None = None,
+    ) -> None:
         self.budget = budget or ResourceBudget()
+        self.shared_gpu_lock = shared_gpu_lock
         self._active: dict[UUID, ModelRequirement] = {}
         self._lock = Lock()
 
@@ -65,11 +77,21 @@ class ModelLeaseScheduler:
                 f"budget allows {self.budget.usable_vram_mb} MB"
             )
 
-        lease = ModelLease(self, requirement)
         with self._lock:
             gpu_leases = sum(item.requires_gpu for item in self._active.values())
             if requirement.requires_gpu and gpu_leases >= self.budget.max_gpu_leases:
                 raise ResourceUnavailable("all GPU model leases are in use")
+            shared_lease = None
+            if requirement.requires_gpu and self.shared_gpu_lock is not None:
+                shared_lease = self.shared_gpu_lock.try_acquire(
+                    owner="pionir",
+                    purpose=requirement.model_id,
+                )
+                if shared_lease is None:
+                    raise ResourceUnavailable(
+                        "GPU is leased by another Pionir-compatible process"
+                    )
+            lease = ModelLease(self, requirement, shared_lease)
             self._active[lease.lease_id] = requirement
         return lease
 

@@ -22,7 +22,13 @@ MAX_OUTPUT_CHARS = 2_000_000
 
 
 class CommandRunner(Protocol):
-    def run(self, arguments: Sequence[str], *, timeout_seconds: int) -> str: ...
+    def run(
+        self,
+        arguments: Sequence[str],
+        *,
+        timeout_seconds: int,
+        input_text: str | None = None,
+    ) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,7 +48,13 @@ class SubprocessCommandRunner:
     def __init__(self, command: Sequence[str]) -> None:
         self._command = tuple(command)
 
-    def run(self, arguments: Sequence[str], *, timeout_seconds: int) -> str:
+    def run(
+        self,
+        arguments: Sequence[str],
+        *,
+        timeout_seconds: int,
+        input_text: str | None = None,
+    ) -> str:
         try:
             process = subprocess.run(
                 [*self._command, *arguments],
@@ -52,6 +64,7 @@ class SubprocessCommandRunner:
                 errors="replace",
                 shell=False,
                 timeout=timeout_seconds,
+                input=input_text,
             )
         except FileNotFoundError as error:
             raise AdapterUnavailable("Atani's configured executable was not found") from error
@@ -102,6 +115,16 @@ class AtaniCliAdapter:
                     ),
                     priority=100,
                 ),
+                Capability(
+                    name="executive.atani_run",
+                    description=(
+                        "Run a versioned plan through Atani's bounded executive, "
+                        "capability broker, action ledger, and postcondition checks"
+                    ),
+                    risk=RiskLevel.PRIVILEGED,
+                    required_permissions=frozenset({"atani.executive"}),
+                    priority=110,
+                ),
             ),
         )
 
@@ -109,8 +132,17 @@ class AtaniCliAdapter:
     def manifest(self) -> AgentManifest:
         return self._manifest
 
-    def _json(self, arguments: Sequence[str]) -> Mapping[str, Any]:
-        raw = self._runner.run(arguments, timeout_seconds=self.settings.timeout_seconds)
+    def _json(
+        self,
+        arguments: Sequence[str],
+        *,
+        input_text: str | None = None,
+    ) -> Mapping[str, Any]:
+        raw = self._runner.run(
+            arguments,
+            timeout_seconds=self.settings.timeout_seconds,
+            input_text=input_text,
+        )
         try:
             document = json.loads(raw)
         except json.JSONDecodeError as error:
@@ -123,6 +155,31 @@ class AtaniCliAdapter:
         return self._json(("status",))
 
     def execute(self, task: Task) -> TaskResult:
+        if task.capability == "executive.atani_run":
+            request = dict(task.payload)
+            if request.get("protocol") != "atani.executive.v1":
+                raise AdapterProtocolError(
+                    "Atani executive requests require protocol atani.executive.v1"
+                )
+            serialized = json.dumps(request, ensure_ascii=False)
+            if len(serialized) > 250_000:
+                raise AdapterProtocolError("Atani executive request exceeds 250000 characters")
+            document = self._json(("executive",), input_text=serialized)
+            goal_id = str(document.get("goal_id") or "").strip()
+            status = str(document.get("status") or "").strip()
+            if not goal_id or status not in {
+                "completed",
+                "waiting_approval",
+                "paused",
+                "failed",
+            }:
+                raise AdapterProtocolError("Atani returned an invalid executive outcome")
+            return TaskResult(
+                task_id=task.task_id,
+                agent_id=self.manifest.agent_id,
+                output=document,
+                evidence=(f"atani:goal:{goal_id}",),
+            )
         if task.capability not in {"reasoning.atani_chat", "reasoning.atani_depth"}:
             raise AdapterProtocolError(f"unsupported Atani capability: {task.capability}")
         content = str(task.payload.get("content") or "").strip()

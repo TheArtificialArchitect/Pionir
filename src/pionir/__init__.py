@@ -24,6 +24,7 @@ from .registry import CapabilityRegistry
 from .reliability import CircuitBreaker, CircuitSnapshot, CircuitState
 from .runtime import AuditEvent, Executive, InMemoryAuditSink, SpecialistAdapter
 from .scheduler import ModelLease, ModelLeaseScheduler, ResourceBudget
+from .shared_gpu import SharedGpuLease, SharedGpuLock
 
 __all__ = [
     "AgentManifest",
@@ -43,6 +44,8 @@ __all__ = [
     "MemoryNamespace",
     "ModelLease",
     "ModelLeaseScheduler",
+    "SharedGpuLease",
+    "SharedGpuLock",
     "ModelRequirement",
     "PionirSettings",
     "PromotionApproval",

@@ -48,6 +48,12 @@ def _parser() -> argparse.ArgumentParser:
     atani.add_argument("text", nargs="+")
     atani.add_argument("--depth", action="store_true")
 
+    atani_plan = commands.add_parser(
+        "run-atani-plan",
+        help="run a versioned JSON plan through Atani's bounded executive",
+    )
+    atani_plan.add_argument("request_file", type=Path)
+
     theo = commands.add_parser(
         "ask-theo-peer",
         help="ask Theo through the conversation-only Atani peer boundary",
@@ -150,6 +156,19 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
                 capability,
                 {"content": " ".join(args.text)},
                 frozenset({"atani.chat"}),
+            )
+        )
+        _print(result.output)
+        return 0
+    if args.command == "run-atani-plan":
+        request = json.loads(args.request_file.read_text(encoding="utf-8"))
+        if not isinstance(request, dict):
+            raise ValueError("Atani executive request file must contain a JSON object")
+        result = runtime.executive.execute(
+            Task(
+                "executive.atani_run",
+                request,
+                frozenset({"atani.executive"}),
             )
         )
         _print(result.output)

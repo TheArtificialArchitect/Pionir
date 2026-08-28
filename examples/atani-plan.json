@@ -1,0 +1,27 @@
+{
+  "protocol": "atani.executive.v1",
+  "goal": {
+    "title": "Create a verified integration note",
+    "description": "Write one bounded file inside Atani's assigned workspace.",
+    "success_criteria": [
+      "The written bytes match the declared SHA-256 digest."
+    ]
+  },
+  "steps": [
+    {
+      "tool": "workspace.create_text",
+      "resource": "Pionir/integration-ready.txt",
+      "reason": "Record the verified Pionir integration boundary.",
+      "expected_outcomes": [
+        "sha256:0f8f60325c74da1d426c053cd006cbc3f7f1d556442accd1c212d755b3f32699"
+      ],
+      "arguments": {
+        "path": "Pionir/integration-ready.txt",
+        "text": "Pionir integration ready.\n",
+        "overwrite": false
+      },
+      "idempotency_key": "pionir-integration-ready-v1"
+    }
+  ],
+  "done_rationale": "The declared file digest was verified by Atani."
+}

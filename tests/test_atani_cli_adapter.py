@@ -11,8 +11,9 @@ class FakeRunner:
         self.document = document
         self.calls: list[tuple[tuple[str, ...], int]] = []
 
-    def run(self, arguments, *, timeout_seconds: int) -> str:
+    def run(self, arguments, *, timeout_seconds: int, input_text=None) -> str:
         self.calls.append((tuple(arguments), timeout_seconds))
+        self.input_text = input_text
         return json.dumps(self.document)
 
 
@@ -61,6 +62,34 @@ class AtaniCliAdapterTests(unittest.TestCase):
         }
         self.assertEqual(models["reasoning.atani_chat"], "qwen2.5:7b-instruct")
         self.assertIn("nemotron", models["reasoning.atani_depth"])
+
+    def test_executive_plan_uses_versioned_stdin_contract(self) -> None:
+        runner = FakeRunner(
+            {"status": "completed", "goal_id": "goal-1", "steps": 1}
+        )
+        adapter = AtaniCliAdapter(runner=runner)
+        request = {
+            "protocol": "atani.executive.v1",
+            "goal_id": "goal-1",
+            "steps": [],
+        }
+        result = adapter.execute(
+            Task(
+                "executive.atani_run",
+                request,
+                frozenset({"atani.executive"}),
+            )
+        )
+        self.assertEqual(runner.calls[0][0], ("executive",))
+        self.assertEqual(json.loads(runner.input_text), request)
+        self.assertEqual(result.evidence, ("atani:goal:goal-1",))
+
+    def test_executive_plan_rejects_wrong_protocol(self) -> None:
+        adapter = AtaniCliAdapter(runner=FakeRunner({}))
+        with self.assertRaises(AdapterProtocolError):
+            adapter.execute(
+                Task("executive.atani_run", {"protocol": "unknown"})
+            )
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from .config import PionirSettings
 from .reliability import CircuitBreaker
 from .runtime import Executive, SpecialistAdapter
 from .scheduler import ModelLeaseScheduler
+from .shared_gpu import SharedGpuLock
 
 
 @dataclass(slots=True)
@@ -35,7 +36,10 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
     configured = settings or PionirSettings.from_environment()
     configured.initialize_runtime()
     executive = Executive(
-        scheduler=ModelLeaseScheduler(configured.resource_budget),
+        scheduler=ModelLeaseScheduler(
+            configured.resource_budget,
+            shared_gpu_lock=SharedGpuLock(configured.gpu_lock_path),
+        ),
         audit_sink=JsonlAuditSink(configured.audit_path),
         circuit_factory=lambda: CircuitBreaker(
             failure_threshold=configured.circuit_failure_threshold,

@@ -20,6 +20,7 @@ dev = [
 
 [project.scripts]
 pionir = "pionir.cli:main"
+pionir-desktop = "pionir.desktop:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pionir"]

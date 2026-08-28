@@ -11,7 +11,8 @@ from pionir.runtime import Executive
 
 
 class AtaniRunner:
-    def run(self, arguments, *, timeout_seconds: int) -> str:
+    def run(self, arguments, *, timeout_seconds: int, input_text=None) -> str:
+        del input_text
         return json.dumps({"answer": "Atani answer", "cycle_id": "sim-1"})
 
 
