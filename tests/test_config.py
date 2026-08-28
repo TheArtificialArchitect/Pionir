@@ -27,6 +27,8 @@ class ConfigTests(unittest.TestCase):
             "PIONIR_GPU_LOCK_FILE": str(
                 Path(os.getcwd()).resolve() / "gpu.lock"
             ),
+            "PIONIR_PROBABILITY_URL": "http://127.0.0.1:8791",
+            "PIONIR_GENESIS_URL": "http://127.0.0.1:8000",
         }
         with patch.dict(os.environ, environment, clear=True):
             settings = PionirSettings.from_environment()
@@ -45,6 +47,8 @@ class ConfigTests(unittest.TestCase):
             settings.gpu_lock_path,
             Path(os.getcwd()).resolve() / "gpu.lock",
         )
+        self.assertEqual(settings.probability_url, "http://127.0.0.1:8791")
+        self.assertEqual(settings.genesis_url, "http://127.0.0.1:8000")
 
     def test_rejects_relative_shared_gpu_lock_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

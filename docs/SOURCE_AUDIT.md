@@ -91,3 +91,51 @@ releases the OS lock automatically; metadata in the file is diagnostic only.
 Autogenesis should enter Pionir as an evaluation and candidate-generation specialist through
 the JSON stdio protocol. Pionir must not import its live organism state or replace its
 supervisor. A read-only status adapter should precede any mutation/evolution command.
+
+## Probability
+
+- Source: supplied local `C:\src\Probability` archive, package version 0.1.0.
+- Python support: 3.11 or newer; the protected kernel has no required third-party runtime
+  dependencies.
+- Runtime: a lightweight local supervisor with deterministic cognition, SQLite life record,
+  capability-limited genes, optional model-assisted experiments, fixed evaluation, and
+  reversible Git promotion.
+- Local dashboard/API: loopback port 8791; `GET /health`, `GET /api/state`, and a mutating
+  `POST /api/control` surface.
+- Discord: source-owned Gateway bot and/or outbound webhook with owner-only control commands.
+- Private material in the supplied archive included a local environment file, access token,
+  state database, experiment data, and Git history. None is imported or committed to Pionir.
+
+### Accepted first boundary
+
+Pionir capability `organism.probability_status` reads `/api/state` only over loopback. The
+adapter returns operational mode, counters, resource pressure, model availability, self-model
+counts, and Discord configuration booleans. It deliberately removes memories, events,
+curiosities, goals, experiments, usage records, channel ID, and all credentials.
+
+Pionir does not call `/api/control`; Probability continues to own pause, resume, dream,
+evolution, emergency stop, evaluation, promotion, watchdog behavior, and Discord delivery.
+
+## Genesis agent
+
+- Source: supplied local `C:\Users\Ian\genesis-agent` archive, package version 0.2.0.
+- Python support: 3.12 with FastAPI, Uvicorn, WebSockets, Pydantic, HTTPX/SOCKS, and PyYAML.
+- Runtime: Ollama-backed life loop, deterministic emotional meters, Markdown/Obsidian vault,
+  proposal-only metacoder, and Tor-fail-closed web research.
+- Local dashboard/API: loopback port 8000; health, state, journal, chat, clear-chat, and
+  WebSocket surfaces.
+- Genesis is browser-hosted, not a native desktop bundle. Its PowerShell launcher owns the
+  Python process, UI preflight, Ollama preflight, and optional private Tor process.
+- The supplied archive included installed dependencies, a Tor cache, and live vault content.
+  None is imported or committed to Pionir.
+
+### Accepted first boundary
+
+Pionir capability `organism.genesis_status` reads `/api/health` and `/api/state` over loopback.
+It retains subsystem booleans, model name, life-loop counters, last action name, and emotion
+meters. It removes filesystem paths, probe details, journal content, inner monologue, and action
+results.
+
+Genesis currently has no API authentication. Pionir therefore does not expose chat, journal,
+clear-chat, WebSocket chat, or any state-changing Genesis operation. Those can be considered
+only after Genesis gains an authenticated capability boundary.

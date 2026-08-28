@@ -11,6 +11,10 @@ from .adapters import (
     AutogenesisStatusSettings,
     BryoStatusAdapter,
     BryoStatusSettings,
+    GenesisStatusAdapter,
+    GenesisStatusSettings,
+    ProbabilityStatusAdapter,
+    ProbabilityStatusSettings,
     TheoPeerAdapter,
     TheoPeerSettings,
     load_stdio_adapters,
@@ -73,6 +77,18 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
                 AutogenesisStatusSettings(
                     command=configured.autogenesis_status_command
                 )
+            )
+        )
+    if configured.probability_url is not None:
+        runtime.register(
+            ProbabilityStatusAdapter(
+                ProbabilityStatusSettings(base_url=configured.probability_url)
+            )
+        )
+    if configured.genesis_url is not None:
+        runtime.register(
+            GenesisStatusAdapter(
+                GenesisStatusSettings(base_url=configured.genesis_url)
             )
         )
     if configured.specialists_file is not None:

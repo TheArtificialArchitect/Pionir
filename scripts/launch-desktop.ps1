@@ -4,6 +4,8 @@ param(
     [string] $AtaniExe = 'C:\src\Atani\.venv\Scripts\atani.exe',
     [string] $BryoPython = 'C:\src\terrarium\.venv\Scripts\python.exe',
     [string] $AutogenesisPython = 'C:\src\autogenesis\.venv\Scripts\python.exe',
+    [string] $ProbabilityRoot = 'C:\src\Probability',
+    [string] $GenesisRoot = 'C:\Users\Ian\genesis-agent',
     [string] $SpecialistsFile = (Join-Path $Repo 'specialists.toml')
 )
 
@@ -34,6 +36,12 @@ if ((Test-Path $AutogenesisPython) -and (Test-Path $AutogenesisState)) {
         'C:\src\autogenesis\state-live',
         'status'
     )
+}
+if (Test-Path $ProbabilityRoot) {
+    $env:PIONIR_PROBABILITY_URL = 'http://127.0.0.1:8791'
+}
+if (Test-Path $GenesisRoot) {
+    $env:PIONIR_GENESIS_URL = 'http://127.0.0.1:8000'
 }
 if (Test-Path $SpecialistsFile) {
     $env:PIONIR_SPECIALISTS_FILE = $SpecialistsFile

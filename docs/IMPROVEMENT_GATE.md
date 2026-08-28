@@ -14,9 +14,9 @@ may perform more than its assigned stage merely because it produced a promising 
 6. Ian approves the exact SHA-256 digest of the candidate record.
 7. The gate returns an authorization decision; it does not deploy the change.
 
-The split is intentional. EvolutionaryAI may propose candidates, Genesis or Terrarium may run
-trials, and Atani may verify evidence, but none of those systems can manufacture Ian's approval
-or silently substitute a different candidate after approval.
+The split is intentional. Probability or Autogenesis may propose candidates, Genesis or
+Terrarium may run trials, and Atani may verify evidence, but none of those systems can
+manufacture Ian's approval or silently substitute a different candidate after approval.
 
 ## Still required before real promotion
 

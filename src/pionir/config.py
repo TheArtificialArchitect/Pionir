@@ -46,6 +46,8 @@ class PionirSettings:
     atani_command: tuple[str, ...] = ("atani",)
     bryo_status_command: tuple[str, ...] | None = None
     autogenesis_status_command: tuple[str, ...] | None = None
+    probability_url: str | None = None
+    genesis_url: str | None = None
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
 
@@ -132,6 +134,12 @@ class PionirSettings:
             ),
             autogenesis_status_command=_command_from_json(
                 "PIONIR_AUTOGENESIS_STATUS_COMMAND_JSON", None
+            ),
+            probability_url=(
+                os.environ.get("PIONIR_PROBABILITY_URL", "").strip() or None
+            ),
+            genesis_url=(
+                os.environ.get("PIONIR_GENESIS_URL", "").strip() or None
             ),
             specialists_file=(
                 Path(os.environ["PIONIR_SPECIALISTS_FILE"])

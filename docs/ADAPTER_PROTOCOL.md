@@ -52,7 +52,7 @@ Specialists are declared in a TOML file outside source control, based on
 manifest declares its command, capabilities, permissions, memory namespaces, risk, priority,
 timeout, and model-resource estimate.
 
-This protocol is the preferred first integration for Probability, Autogenesis, Genesis, and
-EvolutionaryAI because each can keep its own Python version, virtual environment, models, and
-state. A direct library adapter should be used only when a source audit proves that shared
-process state is safe and useful.
+This protocol remains available for independently packaged specialists. Probability and
+Genesis already provide loopback HTTP status APIs, while Autogenesis provides a read-only CLI,
+so Pionir uses those narrower existing interfaces first. A direct library adapter should be
+used only when a source audit proves that shared process state is safe and useful.

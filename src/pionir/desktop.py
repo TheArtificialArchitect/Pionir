@@ -77,6 +77,22 @@ class DesktopController:
             ).output
         )
 
+    def probability_status(self) -> Any:
+        if "probability" not in self.runtime.adapters:
+            raise ValueError("Probability is not configured")
+        return dict(
+            self.runtime.executive.execute(
+                Task("organism.probability_status", {})
+            ).output
+        )
+
+    def genesis_status(self) -> Any:
+        if "genesis" not in self.runtime.adapters:
+            raise ValueError("Genesis is not configured")
+        return dict(
+            self.runtime.executive.execute(Task("organism.genesis_status", {})).output
+        )
+
     def doctor(self) -> Any:
         return _doctor(self.runtime)
 
@@ -175,6 +191,18 @@ class PionirDesktop:
             command=lambda: self._submit(
                 "Autogenesis", self.controller.autogenesis_status
             ),
+        ).pack(side=tk.LEFT, padx=8)
+        ttk.Button(
+            controls,
+            text="Read Probability status",
+            command=lambda: self._submit(
+                "Probability", self.controller.probability_status
+            ),
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            controls,
+            text="Read Genesis status",
+            command=lambda: self._submit("Genesis", self.controller.genesis_status),
         ).pack(side=tk.LEFT, padx=8)
         self.system_output = scrolledtext.ScrolledText(
             system_tab,

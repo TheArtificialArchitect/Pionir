@@ -29,7 +29,7 @@ User or client
 ```
 
 The implementation is deliberately dependency-free. It establishes the contracts that
-Atani, Theo, Bryo/Terrarium, Probability, Autogenesis, Genesis, and EvolutionaryAI can implement
+Atani, Theo, Bryo/Terrarium, Probability, Autogenesis, and Genesis can implement
 without requiring their codebases to be copied into Pionir.
 
 ## Development
@@ -42,7 +42,8 @@ python -m pionir capabilities
 
 The initial dependency-free Windows desktop shell is available after installation as
 `pionir-desktop`; see [Windows setup](docs/SETUP_WINDOWS.md). It presents explicit specialist
-routes until the evaluated automatic router is ready.
+routes until the evaluated automatic router is ready. It is a working desktop control shell,
+not yet a bundled single-file Windows application.
 
 See [docs/FUSION_PLAN.md](docs/FUSION_PLAN.md) for the staged integration plan and
 [docs/ADAPTER_CHECKLIST.md](docs/ADAPTER_CHECKLIST.md) for the source audit template. Confirmed

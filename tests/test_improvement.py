@@ -12,7 +12,7 @@ from pionir.improvement import (
 class ImprovementTests(unittest.TestCase):
     def candidate(self) -> ImprovementCandidate:
         return ImprovementCandidate(
-            source_agent="evolutionary-ai",
+            source_agent="probability",
             target="pionir:router-policy",
             change_ref="candidate:abc123",
             hypothesis="improve specialist selection accuracy",
@@ -77,7 +77,7 @@ class ImprovementTests(unittest.TestCase):
         decision = PromotionGate().assess(
             candidate,
             self.report(candidate),
-            PromotionApproval(candidate.digest, "evolutionary-ai", True),
+            PromotionApproval(candidate.digest, "probability", True),
         )
         self.assertFalse(decision.authorized)
         self.assertIn("approval was not issued by Ian", decision.reasons)

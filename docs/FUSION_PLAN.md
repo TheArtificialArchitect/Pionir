@@ -10,13 +10,12 @@ databases, personalities, or histories.
 
 | System | Intended role | Integration status |
 |---|---|---|
-| Atani | Executive policy, planning, approvals, verification, event ledger | Source audited; adapter pending |
-| Theo / Tech-Support | Human-facing personality, conversation, tools, lessons, LoRA workflow | Source audited; adapter pending |
-| Bryo / Terrarium | Resource governor, CPU-first learning, experiment gate | `build` branch audited; adapter pending |
-| Probability | Forecasting and calibration specialist | Local source audit required |
-| Autogenesis | Unknown until source audit | Local source audit required |
-| Genesis agent | Simulation/evaluation specialist, subject to audit | Local source audit required |
-| EvolutionaryAI | Candidate generation and optimization, subject to audit | Local source audit required |
+| Atani | Executive policy, planning, approvals, verification, event ledger | Working CLI adapter and bounded plan surface |
+| Theo / Tech-Support | Human-facing personality, conversation, tools, lessons, LoRA workflow | Working authenticated safe-peer adapter |
+| Bryo / Terrarium | Resource governor, CPU-first learning, experiment gate | Working read-only status and shared GPU lease |
+| Probability | Measured autonomy, cumulative memory, gene evolution, reversible promotion | Source audited; redacted read-only status working |
+| Autogenesis | Deterministic curriculum, candidate generation, transactional lineage | Source audited; read-only status working |
+| Genesis agent | Local life loop, emotional state, proposal-only metacoder, Tor research | Source audited; redacted read-only status working |
 
 The public `genesis` world-simulator repository must not be assumed to be the same system as
 the local `genesis-agent` directory.
@@ -46,7 +45,7 @@ audited with deterministic failure behavior.
 ### Phase 2 — resource and specialist integration
 
 - Integrate Bryo's governor behind the Pionir scheduler contract.
-- Add Probability, Autogenesis, Genesis, and EvolutionaryAI one at a time.
+- Add Probability, Autogenesis, and Genesis one at a time.
 - Add health checks, timeouts, circuit breakers, and adapter-specific rollback.
 
 Exit criterion: one failed specialist cannot corrupt shared state or prevent the core agent from

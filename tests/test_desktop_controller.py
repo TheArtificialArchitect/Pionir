@@ -24,6 +24,8 @@ class DesktopControllerTests(unittest.TestCase):
                 "theo-peer": object(),
                 "bryo": object(),
                 "autogenesis": object(),
+                "probability": object(),
+                "genesis": object(),
             },
         )
         self.controller = DesktopController(self.runtime)
@@ -54,6 +56,14 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertEqual(
             self.executive.tasks[0].capability,
             "organism.autogenesis_status",
+        )
+
+    def test_probability_and_genesis_status_are_read_only_capabilities(self) -> None:
+        self.controller.probability_status()
+        self.controller.genesis_status()
+        self.assertEqual(
+            [task.capability for task in self.executive.tasks],
+            ["organism.probability_status", "organism.genesis_status"],
         )
 
 

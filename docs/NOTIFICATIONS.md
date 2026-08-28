@@ -7,6 +7,8 @@ by their source agent.
 | Agent | Existing owner | Pionir policy |
 |---|---|---|
 | Bryo | `scripts/discord-notify.ps1` on the `build` branch | Preserve unchanged; do not send the same Bryo lifecycle events |
+| Probability | Its own Discord Gateway app and/or webhook | Read configuration booleans only; never copy tokens, channel IDs, or send duplicate lineage events |
+| Genesis | No Discord integration found in the supplied source | No notification ownership change |
 | Other specialists | Their current local supervisors | Preserve until each notifier is audited |
 
 Rules:
