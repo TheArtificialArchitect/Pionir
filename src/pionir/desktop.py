@@ -175,6 +175,8 @@ class PionirDesktop:
 
     @staticmethod
     def _render(value: Any) -> str:
+        if isinstance(value, str):
+            return value
         if isinstance(value, dict):
             answer = value.get("answer")
             if isinstance(answer, str) and answer.strip():
