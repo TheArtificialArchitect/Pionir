@@ -4,17 +4,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$Pythonw = Join-Path $Repo '.venv\Scripts\pythonw.exe'
-if (-not (Test-Path $Pythonw)) {
-    throw "Pionir's environment is not installed at $Pythonw. Run scripts\bootstrap.ps1 first."
+$LaunchScript = Join-Path $Repo 'scripts\launch-desktop.ps1'
+if (-not (Test-Path $LaunchScript)) {
+    throw "Pionir's desktop launcher is missing at $LaunchScript."
 }
 
 $Desktop = [Environment]::GetFolderPath('Desktop')
 $ShortcutPath = Join-Path $Desktop 'Pionir.lnk'
 $Shell = New-Object -ComObject WScript.Shell
 $Shortcut = $Shell.CreateShortcut($ShortcutPath)
-$Shortcut.TargetPath = $Pythonw
-$Shortcut.Arguments = '-m pionir.desktop'
+$Shortcut.TargetPath = 'powershell.exe'
+$Shortcut.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$LaunchScript`""
 $Shortcut.WorkingDirectory = $Repo
 $Shortcut.Description = 'Pionir specialist-agent desktop console'
 $Shortcut.Save()
