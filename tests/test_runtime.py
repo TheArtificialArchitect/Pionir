@@ -1,9 +1,25 @@
 import unittest
 
 from pionir.contracts import AgentManifest, Capability, ModelRequirement, Task, TaskResult
-from pionir.errors import CircuitOpen
+from pionir.errors import CircuitOpen, ResourceUnavailable
 from pionir.reliability import CircuitBreaker
 from pionir.runtime import Executive, InMemoryAuditSink
+from pionir.scheduler import ModelLeaseScheduler
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+class RefusingScheduler(ModelLeaseScheduler):
+    """Stands in for a GPU already leased by Bryo or another Pionir process."""
+
+    def acquire(self, requirement):  # type: ignore[override]
+        raise ResourceUnavailable("GPU is leased by another Pionir-compatible process")
 
 
 class FakeAdapter:
@@ -72,6 +88,37 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaises(CircuitOpen):
             executive.execute(Task("conversation.reply", {}))
         self.assertEqual(adapter.calls, 2)
+
+    def test_a_refused_lease_does_not_wedge_the_recovery_probe(self) -> None:
+        """A busy GPU must not permanently open a healthy specialist's circuit."""
+
+        clock = FakeClock()
+        adapter = FakeAdapter()
+        circuit = CircuitBreaker(
+            failure_threshold=1,
+            recovery_seconds=10,
+            clock=clock,
+        )
+        executive = Executive(
+            scheduler=RefusingScheduler(),
+            circuit_factory=lambda: circuit,
+        )
+        executive.register(adapter)
+
+        # One genuine adapter failure opens the circuit.
+        circuit.record_failure()
+        clock.now = 10
+
+        # The recovery probe is admitted, then dies on the shared GPU lease.
+        with self.assertRaises(ResourceUnavailable):
+            executive.execute(Task("conversation.reply", {}))
+        self.assertEqual(adapter.calls, 0)
+
+        # Once the GPU frees up the specialist must be reachable again.
+        executive.scheduler = ModelLeaseScheduler()
+        clock.now = 20
+        result = executive.execute(Task("conversation.reply", {}))
+        self.assertEqual(result.output["reply"], "hello")
 
 
 if __name__ == "__main__":

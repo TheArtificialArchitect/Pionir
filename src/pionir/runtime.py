@@ -96,7 +96,13 @@ class Executive:
             if result.agent_id != route.agent_id:
                 raise ValueError("adapter result agent_id does not match the routed agent")
         except Exception as error:
-            if not isinstance(error, (CircuitOpen, ResourceUnavailable)):
+            if isinstance(error, ResourceUnavailable):
+                # The specialist was never called, but if this was the half-open
+                # recovery probe its slot must be returned or the circuit never
+                # closes again.
+                circuit.record_unattempted()
+            elif not isinstance(error, CircuitOpen):
+                # A rejected call holds no probe slot, so there is nothing to return.
                 circuit.record_failure()
             self._record("task.failed", task, route.agent_id, type(error).__name__)
             raise

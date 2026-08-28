@@ -66,6 +66,22 @@ class CircuitBreaker:
             self._failures = 0
             self._probe_in_flight = False
 
+    def record_unattempted(self) -> None:
+        """Hand back a half-open probe for a call that never reached the specialist.
+
+        A refused resource lease says nothing about the specialist's health, so it
+        must not count as a failure. The probe slot still has to be returned, or the
+        circuit stays half-open with a probe permanently in flight and never closes
+        again. Returning to open also restarts the recovery window, so a specialist
+        blocked on a busy GPU is retried on a backoff instead of in a hot loop.
+        """
+
+        with self._lock:
+            if self._state is CircuitState.HALF_OPEN:
+                self._state = CircuitState.OPEN
+                self._opened_at = self._clock()
+            self._probe_in_flight = False
+
     def record_failure(self) -> None:
         with self._lock:
             self._probe_in_flight = False
