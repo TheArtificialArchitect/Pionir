@@ -51,15 +51,27 @@ written and was never re-measured.
 
 At `num_ctx = 4096`, from a verified-cold start (daemon inventory confirmed empty first).
 
-| Model | Resident VRAM | Cold load | Warm latency | Throughput | On GPU |
-|---|---|---|---|---|---|
-| `theo-local-v17-q4` | 4423 MB | 4.1 s | 0.17 s | 47.6 tok/s | yes |
-| `qwen2.5-coder:7b` | 4423 MB | 3.1 s | 0.09 s | 49.0 tok/s | yes |
-| `qwen2.5:7b-instruct` | 4423 MB | 4.6 s | 0.08 s | 49.4 tok/s | yes |
-| `moondream` | 1017 MB | 3.1 s | 0.05 s | 185.5 tok/s | yes |
-| `theo-local-v16` | 7421 MB | 5.6 s | 0.13 s | 30.5 tok/s | yes |
-| `theo-local-v7` (15 GB) | **0 MB** | 18.4 s | — | **6.4 tok/s** | no — CPU |
-| `nemotron-3.5-lightning:30b-a3b` (25 GB) | **0 MB** | 33.3 s | — | **30.4 tok/s** | no — CPU |
+Live routing candidates:
+
+| Model | Role | Resident VRAM | Cold load | Warm latency | Throughput | On GPU |
+|---|---|---|---|---|---|---|
+| `theo-local-v17-q4` | Theo, conversation | 4423 MB | 4.1 s | 0.17 s | 47.6 tok/s | yes |
+| `qwen2.5-coder:7b` | code | 4423 MB | 3.1 s | 0.09 s | 49.0 tok/s | yes |
+| `qwen2.5:7b-instruct` | general | 4423 MB | 4.6 s | 0.08 s | 49.4 tok/s | yes |
+| `moondream` | vision | 1017 MB | 3.1 s | 0.05 s | 185.5 tok/s | yes |
+| `nemotron-3.5-lightning:30b-a3b` | depth (25 GB) | **0 MB** | 33.3 s | — | **30.4 tok/s** | no — CPU |
+
+Retired Theo builds, measured before that was known. They are **not** routing tiers and no
+admission rule should be derived from them; they are kept here only as size-class evidence,
+because the repository holds no other dense model at either size:
+
+| Model | Resident VRAM | Cold load | Throughput | On GPU |
+|---|---|---|---|---|
+| `theo-local-v16` (retired) | 7421 MB | 5.6 s | 30.5 tok/s | yes |
+| `theo-local-v7` (retired, 15 GB) | **0 MB** | 18.4 s | **6.4 tok/s** | no — CPU |
+
+Theo is on v17. `src/pionir/adapters/theo_peer.py` already declares
+`theo-local-v17-q4:latest`, so no code assumed otherwise.
 
 Warm latency is a 16-token round trip against an already-resident model. Throughput is from the
 daemon's own `eval_count / eval_duration` over a 76–160 token generation; an earlier pass
@@ -89,16 +101,18 @@ The consequence for the plan's line "large depth models are cold-loaded only for
 tasks": on this machine a large depth model is not a GPU tenant, so it does not need a GPU lease
 at all. It needs a CPU admission decision and a much longer timeout.
 
-The two behave completely differently and should not share a tier:
+The two behave completely differently, and the difference is architectural rather than a matter
+of size — which is why "large model" is not a useful admission category on its own:
 
-* `theo-local-v7` is dense. At 6.4 tok/s a 300-token answer takes ~47 s plus 18 s to load. It is
-  effectively unusable interactively.
+* `theo-local-v7` (retired) is dense. At 6.4 tok/s a 300-token answer takes ~47 s plus 18 s to
+  load. Any dense model of that size would be unusable interactively here.
 * `nemotron-3.5-lightning:30b-a3b` is a mixture-of-experts with ~3B active parameters. At
-  30.4 tok/s on CPU it matches the 8 GB dense model running *on the GPU*, for zero VRAM. Its
-  cost is the 33 s cold load, not its generation speed.
+  30.4 tok/s on CPU it matches a dense 8B running *on the GPU*, for zero VRAM. Its cost is the
+  33 s cold load, not its generation speed.
 
-That makes the MoE the obvious depth tier: it is the only large model that is both affordable
-and non-competing for the card.
+`nemotron-3.5-lightning:30b-a3b` is therefore the depth tier, and the only large model worth
+routing to: it is both affordable and non-competing for the card. Admission should key on
+active parameters and measured throughput, not on file size.
 
 ## Two 7B models fit simultaneously
 
@@ -118,6 +132,11 @@ stay at one lease. What the measurement rules out is the assumption that co-resi
 impossible; what it rules in is that any relaxation must be computed from declared context, not
 assumed.
 
+With v16 retired, **every live GPU candidate is 4423 MB or smaller** and the depth tier takes no
+VRAM at all. So there is no longer a heavyweight GPU tier to arbitrate between: the realistic
+contention is several same-sized 7Bs, plus whatever Genesis is holding. That is a scheduling
+problem about *how many* small leases fit, not about which single large model wins the card.
+
 ## What this changes
 
 1. `reserved_vram_mb` must rise from 1024 to at least the observed 1830 MB floor. A larger
@@ -126,9 +145,13 @@ assumed.
    today; the shared lock cannot see it, and a free-looking `nvidia-smi` reading four seconds
    after an eviction is not evidence the card is available.
 3. `context_vram_mb` should be computed from the declared context at ~31–43 MB per 1K rather
-   than left at zero.
+   than left at zero. `TheoPeerSettings` currently declares 4700 MB model + 1500 MB context
+   against a measured 4423 MB + 126 MB at 4K context. Both are conservative, so they fail
+   safe and are not bugs; the 1500 MB figure is only correct if Theo runs about 48K context.
 4. The depth tier is a CPU tier on this hardware, and `nemotron-3.5-lightning:30b-a3b` is the
    only large model worth routing to.
+5. There is no heavyweight GPU tier left to arbitrate. Every live GPU candidate is the same
+   4423 MB size class, so the lease question is how many fit, not which one wins.
 
 ## Honesty notes
 
@@ -136,6 +159,10 @@ assumed.
 * `qwen2.5-coder:7b` was evicted from VRAM repeatedly during measurement. Genesis reloads it
   within seconds unaided, and it was resident again at the end of the run.
 * League of Legends was open throughout and was deliberately not touched.
+* `theo-local-v16` and `theo-local-v7` were measured before it was established that both are
+  retired Theo builds. They were included here as a "medium" and a "large" tier; neither is a
+  routing candidate, and the tables above have been corrected. No conclusion in this document
+  now rests on either.
 * `theo-local-v16` reported 7421 MB resident in one pass and 0 MB in another, while returning
   30.5 tok/s both times. A dense 8B on CPU would return roughly 6 tok/s, so it was on the GPU
   in both; the 0 MB is a residency-read race against eviction, not a CPU fallback. The 7421 MB
