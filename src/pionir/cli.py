@@ -10,6 +10,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Sequence
 
+from . import benchmark
 from .adapters import TheoPeerAdapter
 from .bootstrap import PionirRuntime, build_runtime
 from .contracts import Task
@@ -72,6 +73,28 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "genesis-status",
         help="read Genesis health and life-loop counters",
+    )
+
+    bench = commands.add_parser(
+        "benchmark",
+        help="measure observed VRAM, cold start, and warm latency for local models",
+    )
+    bench.add_argument(
+        "models",
+        nargs="*",
+        help="model tags to measure; defaults to every installed model",
+    )
+    bench.add_argument(
+        "--context",
+        type=int,
+        action="append",
+        dest="contexts",
+        help="context length to measure; repeat to measure KV growth (default 4096, 16384)",
+    )
+    bench.add_argument(
+        "--ollama-url",
+        default=benchmark.DEFAULT_OLLAMA_URL,
+        help="local Ollama base URL",
     )
     return parser
 
@@ -244,6 +267,16 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
             raise ValueError("Genesis is not configured; set PIONIR_GENESIS_URL")
         result = runtime.executive.execute(Task("organism.genesis_status", {}))
         _print(result.output)
+        return 0
+    if args.command == "benchmark":
+        models = tuple(args.models) or tuple(
+            benchmark.list_installed_models(args.ollama_url)
+        )
+        if not models:
+            raise ValueError("no models are installed in the local Ollama daemon")
+        contexts = tuple(args.contexts) if args.contexts else (4096, 16384)
+        report = benchmark.run(models, contexts=contexts, base_url=args.ollama_url)
+        _print(report)
         return 0
     return 2
 
