@@ -50,6 +50,7 @@ class GenesisStatusAdapter:
                 Capability(
                     name="organism.genesis_status",
                     description="Read Genesis health and life-loop counters",
+                    routing_hints=frozenset({"genesis", "lifeloop", "counters", "mood"}),
                     priority=100,
                 ),
             ),

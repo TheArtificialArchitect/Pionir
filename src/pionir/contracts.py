@@ -61,10 +61,20 @@ class Capability:
     required_permissions: frozenset[str] = frozenset()
     model: ModelRequirement | None = None
     priority: int = 0
+    routing_hints: frozenset[str] = frozenset()
+    """Extra words a person might use for this capability.
+
+    The intent router scores a request against the name, the description and
+    these, weighting each term by how few capabilities use it. Declaring hints
+    here rather than in a table inside the router is what lets a specialist
+    become routable by registering, without an edit anywhere else.
+    """
 
     def __post_init__(self) -> None:
         if not self.name or any(char.isspace() for char in self.name):
             raise ValueError("capability names must be non-empty and contain no whitespace")
+        if any(not hint or any(char.isspace() for char in hint) for hint in self.routing_hints):
+            raise ValueError("routing hints must be non-empty single words")
 
 
 @dataclass(frozen=True, slots=True)

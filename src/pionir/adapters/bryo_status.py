@@ -72,6 +72,9 @@ class BryoStatusAdapter:
                 Capability(
                     name="organism.bryo_status",
                     description="Read Bryo's current vitals and lineage snapshot",
+                    routing_hints=frozenset(
+                        {"bryo", "terrarium", "organism", "vitals", "alive"}
+                    ),
                     priority=100,
                 ),
             ),

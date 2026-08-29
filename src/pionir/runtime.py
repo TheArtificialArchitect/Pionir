@@ -76,11 +76,20 @@ class Executive:
         self._adapters[adapter.manifest.agent_id] = adapter
         self._circuits[adapter.manifest.agent_id] = self._circuit_factory()
 
-    def execute(self, task: Task) -> TaskResult:
+    def execute(self, task: Task, *, routing_detail: str | None = None) -> TaskResult:
+        """Run one task through the permission, resource, and audit gates.
+
+        ``routing_detail`` is metadata about how this task's capability was
+        chosen - the intent router's confidence and runner-up. It is recorded
+        against ``task.routed`` so the ledger shows not just where a task went
+        but how sure anything was about sending it there. It must stay
+        payload-free; the ledger excludes task content by design.
+        """
+
         route = self.registry.resolve(task)
         adapter = self._adapters[route.agent_id]
         circuit = self._circuits[route.agent_id]
-        self._record("task.routed", task, route.agent_id)
+        self._record("task.routed", task, route.agent_id, routing_detail)
 
         try:
             circuit.before_call()

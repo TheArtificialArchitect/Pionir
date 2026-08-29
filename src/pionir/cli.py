@@ -14,7 +14,9 @@ from . import benchmark
 from .adapters import TheoPeerAdapter
 from .bootstrap import PionirRuntime, build_runtime
 from .contracts import Task
-from .errors import PionirError
+from .errors import PionirError, RoutingAmbiguous
+from .router import IntentRouter
+from .scheduler import observed_free_vram_mb
 
 
 def _jsonable(value: Any) -> Any:
@@ -73,6 +75,36 @@ def _parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "genesis-status",
         help="read Genesis health and life-loop counters",
+    )
+
+    route = commands.add_parser(
+        "route",
+        help=(
+            "classify a plain-English request and run it; exits 3 with a question "
+            "rather than guessing when the classification is not confident"
+        ),
+    )
+    route.add_argument("text", nargs="+")
+    route.add_argument(
+        "--explain",
+        action="store_true",
+        help="show the classification and its evidence without running anything",
+    )
+    route.add_argument(
+        "--permission",
+        action="append",
+        dest="permissions",
+        help=(
+            "grant one permission to this request; repeatable. Permissions are not "
+            "granted by default, so a denied route is reported as denied rather "
+            "than quietly re-pointed at a specialist you can reach"
+        ),
+    )
+    route.add_argument(
+        "--confidence-floor",
+        type=float,
+        default=None,
+        help="override the confidence below which the router asks instead of routing",
     )
 
     bench = commands.add_parser(
@@ -151,6 +183,10 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
         "gpu": {
             "total_vram_mb": runtime.settings.total_vram_mb,
             "reserved_vram_mb": runtime.settings.reserved_vram_mb,
+            "usable_vram_mb": runtime.settings.resource_budget.usable_vram_mb,
+            # None means unmeasurable here, not zero. Admission falls back to the
+            # static budget in that case; see scheduler.observed_free_vram_mb.
+            "observed_free_vram_mb": observed_free_vram_mb(),
             "maximum_heavyweight_leases": 1,
         },
         "specialists": specialists,
@@ -267,6 +303,50 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
             raise ValueError("Genesis is not configured; set PIONIR_GENESIS_URL")
         result = runtime.executive.execute(Task("organism.genesis_status", {}))
         _print(result.output)
+        return 0
+    if args.command == "route":
+        router = IntentRouter(
+            runtime.executive,
+            **(
+                {"confidence_floor": args.confidence_floor}
+                if args.confidence_floor is not None
+                else {}
+            ),
+        )
+        request = " ".join(args.text)
+        if args.explain:
+            _print(router.classify(request))
+            return 0
+        try:
+            decision, result = router.route(
+                request, granted_permissions=frozenset(args.permissions or ())
+            )
+        except RoutingAmbiguous as question:
+            _print(
+                {
+                    "status": "question",
+                    "question": str(question),
+                    "confidence": (
+                        question.decision.confidence if question.decision else 0.0
+                    ),
+                    "reason": question.decision.reason if question.decision else "unknown",
+                    "options": [
+                        candidate.capability
+                        for candidate in (
+                            question.decision.candidates if question.decision else ()
+                        )
+                    ],
+                }
+            )
+            return 3
+        _print(
+            {
+                "routed_to": decision.capability,
+                "confidence": decision.confidence,
+                "agent_id": result.agent_id,
+                "output": dict(result.output),
+            }
+        )
         return 0
     if args.command == "benchmark":
         models = tuple(args.models) or tuple(

@@ -181,12 +181,20 @@ def _capability(document: Mapping[str, Any]) -> Capability:
         isinstance(item, str) and item for item in permissions
     ):
         raise ValueError("required_permissions must be a string list")
+    hints = document.get("routing_hints", [])
+    if not isinstance(hints, list) or not all(
+        isinstance(item, str) and item for item in hints
+    ):
+        raise ValueError("routing_hints must be a string list")
     return Capability(
         name=str(document["name"]),
         description=str(document["description"]),
         risk=RiskLevel(str(document.get("risk", RiskLevel.READ_ONLY.value))),
         required_permissions=frozenset(permissions),
         model=model,
+        # An operator-declared specialist becomes routable by saying what it is
+        # called, without an edit to the router.
+        routing_hints=frozenset(hint.lower() for hint in hints),
         priority=int(document.get("priority", 0)),
     )
 

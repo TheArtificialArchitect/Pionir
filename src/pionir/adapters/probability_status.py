@@ -50,6 +50,7 @@ class ProbabilityStatusAdapter:
                 Capability(
                     name="organism.probability_status",
                     description="Read Probability's operational state without private memory",
+                    routing_hints=frozenset({"probability", "operational"}),
                     priority=100,
                 ),
             ),

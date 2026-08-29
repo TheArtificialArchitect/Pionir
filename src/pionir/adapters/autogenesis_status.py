@@ -74,6 +74,7 @@ class AutogenesisStatusAdapter:
                 Capability(
                     name="organism.autogenesis_status",
                     description="Read Autogenesis controls and recent ledger events",
+                    routing_hints=frozenset({"autogenesis", "controls", "events"}),
                     priority=100,
                 ),
             ),
