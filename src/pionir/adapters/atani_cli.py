@@ -17,6 +17,7 @@ from pionir.contracts import (
     TaskResult,
 )
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
+from pionir.scheduler import kv_cache_vram_mb
 
 MAX_OUTPUT_CHARS = 2_000_000
 
@@ -100,7 +101,15 @@ class AtaniCliAdapter:
                     description="Atani's bounded default conversational reasoning",
                     risk=RiskLevel.REVERSIBLE_WRITE,
                     required_permissions=permission,
-                    model=ModelRequirement("qwen2.5:7b-instruct", 4_700, 1_500),
+                    model=ModelRequirement(
+                        "qwen2.5:7b-instruct",
+                        # Measured resident at 4096 context: 4423 MB.
+                        4_500,
+                        kv_cache_vram_mb(16_384),
+                    ),
+                    routing_hints=frozenset(
+                        {"atani", "reason", "reasoning", "think", "answer", "chat"}
+                    ),
                     priority=100,
                 ),
                 Capability(
@@ -110,8 +119,19 @@ class AtaniCliAdapter:
                     required_permissions=permission,
                     model=ModelRequirement(
                         "nemotron-3.5-lightning:30b-a3b-q4_K_M",
-                        10_000,
-                        1_000,
+                        # Measured: this model holds zero VRAM on a 12 GB card.
+                        # Ollama runs it on the CPU, and because it is a
+                        # mixture-of-experts with ~3B active parameters it still
+                        # returns 30.4 tok/s there - as fast as a dense 8B on the
+                        # GPU. Declaring it as a GPU tenant made it take the one
+                        # GPU lease it never used, and made it unadmittable
+                        # whenever anything else held the card.
+                        0,
+                        0,
+                        requires_gpu=False,
+                    ),
+                    routing_hints=frozenset(
+                        {"deep", "deeply", "careful", "deliberate", "thorough", "analyse"}
                     ),
                     priority=100,
                 ),
@@ -123,6 +143,7 @@ class AtaniCliAdapter:
                     ),
                     risk=RiskLevel.PRIVILEGED,
                     required_permissions=frozenset({"atani.executive"}),
+                    routing_hints=frozenset({"plan", "execute", "workflow", "ledger"}),
                     priority=110,
                 ),
             ),

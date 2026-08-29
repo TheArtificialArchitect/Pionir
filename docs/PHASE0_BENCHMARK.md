@@ -153,6 +153,67 @@ problem about *how many* small leases fit, not about which single large model wi
 5. There is no heavyweight GPU tier left to arbitrate. Every live GPU candidate is the same
    4423 MB size class, so the lease question is how many fit, not which one wins.
 
+## Addendum, 2026-08-28: what changed, and what the numbers now drive
+
+The measurements above stand as taken. Two things about the *machine* moved
+afterwards, and both are recorded here rather than edited into the tables,
+because a measurement with its context rewritten is no longer a measurement.
+
+**The 4423 MB tenant was an orphan, and it is gone.** The `genesis-agent`
+backend holding VRAM on 2026-08-27 had been launched headlessly by an unrelated
+Claude Code session (`launch.ps1 -Port 8000 -NoBrowser`, backgrounded) and
+orphaned when that session exited. Every process in the chain had an empty
+window title, so the project's own contract - close the window and it stops -
+could never fire. It died with a restart. **Nothing was killed by hand.**
+
+**A legitimate Genesis backend replaced it, and it holds a different model.**
+`qwen2.5:7b-instruct` at 4423 MB, resident and fully on the GPU. That is a
+deliberate change by Ian, not a leak, and that backend serves his phone over
+tailscale. Confirmed live on 2026-08-28: 12288 total, 6344 used, 5767 free.
+
+The point is not which model it is. It is that **the number changed under the
+document within a day, twice, for reasons that had nothing to do with Pionir.**
+Any admission rule written against a specific figure from the tables above would
+already be wrong. Admission reads the card at lease time; see `docs/ROUTING.md`
+and `src/pionir/scheduler.py`.
+
+There is one consequence worth naming: the model Genesis now holds is *also*
+Atani's declared model. A plain free-VRAM check would refuse to load a model that
+is already resident and would cost nothing to reuse, so the scheduler asks the
+daemon whether the model is already wholly on the GPU and, if it is, charges the
+requirement only its KV cache rather than its weights.
+
+### The five items above, resolved
+
+1. **`reserved_vram_mb` 1024 to 1830.** Done, in both `ResourceBudget` and
+   `PionirSettings`. Usable VRAM is now 10458 MB.
+2. **Admission must see VRAM held outside the lock.** Done.
+   `ModelLeaseScheduler` probes `nvidia-smi` at lease time. An unmeasurable
+   reading (`None`: no card, no NVIDIA tooling, the Linux CI runners) falls back
+   to the static budget rather than refusing everything - that leaves callers no
+   worse off than before the check existed, and the static check still applies.
+3. **`context_vram_mb` computed, not left at zero.** Done, at the highest
+   measured rate: `kv_cache_vram_mb()` at 43.08 MB per 1024 tokens. Theo and
+   Atani now declare 4500 MB of weights (measured 4423) plus 690 MB for a
+   declared 16K window, replacing a flat 4700 + 1500.
+
+   This turned out to be load-bearing rather than cosmetic. The old declaration
+   totalled 6200 MB; the card had 5756 MB free at the time, so **Theo was being
+   refused a load that would in fact have fitted.** The doc previously called the
+   over-declaration conservative and therefore harmless. It was neither once
+   observed-free admission started using it.
+
+   The 16K figure is a *declared assumption*, not an observation: Theo's bridge
+   owns its own context window and Pionir does not set it. It is four times the
+   window the measurement was taken at. Worth confirming with the Theo pane.
+4. **The depth tier is a CPU tier.** Done, and this was a live defect.
+   `reasoning.atani_depth` declared 10000 MB of GPU for a model measured at
+   **zero** VRAM, so it took the single GPU lease it never used and blocked
+   everything else, and could never be admitted whenever anything held the card.
+   It is now `requires_gpu=False`, 0 MB, and no longer consumes a lease.
+5. **No heavyweight GPU tier remains to arbitrate.** Unchanged and now visible in
+   the code: every GPU capability declares the same 4500 MB class.
+
 ## Honesty notes
 
 * No source project was modified. `genesis-agent` was left running.
@@ -171,3 +232,6 @@ problem about *how many* small leases fit, not about which single large model wi
   deltas proved unreliable whenever a third party loaded a model mid-measurement, which is why
   contended measurements are now recorded as such rather than averaged in. Per-model
   `size_vram` was stable and reproducible; the driver delta was not.
+* The `genesis-agent` process holding VRAM during this run was an orphan left by
+  an unrelated Claude Code session and has since died with a restart. See the
+  2026-08-28 addendum. No process was killed by this work, then or since.

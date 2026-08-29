@@ -8,6 +8,7 @@ from pionir.adapters.theo_peer import TheoPeerAdapter, TheoPeerSettings
 from pionir.audit import JsonlAuditSink
 from pionir.contracts import Task
 from pionir.runtime import Executive
+from pionir.scheduler import ModelLeaseScheduler
 
 
 class AtaniRunner:
@@ -27,7 +28,12 @@ class IntegrationRuntimeTests(unittest.TestCase):
     def test_two_specialists_share_routing_audit_and_gpu_admission(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             audit = JsonlAuditSink(Path(directory) / "events.jsonl", fsync=False)
-            executive = Executive(audit_sink=audit)
+            # Probes off: this test is about the audit chain and the routing
+            # path, not about the machine it happens to run on.
+            executive = Executive(
+                scheduler=ModelLeaseScheduler(vram_probe=None, residency_probe=None),
+                audit_sink=audit,
+            )
             executive.register(AtaniCliAdapter(runner=AtaniRunner()))
             executive.register(
                 TheoPeerAdapter(

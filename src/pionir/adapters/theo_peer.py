@@ -16,6 +16,7 @@ from pionir.errors import (
     AdapterProtocolError,
     AdapterUnavailable,
 )
+from pionir.scheduler import kv_cache_vram_mb
 
 MAX_RESPONSE_BYTES = 1_000_000
 
@@ -37,8 +38,14 @@ class TheoPeerSettings:
     token: str = field(default="", repr=False)
     timeout_seconds: int = 180
     model_id: str = "theo-local-v17-q4:latest"
-    estimated_model_vram_mb: int = 4_700
-    estimated_context_vram_mb: int = 1_500
+    # Measured resident on the target card at 4096 context: 4423 MB. The margin
+    # covers driver variance, not a guess. See docs/PHASE0_BENCHMARK.md.
+    estimated_model_vram_mb: int = 4_500
+    # Theo's bridge owns its own context window and Pionir does not set it, so
+    # this is a declared assumption rather than an observation. It is deliberately
+    # four times the context the measurement was taken at. If the Theo pane
+    # confirms a different window, change this number, not the VRAM figure.
+    context_length: int = 16_384
 
     def __post_init__(self) -> None:
         parsed = urlparse(self.base_url)
@@ -133,7 +140,10 @@ class TheoPeerAdapter:
                     model=ModelRequirement(
                         model_id=settings.model_id,
                         estimated_vram_mb=settings.estimated_model_vram_mb,
-                        context_vram_mb=settings.estimated_context_vram_mb,
+                        context_vram_mb=kv_cache_vram_mb(settings.context_length),
+                    ),
+                    routing_hints=frozenset(
+                        {"theo", "talk", "chat", "conversation", "reply", "speak"}
                     ),
                     priority=100,
                 ),

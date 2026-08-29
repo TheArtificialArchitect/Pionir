@@ -65,7 +65,9 @@ def _command_from_json(
 class PionirSettings:
     state_root: Path = field(default_factory=_default_state_root)
     total_vram_mb: int = 12_288
-    reserved_vram_mb: int = 1_024
+    # The observed idle floor on the target workstation, not an estimate.
+    # See docs/PHASE0_BENCHMARK.md; ResourceBudget carries the same figure.
+    reserved_vram_mb: int = 1_830
     circuit_failure_threshold: int = 3
     circuit_recovery_seconds: float = 30.0
     theo_url: str = "http://127.0.0.1:8765"
