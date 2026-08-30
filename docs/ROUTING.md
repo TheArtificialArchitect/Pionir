@@ -144,6 +144,19 @@ one thing it exists not to do.
 Aim degrades quietly; a measurement taken once and never repeated is an
 impression with a number attached.
 
+**Read the score knowing who wrote the probes.** They were written by whoever
+wrote the classifier, at the same time, which makes a perfect score the weakest
+kind of evidence there is - the implementation tested against its author's own
+idea of what people ask. It catches regressions well and calibration badly.
+
+The ledger is the external vector that fixes this, and the two are complementary
+rather than redundant. The probes give accuracy against known answers on
+invented traffic; the ledger gives the shape of *real* traffic - how often it
+actually asked, and at what confidence. If the ask-rate over a week of real
+requests diverges sharply from the ask-rate across the probe set, it is the
+probe set that is wrong. Requests that had to be asked about are the best source
+of new probes, because they are the only ones nobody made up.
+
 The detail is parseable `key=value` and **never contains the request text**. The
 audit ledger excludes payloads by design and routing is not the place to start
 putting user content into it; `test_the_audit_detail_never_carries_the_request_text`
