@@ -23,12 +23,28 @@ load** — that circularity would spend the GPU the router exists to arbitrate,
 and would make every decision unreproducible.
 
 That was a design argument when it was written. It now has a measurement behind
-it, from the Theo pane on 2026-08-30: a local 7B asked to emit a tool call fired
-8 times out of 8 with narrow schemas at temperature 0, and **0-1 times out of 10
-once a real conversational prompt was in front of it**, at the temperature its
-voice actually requires. A router that asked a small local model which
-specialist to use would have been unreliable in exactly the conditions it would
-run in, and would have looked fine in isolation.
+it, from the Theo pane on 2026-08-30. A local 7B asked to emit a tool call, with
+narrow schemas at temperature 0:
+
+| prompt in front of it | fired |
+|---|---|
+| nothing | 8/8 |
+| irrelevant filler, identical token count | 8/8 |
+| a persona that states plainly what it can and cannot do | 8/8 |
+| a persona of voice alone | 1/8 |
+| its own continuity briefing - diary, self-model, threads | **0/8** |
+
+Not length, and not position: filler of exactly the same size cost nothing. It
+was the *form* of the content. Hand a model a page of its own remembered prose
+and it continues prose instead of emitting a call.
+
+The lesson is not that a model cannot route. With a controlled prompt this one
+routed perfectly, 8 times out of 8. It is that the control required is fragile,
+is owned by whoever last edited an unrelated prompt fragment, and **fails
+silently** - a 0/8 raises nothing, logs nothing, and looks exactly like a turn
+that needed no tool. Pionir's routing decision does not depend on anyone
+maintaining that control, which is the property worth having rather than the
+accuracy.
 
 A capability's vocabulary is whatever it says about itself: its name, its
 description, its agent id, and its declared `routing_hints`. Each term is
