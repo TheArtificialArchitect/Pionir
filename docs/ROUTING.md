@@ -149,6 +149,12 @@ wrote the classifier, at the same time, which makes a perfect score the weakest
 kind of evidence there is - the implementation tested against its author's own
 idea of what people ask. It catches regressions well and calibration badly.
 
+**The harness writes nothing to the ledger**, and a test enforces it. That has
+to hold for the calibration below to mean anything: an instrument that bumps the
+counters it is calibrated against measures itself, and reports the agreement as
+a pass. A green light manufactured out of a loop is worse than no calibration,
+because it looks like evidence.
+
 The ledger is the external vector that fixes this, and the two are complementary
 rather than redundant. The probes give accuracy against known answers on
 invented traffic; the ledger gives the shape of *real* traffic - how often it

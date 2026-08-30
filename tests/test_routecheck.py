@@ -197,6 +197,40 @@ class RunTests(unittest.TestCase):
         self.assertIn(ASK, expectations)
         self.assertGreater(len(expectations - {ASK}), 4)
 
+    def test_the_harness_writes_nothing_to_the_ledger(self) -> None:
+        # The ledger is the external vector this probe set is calibrated
+        # against, so a harness that wrote to it would be measuring itself and
+        # would report the agreement as a pass - a green light manufactured out
+        # of a loop, which is worse than not calibrating at all.
+        #
+        # True today only because run() classifies rather than routes, and the
+        # ask path is what records. That is an accident of which method is
+        # called, so it is asserted here rather than left to hold by luck.
+        router = _router()
+        routecheck.run(
+            router,
+            (
+                Probe("how is bryo doing", "organism.bryo_status", ("organism.bryo_status",)),
+                Probe(
+                    "organism status",
+                    ASK,
+                    ("organism.bryo_status", "organism.genesis_status"),
+                ),
+                Probe("photosynthesis in tomato plants", ASK),
+            ),
+        )
+        self.assertEqual(router.executive.audit_sink.events, ())
+
+    def test_a_real_request_does_reach_the_ledger(self) -> None:
+        # The counterpart, so the assertion above cannot pass because nothing
+        # writes to the ledger under any circumstances.
+        router = _router()
+        router.route("how is bryo doing")
+        self.assertIn(
+            "task.routed",
+            [event.event_type for event in router.executive.audit_sink.events],
+        )
+
     def test_nothing_is_executed(self) -> None:
         # Measuring aim must never take a GPU lease or call a specialist, so it
         # stays safe to run while the card is busy.
