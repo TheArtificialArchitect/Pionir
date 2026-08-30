@@ -23,47 +23,36 @@ load** — that circularity would spend the GPU the router exists to arbitrate,
 and would make every decision unreproducible.
 
 That was a design argument when it was written. It now has a measurement behind
-it, from the Theo pane on 2026-08-30. A local 7B asked to emit a tool call, with
-narrow schemas at temperature 0:
+it, from the Theo pane on 2026-08-30/31: ten distinct probes, each unambiguously
+warranting a tool, replicated.
 
-| prompt in front of it | fired |
+| the model was asked to choose a tool | fired |
 |---|---|
-| nothing | 8/8 |
-| irrelevant filler, identical token count | 8/8 |
-| a persona that states plainly what it can and cannot do | 8/8 |
-| a persona of voice alone | 1/8 |
-| its continuity briefing - diary, self-model, threads | **0/8** |
+| inside its full conversational prompt, at the temperature its voice needs | 1/10 |
+| in a dedicated pass: minimal voiceless prompt, narrow schemas, temperature 0 | **10/10** |
 
-Not length, not position, not conversation: filler of the same token count cost
-nothing, and so did a persona. The axis is **prose against structure** - the
-same facts as terse labelled lines score 8/8, and rewriting the briefing into
-the third person changes nothing, so it is not the model's own voice.
+Two things follow, and only these two. **The capability is intact** - the same
+model, the same tools, the same questions. What decides is the prompt around the
+decision. And **the failure is silent**: a zero raises nothing, logs nothing, and
+is indistinguishable from a turn that needed no tool.
 
-Read those counts carefully. At temperature 0 a fixed prompt is deterministic,
-so eight samples of one prompt are one sample repeated - every cell came out 8/8
-or 0/8 and never 5/8, which is the tell. The prose row is replicated across five
-separately built briefings and is solid. The others rest on one prompt each.
+So a router that asked a small local model which specialist to use would work in
+a harness and degrade in production, without anything anywhere saying so. That
+is the property worth avoiding - not the accuracy, which was perfect under
+controlled conditions. Pionir's routing decision does not depend on anyone
+maintaining those conditions.
 
-An apparent non-monotonicity in the same experiment - two 8/8 blocks measuring
-0/8 once concatenated - turned out to be the harness rather than the model. The
-briefing generator stamped itself with a second-granularity timestamp, so no two
-conditions were ever built from identical bytes. It is worth recording anyway:
-the model was **chaotic rather than noisy** with respect to those four
-characters, perfectly reproducible on identical input and able to flip on a
-timestamp. That is a thing to know before trusting any prompt measurement,
-including one's own.
+The three properties of that decision pass travel together and are confounded
+within this comparison. Which of them is load-bearing is not known.
 
-Everything in this subsection is an active investigation in another repo and
-will keep moving; this citation has already needed correcting twice. What the
-router's design rests on is only the settled part, below.
-
-The lesson is not that a model cannot route. With a controlled prompt this one
-routed perfectly, 8 times out of 8. It is that the control required is fragile,
-is owned by whoever last edited an unrelated prompt fragment, and **fails
-silently** - a 0/8 raises nothing, logs nothing, and looks exactly like a turn
-that needed no tool. Pionir's routing decision does not depend on anyone
-maintaining that control, which is the property worth having rather than the
-accuracy.
+*Earlier revisions of this section cited a per-condition table from the same
+investigation about prose suppressing structured output. Those cells were n=1 -
+at temperature 0 a fixed prompt is deterministic, so sampling one prompt eight
+times measures the loop, not the model - and the finding did not replicate when
+re-run with varied inputs (1/5 against 1/5, p = 1.0). It is withdrawn. The
+correction is kept here because it is more transferable than the claim was: when
+citing someone's live investigation, cite only what is well powered, and expect
+to be wrong otherwise.*
 
 A capability's vocabulary is whatever it says about itself: its name, its
 description, its agent id, and its declared `routing_hints`. Each term is
