@@ -41,10 +41,15 @@ class TheoPeerSettings:
     # Measured resident on the target card at 4096 context: 4423 MB. The margin
     # covers driver variance, not a guess. See docs/PHASE0_BENCHMARK.md.
     estimated_model_vram_mb: int = 4_500
-    # Theo's bridge owns its own context window and Pionir does not set it, so
-    # this is a declared assumption rather than an observation. It is deliberately
-    # four times the context the measurement was taken at. If the Theo pane
-    # confirms a different window, change this number, not the VRAM figure.
+    # Confirmed 16384, from two independent directions rather than assumed.
+    # The bridge requests it: THEO_NUM_CTX is unset at both User and Machine
+    # scope, and the default is hardcoded 16384 in agent/llm/ollama_client.py,
+    # which is what reaches Ollama's options. And the daemon honours it: this
+    # model measured 4423 MB resident at num_ctx 4096 and 4792 MB at 16384, so
+    # the KV cache actually grew with the request. That second half matters,
+    # because a requested context is not always a served one - moondream showed
+    # no change at all across the same pair, its window capped below what was
+    # asked for. See docs/PHASE0_BENCHMARK.md.
     context_length: int = 16_384
 
     def __post_init__(self) -> None:
