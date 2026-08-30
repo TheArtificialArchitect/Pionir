@@ -105,6 +105,10 @@ class PionirSettings:
         return self.state_root / "audit" / "events.jsonl"
 
     @property
+    def routing_check_path(self) -> Path:
+        return self.state_root / "routing" / "last-check.json"
+
+    @property
     def gpu_lock_path(self) -> Path:
         return self.shared_gpu_lock_file or self.state_root / "resource" / "gpu.lock"
 

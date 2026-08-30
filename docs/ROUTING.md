@@ -121,6 +121,29 @@ answering — how often it could not tell — would have no evidence behind it.
 4 theo-peer outcome=route capability=conversation.theo_peer_reply confidence=1.00 reason=matched runner_up=none
 ```
 
+The ledger measures **reach** and cannot measure **aim**. It records which
+capability was chosen and how confidently, so a ledger full of confident routes
+reads identically whether those routes were right or wrong. Accuracy is a
+separate instrument:
+
+```
+$ pionir route-check
+{"status": "ok", "accuracy": 1.0, "correct": 12, "probes": 12,
+ "under_ask": [], "misroutes": []}
+```
+
+Known-answer probes, classified and thrown away — nothing is executed, no model
+loads, no GPU lease is taken, so it is safe to run while the card is busy. The
+three failure kinds are counted apart because they are not equally bad: a
+`misroute` sends the wrong specialist to answer confidently, an `over_ask` is
+the router doing its job at some cost, and an **`under_ask` fails the check on
+its own whatever the score**, because guessing where it should have asked is the
+one thing it exists not to do.
+
+`pionir doctor` reports the last result, its age, and warns past 30 days.
+Aim degrades quietly; a measurement taken once and never repeated is an
+impression with a number attached.
+
 The detail is parseable `key=value` and **never contains the request text**. The
 audit ledger excludes payloads by design and routing is not the place to start
 putting user content into it; `test_the_audit_detail_never_carries_the_request_text`

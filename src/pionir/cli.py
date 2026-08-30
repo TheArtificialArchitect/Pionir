@@ -10,7 +10,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import benchmark
+from . import benchmark, routecheck
 from .adapters import TheoPeerAdapter
 from .bootstrap import PionirRuntime, build_runtime
 from .contracts import Task
@@ -107,6 +107,19 @@ def _parser() -> argparse.ArgumentParser:
         help="override the confidence below which the router asks instead of routing",
     )
 
+    check = commands.add_parser(
+        "route-check",
+        help=(
+            "measure routing aim against known-answer probes; classifies only, "
+            "executes nothing, and takes no GPU lease"
+        ),
+    )
+    check.add_argument(
+        "--no-save",
+        action="store_true",
+        help="report without recording the result for doctor to read",
+    )
+
     bench = commands.add_parser(
         "benchmark",
         help="measure observed VRAM, cold start, and warm latency for local models",
@@ -172,6 +185,27 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
             "status": "not_configured",
             "message": "set PIONIR_GENESIS_URL",
         }
+    recorded = routecheck.load(runtime.settings.routing_check_path)
+    if recorded is None:
+        # Never measured is reported, not omitted. An absent row is the state
+        # most likely to be read as fine.
+        aim: dict[str, Any] = {
+            "status": "never_measured",
+            "message": "run 'pionir route-check' to measure routing aim",
+        }
+    else:
+        age = recorded.age_days()
+        aim = {
+            "status": recorded.status,
+            "accuracy": recorded.accuracy,
+            "correct": recorded.correct,
+            "probes": recorded.total,
+            "under_ask": len(recorded.under_ask),
+            "misroutes": len(recorded.misroutes),
+            "age_days": age,
+        }
+        if age > routecheck.STALE_DAYS:
+            aim["stale"] = f"last measured {age:.0f} days ago"
     return {
         "runtime": "ok",
         "state_root": str(runtime.settings.state_root),
@@ -189,6 +223,9 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
             "observed_free_vram_mb": observed_free_vram_mb(),
             "maximum_heavyweight_leases": 1,
         },
+        # The ledger records how confident routing was. This records whether it
+        # was right, which the ledger structurally cannot say.
+        "routing_aim": aim,
         "specialists": specialists,
     }
 
@@ -222,12 +259,11 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
     if args.command == "doctor":
         report = _doctor(runtime)
         _print(report)
-        return int(
-            any(
-                item["status"] == "unavailable"
-                for item in report["specialists"].values()
-            )
+        unavailable = any(
+            item["status"] == "unavailable"
+            for item in report["specialists"].values()
         )
+        return int(unavailable or report["routing_aim"]["status"] == "failing")
     if args.command == "capabilities":
         _print(_capabilities(runtime))
         return 0
@@ -348,6 +384,26 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
             }
         )
         return 0
+    if args.command == "route-check":
+        result = routecheck.run(IntentRouter(runtime.executive))
+        if not args.no_save:
+            routecheck.save(runtime.settings.routing_check_path, result)
+        _print(
+            {
+                "status": result.status,
+                "accuracy": result.accuracy,
+                "correct": result.correct,
+                "probes": result.total,
+                "under_ask": [item.request for item in result.under_ask],
+                "misroutes": [
+                    {"request": item.request, "expected": item.expected, "got": item.actual}
+                    for item in result.misroutes
+                ],
+                "skipped": list(result.skipped),
+                "results": [item for item in result.results],
+            }
+        )
+        return 0 if result.status != "failing" else 1
     if args.command == "benchmark":
         models = tuple(args.models) or tuple(
             benchmark.list_installed_models(args.ollama_url)

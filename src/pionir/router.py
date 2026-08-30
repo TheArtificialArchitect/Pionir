@@ -63,9 +63,16 @@ _STOPWORDS = frozenset(
     }
 )
 
-# A term is distinctive when fewer than this share of capabilities use it. A
-# request matching only shared vocabulary has named a family of capabilities,
-# not a member of it, and the honest answer is to ask which member.
+# A term is distinctive when it names one capability outright, or when fewer
+# than this share of them use it. A request matching only shared vocabulary has
+# named a family of capabilities rather than a member of it, and the honest
+# answer is to ask which member.
+#
+# The unique-term case has to be stated separately rather than left to the
+# share. With two capabilities registered, "fewer than half of two" means fewer
+# than one, so a term belonging to exactly one of them failed the test and the
+# router could not route anything at all. Nothing caught that until a probe set
+# ran against a two-capability registry: the estate has eight.
 _DISTINCTIVE_SHARE = 0.5
 
 # Confidence is the winner's share of the top two scores, so 0.6 means the
@@ -265,7 +272,8 @@ class IntentRouter:
         options = tuple(scored[: self.max_options])
 
         distinctive = any(
-            frequency[token] < total * _DISTINCTIVE_SHARE for token in best.matched
+            frequency[token] == 1 or frequency[token] < total * _DISTINCTIVE_SHARE
+            for token in best.matched
         )
         if total > 1 and not distinctive:
             return RoutingDecision(None, confidence, "not_distinctive", options)

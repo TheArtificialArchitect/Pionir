@@ -210,6 +210,26 @@ class ClassificationTests(unittest.TestCase):
         )
         self.assertEqual(router.classify("kairos clip").capability, "media.kairos_clip")
 
+    def test_a_two_capability_registry_can_still_route(self) -> None:
+        # Regression: distinctiveness was "used by fewer than half the
+        # capabilities", and fewer than half of two is fewer than one, so a term
+        # naming exactly one of two capabilities failed the test and nothing
+        # could ever be routed. Invisible against the four- and eight-capability
+        # registries everything else here uses.
+        executive = _executive()
+        for name in ("alpha", "beta"):
+            executive.register(
+                _Adapter(
+                    AgentManifest(
+                        name,
+                        "1",
+                        (_capability(f"organism.{name}_status", f"Read {name} vitals"),),
+                    )
+                )
+            )
+        decision = IntentRouter(executive).classify("alpha vitals")
+        self.assertEqual(decision.capability, "organism.alpha_status")
+
     def test_an_empty_registry_asks_instead_of_failing_obscurely(self) -> None:
         decision = IntentRouter(_executive()).classify("anything at all")
         self.assertEqual(decision.reason, "no_capabilities")
