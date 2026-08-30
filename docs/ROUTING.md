@@ -32,11 +32,22 @@ narrow schemas at temperature 0:
 | irrelevant filler, identical token count | 8/8 |
 | a persona that states plainly what it can and cannot do | 8/8 |
 | a persona of voice alone | 1/8 |
-| its own continuity briefing - diary, self-model, threads | **0/8** |
+| its continuity briefing - diary, self-model, threads | **0/8** |
 
-Not length, and not position: filler of exactly the same size cost nothing. It
-was the *form* of the content. Hand a model a page of its own remembered prose
-and it continues prose instead of emitting a call.
+Not length, not position, not conversation: filler of the same token count cost
+nothing, and so did a persona. It is **prose against structure**. The same facts
+as terse labelled lines score 8/8, and so do the *same bytes* wrapped as a JSON
+string. Rewriting the briefing into the third person changes nothing, so it is
+not the model's own voice - which is what this document claimed until
+2026-08-31, and was wrong about. Flowing paragraphs immediately before a request
+for structured output suppress it; the same facts in lines do not.
+
+That holds in isolation and does not yet survive integration: a persona at 8/8
+concatenated with a structured briefing at 8/8 measures 0/8, while adding
+further prose on top returns it to 8/8. At temperature 0 those cells are
+near-deterministic, so the contradiction is real rather than sampling noise. It
+is unresolved, and the Theo pane has left the structured form off by default
+because of it.
 
 The lesson is not that a model cannot route. With a controlled prompt this one
 routed perfectly, 8 times out of 8. It is that the control required is fragile,
