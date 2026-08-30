@@ -35,19 +35,27 @@ narrow schemas at temperature 0:
 | its continuity briefing - diary, self-model, threads | **0/8** |
 
 Not length, not position, not conversation: filler of the same token count cost
-nothing, and so did a persona. It is **prose against structure**. The same facts
-as terse labelled lines score 8/8, and so do the *same bytes* wrapped as a JSON
-string. Rewriting the briefing into the third person changes nothing, so it is
-not the model's own voice - which is what this document claimed until
-2026-08-31, and was wrong about. Flowing paragraphs immediately before a request
-for structured output suppress it; the same facts in lines do not.
+nothing, and so did a persona. The axis is **prose against structure** - the
+same facts as terse labelled lines score 8/8, and rewriting the briefing into
+the third person changes nothing, so it is not the model's own voice.
 
-That holds in isolation and does not yet survive integration: a persona at 8/8
-concatenated with a structured briefing at 8/8 measures 0/8, while adding
-further prose on top returns it to 8/8. At temperature 0 those cells are
-near-deterministic, so the contradiction is real rather than sampling noise. It
-is unresolved, and the Theo pane has left the structured form off by default
-because of it.
+Read those counts carefully. At temperature 0 a fixed prompt is deterministic,
+so eight samples of one prompt are one sample repeated - every cell came out 8/8
+or 0/8 and never 5/8, which is the tell. The prose row is replicated across five
+separately built briefings and is solid. The others rest on one prompt each.
+
+An apparent non-monotonicity in the same experiment - two 8/8 blocks measuring
+0/8 once concatenated - turned out to be the harness rather than the model. The
+briefing generator stamped itself with a second-granularity timestamp, so no two
+conditions were ever built from identical bytes. It is worth recording anyway:
+the model was **chaotic rather than noisy** with respect to those four
+characters, perfectly reproducible on identical input and able to flip on a
+timestamp. That is a thing to know before trusting any prompt measurement,
+including one's own.
+
+Everything in this subsection is an active investigation in another repo and
+will keep moving; this citation has already needed correcting twice. What the
+router's design rests on is only the settled part, below.
 
 The lesson is not that a model cannot route. With a controlled prompt this one
 routed perfectly, 8 times out of 8. It is that the control required is fragile,
