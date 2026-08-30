@@ -1,5 +1,7 @@
 import unittest
 
+from support import offline_scheduler
+
 from pionir.contracts import AgentManifest, Capability, ModelRequirement, Task, TaskResult
 from pionir.errors import CircuitOpen, ResourceUnavailable
 from pionir.reliability import CircuitBreaker
@@ -52,7 +54,7 @@ class FakeAdapter:
 class RuntimeTests(unittest.TestCase):
     def test_routes_executes_and_audits_without_payload(self) -> None:
         audit = InMemoryAuditSink()
-        executive = Executive(audit_sink=audit)
+        executive = Executive(scheduler=offline_scheduler(), audit_sink=audit)
         executive.register(FakeAdapter())
         result = executive.execute(Task("conversation.reply", {"secret": "not logged"}))
         self.assertEqual(result.output["reply"], "hello")
@@ -65,7 +67,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_adapter_failure_releases_lease_and_is_audited(self) -> None:
         audit = InMemoryAuditSink()
-        executive = Executive(audit_sink=audit)
+        executive = Executive(scheduler=offline_scheduler(), audit_sink=audit)
         executive.register(FakeAdapter(fail=True))
         with self.assertRaises(RuntimeError):
             executive.execute(Task("conversation.reply", {}))
@@ -76,6 +78,7 @@ class RuntimeTests(unittest.TestCase):
     def test_repeated_adapter_failure_opens_circuit_without_another_call(self) -> None:
         adapter = FakeAdapter(fail=True)
         executive = Executive(
+            scheduler=offline_scheduler(),
             circuit_factory=lambda: CircuitBreaker(
                 failure_threshold=2,
                 recovery_seconds=60,
@@ -115,7 +118,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(adapter.calls, 0)
 
         # Once the GPU frees up the specialist must be reachable again.
-        executive.scheduler = ModelLeaseScheduler()
+        executive.scheduler = offline_scheduler()
         clock.now = 20
         result = executive.execute(Task("conversation.reply", {}))
         self.assertEqual(result.output["reply"], "hello")
