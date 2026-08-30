@@ -22,6 +22,14 @@ Deterministic and lexical. **No model is consulted to decide which model to
 load** — that circularity would spend the GPU the router exists to arbitrate,
 and would make every decision unreproducible.
 
+That was a design argument when it was written. It now has a measurement behind
+it, from the Theo pane on 2026-08-30: a local 7B asked to emit a tool call fired
+8 times out of 8 with narrow schemas at temperature 0, and **0-1 times out of 10
+once a real conversational prompt was in front of it**, at the temperature its
+voice actually requires. A router that asked a small local model which
+specialist to use would have been unreliable in exactly the conditions it would
+run in, and would have looked fine in isolation.
+
 A capability's vocabulary is whatever it says about itself: its name, its
 description, its agent id, and its declared `routing_hints`. Each term is
 weighted by how *few* capabilities use it, computed from the registry at
