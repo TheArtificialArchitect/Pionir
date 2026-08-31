@@ -58,10 +58,33 @@ execution*.
 
 That condition is closer to met than it was: Theo now has a two-pass turn (`THEO_TWO_PASS`)
 that separates deciding from speaking. It is not sufficient on its own — the split happens
-inside Theo and does not hand authorization to Pionir, and the switch is off by default. Closing
-this needs Ian, and it needs the Theo pane, because either the peer path learns that Ian can be
-the speaker or Pionir gets a third endpoint that is voice-with-memory but still tool-free.
-Neither is Pionir's to build alone.
+inside Theo and does not hand authorization to Pionir, and the switch is off by default.
+
+**Resolved 2026-08-30. Ian chose neither existing path.** `/chat/send` was offered and declined:
+it would give full Theo and also let his tools reach past Pionir's permission gates and audit
+ledger, which is the thing this deferral was protecting. The agreed target is a third endpoint,
+requested from the Theo pane:
+
+    POST /voice/chat        Bearer, loopback
+    request   {"content": "...", "conv": "..."}
+    response  {"ok": true, "conv": "...", "message": {...}}   as /chat/send
+
+`PERSONA_BASE` + `compose_self_spine()` + continuity briefing + recall + human model, the
+speaker is Ian rather than a peer, and — the single reason the endpoint exists rather than
+Pionir calling `/chat/send` — `llm.chat(transcript, tools=[])`. Full memory, zero tools, action
+authorization stays with Pionir. Health should advertise it so Pionir probes the capability it
+uses rather than a neighbouring one.
+
+**Until it exists, Pionir stays on `/peer/chat` and no client is written for `/voice/chat`.** An
+adapter pointed at an endpoint that returns 404 is a tested component that does nothing, which
+is this estate's most expensive failure; the Pionir side gets built and verified end to end
+against a live endpoint, in one piece.
+
+One defect found in `/chat/send` while specifying this, reported and not inherited:
+`_serve_chat_send` catches a handler exception, sets the reply to `"(internal error: ...)"`,
+persists it as an assistant message, and returns HTTP 200 with `ok: true`. A caller cannot tell
+that from an answer, so Pionir would render an error string as something Theo said and record
+the task as completed.
 
 ## Atani
 
