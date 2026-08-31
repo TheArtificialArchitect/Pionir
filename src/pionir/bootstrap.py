@@ -62,6 +62,7 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
                 TheoSettings(
                     base_url=configured.theo_url,
                     token=configured.theo_token,
+                    model_id=configured.theo_model_id,
                 )
             )
         )

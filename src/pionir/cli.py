@@ -222,12 +222,34 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
             # static budget in that case; see scheduler.observed_free_vram_mb.
             "observed_free_vram_mb": observed_free_vram_mb(),
             "maximum_heavyweight_leases": 1,
+            # Every declared model against what the daemon actually holds. A
+            # declaration naming a model nobody runs any more still works, but
+            # silently loses the resident-model discount and starts refusing
+            # turns that would have fitted - with nothing to say why.
+            "declared_models": _declared_models(runtime),
         },
         # The ledger records how confident routing was. This records whether it
         # was right, which the ledger structurally cannot say.
         "routing_aim": aim,
         "specialists": specialists,
     }
+
+
+def _declared_models(runtime: PionirRuntime) -> list[dict[str, Any]]:
+    try:
+        resident = {item.name for item in benchmark.read_loaded_models()}
+        reachable = True
+    except benchmark.BenchmarkError:
+        resident, reachable = set(), False
+    seen: dict[str, bool] = {}
+    for manifest in runtime.executive.registry.manifests():
+        for capability in manifest.capabilities:
+            if capability.model is not None and capability.model.requires_gpu:
+                seen[capability.model.model_id] = capability.model.model_id in resident
+    return [
+        {"model_id": name, "resident": seen[name] if reachable else None}
+        for name in sorted(seen)
+    ]
 
 
 def _capabilities(runtime: PionirRuntime) -> list[dict[str, Any]]:

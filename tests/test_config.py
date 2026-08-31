@@ -62,3 +62,31 @@ class ConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheoModelIdTests(unittest.TestCase):
+    """Which model Theo runs is a fact about another process, so it is settable.
+
+    It only feeds the resident-model discount in admission. A stale value fails
+    safe by over-charging, but over-charging refuses turns that would have
+    worked and says nothing about why, so a retrain must not need a code change.
+    """
+
+    def test_defaults_to_the_currently_declared_build(self) -> None:
+        self.assertEqual(PionirSettings().theo_model_id, "theo-local-v17-q4:latest")
+
+    def test_the_environment_overrides_it(self) -> None:
+        with patch.dict(
+            os.environ, {"PIONIR_THEO_MODEL_ID": "theo-local-v18-q4:latest"}, clear=False
+        ):
+            self.assertEqual(
+                PionirSettings.from_environment().theo_model_id,
+                "theo-local-v18-q4:latest",
+            )
+
+    def test_a_blank_override_falls_back_rather_than_declaring_nothing(self) -> None:
+        with patch.dict(os.environ, {"PIONIR_THEO_MODEL_ID": "   "}, clear=False):
+            self.assertEqual(
+                PionirSettings.from_environment().theo_model_id,
+                "theo-local-v17-q4:latest",
+            )
