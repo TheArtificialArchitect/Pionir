@@ -94,6 +94,31 @@ to end: routing reached `conversation.theo_reply` at confidence 1.0 and admissio
 turn before touching the bridge — 5190 MB required against 1270 MB observed free. Treat the
 reply path as unbuilt until one real turn has gone through it.
 
+### The seam Pionir cannot check for itself
+
+Worth stating plainly, because it is the one place work on Theo can reach Pionir without
+anything here noticing.
+
+**Pionir's authorization boundary rests on a property enforced entirely inside Theo's process.**
+If `/voice/chat` ever offers the model a non-empty tool list, Theo can act — Melete's hands,
+Daedalus's worktrees — outside Pionir's permission gates and outside its audit ledger, and
+Pionir will record the turn as an ordinary conversation and report success. There is no
+observation available on this side that would distinguish the two: the reply looks the same.
+
+It is guarded, and guarded well: the source applies `no_tools` *after* the tool selector's
+exception fallback, which is the route that would otherwise quietly re-arm the full set, and the
+selftest asserts the property with `THEO_TWO_PASS` on and carries a control asserting the
+ordinary path still receives tools. But that is Theo's test protecting Pionir's boundary, and
+from inside Theo an empty tool list looks like an omission rather than the whole reason the
+endpoint exists.
+
+Two smaller couplings, for completeness. The `/voice/chat` request and response shape and the
+`voice_chat` health flag: a change there breaks this adapter loudly, with a typed error, which is
+the right failure. And the declared model id, which drifts on every retrain — see
+`PIONIR_THEO_MODEL_ID`. Everything else in Pionir is indifferent to Theo's internals; with the
+adapter unconfigured the runtime boots, the audit verifies, routing aim scores full marks on the
+remaining probes, and a conversational request asks which route rather than substituting Atani.
+
 ### The decision behind it
 
 **Ian chose neither existing path, 2026-08-30.** `/chat/send` was offered and declined:
