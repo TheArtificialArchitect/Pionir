@@ -30,6 +30,12 @@ in the shell that launches Pionir:
 $env:PIONIR_STATE_ROOT = "$env:USERPROFILE\.pionir"
 $env:PIONIR_THEO_URL = "http://127.0.0.1:8765"
 $env:PIONIR_THEO_TOKEN = (Get-Content "$env:USERPROFILE\.techsupport_agent\bridge_token.txt" -Raw).Trim()
+# If Theo put the token in the environment rather than that file, use it directly:
+#   $env:PIONIR_THEO_TOKEN = $env:BRIDGE_TOKEN
+# Update this after a Theo retrain. It feeds only the resident-model discount in
+# admission, so a stale value quietly over-charges VRAM and refuses turns that
+# would have fitted. `pionir doctor` shows it under gpu.declared_models.
+$env:PIONIR_THEO_MODEL_ID = "theo-local-v17-q4:latest"
 $env:PIONIR_ATANI_COMMAND_JSON = '["C:\\src\\Atani\\.venv\\Scripts\\atani.exe"]'
 $env:PIONIR_BRYO_STATUS_COMMAND_JSON = '["C:\\src\\terrarium\\.venv\\Scripts\\python.exe","-m","bryo.status"]'
 $env:PIONIR_PROBABILITY_URL = "http://127.0.0.1:8791"
