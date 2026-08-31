@@ -21,7 +21,7 @@ class DesktopControllerTests(unittest.TestCase):
             executive=self.executive,
             adapters={
                 "atani": object(),
-                "theo-peer": object(),
+                "theo": object(),
                 "bryo": object(),
                 "autogenesis": object(),
                 "probability": object(),
@@ -39,16 +39,16 @@ class DesktopControllerTests(unittest.TestCase):
 
     def test_depth_and_theo_are_explicit_routes(self) -> None:
         self.controller.ask("Atani · depth", "Think")
-        self.controller.ask("Theo · safe peer", "Reflect")
+        self.controller.ask("Theo", "Reflect")
         self.assertEqual(
             [task.capability for task in self.executive.tasks],
-            ["reasoning.atani_depth", "conversation.theo_peer_reply"],
+            ["reasoning.atani_depth", "conversation.theo_reply"],
         )
 
     def test_missing_theo_fails_before_dispatch(self) -> None:
-        self.runtime.adapters.pop("theo-peer")
+        self.runtime.adapters.pop("theo")
         with self.assertRaisesRegex(ValueError, "not configured"):
-            self.controller.ask("Theo · safe peer", "Hello")
+            self.controller.ask("Theo", "Hello")
         self.assertEqual(self.executive.tasks, [])
 
     def test_autogenesis_status_is_read_only_capability(self) -> None:

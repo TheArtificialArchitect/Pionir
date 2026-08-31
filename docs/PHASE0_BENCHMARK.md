@@ -70,7 +70,7 @@ because the repository holds no other dense model at either size:
 | `theo-local-v16` (retired) | 7421 MB | 5.6 s | 30.5 tok/s | yes |
 | `theo-local-v7` (retired, 15 GB) | **0 MB** | 18.4 s | **6.4 tok/s** | no — CPU |
 
-Theo is on v17. `src/pionir/adapters/theo_peer.py` already declares
+Theo is on v17. `src/pionir/adapters/theo.py` already declares
 `theo-local-v17-q4:latest`, so no code assumed otherwise.
 
 Warm latency is a 16-token round trip against an already-resident model. Throughput is from the
@@ -145,7 +145,7 @@ problem about *how many* small leases fit, not about which single large model wi
    today; the shared lock cannot see it, and a free-looking `nvidia-smi` reading four seconds
    after an eviction is not evidence the card is available.
 3. `context_vram_mb` should be computed from the declared context at ~31–43 MB per 1K rather
-   than left at zero. `TheoPeerSettings` currently declares 4700 MB model + 1500 MB context
+   than left at zero. `TheoSettings` currently declares 4700 MB model + 1500 MB context
    against a measured 4423 MB + 126 MB at 4K context. Both are conservative, so they fail
    safe and are not bugs; the 1500 MB figure is only correct if Theo runs about 48K context.
 4. The depth tier is a CPU tier on this hardware, and `nemotron-3.5-lightning:30b-a3b` is the

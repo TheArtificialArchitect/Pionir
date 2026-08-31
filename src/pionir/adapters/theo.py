@@ -1,4 +1,26 @@
-"""Authenticated adapter for Theo's bounded, conversation-only peer endpoint."""
+"""Authenticated adapter for Theo's full-memory, no-tools voice endpoint.
+
+Ian decided on 2026-08-30 that Theo is Pionir's voice, and the Theo pane built
+`/voice/chat` for it. The three Theo endpoints are not interchangeable and the
+choice between them is the whole of this adapter's design:
+
+* `/peer/chat` opens each turn with "the current speaker is another local
+  synthetic agent - not Ian", carries no briefing and no human model, and pins
+  the peer name to `Atani`. Ian reaching Theo through it meets someone who
+  thinks he is talking to Atani and has never met him. Atani itself still uses
+  it, correctly, because Atani *is* a peer.
+* `/chat/send` is full Theo including `execute_task`, which reaches Melete and
+  Daedalus outside Pionir's permission gates and outside its audit ledger. It
+  was offered to Ian and declined for exactly that reason.
+* `/voice/chat` is the one this uses: the ordinary turn - persona, self spine,
+  continuity briefing, recall, mood, the human model - with an empty tool list.
+  Full memory, zero hands, and action authorization stays with Pionir.
+
+The source runs it through the same code path as an ordinary turn with
+`no_tools=True` rather than a parallel implementation, so there is exactly one
+place the property can be broken, and a source-side selftest asserts the model
+is offered no tools while asserting that the ordinary path still is.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +42,11 @@ from pionir.scheduler import kv_cache_vram_mb
 
 MAX_RESPONSE_BYTES = 1_000_000
 
+# The source caps content at this length and answers 400 above it. Checked here
+# so an over-long request fails with Pionir's own error instead of a bare HTTP
+# code from the far side of the bridge.
+MAX_CONTENT_CHARS = 32_000
+
 
 class JsonTransport(Protocol):
     def request(
@@ -31,11 +58,14 @@ class JsonTransport(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class TheoPeerSettings:
+class TheoSettings:
     """Connection details for Tech-Support's authenticated local bridge."""
 
     base_url: str = "http://127.0.0.1:8765"
     token: str = field(default="", repr=False)
+    # A voice turn is 5-40 seconds of real work on the 3060. This is generous
+    # against that rather than tuned to it, because the turn does recall and a
+    # cold model load lands inside the same request.
     timeout_seconds: int = 180
     model_id: str = "theo-local-v17-q4:latest"
     # Measured resident on the target card: 4423 MB at 4096 context, and 4940 MB
@@ -61,7 +91,7 @@ class TheoPeerSettings:
             "localhost",
             "::1",
         }:
-            raise ValueError("Theo's peer bridge must use loopback HTTP")
+            raise ValueError("Theo's voice bridge must use loopback HTTP")
         if parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("Theo's bridge URL cannot contain credentials or query data")
         if not self.token.strip():
@@ -73,11 +103,27 @@ class TheoPeerSettings:
 class AuthenticatedLoopbackTransport:
     """Small stdlib JSON client that deliberately ignores proxy configuration."""
 
-    def __init__(self, settings: TheoPeerSettings) -> None:
+    def __init__(self, settings: TheoSettings) -> None:
         self._base_url = settings.base_url.rstrip("/")
         self._token = settings.token
         self._timeout = settings.timeout_seconds
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    @staticmethod
+    def _reason(error: urllib.error.HTTPError) -> str:
+        """The far side's own explanation, when it sent one.
+
+        `/voice/chat` answers a failure with a non-200 carrying
+        ``{"ok": false, "error": "..."}``. Reporting only the status code would
+        throw that away and leave a bare number where a diagnosis was offered.
+        """
+
+        try:
+            document = json.loads(error.read(MAX_RESPONSE_BYTES).decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return ""
+        reason = document.get("error") if isinstance(document, dict) else None
+        return f": {reason}" if isinstance(reason, str) and reason.strip() else ""
 
     def request(
         self,
@@ -104,11 +150,11 @@ class AuthenticatedLoopbackTransport:
                     f"Theo rejected Pionir's bridge token ({error.code})"
                 ) from error
             raise AdapterProtocolError(
-                f"Theo rejected the peer request with HTTP {error.code}"
+                f"Theo answered HTTP {error.code}{self._reason(error)}"
             ) from error
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise AdapterUnavailable(
-                f"Theo's peer bridge is unavailable at {self._base_url}"
+                f"Theo's bridge is unavailable at {self._base_url}"
             ) from error
         if len(raw) > MAX_RESPONSE_BYTES:
             raise AdapterProtocolError("Theo's bridge response exceeded the size limit")
@@ -121,28 +167,23 @@ class AuthenticatedLoopbackTransport:
         return document
 
 
-class TheoPeerAdapter:
-    """Expose Theo's existing Atani-only peer exchange as a Pionir capability.
-
-    This adapter does not use Theo's ordinary ``/chat/send`` endpoint. The peer
-    endpoint disables tools, recall, growth writes, transcript logging, and Ian's
-    private-memory briefing in the Tech-Support runtime itself.
-    """
+class TheoAdapter:
+    """Theo as Pionir's conversational voice: full memory, no tools."""
 
     def __init__(
         self,
-        settings: TheoPeerSettings,
+        settings: TheoSettings,
         *,
         transport: JsonTransport | None = None,
     ) -> None:
         self.settings = settings
         self._transport = transport or AuthenticatedLoopbackTransport(settings)
         self._manifest = AgentManifest(
-            agent_id="theo-peer",
+            agent_id="theo",
             version="tech-support/machine-learning",
             capabilities=(
                 Capability(
-                    name="conversation.theo_peer_reply",
+                    name="conversation.theo_reply",
                     description="Theo speaking - Pionir's conversational voice",
                     model=ModelRequirement(
                         model_id=settings.model_id,
@@ -162,44 +203,60 @@ class TheoPeerAdapter:
         return self._manifest
 
     def status(self) -> Mapping[str, Any]:
+        """Probe the capability this adapter actually calls.
+
+        `voice_chat`, not `peer` and not `voice` - the source flags Piper's
+        text-to-speech as `voice`, so probing that would report health for a
+        different subsystem entirely. A check that proves something is
+        listening proves nothing about the thing being used.
+        """
+
         document = self._transport.request("/health")
         capabilities = document.get("capabilities")
         if document.get("ok") is not True or not isinstance(capabilities, dict):
             raise AdapterProtocolError("Theo's health response is malformed")
-        if capabilities.get("peer") is not True:
-            raise AdapterProtocolError("Theo is running without the peer capability")
+        if capabilities.get("voice_chat") is not True:
+            raise AdapterProtocolError(
+                "Theo is running without the voice_chat capability; his backend "
+                "is up but the full-memory no-tools path is not attached"
+            )
         return document
 
     def execute(self, task: Task) -> TaskResult:
         content = str(task.payload.get("content") or "").strip()
         if not content:
             raise AdapterProtocolError("conversation content is required")
-        if len(content) > 8_000:
-            raise AdapterProtocolError("conversation content exceeds Theo's 8000-character limit")
-        conversation_id = str(
-            task.payload.get("conversation_id") or f"atani:{task.task_id}"
-        ).strip()
+        if len(content) > MAX_CONTENT_CHARS:
+            raise AdapterProtocolError(
+                f"conversation content exceeds Theo's {MAX_CONTENT_CHARS}-character limit"
+            )
+        # An empty conversation id asks Theo to open a thread and tell us which
+        # one. Inventing an id here would 404: the source requires a thread that
+        # already exists in his own store, and continuity across turns is most
+        # of why this endpoint was built rather than the peer one.
+        conversation_id = str(task.payload.get("conversation_id") or "").strip()
 
         self.status()
         document = self._transport.request(
-            "/peer/chat",
-            payload={
-                "peer": "Atani",
-                "conversation": conversation_id,
-                "content": content,
-            },
+            "/voice/chat",
+            payload={"conv": conversation_id, "content": content},
         )
         if document.get("ok") is not True:
             raise AdapterProtocolError(str(document.get("error") or "Theo did not answer"))
-        reply = document.get("reply")
+        message = document.get("message")
+        if not isinstance(message, dict):
+            raise AdapterProtocolError("Theo's voice reply carried no message record")
+        reply = message.get("content")
         if not isinstance(reply, str) or not reply.strip():
-            raise AdapterProtocolError("Theo returned an empty peer reply")
+            raise AdapterProtocolError("Theo returned an empty voice reply")
         return TaskResult(
             task_id=task.task_id,
             agent_id=self.manifest.agent_id,
             output={
                 "reply": reply.strip(),
-                "conversation_id": conversation_id,
+                # Theo's, not ours. Returned so the caller can continue the
+                # thread rather than starting a new one on every turn.
+                "conversation_id": str(document.get("conv") or conversation_id),
             },
-            evidence=("theo:authenticated-loopback", "theo:conversation-only-peer"),
+            evidence=("theo:authenticated-loopback", "theo:voice-full-memory-no-tools"),
         )

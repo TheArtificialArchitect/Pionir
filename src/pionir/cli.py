@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import benchmark, routecheck
-from .adapters import TheoPeerAdapter
+from .adapters import TheoAdapter
 from .bootstrap import PionirRuntime, build_runtime
 from .contracts import Task
 from .errors import PionirError, RoutingAmbiguous
@@ -58,7 +58,7 @@ def _parser() -> argparse.ArgumentParser:
     atani_plan.add_argument("request_file", type=Path)
 
     theo = commands.add_parser(
-        "ask-theo-peer",
+        "ask-theo",
         help="ask Theo through the conversation-only Atani peer boundary",
     )
     theo.add_argument("text", nargs="+")
@@ -160,8 +160,8 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
                 "error_type": type(error).__name__,
                 "message": str(error),
             }
-    if "theo-peer" not in runtime.adapters:
-        specialists["theo-peer"] = {
+    if "theo" not in runtime.adapters:
+        specialists["theo"] = {
             "status": "not_configured",
             "message": "set PIONIR_THEO_TOKEN or BRIDGE_TOKEN",
         }
@@ -295,14 +295,14 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
         )
         _print(result.output)
         return 0
-    if args.command == "ask-theo-peer":
-        adapter = runtime.adapters.get("theo-peer")
-        if not isinstance(adapter, TheoPeerAdapter):
+    if args.command == "ask-theo":
+        adapter = runtime.adapters.get("theo")
+        if not isinstance(adapter, TheoAdapter):
             raise ValueError("Theo peer is not configured; set PIONIR_THEO_TOKEN")
         payload = {"content": " ".join(args.text)}
         if args.conversation:
             payload["conversation_id"] = args.conversation
-        result = runtime.executive.execute(Task("conversation.theo_peer_reply", payload))
+        result = runtime.executive.execute(Task("conversation.theo_reply", payload))
         _print(result.output)
         return 0
     if args.command == "bryo-status":

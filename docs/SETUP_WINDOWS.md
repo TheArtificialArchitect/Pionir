@@ -72,7 +72,7 @@ Probability, and Genesis status. Automatic intent routing is deliberately not im
 
 ```powershell
 .\.venv\Scripts\pionir.exe ask-atani "Explain the evidence for this decision"
-.\.venv\Scripts\pionir.exe ask-theo-peer "Give Atani your actual view of this design"
+.\.venv\Scripts\pionir.exe ask-theo "Give Atani your actual view of this design"
 .\.venv\Scripts\pionir.exe bryo-status
 .\.venv\Scripts\pionir.exe probability-status
 .\.venv\Scripts\pionir.exe genesis-status

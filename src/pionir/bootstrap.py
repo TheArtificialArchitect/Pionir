@@ -15,8 +15,8 @@ from .adapters import (
     GenesisStatusSettings,
     ProbabilityStatusAdapter,
     ProbabilityStatusSettings,
-    TheoPeerAdapter,
-    TheoPeerSettings,
+    TheoAdapter,
+    TheoSettings,
     load_stdio_adapters,
 )
 from .audit import JsonlAuditSink
@@ -58,8 +58,8 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
     )
     if configured.theo_token:
         runtime.register(
-            TheoPeerAdapter(
-                TheoPeerSettings(
+            TheoAdapter(
+                TheoSettings(
                     base_url=configured.theo_url,
                     token=configured.theo_token,
                 )

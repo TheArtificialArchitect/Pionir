@@ -6,7 +6,7 @@ from .bryo_status import BryoStatusAdapter, BryoStatusSettings
 from .genesis_status import GenesisStatusAdapter, GenesisStatusSettings
 from .probability_status import ProbabilityStatusAdapter, ProbabilityStatusSettings
 from .stdio_json import StdioJsonAdapter, StdioJsonSettings, load_stdio_adapters
-from .theo_peer import TheoPeerAdapter, TheoPeerSettings
+from .theo import TheoAdapter, TheoSettings
 
 __all__ = [
     "AtaniCliAdapter",
@@ -21,7 +21,7 @@ __all__ = [
     "ProbabilityStatusSettings",
     "StdioJsonAdapter",
     "StdioJsonSettings",
-    "TheoPeerAdapter",
-    "TheoPeerSettings",
+    "TheoAdapter",
+    "TheoSettings",
     "load_stdio_adapters",
 ]

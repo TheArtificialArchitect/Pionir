@@ -72,13 +72,13 @@ def _estate() -> tuple[Executive, dict[str, _Adapter]]:
                 ),
             )
         ),
-        "theo-peer": _Adapter(
+        "theo": _Adapter(
             AgentManifest(
-                "theo-peer",
+                "theo",
                 "1",
                 (
                     _capability(
-                        "conversation.theo_peer_reply",
+                        "conversation.theo_reply",
                         "A bounded, conversation-only Theo reply",
                         routing_hints=frozenset({"theo", "talk", "chat"}),
                     ),
@@ -288,7 +288,7 @@ class PermissionTests(unittest.TestCase):
         executive, adapters = _estate()
         with self.assertRaises(PermissionDenied):
             IntentRouter(executive).route("ask atani to reason about this")
-        self.assertEqual(adapters["theo-peer"].calls, [])
+        self.assertEqual(adapters["theo"].calls, [])
         self.assertEqual(adapters["atani"].calls, [])
 
     def test_granting_the_permission_lets_the_same_request_through(self) -> None:
@@ -305,7 +305,7 @@ class ExecutionTests(unittest.TestCase):
     def test_the_request_reaches_the_specialist_as_its_payload(self) -> None:
         executive, adapters = _estate()
         IntentRouter(executive).route("talk to theo about the weather")
-        (task,) = adapters["theo-peer"].calls
+        (task,) = adapters["theo"].calls
         self.assertEqual(task.payload["content"], "talk to theo about the weather")
 
     def test_the_question_names_the_candidate_routes(self) -> None:

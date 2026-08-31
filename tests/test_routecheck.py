@@ -186,11 +186,11 @@ class RunTests(unittest.TestCase):
         # would make the number meaningless on any partial install.
         check = routecheck.run(
             _router(),
-            (Probe("talk to theo", "conversation.theo_peer_reply", ("conversation.theo_peer_reply",)),),
+            (Probe("talk to theo", "conversation.theo_reply", ("conversation.theo_reply",)),),
         )
         self.assertEqual(check.total, 0)
         self.assertEqual(len(check.skipped), 1)
-        self.assertIn("conversation.theo_peer_reply", check.skipped[0])
+        self.assertIn("conversation.theo_reply", check.skipped[0])
 
     def test_the_shipped_probe_set_covers_asking_as_well_as_routing(self) -> None:
         expectations = {probe.expected for probe in routecheck.default_probes()}

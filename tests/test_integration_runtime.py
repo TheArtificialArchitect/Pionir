@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from pionir.adapters.atani_cli import AtaniCliAdapter
-from pionir.adapters.theo_peer import TheoPeerAdapter, TheoPeerSettings
+from pionir.adapters.theo import TheoAdapter, TheoSettings
 from pionir.audit import JsonlAuditSink
 from pionir.contracts import Task
 from pionir.runtime import Executive
@@ -20,8 +20,12 @@ class AtaniRunner:
 class TheoTransport:
     def request(self, path, *, payload=None):
         if path == "/health":
-            return {"ok": True, "capabilities": {"peer": True}}
-        return {"ok": True, "reply": "Theo answer"}
+            return {"ok": True, "capabilities": {"voice_chat": True}}
+        return {
+            "ok": True,
+            "conv": "conv-1",
+            "message": {"id": "m1", "role": "assistant", "content": "Theo answer"},
+        }
 
 
 class IntegrationRuntimeTests(unittest.TestCase):
@@ -36,8 +40,8 @@ class IntegrationRuntimeTests(unittest.TestCase):
             )
             executive.register(AtaniCliAdapter(runner=AtaniRunner()))
             executive.register(
-                TheoPeerAdapter(
-                    TheoPeerSettings(token="test-token"),
+                TheoAdapter(
+                    TheoSettings(token="test-token"),
                     transport=TheoTransport(),
                 )
             )
@@ -49,10 +53,10 @@ class IntegrationRuntimeTests(unittest.TestCase):
                 )
             )
             theo = executive.execute(
-                Task("conversation.theo_peer_reply", {"content": "answer this"})
+                Task("conversation.theo_reply", {"content": "answer this"})
             )
             self.assertEqual(atani.agent_id, "atani")
-            self.assertEqual(theo.agent_id, "theo-peer")
+            self.assertEqual(theo.agent_id, "theo")
             sequence, _ = audit.verify()
             self.assertEqual(sequence, 4)
             self.assertEqual(executive.scheduler.active_requirements, ())

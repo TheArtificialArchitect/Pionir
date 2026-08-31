@@ -100,7 +100,7 @@ coin toss presented as a decision.
 
 Plain conversation used to produce the same question, because Theo and Atani both
 held one. It no longer does: Ian decided on 2026-08-30 that **Theo is Pionir's
-voice**, so `"chat with someone"` routes to `conversation.theo_peer_reply` at full
+voice**, so `"chat with someone"` routes to `conversation.theo_reply` at full
 confidence. That decision lives in the capabilities' own declared vocabulary
 rather than in a special case here - Atani gave up the conversational words, and
 `reasoning.atani_chat` was renamed `reasoning.atani_answer` because the router
@@ -128,9 +128,9 @@ answering — how often it could not tell — would have no evidence behind it.
 
 ```
 1 unrouted  outcome=ask   confidence=0.50 reason=not_distinctive options=organism.bryo_status,organism.genesis_status
-2 unrouted  outcome=ask   confidence=0.00 reason=no_match        options=conversation.theo_peer_reply,executive.atani_run,...
-3 unrouted  outcome=route capability=reasoning.atani_answer confidence=0.77 reason=matched runner_up=conversation.theo_peer_reply refused=PermissionDenied
-4 theo-peer outcome=route capability=conversation.theo_peer_reply confidence=1.00 reason=matched runner_up=none
+2 unrouted  outcome=ask   confidence=0.00 reason=no_match        options=conversation.theo_reply,executive.atani_run,...
+3 unrouted  outcome=route capability=reasoning.atani_answer confidence=0.77 reason=matched runner_up=conversation.theo_reply refused=PermissionDenied
+4 theo      outcome=route capability=conversation.theo_reply confidence=1.00 reason=matched runner_up=none
 ```
 
 The ledger measures **reach** and cannot measure **aim**. It records which

@@ -19,7 +19,7 @@ transcripts, embeddings, model files, or private runtime state.
 
 ### Accepted first boundary
 
-Pionir capability `conversation.theo_peer_reply` calls the authenticated `/peer/chat` endpoint.
+Pionir capability `conversation.theo_reply` calls the authenticated `/peer/chat` endpoint.
 Theo's own implementation makes this path conversation-only: no recall, no tools
 (`llm.chat(..., tools=[])`), no hands/code routing, no dream watermark, no growth scoring, no
 transcript logging, and no access to Ian's private-memory briefing.
@@ -60,7 +60,43 @@ That condition is closer to met than it was: Theo now has a two-pass turn (`THEO
 that separates deciding from speaking. It is not sufficient on its own — the split happens
 inside Theo and does not hand authorization to Pionir, and the switch is off by default.
 
-**Resolved 2026-08-30. Ian chose neither existing path.** `/chat/send` was offered and declined:
+**Built and adopted 2026-08-30.** `/voice/chat` exists in the source and Pionir calls it.
+`Agent.voice_chat()` runs `self.chat(text, no_tools=True)` — the *same* code path as an ordinary
+turn rather than a parallel one, so it inherits every improvement the normal turn gets and there
+is exactly one place the no-tools property can break. A source-side selftest asserts the model is
+offered no tools, with a control asserting the ordinary path still is, so it cannot pass in a
+world where nothing ever receives tools.
+
+Contract as implemented, loopback-only and Bearer-authenticated:
+
+    POST /voice/chat   {"content": str <= 32000, "conv": str optional}
+    200                {"ok": true, "conv": str, "message": {id, role, content, createdAt, seq}}
+    non-200            {"ok": false, "conv": str, "error": str}
+
+Health advertises `capabilities["voice_chat"]`. **Not `voice`** — that flag already meant Piper's
+text-to-speech, so probing it would report health for a different subsystem entirely. Pionir
+probes `voice_chat`, and a test asserts it fails on a bridge with `peer` and `voice` up but the
+voice path detached.
+
+An empty `conv` asks Theo to open a thread and return its id; a non-existent one is a 404, so
+Pionir sends `""` rather than inventing an id, and returns the id Theo gives back so the thread
+continues across turns.
+
+Pionir's adapter, capability, and agent id dropped "peer" from their names, because it no longer
+calls that endpoint: `conversation.theo_reply` on agent `theo`, in `adapters/theo.py`. The
+desktop route reads "Theo" rather than "Theo · safe peer" — that label was accurate while the
+peer path was the truth and would be a lie now.
+
+**The success path has not been run live.** Theo's backend was not listening on 8765 and the card
+had 1270 MB free at 100% utilisation, so a real turn could not be attempted, and starting the
+backend by hand would hold the mutex the desktop app needs. The failure path *was* exercised end
+to end: routing reached `conversation.theo_reply` at confidence 1.0 and admission refused the
+turn before touching the bridge — 5190 MB required against 1270 MB observed free. Treat the
+reply path as unbuilt until one real turn has gone through it.
+
+### The decision behind it
+
+**Ian chose neither existing path, 2026-08-30.** `/chat/send` was offered and declined:
 it would give full Theo and also let his tools reach past Pionir's permission gates and audit
 ledger, which is the thing this deferral was protecting. The agreed target is a third endpoint,
 requested from the Theo pane:

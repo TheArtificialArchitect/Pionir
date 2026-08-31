@@ -190,8 +190,8 @@ def default_probes() -> tuple[Probe, ...]:
         ),
         Probe(
             "talk to theo about my day",
-            "conversation.theo_peer_reply",
-            ("conversation.theo_peer_reply",),
+            "conversation.theo_reply",
+            ("conversation.theo_reply",),
         ),
         Probe(
             "how is bryo doing, check the terrarium vitals",
@@ -219,8 +219,8 @@ def default_probes() -> tuple[Probe, ...]:
         # answer, and this probe is what holds the router to it.
         Probe(
             "chat with someone",
-            "conversation.theo_peer_reply",
-            ("conversation.theo_peer_reply", "reasoning.atani_answer"),
+            "conversation.theo_reply",
+            ("conversation.theo_reply", "reasoning.atani_answer"),
         ),
         # Names a family rather than a member of it.
         Probe(
