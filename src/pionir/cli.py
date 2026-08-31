@@ -272,7 +272,7 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
         _print({"status": "verified", "events": sequence, "head_sha256": digest})
         return 0
     if args.command == "ask-atani":
-        capability = "reasoning.atani_depth" if args.depth else "reasoning.atani_chat"
+        capability = "reasoning.atani_depth" if args.depth else "reasoning.atani_answer"
         result = runtime.executive.execute(
             Task(
                 capability,

@@ -34,7 +34,7 @@ class DesktopControllerTests(unittest.TestCase):
         result = self.controller.ask("Atani", "Hello")
         task = self.executive.tasks[0]
         self.assertEqual(result["answer"], "ready")
-        self.assertEqual(task.capability, "reasoning.atani_chat")
+        self.assertEqual(task.capability, "reasoning.atani_answer")
         self.assertEqual(task.granted_permissions, frozenset({"atani.chat"}))
 
     def test_depth_and_theo_are_explicit_routes(self) -> None:

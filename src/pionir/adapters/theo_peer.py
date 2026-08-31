@@ -38,8 +38,10 @@ class TheoPeerSettings:
     token: str = field(default="", repr=False)
     timeout_seconds: int = 180
     model_id: str = "theo-local-v17-q4:latest"
-    # Measured resident on the target card at 4096 context: 4423 MB. The margin
-    # covers driver variance, not a guess. See docs/PHASE0_BENCHMARK.md.
+    # Measured resident on the target card: 4423 MB at 4096 context, and 4940 MB
+    # in live use at its actual 16384 window (2026-08-30). Declared as 4500 plus
+    # a computed KV cache, which totals 5190 and so stays above what was
+    # observed. See docs/PHASE0_BENCHMARK.md.
     estimated_model_vram_mb: int = 4_500
     # Confirmed 16384, from two independent directions rather than assumed.
     # The bridge requests it: THEO_NUM_CTX is unset at both User and Machine
@@ -141,7 +143,7 @@ class TheoPeerAdapter:
             capabilities=(
                 Capability(
                     name="conversation.theo_peer_reply",
-                    description="A bounded, conversation-only Theo reply to Atani",
+                    description="Theo speaking - Pionir's conversational voice",
                     model=ModelRequirement(
                         model_id=settings.model_id,
                         estimated_vram_mb=settings.estimated_model_vram_mb,

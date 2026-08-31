@@ -91,7 +91,7 @@ def _estate() -> tuple[Executive, dict[str, _Adapter]]:
                 "1",
                 (
                     _capability(
-                        "reasoning.atani_chat",
+                        "reasoning.atani_answer",
                         "Atani's bounded default conversational reasoning",
                         required_permissions=frozenset({"atani.chat"}),
                         routing_hints=frozenset({"atani", "reason", "chat"}),
@@ -265,7 +265,7 @@ class AuditTests(unittest.TestCase):
         details = _routed_events(executive)
         self.assertEqual(len(details), 1)
         self.assertIn("refused=PermissionDenied", details[0])
-        self.assertIn("capability=reasoning.atani_chat", details[0])
+        self.assertIn("capability=reasoning.atani_answer", details[0])
 
     def test_the_audit_detail_never_carries_the_request_text(self) -> None:
         # The ledger is metadata-only by design; routing is not the place to
@@ -296,7 +296,7 @@ class PermissionTests(unittest.TestCase):
         decision, result = IntentRouter(executive).route(
             "ask atani to reason about this", granted_permissions={"atani.chat"}
         )
-        self.assertEqual(decision.capability, "reasoning.atani_chat")
+        self.assertEqual(decision.capability, "reasoning.atani_answer")
         self.assertEqual(result.agent_id, "atani")
         self.assertEqual(len(adapters["atani"].calls), 1)
 

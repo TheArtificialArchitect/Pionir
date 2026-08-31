@@ -97,8 +97,14 @@ class AtaniCliAdapter:
             version=self.settings.version,
             capabilities=(
                 Capability(
-                    name="reasoning.atani_chat",
-                    description="Atani's bounded default conversational reasoning",
+                    # Renamed from reasoning.atani_chat on 2026-08-30. The
+                    # router scores a capability's own name as vocabulary, so
+                    # "chat" in the name kept Atani tied with Theo on any plain
+                    # conversational request no matter what the hints said - and
+                    # the name had become untrue anyway once chat became Theo's.
+                    # Ledger entries from before the rename carry the old name.
+                    name="reasoning.atani_answer",
+                    description="Atani's bounded reasoning over a question",
                     risk=RiskLevel.REVERSIBLE_WRITE,
                     required_permissions=permission,
                     model=ModelRequirement(
@@ -107,8 +113,14 @@ class AtaniCliAdapter:
                         4_500,
                         kv_cache_vram_mb(16_384),
                     ),
+                    # "chat" is deliberately absent. Ian decided on 2026-08-30
+                    # that Theo is Pionir's voice, so plain conversation is
+                    # Theo's and Atani keeps the reasoning vocabulary. Encoding
+                    # that here rather than as a special case inside the router
+                    # is the whole point of capabilities declaring their own
+                    # words: the decision is visible where it applies.
                     routing_hints=frozenset(
-                        {"atani", "reason", "reasoning", "think", "answer", "chat"}
+                        {"atani", "reason", "reasoning", "think", "answer"}
                     ),
                     priority=100,
                 ),
@@ -119,13 +131,25 @@ class AtaniCliAdapter:
                     required_permissions=permission,
                     model=ModelRequirement(
                         "nemotron-3.5-lightning:30b-a3b-q4_K_M",
-                        # Measured: this model holds zero VRAM on a 12 GB card.
-                        # Ollama runs it on the CPU, and because it is a
-                        # mixture-of-experts with ~3B active parameters it still
-                        # returns 30.4 tok/s there - as fast as a dense 8B on the
-                        # GPU. Declaring it as a GPU tenant made it take the one
-                        # GPU lease it never used, and made it unadmittable
-                        # whenever anything else held the card.
+                        # This model is an elastic tenant, and the zeros are a
+                        # statement about leases rather than about VRAM.
+                        #
+                        # Measured twice on the same card and the same daemon:
+                        # 0 MB resident on 2026-08-27, and 2611 MB on 2026-08-30.
+                        # Ollama partial-offloads whatever happens to fit and
+                        # runs the rest on the CPU, so there is no fixed
+                        # footprint to declare and any number written here would
+                        # be wrong by the next reading.
+                        #
+                        # It needs no GPU lease because it never fails to run -
+                        # a mixture-of-experts with ~3B active parameters still
+                        # returned 30.4 tok/s with nothing on the card at all.
+                        # Declaring it a GPU tenant took the single lease it did
+                        # not need and made it unadmittable whenever anything
+                        # else held the card. What makes the elastic
+                        # consumption safe is that admission reads free VRAM at
+                        # lease time rather than summing these declarations, so
+                        # whatever this model has taken is already priced in.
                         0,
                         0,
                         requires_gpu=False,
@@ -201,7 +225,7 @@ class AtaniCliAdapter:
                 output=document,
                 evidence=(f"atani:goal:{goal_id}",),
             )
-        if task.capability not in {"reasoning.atani_chat", "reasoning.atani_depth"}:
+        if task.capability not in {"reasoning.atani_answer", "reasoning.atani_depth"}:
             raise AdapterProtocolError(f"unsupported Atani capability: {task.capability}")
         content = str(task.payload.get("content") or "").strip()
         if not content:

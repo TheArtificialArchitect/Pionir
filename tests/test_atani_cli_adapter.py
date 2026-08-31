@@ -24,7 +24,7 @@ class AtaniCliAdapterTests(unittest.TestCase):
         )
         adapter = AtaniCliAdapter(runner=runner)
         task = Task(
-            "reasoning.atani_chat",
+            "reasoning.atani_answer",
             {"content": "Think about this"},
             frozenset({"atani.chat"}),
         )
@@ -51,7 +51,7 @@ class AtaniCliAdapterTests(unittest.TestCase):
     def test_requires_answer_in_response(self) -> None:
         adapter = AtaniCliAdapter(runner=FakeRunner({"cycle_id": "cycle-3"}))
         with self.assertRaises(AdapterProtocolError):
-            adapter.execute(Task("reasoning.atani_chat", {"content": "hello"}))
+            adapter.execute(Task("reasoning.atani_answer", {"content": "hello"}))
 
     def test_manifest_separates_default_and_depth_models(self) -> None:
         adapter = AtaniCliAdapter(AtaniCliSettings(command=("atani",)))
@@ -60,7 +60,7 @@ class AtaniCliAdapterTests(unittest.TestCase):
             for capability in adapter.manifest.capabilities
             if capability.model is not None
         }
-        self.assertEqual(models["reasoning.atani_chat"], "qwen2.5:7b-instruct")
+        self.assertEqual(models["reasoning.atani_answer"], "qwen2.5:7b-instruct")
         self.assertIn("nemotron", models["reasoning.atani_depth"])
 
     def test_executive_plan_uses_versioned_stdin_contract(self) -> None:

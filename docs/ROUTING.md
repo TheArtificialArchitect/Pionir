@@ -81,19 +81,31 @@ An ask exits **3** and prints the candidate routes, so the question is
 answerable rather than merely a refusal:
 
 ```
-$ pionir route "chat with someone"
+$ pionir route "organism status"
 {
   "status": "question",
   "question": "That names a family of capabilities rather than one of them. Which did you mean?
-    1. conversation.theo_peer_reply - A bounded, conversation-only Theo reply to Atani
-    2. reasoning.atani_chat - Atani's bounded default conversational reasoning",
+    1. organism.autogenesis_status - Read Autogenesis controls and recent ledger events
+    2. organism.bryo_status - Read Bryo's current vitals and lineage snapshot
+    3. organism.genesis_status - Read Genesis health and life-loop counters
+    4. organism.probability_status - Read Probability's operational state without private memory",
   "confidence": 0.5,
   "reason": "not_distinctive"
 }
 ```
 
-That is the correct answer to that request. Theo and Atani both hold a
-conversation; choosing one would be a coin toss presented as a decision.
+That is the correct answer to that request. Four specialists report status, and
+the request names the family rather than a member of it; picking one would be a
+coin toss presented as a decision.
+
+Plain conversation used to produce the same question, because Theo and Atani both
+held one. It no longer does: Ian decided on 2026-08-30 that **Theo is Pionir's
+voice**, so `"chat with someone"` routes to `conversation.theo_peer_reply` at full
+confidence. That decision lives in the capabilities' own declared vocabulary
+rather than in a special case here - Atani gave up the conversational words, and
+`reasoning.atani_chat` was renamed `reasoning.atani_answer` because the router
+scores a capability's own name, so "chat" in the name kept Atani tied with Theo
+whatever the hints said.
 
 ## What it does not do
 
@@ -115,9 +127,9 @@ that were confident *and* allowed, and the question the system most needs
 answering — how often it could not tell — would have no evidence behind it.
 
 ```
-1 unrouted  outcome=ask   confidence=0.50 reason=not_distinctive options=conversation.theo_peer_reply,reasoning.atani_chat
+1 unrouted  outcome=ask   confidence=0.50 reason=not_distinctive options=organism.bryo_status,organism.genesis_status
 2 unrouted  outcome=ask   confidence=0.00 reason=no_match        options=conversation.theo_peer_reply,executive.atani_run,...
-3 unrouted  outcome=route capability=reasoning.atani_chat confidence=0.77 reason=matched runner_up=conversation.theo_peer_reply refused=PermissionDenied
+3 unrouted  outcome=route capability=reasoning.atani_answer confidence=0.77 reason=matched runner_up=conversation.theo_peer_reply refused=PermissionDenied
 4 theo-peer outcome=route capability=conversation.theo_peer_reply confidence=1.00 reason=matched runner_up=none
 ```
 

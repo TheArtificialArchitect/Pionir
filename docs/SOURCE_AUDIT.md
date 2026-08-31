@@ -20,17 +20,48 @@ transcripts, embeddings, model files, or private runtime state.
 ### Accepted first boundary
 
 Pionir capability `conversation.theo_peer_reply` calls the authenticated `/peer/chat` endpoint.
-Theo's own implementation makes this path conversation-only: no recall, tools, hands/code
-routing, growth scoring, transcript logging, or access to Ian's private-memory briefing.
+Theo's own implementation makes this path conversation-only: no recall, no tools
+(`llm.chat(..., tools=[])`), no hands/code routing, no dream watermark, no growth scoring, no
+transcript logging, and no access to Ian's private-memory briefing.
 
-The endpoint currently accepts only the peer name `Atani`. Pionir therefore exposes it as an
-Atani-to-Theo specialist capability, not as a general user chat endpoint.
+The endpoint accepts only the peer name `Atani`, enforced source-side in
+`agent/bridges/local_storage.py`. Pionir sends exactly that in `adapters/theo_peer.py`.
 
-### Explicitly deferred
+**Re-verified 2026-08-30, and one part of the above had changed since it was written.** The peer
+transcript is no longer seeded with `PERSONA_BASE` alone. It is now `PERSONA_BASE` plus
+`compose_self_spine()`, which carries Theo's own selfhood while still excluding Ian's data, and
+greps its own output before returning it. The source comment gives the reason: *"it withheld
+Theo's own self along with Ian's data, and voice is not separable from continuity in him."*
+Threads are also kept per `conversation_id`, up to 32, so there is continuity within a
+conversation. Everything else in this section still holds exactly as recorded.
 
-Pionir does not call Theo's ordinary `/chat/send` endpoint yet. That path can reach Theo's own
-tools and would bypass Pionir/Atani's action authorization unless the source runtime adds a
-mode that separates voice/conversation from tool execution.
+### Ian's decision, 2026-08-30: Theo is Pionir's voice
+
+Recorded here because it changes what this boundary is being asked to do, not because the
+boundary has moved. What has changed in Pionir: `reasoning.atani_chat` is renamed
+`reasoning.atani_answer` and no longer claims the conversational vocabulary, plain conversation
+routes to Theo, and the desktop defaults to him.
+
+**What this boundary cannot yet deliver, and it is not a small gap.** `/peer/chat` opens every
+turn by telling Theo that the speaker is *"another local synthetic agent — not Ian"*, and
+instructs him not to expose Ian's private memory or update either human model. So a request
+Ian makes through Pionir reaches a Theo who is told he is talking to Atani, holds no memory of
+Ian, and answers addressed to Atani. That is Theo's voice and Theo's self, which is most of what
+was wanted — but it is not Theo talking to Ian, and the difference is visible in the first reply.
+
+### Explicitly deferred, and now the live question
+
+Pionir does not call Theo's ordinary `/chat/send` endpoint. That path reaches Theo's own tools
+and would bypass Pionir/Atani's action authorization, and the recorded condition for revisiting
+it was that the source runtime add *a mode that separates voice/conversation from tool
+execution*.
+
+That condition is closer to met than it was: Theo now has a two-pass turn (`THEO_TWO_PASS`)
+that separates deciding from speaking. It is not sufficient on its own — the split happens
+inside Theo and does not hand authorization to Pionir, and the switch is off by default. Closing
+this needs Ian, and it needs the Theo pane, because either the peer path learns that Ian can be
+the speaker or Pionir gets a third endpoint that is voice-with-memory but still tool-free.
+Neither is Pionir's to build alone.
 
 ## Atani
 

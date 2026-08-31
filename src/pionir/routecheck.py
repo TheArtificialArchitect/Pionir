@@ -175,8 +175,8 @@ def default_probes() -> tuple[Probe, ...]:
     return (
         Probe(
             "ask atani to reason about this problem",
-            "reasoning.atani_chat",
-            ("reasoning.atani_chat",),
+            "reasoning.atani_answer",
+            ("reasoning.atani_answer",),
         ),
         Probe(
             "think deeply and carefully about this, take a thorough look",
@@ -213,12 +213,14 @@ def default_probes() -> tuple[Probe, ...]:
             "organism.autogenesis_status",
             ("organism.autogenesis_status",),
         ),
-        # Both of these hold a conversation, so choosing between them on this
-        # request would be a coin toss presented as a decision.
+        # This used to expect ASK: both capabilities held a conversation, so
+        # choosing between them would have been a coin toss. Ian settled it on
+        # 2026-08-30 - Theo is the voice - so plain conversation now has a right
+        # answer, and this probe is what holds the router to it.
         Probe(
             "chat with someone",
-            ASK,
-            ("conversation.theo_peer_reply", "reasoning.atani_chat"),
+            "conversation.theo_peer_reply",
+            ("conversation.theo_peer_reply", "reasoning.atani_answer"),
         ),
         # Names a family rather than a member of it.
         Probe(

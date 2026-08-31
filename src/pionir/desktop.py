@@ -41,7 +41,7 @@ class DesktopController:
             raise ValueError("Enter a message first")
         if route == "Atani":
             task = Task(
-                "reasoning.atani_chat",
+                "reasoning.atani_answer",
                 {"content": message},
                 frozenset({"atani.chat"}),
             )
@@ -142,7 +142,12 @@ class PionirDesktop:
         self.route = ttk.Combobox(
             route_row,
             state="readonly",
-            values=("Atani", "Atani · depth", "Theo · safe peer"),
+            # Theo leads and is the default: Ian decided on 2026-08-30 that he
+            # is Pionir's voice. The label still says "safe peer" because that
+            # is still the path - bounded, tool-free, and addressed to Atani.
+            # Relabelling it "Theo" while that is true would hide the one thing
+            # about this route worth knowing.
+            values=("Theo · safe peer", "Atani", "Atani · depth"),
             width=24,
         )
         self.route.current(0)

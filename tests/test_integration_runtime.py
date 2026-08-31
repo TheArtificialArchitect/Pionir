@@ -43,7 +43,7 @@ class IntegrationRuntimeTests(unittest.TestCase):
             )
             atani = executive.execute(
                 Task(
-                    "reasoning.atani_chat",
+                    "reasoning.atani_answer",
                     {"content": "question"},
                     frozenset({"atani.chat"}),
                 )
