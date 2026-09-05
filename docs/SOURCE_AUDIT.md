@@ -103,7 +103,26 @@ calls that endpoint: `conversation.theo_reply` on agent `theo`, in `adapters/the
 desktop route reads "Theo" rather than "Theo · safe peer" — that label was accurate while the
 peer path was the truth and would be a lie now.
 
-**The success path has not been run live.** Theo's backend was not listening on 8765 and the card
+**Verified live 2026-09-04, and it found something no test on either side could.** A turn
+completed in 23 s: Theo answered, opened a thread and returned its id, and continuity across
+turns worked. Full memory is there - he knows Ian, the repository, and the history.
+
+**But he does not know the speaker is Ian.** Asked "Who am I?" on a cold thread he answered
+"You're Theo", and asked "Who are you speaking with right now?" he described himself, referred to
+Ian in the third person, and closed with *"You are the human, here as yourself... say yours when
+you speak."* He is asking to be told who is speaking.
+
+This is almost certainly not endpoint-specific: `voice_chat()` is `chat(text, no_tools=True)` down
+the ordinary path, so the desktop should show the same thing. The likely cause is source commit
+`b22eae6b` of the same day, which moved "who everyone is" from a standing anchor to
+on-demand-when-named. That change measurably fixed a recitation reflex (0/8 against 4/8) and the
+speaker's identity appears to have gone with the roster. Requested as a fix on the Theo side,
+where the ordinary path is composed; Pionir cannot supply it, because `/voice/chat` takes only
+`content` and `conv`.
+
+Superseded: the note below was written before that run.
+
+**The success path had not been run live.** Theo's backend was not listening on 8765 and the card
 had 1270 MB free at 100% utilisation, so a real turn could not be attempted, and starting the
 backend by hand would hold the mutex the desktop app needs. The failure path *was* exercised end
 to end: routing reached `conversation.theo_reply` at confidence 1.0 and admission refused the

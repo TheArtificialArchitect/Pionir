@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -16,7 +17,7 @@ from .bootstrap import PionirRuntime, build_runtime
 from .contracts import Task
 from .errors import PionirError, RoutingAmbiguous
 from .router import IntentRouter
-from .scheduler import observed_free_vram_mb
+from .scheduler import canonical_model, observed_free_vram_mb
 
 
 def _jsonable(value: Any) -> Any:
@@ -26,7 +27,11 @@ def _jsonable(value: Any) -> Any:
         return value.value
     if isinstance(value, Path):
         return str(value)
-    if isinstance(value, dict):
+    # Mapping, not dict. Every TaskResult.output is a MappingProxyType, which is
+    # not a dict subclass, so it fell through to `default=str` and every reply
+    # printed as a quoted Python repr instead of JSON - unparseable by anything
+    # downstream. Seen on the first live Theo turn.
+    if isinstance(value, Mapping):
         return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set, frozenset)):
         return [_jsonable(item) for item in value]
@@ -237,7 +242,7 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
 
 def _declared_models(runtime: PionirRuntime) -> list[dict[str, Any]]:
     try:
-        resident = {item.name for item in benchmark.read_loaded_models()}
+        resident = {canonical_model(item.name) for item in benchmark.read_loaded_models()}
         reachable = True
     except benchmark.BenchmarkError:
         resident, reachable = set(), False
@@ -245,7 +250,14 @@ def _declared_models(runtime: PionirRuntime) -> list[dict[str, Any]]:
     for manifest in runtime.executive.registry.manifests():
         for capability in manifest.capabilities:
             if capability.model is not None and capability.model.requires_gpu:
-                seen[capability.model.model_id] = capability.model.model_id in resident
+                # Normalised, exactly as admission does. Compared verbatim this
+                # read False for a model that was resident - Theo reports his
+                # build untagged and the daemon tags it `:latest` - so the view
+                # built to show declaration drift was inventing it, while the
+                # scheduler underneath was correct. Observed live 2026-09-04.
+                seen[capability.model.model_id] = (
+                    canonical_model(capability.model.model_id) in resident
+                )
     return [
         {"model_id": name, "resident": seen[name] if reachable else None}
         for name in sorted(seen)
