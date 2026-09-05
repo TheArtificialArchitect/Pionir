@@ -2,16 +2,20 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from support import offline_scheduler
 
+from pionir.benchmark import LoadedModel
 from pionir.contracts import ModelRequirement
 from pionir.errors import ResourceUnavailable
 from pionir.scheduler import (
     KV_CACHE_MB_PER_1K_TOKENS,
     ModelLeaseScheduler,
     ResourceBudget,
+    canonical_model,
     kv_cache_vram_mb,
+    model_already_resident,
 )
 from pionir.shared_gpu import SharedGpuLock
 
@@ -155,3 +159,31 @@ class ContextCostTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ModelNameTests(unittest.TestCase):
+    """Ollama reports `name:tag`; Theo's promotion writes the name untagged.
+
+    Comparing the two verbatim never matches, so the residency discount would
+    silently never apply and every turn would be charged full weights.
+    """
+
+    def test_an_untagged_name_means_latest(self) -> None:
+        self.assertEqual(canonical_model("theo-local-v25-q4"), "theo-local-v25-q4:latest")
+
+    def test_an_explicit_tag_is_left_alone(self) -> None:
+        self.assertEqual(canonical_model("theo-local-v25-q4:latest"), "theo-local-v25-q4:latest")
+        self.assertEqual(canonical_model("qwen2.5:7b-instruct"), "qwen2.5:7b-instruct")
+
+    def test_residency_matches_across_the_tag_difference(self) -> None:
+        loaded = LoadedModel(
+            name="theo-local-v25-q4:latest",
+            size_bytes=100,
+            size_vram_bytes=100,
+            context_length=16384,
+        )
+        with patch("pionir.scheduler.read_loaded_models", return_value=[loaded]):
+            # What the promotion mechanism writes, without a tag.
+            self.assertTrue(model_already_resident("theo-local-v25-q4"))
+            # And a different build must still not match.
+            self.assertFalse(model_already_resident("theo-local-v17-q4"))

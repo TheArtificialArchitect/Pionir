@@ -67,7 +67,14 @@ class TheoSettings:
     # against that rather than tuned to it, because the turn does recall and a
     # cold model load lands inside the same request.
     timeout_seconds: int = 180
-    model_id: str = "theo-local-v17-q4:latest"
+    # A last resort, used only when Theo is unreachable - and if he is
+    # unreachable no turn can happen anyway, so its exact value barely matters.
+    # The real one comes from `/health`, which reports the model the live client
+    # actually resolved. Never read OLLAMA_MODEL: the source's own history is
+    # that a persisted env var outvoting the launcher is how retrains v10 to v16
+    # landed in Ollama and were never served, and a stale process-scope copy of
+    # it was observed here on 2026-09-04 reading v17 while v25 was promoted.
+    model_id: str = "theo-local-v25-q4:latest"
     # Measured resident on the target card: 4423 MB at 4096 context, and 4940 MB
     # in live use at its actual 16384 window (2026-08-30). Declared as 4500 plus
     # a computed KV cache, which totals 5190 and so stays above what was
@@ -165,6 +172,28 @@ class AuthenticatedLoopbackTransport:
         if not isinstance(document, dict):
             raise AdapterProtocolError("Theo's bridge returned a non-object response")
         return document
+
+
+def resolve_served_model(settings: TheoSettings) -> str | None:
+    """Ask Theo which brain he is actually serving, or None if he cannot say.
+
+    This id drives Pionir's VRAM admission discount. Hardcoding it meant that
+    every promotion silently stopped it matching, so Pionir charged full weights
+    instead of a KV cache and began refusing turns that would have fitted - a
+    correct-looking ResourceUnavailable naming a real shortfall, with nothing
+    anywhere saying the constant had gone stale.
+
+    Failure is not an error. Theo being down is the ordinary case at boot, and
+    the declared fallback covers it; `pionir doctor` shows the declaration
+    against what the daemon actually holds either way.
+    """
+
+    try:
+        document = AuthenticatedLoopbackTransport(settings).request("/health")
+    except (AdapterUnavailable, AdapterProtocolError, AdapterAuthenticationError):
+        return None
+    model = document.get("model")
+    return model.strip() if isinstance(model, str) and model.strip() else None
 
 
 class TheoAdapter:

@@ -7,7 +7,12 @@ back.
 
 import unittest
 
-from pionir.adapters.theo import MAX_CONTENT_CHARS, TheoAdapter, TheoSettings
+from pionir.adapters.theo import (
+    MAX_CONTENT_CHARS,
+    AuthenticatedLoopbackTransport,
+    TheoAdapter,
+    TheoSettings,
+)
 from pionir.contracts import Task
 from pionir.errors import AdapterProtocolError
 
@@ -163,5 +168,50 @@ class RefusalTests(unittest.TestCase):
             adapter.execute(Task("conversation.theo_reply", {"content": "hi"}))
 
 
+
+class ServedModelTests(unittest.TestCase):
+    """Pionir asks Theo which brain he serves instead of declaring one.
+
+    The id drives the VRAM admission discount. Hardcoding it meant every
+    promotion silently stopped it matching, so Pionir charged full weights
+    instead of a KV cache and refused turns that would have fitted - a
+    correct-looking ResourceUnavailable naming a real shortfall, with nothing
+    saying the constant had gone stale.
+    """
+
+    def test_reads_the_model_the_live_client_resolved(self) -> None:
+        from unittest import mock
+
+        from pionir.adapters.theo import resolve_served_model
+
+        with mock.patch.object(
+            AuthenticatedLoopbackTransport,
+            "request",
+            return_value={"ok": True, "model": " theo-local-v25-q4 "},
+        ):
+            self.assertEqual(resolve_served_model(_settings()), "theo-local-v25-q4")
+
+    def test_theo_being_down_is_not_an_error(self) -> None:
+        # Boot must not depend on him. The declared fallback covers it and
+        # doctor shows the declaration against what the daemon actually holds.
+        from unittest import mock
+
+        from pionir.adapters.theo import resolve_served_model
+        from pionir.errors import AdapterUnavailable
+
+        with mock.patch.object(
+            AuthenticatedLoopbackTransport, "request", side_effect=AdapterUnavailable("down")
+        ):
+            self.assertIsNone(resolve_served_model(_settings()))
+
+    def test_a_health_response_without_a_model_reports_none(self) -> None:
+        from unittest import mock
+
+        from pionir.adapters.theo import resolve_served_model
+
+        with mock.patch.object(
+            AuthenticatedLoopbackTransport, "request", return_value={"ok": True, "model": None}
+        ):
+            self.assertIsNone(resolve_served_model(_settings()))
 if __name__ == "__main__":
     unittest.main()

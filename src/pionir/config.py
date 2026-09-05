@@ -72,12 +72,11 @@ class PionirSettings:
     circuit_recovery_seconds: float = 30.0
     theo_url: str = "http://127.0.0.1:8765"
     theo_token: str = field(default="", repr=False)
-    # Which model Theo is running is a fact about somebody else's process, and
-    # /health reports only booleans, so Pionir cannot ask. It only affects the
-    # resident-model discount in admission, and a stale value fails safe by
-    # over-charging - but over-charging refuses turns that would have worked.
-    # Settable so a retrain does not need a code change.
-    theo_model_id: str = "theo-local-v17-q4:latest"
+    # None means ask Theo, which is now the right answer: `/health` reports the
+    # model his live client actually resolved. Set this only to pin a specific
+    # build; a pinned value that goes stale silently loses the resident-model
+    # discount and starts refusing turns that would have fitted.
+    theo_model_id: str | None = None
 
     atani_command: tuple[str, ...] = ("atani",)
     bryo_status_command: tuple[str, ...] | None = None
@@ -167,10 +166,7 @@ class PionirSettings:
                 )
             ),
             theo_url=os.environ.get("PIONIR_THEO_URL", _declared("theo_url")),
-            theo_model_id=(
-                os.environ.get("PIONIR_THEO_MODEL_ID", "").strip()
-                or _declared("theo_model_id")
-            ),
+            theo_model_id=(os.environ.get("PIONIR_THEO_MODEL_ID", "").strip() or None),
             theo_token=(
                 os.environ.get("PIONIR_THEO_TOKEN", "").strip()
                 or os.environ.get("BRIDGE_TOKEN", "").strip()

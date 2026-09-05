@@ -60,6 +60,19 @@ def observed_free_vram_mb() -> int | None:
         return None
 
 
+def canonical_model(name: str) -> str:
+    """Normalise a model name the way Ollama's own inventory reports it.
+
+    A name written without a tag means `:latest`. Theo's promotion mechanism
+    writes `theo-local-v25-q4` while the daemon reports
+    `theo-local-v25-q4:latest`, so comparing the two verbatim never matches and
+    the residency discount silently never applies.
+    """
+
+    name = name.strip()
+    return name if ":" in name else f"{name}:latest"
+
+
 def model_already_resident(model_id: str) -> bool:
     """Whether the local daemon already holds this model wholly on the GPU.
 
@@ -70,8 +83,10 @@ def model_already_resident(model_id: str) -> bool:
     """
 
     try:
+        wanted = canonical_model(model_id)
         return any(
-            item.name == model_id and item.fully_on_gpu for item in read_loaded_models()
+            canonical_model(item.name) == wanted and item.fully_on_gpu
+            for item in read_loaded_models()
         )
     except BenchmarkError:
         return False

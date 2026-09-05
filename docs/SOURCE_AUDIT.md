@@ -73,6 +73,22 @@ Contract as implemented, loopback-only and Bearer-authenticated:
     200                {"ok": true, "conv": str, "message": {id, role, content, createdAt, seq}}
     non-200            {"ok": false, "conv": str, "error": str}
 
+Health also reports `"model"`, added 2026-09-04 at Pionir's request: the model the live client
+actually resolved, read off the attached Agent rather than from `OLLAMA_MODEL`. Pionir asks for
+it at boot instead of declaring a version, because Theo is promoted often and a declared id goes
+stale silently - it stops matching anything resident, admission charges full weights instead of a
+KV cache, and turns that would have fitted are refused with a correct-looking shortfall.
+`PIONIR_THEO_MODEL_ID` pins a build when that is wanted; unset means ask.
+
+**Do not read `OLLAMA_MODEL` for this.** The source's own history is that a persisted env var
+outvoting the launcher is how retrains v10 through v16 landed in Ollama and were never served,
+and on 2026-09-04 this session observed a process-scope copy reading `theo-local-v17-q4` while
+User scope and the promotion both said `theo-local-v25-q4`.
+
+Model names are normalised before comparison: the promotion writes `theo-local-v25-q4` and the
+daemon reports `theo-local-v25-q4:latest`, so a verbatim comparison never matches and the
+discount would never apply.
+
 Health advertises `capabilities["voice_chat"]`. **Not `voice`** — that flag already meant Piper's
 text-to-speech, so probing it would report health for a different subsystem entirely. Pionir
 probes `voice_chat`, and a test asserts it fails on a bridge with `peer` and `voice` up but the

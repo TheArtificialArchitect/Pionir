@@ -65,28 +65,28 @@ if __name__ == "__main__":
 
 
 class TheoModelIdTests(unittest.TestCase):
-    """Which model Theo runs is a fact about another process, so it is settable.
+    """Which model Theo serves is a fact about his process, so Pionir asks him.
 
-    It only feeds the resident-model discount in admission. A stale value fails
-    safe by over-charging, but over-charging refuses turns that would have
-    worked and says nothing about why, so a retrain must not need a code change.
+    Unset means ask. It is settable only to pin a specific build, and a pinned
+    value that goes stale silently loses the resident-model discount and starts
+    refusing turns that would have fitted.
     """
 
-    def test_defaults_to_the_currently_declared_build(self) -> None:
-        self.assertEqual(PionirSettings().theo_model_id, "theo-local-v17-q4:latest")
+    def test_unset_means_ask_theo_rather_than_declare_a_version(self) -> None:
+        self.assertIsNone(PionirSettings().theo_model_id)
 
-    def test_the_environment_overrides_it(self) -> None:
+    def test_the_environment_pins_a_specific_build(self) -> None:
         with patch.dict(
-            os.environ, {"PIONIR_THEO_MODEL_ID": "theo-local-v18-q4:latest"}, clear=False
+            os.environ, {"PIONIR_THEO_MODEL_ID": "theo-local-v25-q4"}, clear=False
         ):
             self.assertEqual(
-                PionirSettings.from_environment().theo_model_id,
-                "theo-local-v18-q4:latest",
+                PionirSettings.from_environment().theo_model_id, "theo-local-v25-q4"
             )
 
-    def test_a_blank_override_falls_back_rather_than_declaring_nothing(self) -> None:
+    def test_a_blank_pin_reverts_to_asking_rather_than_pinning_nothing(self) -> None:
         with patch.dict(os.environ, {"PIONIR_THEO_MODEL_ID": "   "}, clear=False):
-            self.assertEqual(
-                PionirSettings.from_environment().theo_model_id,
-                "theo-local-v17-q4:latest",
-            )
+            self.assertIsNone(PionirSettings.from_environment().theo_model_id)
+
+
+if __name__ == "__main__":
+    unittest.main()
