@@ -11,7 +11,7 @@ databases, personalities, or histories.
 | System | Intended role | Integration status |
 |---|---|---|
 | Atani | Executive policy, planning, approvals, verification, event ledger | Working CLI adapter and bounded plan surface |
-| Theo / Tech-Support | Human-facing personality, conversation, tools, lessons, LoRA workflow | Working authenticated safe-peer adapter |
+| Theo / Tech-Support | Human-facing personality, conversation, tools, lessons, LoRA workflow | Working authenticated voice adapter (full memory, no tools) |
 | Bryo / Terrarium | Resource governor, CPU-first learning, experiment gate | Working read-only status and shared GPU lease |
 | Probability | Measured autonomy, cumulative memory, gene evolution, reversible promotion | Source audited; redacted read-only status working |
 | Autogenesis | Deterministic curriculum, candidate generation, transactional lineage | Source audited; read-only status working |

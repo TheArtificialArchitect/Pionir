@@ -32,10 +32,11 @@ $env:PIONIR_THEO_URL = "http://127.0.0.1:8765"
 $env:PIONIR_THEO_TOKEN = (Get-Content "$env:USERPROFILE\.techsupport_agent\bridge_token.txt" -Raw).Trim()
 # If Theo put the token in the environment rather than that file, use it directly:
 #   $env:PIONIR_THEO_TOKEN = $env:BRIDGE_TOKEN
-# Update this after a Theo retrain. It feeds only the resident-model discount in
-# admission, so a stale value quietly over-charges VRAM and refuses turns that
-# would have fitted. `pionir doctor` shows it under gpu.declared_models.
-$env:PIONIR_THEO_MODEL_ID = "theo-local-v17-q4:latest"
+# Leave PIONIR_THEO_MODEL_ID unset. Pionir asks Theo which model he actually
+# serves, once at boot, through /health. Set it only to pin a specific build:
+# a pinned id goes stale on the next promotion and the only symptom is Pionir
+# over-charging VRAM and refusing turns that would have fitted.
+# `pionir doctor` shows what is declared against what the daemon holds.
 $env:PIONIR_ATANI_COMMAND_JSON = '["C:\\src\\Atani\\.venv\\Scripts\\atani.exe"]'
 $env:PIONIR_BRYO_STATUS_COMMAND_JSON = '["C:\\src\\terrarium\\.venv\\Scripts\\python.exe","-m","bryo.status"]'
 $env:PIONIR_PROBABILITY_URL = "http://127.0.0.1:8791"
@@ -71,7 +72,7 @@ The launcher supplies the standard `C:\src\Atani`, `C:\src\terrarium`,
 `C:\src\autogenesis`, `C:\src\Probability`, and `C:\Users\Ian\genesis-agent` paths and reads
 Theo's existing bridge token from his private state file for that process only. Override the
 launcher parameters if those checkouts live elsewhere. The shell exposes explicit Atani
-normal/depth and Theo safe-peer routes plus doctor, capabilities, Bryo, Autogenesis,
+normal/depth and Theo voice routes plus doctor, capabilities, Bryo, Autogenesis,
 Probability, and Genesis status. Automatic intent routing is deliberately not implied yet.
 
 ## First bounded calls
@@ -85,9 +86,10 @@ Probability, and Genesis status. Automatic intent routing is deliberately not im
 .\.venv\Scripts\pionir.exe run-atani-plan .\examples\atani-plan.json
 ```
 
-The Theo peer command uses his conversation-only route. It cannot call his tools or read Ian's
-private memory. Ordinary user-facing Theo chat remains outside Pionir until the source runtime
-offers an action boundary that cannot bypass Atani's approvals.
+`ask-theo` reaches Theo's `/voice/chat`: the ordinary turn - persona, self spine, continuity
+briefing, recall, the human model - with an empty tool list. Full memory, zero hands. Action
+authorization stays with Pionir, which is why this endpoint exists rather than Pionir calling
+`/chat/send`.
 
 Probability must already be running on loopback port 8791 and Genesis on loopback port 8000.
 Pionir does not start or stop either process. This preserves each agent's watchdog, state,

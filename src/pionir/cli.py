@@ -64,7 +64,7 @@ def _parser() -> argparse.ArgumentParser:
 
     theo = commands.add_parser(
         "ask-theo",
-        help="ask Theo through the conversation-only Atani peer boundary",
+        help="ask Theo directly: his full memory and self, with no tools",
     )
     theo.add_argument("text", nargs="+")
     theo.add_argument("--conversation")
@@ -332,7 +332,7 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
     if args.command == "ask-theo":
         adapter = runtime.adapters.get("theo")
         if not isinstance(adapter, TheoAdapter):
-            raise ValueError("Theo peer is not configured; set PIONIR_THEO_TOKEN")
+            raise ValueError("Theo is not configured; set PIONIR_THEO_TOKEN")
         payload = {"content": " ".join(args.text)}
         if args.conversation:
             payload["conversation_id"] = args.conversation

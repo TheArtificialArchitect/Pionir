@@ -112,13 +112,42 @@ turns worked. Full memory is there - he knows Ian, the repository, and the histo
 Ian in the third person, and closed with *"You are the human, here as yourself... say yours when
 you speak."* He is asking to be told who is speaking.
 
-This is almost certainly not endpoint-specific: `voice_chat()` is `chat(text, no_tools=True)` down
-the ordinary path, so the desktop should show the same thing. The likely cause is source commit
-`b22eae6b` of the same day, which moved "who everyone is" from a standing anchor to
-on-demand-when-named. That change measurably fixed a recitation reflex (0/8 against 4/8) and the
-speaker's identity appears to have gone with the roster. Requested as a fix on the Theo side,
-where the ordinary path is composed; Pionir cannot supply it, because `/voice/chat` takes only
-`content` and `conv`.
+**Not endpoint-specific, confirmed on the source side the same day.** The Theo pane ran the same
+prompts through `eval_generate` - the ordinary path's own context, the one the desktop serves -
+and they invert identically. `/voice/chat` is innocent, as `voice_chat()` being
+`chat(text, no_tools=True)` predicted.
+
+**The cause recorded here first was wrong, and the correction is the interesting half.** This
+session attributed it to source commit `b22eae6b`, which moved "who everyone is" from a standing
+anchor to on-demand-when-named, and guessed the speaker's identity left with the roster. It never
+left, because it was never there. Every prompt named Ian as somebody who *exists* - "Ian is the
+human you partner with" - and none named him as the person typing. The claim that the speaker is
+Ian lived only in the docstrings of `Agent.voice_chat` and `_serve_voice`, which is exactly the
+shape of HEAD 3.6: a comment asserting a property that no code establishes. So `b22eae6b` is
+clear and its measured win (recitation reflex 0/8 against 4/8) stands unreverted.
+
+**Fixed source-side in `b47b15b1`, and it changes nothing measurable.** A "## Who you are talking
+to" block in `_name_block()`, carrying the per-path default this session argued for: `/peer/chat`
+composes its own transcript from `PERSONA_BASE` + the self spine and never touches `_name_block`,
+so Atani stays correctly a peer without special-casing, and a source selftest now asserts the peer
+path does not inherit the default. The clause "unless a system line in this conversation names a
+different speaker" is what makes the peer path's negative assertion and this positive one one rule
+rather than two.
+
+Measured four arms at n=30, interleaved with the order rotated: 9/30 wrong before, 8/30 with the
+block, 8/30 with the briefing register also reframed, 6/30 labelling the user turn `Ian: <text>`
+against a 7/30 baseline. Then the *same* baseline code again: 7/30 against the first run's 9/30.
+That last number is what makes the other four readable - an effect under about +/-3/30 is invisible
+to this harness and every arm sits inside the band. The block ships because it says something true
+for 70 tokens, and its docstring records in capitals that it does not fix the behaviour, so nobody
+later reads it as a fix that regressed.
+
+**Pionir asked for a `speaker` field on `/voice/chat` and it was declined, correctly.** It could
+only ever hold "Ian" - any other value is a peer, and `/peer/chat` already carries that with a
+boundary the voice path deliberately lacks. A field with one valid value is a field that
+eventually carries a wrong one, and it would give this endpoint a second, weaker way to say
+something that already has a right answer. Nothing to build here: the default is the mechanism,
+and it lives where the ordinary turn is composed.
 
 Superseded: the note below was written before that run.
 
