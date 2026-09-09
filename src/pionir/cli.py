@@ -227,6 +227,11 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
             # static budget in that case; see scheduler.observed_free_vram_mb.
             "observed_free_vram_mb": observed_free_vram_mb(),
             "maximum_heavyweight_leases": 1,
+            # The exact path of the shared GPU lock, surfaced so Bryo can be
+            # pointed at the same file rather than deriving it independently -
+            # two components resolving one piece of state is how they desync
+            # (HEAD 3.9). Pionir is the authority; this is the value to match.
+            "shared_gpu_lock_path": str(runtime.settings.gpu_lock_path),
             # Every declared model against what the daemon actually holds. A
             # declaration naming a model nobody runs any more still works, but
             # silently loses the resident-model discount and starts refusing
