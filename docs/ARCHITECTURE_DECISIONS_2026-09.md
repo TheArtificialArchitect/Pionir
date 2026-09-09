@@ -98,13 +98,16 @@ Both are the estate's most expensive, best-documented failures.
   ledger, not Theo's. This is the boundary that made `/chat/send` get declined for
   the voice — resolved in Pionir's favor.
 
+- **Memory: lexical, and Pionir's own for now.** Recall is BM25 + recency, no
+  embedding model on the card. `cortex.py` is built and wired into Pionir alone;
+  the standalone conversationalist builds its own in its session, and the two are
+  compared later rather than forced onto one library now. Semantic recall stays a
+  documented addition that re-ranks the same candidate set, not a rewrite — added
+  only if measured recall quality asks for it.
+
 ## Open decisions, not yet made
 
 - Whether the new standalone conversationalist and Galatea-the-voice stay two
   agents or eventually converge. For now: two.
-- **One memory engine or two.** The standalone conversationalist's brief tells it
-  to build "its own Cortex"; Pionir needs a shared memory engine for the voice
-  and the bots. Both are retrieval-first and both fight the same forgetting. Open
-  question whether the hard core (recall, consolidation, char-budget,
-  anti-forgetting) is built once as a reusable library both consume, or twice.
-  Building it twice in parallel risks the same drift as any state split (HEAD 3.9).
+- Whether Pionir's memory and the standalone agent's memory converge later, once
+  both exist and can be compared.

@@ -119,6 +119,10 @@ class PionirSettings:
         return self.shared_gpu_lock_file or self.state_root / "resource" / "gpu.lock"
 
     @property
+    def cortex_path(self) -> Path:
+        return self.state_root / "cortex" / "memory.db"
+
+    @property
     def resource_budget(self) -> ResourceBudget:
         return ResourceBudget(
             total_vram_mb=self.total_vram_mb,

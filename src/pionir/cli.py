@@ -146,6 +146,25 @@ def _parser() -> argparse.ArgumentParser:
         default=benchmark.DEFAULT_OLLAMA_URL,
         help="local Ollama base URL",
     )
+
+    remember = commands.add_parser(
+        "remember",
+        help="write one memory into Pionir's store",
+    )
+    remember.add_argument("text", nargs="+", help="the memory text")
+    remember.add_argument(
+        "--kind", default="note", help="episode, fact, canon, note, lookup, thought (default note)"
+    )
+    remember.add_argument("--namespace", default="shared", help="which stream it belongs to")
+    remember.add_argument("--salience", type=float, default=None, help="override the kind default")
+
+    recall = commands.add_parser(
+        "recall",
+        help="recall the memories most relevant to a query (lexical, no model, no GPU)",
+    )
+    recall.add_argument("query", nargs="+", help="what to recall about")
+    recall.add_argument("-k", type=int, default=8, help="how many to return (default 8)")
+    recall.add_argument("--namespace", default=None, help="scope to one stream (default: all)")
     return parser
 
 
@@ -241,6 +260,10 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
         # The ledger records how confident routing was. This records whether it
         # was right, which the ledger structurally cannot say.
         "routing_aim": aim,
+        # Counts, not a health verdict. An empty store here is honest - ready and
+        # unused, not broken - and distinguishing that from a store that recalls
+        # nothing because it is broken is exactly the wired-but-inert check (3.1).
+        "memory": runtime.cortex.stats(),
         "specialists": specialists,
     }
 
@@ -452,6 +475,29 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
         contexts = tuple(args.contexts) if args.contexts else (4096, 16384)
         report = benchmark.run(models, contexts=contexts, base_url=args.ollama_url)
         _print(report)
+        return 0
+    if args.command == "remember":
+        memory_id = runtime.cortex.remember(
+            args.kind, " ".join(args.text), namespace=args.namespace, salience=args.salience
+        )
+        _print({"remembered": memory_id, "stats": runtime.cortex.stats()})
+        return 0
+    if args.command == "recall":
+        hits = runtime.cortex.recall(" ".join(args.query), k=args.k, namespace=args.namespace)
+        _print(
+            {
+                "query": " ".join(args.query),
+                "recalled": [
+                    {
+                        "kind": memory.kind,
+                        "namespace": memory.namespace,
+                        "score": round(memory.score, 3),
+                        "text": memory.text,
+                    }
+                    for memory in hits
+                ],
+            }
+        )
         return 0
     return 2
 
