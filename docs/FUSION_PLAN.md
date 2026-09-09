@@ -13,9 +13,9 @@ databases, personalities, or histories.
 | Atani | Executive policy, planning, approvals, verification, event ledger | Working CLI adapter and bounded plan surface |
 | Theo / Tech-Support | Human-facing personality, conversation, tools, lessons, LoRA workflow | Working authenticated voice adapter (full memory, no tools) |
 | Bryo / Terrarium | Resource governor, CPU-first learning, experiment gate | Working read-only status and shared GPU lease |
-| Probability | Measured autonomy, cumulative memory, gene evolution, reversible promotion | Source audited; redacted read-only status working |
-| Autogenesis | Deterministic curriculum, candidate generation, transactional lineage | Source audited; read-only status working |
-| Genesis agent | Local life loop, emotional state, proposal-only metacoder, Tor research | Source audited; redacted read-only status working |
+| ~~Probability~~ | ~~Measured autonomy, cumulative memory, gene evolution~~ | **Retired 2026-09-09.** Adapter removed from Pionir; its consolidation/memory ideas were harvested into the memory engine. See ARCHITECTURE_DECISIONS_2026-09.md. |
+| ~~Autogenesis~~ | ~~Deterministic curriculum, candidate generation, transactional lineage~~ | **Retired 2026-09-09.** Adapter removed; harvested for parts. |
+| ~~Genesis agent~~ | ~~Local life loop, emotional state, Tor research~~ | **Retired 2026-09-09.** Adapter removed; emotional meters and the Tor-fail-closed pattern harvested. |
 
 The public `genesis` world-simulator repository must not be assumed to be the same system as
 the local `genesis-agent` directory.

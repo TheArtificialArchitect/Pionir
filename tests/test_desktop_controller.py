@@ -23,9 +23,6 @@ class DesktopControllerTests(unittest.TestCase):
                 "atani": object(),
                 "theo": object(),
                 "bryo": object(),
-                "autogenesis": object(),
-                "probability": object(),
-                "genesis": object(),
             },
         )
         self.controller = DesktopController(self.runtime)
@@ -50,21 +47,6 @@ class DesktopControllerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not configured"):
             self.controller.ask("Theo", "Hello")
         self.assertEqual(self.executive.tasks, [])
-
-    def test_autogenesis_status_is_read_only_capability(self) -> None:
-        self.controller.autogenesis_status()
-        self.assertEqual(
-            self.executive.tasks[0].capability,
-            "organism.autogenesis_status",
-        )
-
-    def test_probability_and_genesis_status_are_read_only_capabilities(self) -> None:
-        self.controller.probability_status()
-        self.controller.genesis_status()
-        self.assertEqual(
-            [task.capability for task in self.executive.tasks],
-            ["organism.probability_status", "organism.genesis_status"],
-        )
 
 
 if __name__ == "__main__":

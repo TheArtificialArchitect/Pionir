@@ -105,6 +105,24 @@ Both are the estate's most expensive, best-documented failures.
   documented addition that re-ranks the same candidate set, not a rewrite — added
   only if measured recall quality asks for it.
 
+## Memory engine — open items (built core, deferred by choice)
+
+The core store is built, wired, and driveable from the CLI. These are the next
+pieces, none urgent, none needing the strip:
+
+- **A recall eval (`recall-check`).** Like `route-check`, but for memory:
+  known-answer probes measuring recall@k. It is the instrument that decides the
+  lexical-vs-semantic question for real, and the guard that catches an import
+  regression (a memory system read 97% then 81% on one bad batch — HEAD 3.13).
+  Build this before trusting recall quality by feel.
+- **Link expansion.** `recall()` returning one hop of `[[slug]]`-linked memories
+  alongside the direct hits. Slugs and links are already stored; the expansion is
+  the unbuilt half.
+- **The consolidation seam.** A model-free interface for a caller (the voice, a
+  distill pass) to fold raw messages into episodes and extract facts. The engine
+  stays model-free and testable; the distilling lives in the caller. Do not build
+  it until something is writing conversations for it to fold.
+
 ## Open decisions, not yet made
 
 - Whether the new standalone conversationalist and Galatea-the-voice stay two

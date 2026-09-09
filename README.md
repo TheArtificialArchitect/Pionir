@@ -29,7 +29,7 @@ User or client
 ```
 
 The implementation is deliberately dependency-free. It establishes the contracts that
-Atani, Theo, Bryo/Terrarium, Probability, Autogenesis, and Genesis can implement
+Atani, Theo, and Bryo/Terrarium can implement
 without requiring their codebases to be copied into Pionir.
 
 ## Development

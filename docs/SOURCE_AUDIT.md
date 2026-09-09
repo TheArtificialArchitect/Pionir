@@ -257,6 +257,15 @@ non-blocking lock at `~/.pionir/resource/gpu.lock` for every heavyweight GPU cal
 hold that same lock for the complete lifetime of each opportunistic GPU lease. Process exit
 releases the OS lock automatically; metadata in the file is diagnostic only.
 
+## Retired from Pionir — 2026-09-09
+
+The three sections below (Autogenesis, Probability, Genesis agent) record audits
+of integrations that **no longer exist in Pionir.** Their status adapters,
+config, CLI commands, and desktop routes were removed on 2026-09-09 once the new
+voice session had harvested what it needed from them. The audits are kept as the
+record of what was integrated and why it was removed; the order and reasoning are
+in `ARCHITECTURE_DECISIONS_2026-09.md`. Bryo (governor) and Atani (manager) stay.
+
 ## Autogenesis
 
 - Source: `PreShotCome/autogenesis`, branch `main`, package version 0.1.0.

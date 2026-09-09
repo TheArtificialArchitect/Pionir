@@ -198,21 +198,6 @@ def default_probes() -> tuple[Probe, ...]:
             "organism.bryo_status",
             ("organism.bryo_status",),
         ),
-        Probe(
-            "genesis life loop counters",
-            "organism.genesis_status",
-            ("organism.genesis_status",),
-        ),
-        Probe(
-            "probability operational state",
-            "organism.probability_status",
-            ("organism.probability_status",),
-        ),
-        Probe(
-            "autogenesis controls and recent ledger events",
-            "organism.autogenesis_status",
-            ("organism.autogenesis_status",),
-        ),
         # This used to expect ASK: both capabilities held a conversation, so
         # choosing between them would have been a coin toss. Ian settled it on
         # 2026-08-30 - Theo is the voice - so plain conversation now has a right
@@ -221,12 +206,6 @@ def default_probes() -> tuple[Probe, ...]:
             "chat with someone",
             "conversation.theo_reply",
             ("conversation.theo_reply", "reasoning.atani_answer"),
-        ),
-        # Names a family rather than a member of it.
-        Probe(
-            "organism status",
-            ASK,
-            ("organism.bryo_status", "organism.genesis_status"),
         ),
         # Nothing registered does this, and inventing a route would be worse
         # than saying so.

@@ -69,18 +69,6 @@ def _parser() -> argparse.ArgumentParser:
     theo.add_argument("text", nargs="+")
     theo.add_argument("--conversation")
     commands.add_parser("bryo-status", help="read Bryo's non-mutating status snapshot")
-    commands.add_parser(
-        "autogenesis-status",
-        help="read Autogenesis controls and recent ledger events",
-    )
-    commands.add_parser(
-        "probability-status",
-        help="read Probability's redacted operational status",
-    )
-    commands.add_parser(
-        "genesis-status",
-        help="read Genesis health and life-loop counters",
-    )
 
     route = commands.add_parser(
         "route",
@@ -193,21 +181,6 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
         specialists["bryo"] = {
             "status": "not_configured",
             "message": "set PIONIR_BRYO_STATUS_COMMAND_JSON",
-        }
-    if "autogenesis" not in runtime.adapters:
-        specialists["autogenesis"] = {
-            "status": "not_configured",
-            "message": "set PIONIR_AUTOGENESIS_STATUS_COMMAND_JSON",
-        }
-    if "probability" not in runtime.adapters:
-        specialists["probability"] = {
-            "status": "not_configured",
-            "message": "set PIONIR_PROBABILITY_URL",
-        }
-    if "genesis" not in runtime.adapters:
-        specialists["genesis"] = {
-            "status": "not_configured",
-            "message": "set PIONIR_GENESIS_URL",
         }
     recorded = routecheck.load(runtime.settings.routing_check_path)
     if recorded is None:
@@ -373,33 +346,6 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
                 "Bryo is not configured; set PIONIR_BRYO_STATUS_COMMAND_JSON"
             )
         result = runtime.executive.execute(Task("organism.bryo_status", {}))
-        _print(result.output)
-        return 0
-    if args.command == "autogenesis-status":
-        if "autogenesis" not in runtime.adapters:
-            raise ValueError(
-                "Autogenesis is not configured; set "
-                "PIONIR_AUTOGENESIS_STATUS_COMMAND_JSON"
-            )
-        result = runtime.executive.execute(
-            Task("organism.autogenesis_status", {})
-        )
-        _print(result.output)
-        return 0
-    if args.command == "probability-status":
-        if "probability" not in runtime.adapters:
-            raise ValueError(
-                "Probability is not configured; set PIONIR_PROBABILITY_URL"
-            )
-        result = runtime.executive.execute(
-            Task("organism.probability_status", {})
-        )
-        _print(result.output)
-        return 0
-    if args.command == "genesis-status":
-        if "genesis" not in runtime.adapters:
-            raise ValueError("Genesis is not configured; set PIONIR_GENESIS_URL")
-        result = runtime.executive.execute(Task("organism.genesis_status", {}))
         _print(result.output)
         return 0
     if args.command == "route":

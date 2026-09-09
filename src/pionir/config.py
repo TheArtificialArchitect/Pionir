@@ -80,9 +80,6 @@ class PionirSettings:
 
     atani_command: tuple[str, ...] = ("atani",)
     bryo_status_command: tuple[str, ...] | None = None
-    autogenesis_status_command: tuple[str, ...] | None = None
-    probability_url: str | None = None
-    genesis_url: str | None = None
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
 
@@ -98,11 +95,6 @@ class PionirSettings:
             or any(not part for part in self.bryo_status_command)
         ):
             raise ValueError("Bryo status command cannot be empty")
-        if self.autogenesis_status_command is not None and (
-            not self.autogenesis_status_command
-            or any(not part for part in self.autogenesis_status_command)
-        ):
-            raise ValueError("Autogenesis status command cannot be empty")
         # Reuse the scheduler's complete budget validation.
         _ = self.resource_budget
 
@@ -181,15 +173,6 @@ class PionirSettings:
             or _declared("atani_command"),
             bryo_status_command=_command_from_json(
                 "PIONIR_BRYO_STATUS_COMMAND_JSON", None
-            ),
-            autogenesis_status_command=_command_from_json(
-                "PIONIR_AUTOGENESIS_STATUS_COMMAND_JSON", None
-            ),
-            probability_url=(
-                os.environ.get("PIONIR_PROBABILITY_URL", "").strip() or None
-            ),
-            genesis_url=(
-                os.environ.get("PIONIR_GENESIS_URL", "").strip() or None
             ),
             specialists_file=(
                 Path(os.environ["PIONIR_SPECIALISTS_FILE"])

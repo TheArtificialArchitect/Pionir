@@ -39,8 +39,6 @@ $env:PIONIR_THEO_TOKEN = (Get-Content "$env:USERPROFILE\.techsupport_agent\bridg
 # `pionir doctor` shows what is declared against what the daemon holds.
 $env:PIONIR_ATANI_COMMAND_JSON = '["C:\\src\\Atani\\.venv\\Scripts\\atani.exe"]'
 $env:PIONIR_BRYO_STATUS_COMMAND_JSON = '["C:\\src\\terrarium\\.venv\\Scripts\\python.exe","-m","bryo.status"]'
-$env:PIONIR_PROBABILITY_URL = "http://127.0.0.1:8791"
-$env:PIONIR_GENESIS_URL = "http://127.0.0.1:8000"
 ```
 
 If Atani's environment uses a different path, change only
@@ -68,12 +66,11 @@ To add a `Pionir` shortcut to the current user's Windows desktop:
 .\scripts\install-desktop-shortcut.ps1
 ```
 
-The launcher supplies the standard `C:\src\Atani`, `C:\src\terrarium`,
-`C:\src\autogenesis`, `C:\src\Probability`, and `C:\Users\Ian\genesis-agent` paths and reads
+The launcher supplies the standard `C:\src\Atani` and `C:\src\terrarium` paths and reads
 Theo's existing bridge token from his private state file for that process only. Override the
 launcher parameters if those checkouts live elsewhere. The shell exposes explicit Atani
-normal/depth and Theo voice routes plus doctor, capabilities, Bryo, Autogenesis,
-Probability, and Genesis status. Automatic intent routing is deliberately not implied yet.
+normal/depth and Theo voice routes plus doctor, capabilities, and Bryo status. Automatic
+intent routing is deliberately not implied yet.
 
 ## First bounded calls
 
@@ -81,8 +78,6 @@ Probability, and Genesis status. Automatic intent routing is deliberately not im
 .\.venv\Scripts\pionir.exe ask-atani "Explain the evidence for this decision"
 .\.venv\Scripts\pionir.exe ask-theo "Give Atani your actual view of this design"
 .\.venv\Scripts\pionir.exe bryo-status
-.\.venv\Scripts\pionir.exe probability-status
-.\.venv\Scripts\pionir.exe genesis-status
 .\.venv\Scripts\pionir.exe run-atani-plan .\examples\atani-plan.json
 ```
 
@@ -91,6 +86,5 @@ briefing, recall, the human model - with an empty tool list. Full memory, zero h
 authorization stays with Pionir, which is why this endpoint exists rather than Pionir calling
 `/chat/send`.
 
-Probability must already be running on loopback port 8791 and Genesis on loopback port 8000.
-Pionir does not start or stop either process. This preserves each agent's watchdog, state,
-Discord integration, and failure recovery.
+Bryo's read-only status is read through its own module in its own environment; Pionir does not
+start, stop, or mutate it, preserving its governor, watchdog, and state.
