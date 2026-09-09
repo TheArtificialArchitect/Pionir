@@ -91,10 +91,20 @@ Probability's 24/7 organism half once its memory parts are lifted.
 Do steps out of order and you lose a harvest source or wire an inert component.
 Both are the estate's most expensive, best-documented failures.
 
+## Decided 2026-09-08
+
+- **Pionir owns Daedalus's and Melete's action authorization.** Once promoted out
+  of Theo's scope, their actions flow through Pionir's permission gates and audit
+  ledger, not Theo's. This is the boundary that made `/chat/send` get declined for
+  the voice — resolved in Pionir's favor.
+
 ## Open decisions, not yet made
 
-- Who owns Daedalus/Melete's action authorization once promoted — Pionir's gates
-  or Theo's? (Load-bearing; it's the boundary that made `/chat/send` get
-  declined for the voice.)
 - Whether the new standalone conversationalist and Galatea-the-voice stay two
   agents or eventually converge. For now: two.
+- **One memory engine or two.** The standalone conversationalist's brief tells it
+  to build "its own Cortex"; Pionir needs a shared memory engine for the voice
+  and the bots. Both are retrieval-first and both fight the same forgetting. Open
+  question whether the hard core (recall, consolidation, char-budget,
+  anti-forgetting) is built once as a reusable library both consume, or twice.
+  Building it twice in parallel risks the same drift as any state split (HEAD 3.9).
