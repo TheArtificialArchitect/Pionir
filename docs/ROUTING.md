@@ -98,14 +98,15 @@ That is the correct answer to that request. Four specialists report status, and
 the request names the family rather than a member of it; picking one would be a
 coin toss presented as a decision.
 
-Plain conversation used to produce the same question, because Theo and Atani both
-held one. It no longer does: Ian decided on 2026-08-30 that **Theo is Pionir's
-voice**, so `"chat with someone"` routes to `conversation.theo_reply` at full
-confidence. That decision lives in the capabilities' own declared vocabulary
-rather than in a special case here - Atani gave up the conversational words, and
-`reasoning.atani_chat` was renamed `reasoning.atani_answer` because the router
-scores a capability's own name, so "chat" in the name kept Atani tied with Theo
-whatever the hints said.
+Plain conversation is an **ASK** again as of 2026-09-10: Theo was removed from
+Pionir (he was only ever a placeholder voice; Galatea is the intended voice and
+is not wired yet), so there is no conversational capability at all, and `"chat
+with someone"` has no right answer. The router asks rather than misrouting it to
+Atani's reasoning - which it can only do because Atani gave up the conversational
+words: `reasoning.atani_chat` was renamed `reasoning.atani_answer` so the router,
+which scores a capability's own name, does not let "chat" pull conversation to
+Atani. When the voice is wired, plain conversation gets a right answer again and
+the probe returns to expecting it.
 
 ## What it does not do
 

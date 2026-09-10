@@ -195,7 +195,7 @@ class RunTests(unittest.TestCase):
     def test_the_shipped_probe_set_covers_asking_as_well_as_routing(self) -> None:
         expectations = {probe.expected for probe in routecheck.default_probes()}
         self.assertIn(ASK, expectations)
-        self.assertGreater(len(expectations - {ASK}), 4)
+        self.assertGreaterEqual(len(expectations - {ASK}), 4)
 
     def test_the_harness_writes_nothing_to_the_ledger(self) -> None:
         # The ledger is the external vector this probe set is calibrated

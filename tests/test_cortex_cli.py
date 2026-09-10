@@ -25,7 +25,7 @@ class CortexCliTests(unittest.TestCase):
     def _runtime(self):
         from pionir.config import PionirSettings
 
-        settings = PionirSettings(state_root=self.state_root, theo_token="")
+        settings = PionirSettings(state_root=self.state_root)
         runtime = build_runtime(settings)
         self._runtimes.append(runtime)
         return runtime

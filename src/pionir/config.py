@@ -82,13 +82,6 @@ class PionirSettings:
     reserved_vram_mb: int = 1_830
     circuit_failure_threshold: int = 3
     circuit_recovery_seconds: float = 30.0
-    theo_url: str = "http://127.0.0.1:8765"
-    theo_token: str = field(default="", repr=False)
-    # None means ask Theo, which is now the right answer: `/health` reports the
-    # model his live client actually resolved. Set this only to pin a specific
-    # build; a pinned value that goes stale silently loses the resident-model
-    # discount and starts refusing turns that would have fitted.
-    theo_model_id: str | None = None
 
     atani_command: tuple[str, ...] = ("atani",)
     bryo_status_command: tuple[str, ...] | None = None
@@ -176,12 +169,6 @@ class PionirSettings:
                     "PIONIR_CIRCUIT_RECOVERY_SECONDS",
                     _declared("circuit_recovery_seconds"),
                 )
-            ),
-            theo_url=os.environ.get("PIONIR_THEO_URL", _declared("theo_url")),
-            theo_model_id=(os.environ.get("PIONIR_THEO_MODEL_ID", "").strip() or None),
-            theo_token=(
-                os.environ.get("PIONIR_THEO_TOKEN", "").strip()
-                or os.environ.get("BRIDGE_TOKEN", "").strip()
             ),
             atani_command=_command_from_json(
                 "PIONIR_ATANI_COMMAND_JSON", _declared("atani_command")

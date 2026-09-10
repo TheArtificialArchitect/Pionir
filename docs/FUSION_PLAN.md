@@ -11,7 +11,7 @@ databases, personalities, or histories.
 | System | Intended role | Integration status |
 |---|---|---|
 | Atani | Executive policy, planning, approvals, verification, event ledger | Working CLI adapter and bounded plan surface |
-| Theo / Tech-Support | Human-facing personality, conversation, tools, lessons, LoRA workflow | Working authenticated voice adapter (full memory, no tools) |
+| ~~Theo / Tech-Support~~ | ~~Human-facing personality, conversation~~ | **Removed from Pionir 2026-09-10.** Was a placeholder voice only; the voice is Galatea (not yet wired). See SOURCE_AUDIT.md. |
 | Bryo / Terrarium | Resource governor, CPU-first learning, experiment gate | Working read-only status and shared GPU lease |
 | ~~Probability~~ | ~~Measured autonomy, cumulative memory, gene evolution~~ | **Retired 2026-09-09.** Adapter removed from Pionir; its consolidation/memory ideas were harvested into the memory engine. See ARCHITECTURE_DECISIONS_2026-09.md. |
 | ~~Autogenesis~~ | ~~Deterministic curriculum, candidate generation, transactional lineage~~ | **Retired 2026-09-09.** Adapter removed; harvested for parts. |

@@ -51,10 +51,6 @@ class DesktopController:
                 {"content": message},
                 frozenset({"atani.chat"}),
             )
-        elif route == "Theo":
-            if "theo" not in self.runtime.adapters:
-                raise ValueError("Theo is not configured; set PIONIR_THEO_TOKEN")
-            task = Task("conversation.theo_reply", {"content": message})
         else:
             raise ValueError(f"Unknown desktop route: {route}")
         return dict(self.runtime.executive.execute(task).output)
@@ -117,12 +113,9 @@ class PionirDesktop:
         self.route = ttk.Combobox(
             route_row,
             state="readonly",
-            # Theo leads and is the default: Ian decided on 2026-08-30 that he
-            # is Pionir's voice. It read "Theo · safe peer" for as long as that
-            # was the path, because relabelling a bounded peer exchange as
-            # "Theo" would have hidden the one thing worth knowing about it.
-            # /voice/chat replaced it, so the plain label is now the true one.
-            values=("Theo", "Atani", "Atani · depth"),
+            # Atani is the only conversational-ish route until the voice (Galatea)
+            # is wired in; Theo was removed from Pionir.
+            values=("Atani", "Atani · depth"),
             width=24,
         )
         self.route.current(0)
@@ -246,7 +239,6 @@ class PionirDesktop:
             target = self.transcript if label in {
                 "Atani",
                 "Atani · depth",
-                "Theo",
             } else self.system_output
             self._append(target, label, value)
             self.status.set("Ready")

@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from . import benchmark, recallcheck, routecheck
-from .adapters import TheoAdapter
 from .bootstrap import PionirRuntime, build_runtime
 from .contracts import Task
 from .errors import PionirError, RoutingAmbiguous
@@ -62,12 +61,6 @@ def _parser() -> argparse.ArgumentParser:
     )
     atani_plan.add_argument("request_file", type=Path)
 
-    theo = commands.add_parser(
-        "ask-theo",
-        help="ask Theo directly: his full memory and self, with no tools",
-    )
-    theo.add_argument("text", nargs="+")
-    theo.add_argument("--conversation")
     commands.add_parser("bryo-status", help="read Bryo's non-mutating status snapshot")
 
     route = commands.add_parser(
@@ -216,11 +209,6 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
                 "error_type": type(error).__name__,
                 "message": str(error),
             }
-    if "theo" not in runtime.adapters:
-        specialists["theo"] = {
-            "status": "not_configured",
-            "message": "set PIONIR_THEO_TOKEN or BRIDGE_TOKEN",
-        }
     if "bryo" not in runtime.adapters:
         specialists["bryo"] = {
             "status": "not_configured",
@@ -372,16 +360,6 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
                 frozenset({"atani.executive"}),
             )
         )
-        _print(result.output)
-        return 0
-    if args.command == "ask-theo":
-        adapter = runtime.adapters.get("theo")
-        if not isinstance(adapter, TheoAdapter):
-            raise ValueError("Theo is not configured; set PIONIR_THEO_TOKEN")
-        payload = {"content": " ".join(args.text)}
-        if args.conversation:
-            payload["conversation_id"] = args.conversation
-        result = runtime.executive.execute(Task("conversation.theo_reply", payload))
         _print(result.output)
         return 0
     if args.command == "bryo-status":

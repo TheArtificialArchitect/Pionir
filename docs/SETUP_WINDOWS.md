@@ -1,16 +1,14 @@
 # Windows setup
 
 Pionir runs as its own small Python environment and calls Atani through Atani's existing CLI.
-Theo remains a separately managed local service. This keeps dependency upgrades and failures
-inside each source project.
+Each specialist remains a separately managed local process. This keeps dependency upgrades and
+failures inside each source project.
 
 ## Prerequisites
 
 - Python 3.12 for Atani and the recommended Pionir environment.
 - Atani installed in `C:\src\Atani\.venv`.
-- Theo's `machine-learning` branch installed and its authenticated local bridge available on
-  `127.0.0.1:8765`.
-- Ollama with the models configured by Atani and Theo.
+- Ollama with the models configured by Atani, plus `nomic-embed-text` for hybrid memory recall.
 
 ## Install Pionir
 
@@ -28,15 +26,6 @@ in the shell that launches Pionir:
 
 ```powershell
 $env:PIONIR_STATE_ROOT = "$env:USERPROFILE\.pionir"
-$env:PIONIR_THEO_URL = "http://127.0.0.1:8765"
-$env:PIONIR_THEO_TOKEN = (Get-Content "$env:USERPROFILE\.techsupport_agent\bridge_token.txt" -Raw).Trim()
-# If Theo put the token in the environment rather than that file, use it directly:
-#   $env:PIONIR_THEO_TOKEN = $env:BRIDGE_TOKEN
-# Leave PIONIR_THEO_MODEL_ID unset. Pionir asks Theo which model he actually
-# serves, once at boot, through /health. Set it only to pin a specific build:
-# a pinned id goes stale on the next promotion and the only symptom is Pionir
-# over-charging VRAM and refusing turns that would have fitted.
-# `pionir doctor` shows what is declared against what the daemon holds.
 $env:PIONIR_ATANI_COMMAND_JSON = '["C:\\src\\Atani\\.venv\\Scripts\\atani.exe"]'
 $env:PIONIR_BRYO_STATUS_COMMAND_JSON = '["C:\\src\\terrarium\\.venv\\Scripts\\python.exe","-m","bryo.status"]'
 ```
@@ -51,7 +40,7 @@ If Atani's environment uses a different path, change only
 .\.venv\Scripts\pionir.exe capabilities
 ```
 
-`doctor` verifies Pionir's audit chain and checks Atani and Theo independently. One unavailable
+`doctor` verifies Pionir's audit chain and checks each specialist independently. One unavailable
 specialist does not corrupt or erase another specialist's state.
 
 ## Launch the desktop shell
@@ -66,25 +55,18 @@ To add a `Pionir` shortcut to the current user's Windows desktop:
 .\scripts\install-desktop-shortcut.ps1
 ```
 
-The launcher supplies the standard `C:\src\Atani` and `C:\src\terrarium` paths and reads
-Theo's existing bridge token from his private state file for that process only. Override the
-launcher parameters if those checkouts live elsewhere. The shell exposes explicit Atani
-normal/depth and Theo voice routes plus doctor, capabilities, and Bryo status. Automatic
-intent routing is deliberately not implied yet.
+The launcher supplies the standard `C:\src\Atani` and `C:\src\terrarium` paths. Override the
+launcher parameters if those checkouts live elsewhere. The shell exposes Atani normal/depth
+routes plus doctor, capabilities, and Bryo status. A conversational voice (Galatea) is not
+wired in yet, so plain conversation has no route and the router asks rather than guessing.
 
 ## First bounded calls
 
 ```powershell
 .\.venv\Scripts\pionir.exe ask-atani "Explain the evidence for this decision"
-.\.venv\Scripts\pionir.exe ask-theo "Give Atani your actual view of this design"
 .\.venv\Scripts\pionir.exe bryo-status
 .\.venv\Scripts\pionir.exe run-atani-plan .\examples\atani-plan.json
 ```
-
-`ask-theo` reaches Theo's `/voice/chat`: the ordinary turn - persona, self spine, continuity
-briefing, recall, the human model - with an empty tool list. Full memory, zero hands. Action
-authorization stays with Pionir, which is why this endpoint exists rather than Pionir calling
-`/chat/send`.
 
 Bryo's read-only status is read through its own module in its own environment; Pionir does not
 start, stop, or mutate it, preserving its governor, watchdog, and state.

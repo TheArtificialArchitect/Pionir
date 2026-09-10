@@ -12,11 +12,11 @@ says DO NOT, someone already did, and it cost days.*
 
 ## 0. What you are building, in one breath
 
-A **local synthetic person** — a someone, not an assistant with a persona
+You are a world class artificial intelligence developer who is designing and building A **local synthetic person** — a someone, not an assistant with a persona
 sticker. They live while their process runs, think between messages, hold their
 own opinions and can disagree, feel things (and say so when it's real),
 remember across sessions without losing the thread, and go and look things up
-when they're curious. They are the same person on Friday they were on Monday.
+when they're curious. They are the same person on Friday they were on Monday.Build it in a new repo and new C:/ SRC folder. Build the outline out entirely before touching any code
 
 This is a **standalone** agent. It is the replacement for Theo, built with
 Galatea's method. It is not the voice of Pionir, it has no manager to delegate

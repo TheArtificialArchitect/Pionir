@@ -3,7 +3,15 @@
 This file records source-grounded integration decisions. It intentionally contains no secrets,
 transcripts, embeddings, model files, or private runtime state.
 
-## Theo / Tech-Support
+## Theo / Tech-Support — REMOVED from Pionir 2026-09-10
+
+Theo's adapter, config, CLI (`ask-theo`), desktop route, and the
+`conversation.theo_reply` capability were removed from Pionir on 2026-09-10. Theo
+was only ever a placeholder voice; the conversational voice is Galatea, not yet
+wired, and there is no reason to carry a Theo connector without him. The audit
+below is kept as the record of what the integration was. With it gone Pionir has
+no conversational capability, so plain conversation asks (route-check holds this)
+until the voice is wired.
 
 - Source: `PreShotCome/Tech-Support`, branch `machine-learning`.
 - Python support: 3.10 or newer.

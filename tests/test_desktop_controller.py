@@ -21,7 +21,6 @@ class DesktopControllerTests(unittest.TestCase):
             executive=self.executive,
             adapters={
                 "atani": object(),
-                "theo": object(),
                 "bryo": object(),
             },
         )
@@ -34,19 +33,13 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertEqual(task.capability, "reasoning.atani_answer")
         self.assertEqual(task.granted_permissions, frozenset({"atani.chat"}))
 
-    def test_depth_and_theo_are_explicit_routes(self) -> None:
+    def test_depth_is_an_explicit_route(self) -> None:
         self.controller.ask("Atani · depth", "Think")
-        self.controller.ask("Theo", "Reflect")
         self.assertEqual(
             [task.capability for task in self.executive.tasks],
-            ["reasoning.atani_depth", "conversation.theo_reply"],
+            ["reasoning.atani_depth"],
         )
 
-    def test_missing_theo_fails_before_dispatch(self) -> None:
-        self.runtime.adapters.pop("theo")
-        with self.assertRaisesRegex(ValueError, "not configured"):
-            self.controller.ask("Theo", "Hello")
-        self.assertEqual(self.executive.tasks, [])
 
 
 if __name__ == "__main__":

@@ -189,24 +189,16 @@ def default_probes() -> tuple[Probe, ...]:
             ("executive.atani_run",),
         ),
         Probe(
-            "talk to theo about my day",
-            "conversation.theo_reply",
-            ("conversation.theo_reply",),
-        ),
-        Probe(
             "how is bryo doing, check the terrarium vitals",
             "organism.bryo_status",
             ("organism.bryo_status",),
         ),
-        # This used to expect ASK: both capabilities held a conversation, so
-        # choosing between them would have been a coin toss. Ian settled it on
-        # 2026-08-30 - Theo is the voice - so plain conversation now has a right
-        # answer, and this probe is what holds the router to it.
-        Probe(
-            "chat with someone",
-            "conversation.theo_reply",
-            ("conversation.theo_reply", "reasoning.atani_answer"),
-        ),
+        # No conversational capability is registered any more - Theo was removed
+        # and the voice (Galatea) is not wired yet - so plain conversation has no
+        # right answer and must ASK rather than misroute to Atani's reasoning. The
+        # capability rename (atani_answer, not atani_chat) is what keeps "chat"
+        # from pulling this to Atani; this probe holds that.
+        Probe("chat with someone", ASK, ("reasoning.atani_answer",)),
         # Nothing registered does this, and inventing a route would be worse
         # than saying so.
         Probe("photosynthesis in tomato plants", ASK),
