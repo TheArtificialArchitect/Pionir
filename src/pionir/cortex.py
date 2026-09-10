@@ -23,15 +23,21 @@ Generalised here for a system of bots rather than one person:
   (HEAD 3.11). Recall scores lazily at query time over a candidate set, so a write
   is one INSERT and nothing else.
 
-Recall is lexical (BM25 + recency), with no embedding model and so no second
-model on the card. Semantic recall is a documented future addition, not a
-rewrite: `recall()` already ranks a candidate set, and an embedding pass would
-re-rank the same set. Do not add it until measured recall quality asks for it.
+Recall is hybrid when an embedder is supplied: BM25 fused with a local-embedding
+cosine ranking by reciprocal rank, then weighted by recency and salience. With no
+embedder it is exactly the lexical ranking, unchanged - the embedding path is
+fail-open, so a missing or unavailable embedder silently falls back rather than
+failing a recall. The embedding model runs in its own process (Ollama,
+`nomic-embed-text` ~0.32 GB) and is never the speaking model. Proven on
+Psyche/Bram, reimplemented here; Bram's own tree is untouched.
 """
 
 from __future__ import annotations
 
+import array
 import json
+import urllib.error
+import urllib.request
 import math
 import re
 import sqlite3
@@ -39,7 +45,13 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Protocol, Sequence
+
+# Reciprocal-rank fusion constant. Fusion combines lexical and semantic recall by
+# rank, not by raw score, because a BM25 score and a cosine similarity live on
+# different scales and adding them is meaningless. RRF_K damps the top ranks so a
+# memory need not win both lists to place well - appearing high in either counts.
+RRF_K = 60
 
 # The kinds a memory can be. Not enforced as an enum - a caller may coin a new
 # one - but these are the ones recall weights by default salience for.
@@ -69,6 +81,12 @@ CREATE TABLE IF NOT EXISTS memories (
 CREATE INDEX IF NOT EXISTS ix_mem_ns   ON memories(namespace, active);
 CREATE INDEX IF NOT EXISTS ix_mem_kind ON memories(kind, active);
 CREATE INDEX IF NOT EXISTS ix_mem_slug ON memories(slug);
+CREATE TABLE IF NOT EXISTS vectors (
+    memory_id INTEGER PRIMARY KEY,
+    model     TEXT NOT NULL,
+    vec       BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_vec_model ON vectors(model);
 """
 
 _WORD = re.compile(r"[a-z0-9']+")
@@ -135,11 +153,54 @@ class NewMemory:
     meta: dict[str, Any] | None = None
 
 
-class Cortex:
-    """SQLite-backed relevance memory. Stdlib only; no model, no external service."""
+class Embedder(Protocol):
+    """Turns text into vectors. Optional: without one, recall is lexical-only.
 
-    def __init__(self, path: str | Path, *, now=time.time) -> None:
+    `embed` returns one vector per input, or None when embedding is unavailable
+    (daemon down, model not pulled, a malformed reply). None is not an error to
+    raise - it is the signal to fall back to lexical recall, which is why the
+    whole embedding path is fail-open.
+    """
+
+    @property
+    def model(self) -> str: ...
+
+    def embed(self, texts: Sequence[str]) -> list[list[float]] | None: ...
+
+
+def _pack(vec: Sequence[float]) -> bytes:
+    return array.array("f", vec).tobytes()
+
+
+def _unpack(blob: bytes) -> array.array:
+    out = array.array("f")
+    out.frombytes(blob)
+    return out
+
+
+def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
+    if len(a) != len(b):
+        return 0.0
+    dot = na = nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na <= 0 or nb <= 0:
+        return 0.0
+    return dot / math.sqrt(na * nb)
+
+
+class Cortex:
+    """SQLite-backed relevance memory: lexical BM25, optionally fused with a
+    semantic embedding recall when an Embedder is supplied. Stdlib only; the
+    embedding model, if any, runs in its own process (Ollama) - never in here."""
+
+    def __init__(
+        self, path: str | Path, *, now=time.time, embedder: Embedder | None = None
+    ) -> None:
         self._now = now
+        self.embedder = embedder
         self.path = Path(path)
         if self.path.parent and str(self.path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -198,7 +259,54 @@ class Cortex:
         )
         ids = [self._db.execute(sql, row).lastrowid for row in rows]
         self._db.commit()
+        # Best-effort embedding, in one batched call. It never blocks the write:
+        # if the embedder is absent or unavailable the memory is stored without a
+        # vector and is still recalled lexically. Un-embedded rows are filled in
+        # later by reindex(). This embeds only the new rows - O(new), never a
+        # re-score of the whole store (HEAD 3.11).
+        self._embed_and_store(ids, [r[3] for r in rows])
         return ids
+
+    def _embed_and_store(self, ids: Sequence[int], texts: Sequence[str]) -> int:
+        """Embed these texts and store their vectors. Returns how many landed;
+        0 on any failure, which is not an error - recall falls back to lexical."""
+        if self.embedder is None or not ids:
+            return 0
+        try:
+            vecs = self.embedder.embed(list(texts))
+        except Exception:  # noqa: BLE001 - embedding is fail-open by contract
+            return 0
+        if not vecs or len(vecs) != len(ids):
+            return 0
+        model = self.embedder.model
+        self._db.executemany(
+            "INSERT OR REPLACE INTO vectors(memory_id, model, vec) VALUES(?,?,?)",
+            [(mid, model, _pack(vec)) for mid, vec in zip(ids, vecs)],
+        )
+        self._db.commit()
+        return len(ids)
+
+    def reindex(self) -> int:
+        """Embed every active memory that lacks a vector for the current model,
+        in batches. Run after enabling an embedder on an existing store, or after
+        changing the embedding model - cosine between two models' vectors is
+        meaningless, so a new model rebuilds rather than mixes."""
+        if self.embedder is None:
+            return 0
+        model = self.embedder.model
+        rows = list(
+            self._db.execute(
+                "SELECT m.id AS id, m.text AS text FROM memories m "
+                "LEFT JOIN vectors v ON v.memory_id = m.id AND v.model = ? "
+                "WHERE m.active = 1 AND v.memory_id IS NULL",
+                (model,),
+            )
+        )
+        done = 0
+        for start in range(0, len(rows), 64):
+            batch = rows[start : start + 64]
+            done += self._embed_and_store([r["id"] for r in batch], [r["text"] for r in batch])
+        return done
 
     def forget(self, memory_id: int) -> bool:
         """Retire a memory. Soft delete - a one-way hard delete is a door with no
@@ -223,12 +331,17 @@ class Cortex:
     ) -> list[Memory]:
         """The heart of it: the memories most relevant to `query`, newest-weighted.
 
-        Scored lazily over the candidate set - BM25 with a recency multiplier and
-        the memory's own salience. `namespace` scopes the recall (one, several, or
-        all); `kinds` filters by type. `budget_chars`, if given, trims the result
-        so the injected block fits a window budget - trim the recalled block, never
-        the identity ahead of it, because a model silently drops the front of an
-        over-length prompt (Galatea, docs/PHASE0 lineage)."""
+        Lexical BM25 always runs. When an embedder is present and vectors exist,
+        a semantic ranking runs too and the two are fused by reciprocal rank, so
+        a memory that shares the query's *meaning* but not its words still
+        surfaces - the case pure lexical structurally cannot reach. With no
+        embedder, or when the semantic side finds nothing, the result is exactly
+        the lexical ranking, unchanged.
+
+        `namespace` scopes the recall (one, several, or all); `kinds` filters by
+        type. `budget_chars`, if given, trims the result so the injected block
+        fits a window budget - trim the recalled block, never the identity ahead
+        of it, because a model silently drops the front of an over-length prompt."""
         q = tokens(query)
         if not q:
             return []
@@ -236,14 +349,33 @@ class Cortex:
         if not candidates:
             return []
 
+        now = self._now()
+        lexical = self._bm25_scored(q, candidates)
+        semantic = self._semantic_scored(query, candidates)
+        if semantic:
+            ranked = self._fuse(lexical, semantic, now)
+        else:
+            ranked = self._weight_lexical(lexical, now)
+
+        out: list[Memory] = []
+        used = 0
+        for score, row in ranked[: max(k, 0)]:
+            if budget_chars is not None and used + len(row["text"]) > budget_chars and out:
+                break
+            out.append(self._row_to_memory(row, score=score))
+            used += len(row["text"])
+        return out
+
+    def _bm25_scored(
+        self, q: list[str], candidates: list[sqlite3.Row]
+    ) -> list[tuple[float, sqlite3.Row]]:
+        """Raw BM25 score per candidate that matches at least one query term."""
         toks = [tokens(c["text"]) for c in candidates]
         n = len(candidates)
         avgdl = sum(len(t) for t in toks) / n or 1.0
         df: Counter = Counter()
         for t in toks:
             df.update(set(t))
-
-        now = self._now()
         k1, b = 1.5, 0.75
         scored: list[tuple[float, sqlite3.Row]] = []
         for row, t in zip(candidates, toks):
@@ -257,22 +389,77 @@ class Cortex:
                     continue
                 idf = math.log(1 + (n - df[term] + 0.5) / (df[term] + 0.5))
                 s += idf * f * (k1 + 1) / (f + k1 * (1 - b + b * len(t) / avgdl))
-            if s <= 0:
-                continue
-            age_days = max(0.0, (now - row["ts"]) / 86400)
-            recency = 0.6 + 0.4 * math.exp(-age_days / 45)
-            scored.append((s * recency * (0.5 + row["salience"] / 12), row))
-
+            if s > 0:
+                scored.append((s, row))
         scored.sort(key=lambda pair: pair[0], reverse=True)
+        return scored
 
-        out: list[Memory] = []
-        used = 0
-        for score, row in scored[: max(k, 0)]:
-            if budget_chars is not None and used + len(row["text"]) > budget_chars and out:
-                break
-            out.append(self._row_to_memory(row, score=score))
-            used += len(row["text"])
-        return out
+    def _semantic_scored(
+        self, query: str, candidates: list[sqlite3.Row]
+    ) -> list[tuple[float, sqlite3.Row]]:
+        """Cosine of the query against each candidate's stored vector, for the
+        current embedding model only. Empty when there is no embedder, the query
+        cannot be embedded, or no candidate has a current-model vector - each of
+        which sends recall cleanly back to lexical."""
+        if self.embedder is None:
+            return []
+        try:
+            embedded = self.embedder.embed([query])
+        except Exception:  # noqa: BLE001 - fail-open
+            return []
+        if not embedded:
+            return []
+        qvec = embedded[0]
+        by_id = {c["id"]: c for c in candidates}
+        if not by_id:
+            return []
+        placeholders = ",".join("?" * len(by_id))
+        rows = self._db.execute(
+            f"SELECT memory_id, vec FROM vectors WHERE model = ? "
+            f"AND memory_id IN ({placeholders})",
+            [self.embedder.model, *by_id.keys()],
+        )
+        scored: list[tuple[float, sqlite3.Row]] = []
+        for r in rows:
+            s = _cosine(qvec, _unpack(r["vec"]))
+            if s > 0:
+                scored.append((s, by_id[r["memory_id"]]))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return scored
+
+    def _weight(self, row: sqlite3.Row, now: float) -> float:
+        age_days = max(0.0, (now - row["ts"]) / 86400)
+        recency = 0.6 + 0.4 * math.exp(-age_days / 45)
+        return recency * (0.5 + row["salience"] / 12)
+
+    def _weight_lexical(
+        self, lexical: list[tuple[float, sqlite3.Row]], now: float
+    ) -> list[tuple[float, sqlite3.Row]]:
+        """The lexical-only path, scored exactly as before: BM25 x recency x
+        salience. Kept identical so recall is unchanged where no embedder runs."""
+        scored = [(s * self._weight(row, now), row) for s, row in lexical]
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return scored
+
+    def _fuse(
+        self,
+        lexical: list[tuple[float, sqlite3.Row]],
+        semantic: list[tuple[float, sqlite3.Row]],
+        now: float,
+    ) -> list[tuple[float, sqlite3.Row]]:
+        """Reciprocal-rank fusion of the two rankings, then the recency/salience
+        weight. Rank, not raw score, because BM25 and cosine are not comparable."""
+        fused: dict[int, dict] = {}
+        for rankings in (lexical, semantic):
+            for i, (_, row) in enumerate(rankings):
+                slot = fused.setdefault(row["id"], {"row": row, "rrf": 0.0})
+                slot["rrf"] += 1.0 / (RRF_K + i + 1)
+        scored = [
+            (slot["rrf"] * self._weight(slot["row"], now), slot["row"])
+            for slot in fused.values()
+        ]
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return scored
 
     def stats(self) -> dict[str, Any]:
         """Counts, so a caller can prove the store is not empty - the wired-but-inert
@@ -291,7 +478,25 @@ class Cortex:
                 "SELECT namespace, COUNT(*) AS c FROM memories WHERE active=1 GROUP BY namespace"
             )
         }
-        return {"total": total, "by_kind": by_kind, "by_namespace": by_ns}
+        # Recall is hybrid only where vectors exist for the live model; report
+        # coverage honestly so a store that is silently lexical-only is visible
+        # rather than mistaken for hybrid (HEAD 3.20).
+        model = self.embedder.model if self.embedder is not None else None
+        embedded = 0
+        if model is not None:
+            embedded = self._db.execute(
+                "SELECT COUNT(*) FROM vectors v JOIN memories m ON m.id = v.memory_id "
+                "WHERE m.active = 1 AND v.model = ?",
+                (model,),
+            ).fetchone()[0]
+        return {
+            "total": total,
+            "by_kind": by_kind,
+            "by_namespace": by_ns,
+            "recall": "hybrid" if (model and embedded) else "lexical",
+            "embed_model": model,
+            "embedded": embedded,
+        }
 
     def close(self) -> None:
         self._db.close()
@@ -327,3 +532,59 @@ class Cortex:
             meta=json.loads(row["meta"]),
             score=score,
         )
+
+
+class OllamaEmbedder:
+    """Local embeddings through Ollama, stdlib urllib only - no third-party deps.
+
+    Default model `nomic-embed-text`: measured at 0.32 GB of VRAM, co-resident
+    with a 12B speaking model on the 12 GB card (Psyche/Bram, 2026-09-09). The
+    embedder is tiny; only the speaker is big, which is why semantic recall does
+    not cost a second heavyweight lease. The speaking model is never asked to
+    embed - a 12B doing it would evict itself from the card between turns.
+
+    Every failure path returns None rather than raising, because the Cortex
+    embedding contract is fail-open: None means "fall back to lexical", not
+    "the turn failed".
+    """
+
+    def __init__(
+        self,
+        model: str = "nomic-embed-text",
+        base_url: str = "http://127.0.0.1:11434",
+        timeout_seconds: int = 30,
+    ) -> None:
+        self._model = model
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout_seconds
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def embed(self, texts: Sequence[str]) -> list[list[float]] | None:
+        items = [t for t in texts]
+        if not items:
+            return []
+        body = json.dumps({"model": self._model, "input": items}).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self._base_url}/api/embed",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with self._opener.open(request, timeout=self._timeout) as response:
+                document = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+            return None
+        vectors = document.get("embeddings") if isinstance(document, dict) else None
+        if not isinstance(vectors, list) or len(vectors) != len(items):
+            return None
+        out: list[list[float]] = []
+        for vec in vectors:
+            if not isinstance(vec, list) or not vec:
+                return None
+            out.append([float(x) for x in vec])
+        return out

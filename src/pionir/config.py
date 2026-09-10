@@ -61,6 +61,18 @@ def _command_from_json(
     return tuple(document)
 
 
+def _embed_model_from_env(default: str = "nomic-embed-text") -> str | None:
+    """PIONIR_EMBED_MODEL: a model name, or "" / "off" / "none" to disable
+    hybrid recall entirely. Unset keeps the default (embeddings on, fail-open)."""
+    raw = os.environ.get("PIONIR_EMBED_MODEL")
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if raw == "" or raw.lower() in {"off", "none", "false", "0"}:
+        return None
+    return raw
+
+
 @dataclass(frozen=True, slots=True)
 class PionirSettings:
     state_root: Path = field(default_factory=_default_state_root)
@@ -82,6 +94,10 @@ class PionirSettings:
     bryo_status_command: tuple[str, ...] | None = None
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
+    # The local embedding model for hybrid recall. Default on: it is ~0.32 GB and
+    # fail-open, so if it is not pulled or Ollama is down, recall silently uses
+    # BM25 alone. Set PIONIR_EMBED_MODEL to "" or "off" to disable it outright.
+    embed_model: str | None = "nomic-embed-text"
 
     def __post_init__(self) -> None:
         if self.circuit_failure_threshold < 1:
@@ -174,6 +190,7 @@ class PionirSettings:
             bryo_status_command=_command_from_json(
                 "PIONIR_BRYO_STATUS_COMMAND_JSON", None
             ),
+            embed_model=_embed_model_from_env(),
             specialists_file=(
                 Path(os.environ["PIONIR_SPECIALISTS_FILE"])
                 if os.environ.get("PIONIR_SPECIALISTS_FILE")

@@ -155,12 +155,21 @@ def _parser() -> argparse.ArgumentParser:
     recall.add_argument("--namespace", default=None, help="scope to one stream (default: all)")
 
     commands.add_parser(
+        "reindex-memory",
+        help="embed any memories that lack a vector for the current model (hybrid recall backfill)",
+    )
+    rc = commands.add_parser(
         "recall-check",
         help=(
             "measure the memory engine's recall against known-answer probes; "
             "gates exact/buried recall, reports paraphrase recall as the "
-            "lexical-vs-semantic signal. No model, no GPU."
+            "lexical-vs-semantic signal. Lexical by default, no model, no GPU."
         ),
+    )
+    rc.add_argument(
+        "--embed",
+        action="store_true",
+        help="also run the probes through the local embedder to show the hybrid lift",
     )
     return parser
 
@@ -454,8 +463,13 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
             }
         )
         return 0
+    if args.command == "reindex-memory":
+        filled = runtime.cortex.reindex()
+        _print({"reindexed": filled, "stats": runtime.cortex.stats()})
+        return 0
     if args.command == "recall-check":
-        result = recallcheck.run()
+        embedder = runtime.cortex.embedder if getattr(args, "embed", False) else None
+        result = recallcheck.run(embedder=embedder)
         _print(result.to_dict())
         # Non-zero when gated recall falls below the floor, so CI can gate on it.
         return 0 if result.passed else 1

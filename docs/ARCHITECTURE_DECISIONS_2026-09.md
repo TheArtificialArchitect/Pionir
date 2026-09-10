@@ -143,6 +143,16 @@ Psyche's hybrid recall + consolidation onto that core (its reference is proven),
 then add the `lessons` namespace and the recall-before-act hook. None of this
 needs the strip; it is additive.
 
+**Hybrid recall BUILT 2026-09-09** (clean-room in `cortex.py`, Bram untouched).
+BM25 fused with local-embedding cosine by reciprocal rank, fail-open (no embedder
+or a dead one silently falls back to lexical), embeddings batched and best-effort
+on write with `reindex-memory` to backfill, one embedding space at a time.
+`recall-check --embed` measured the lift live through `nomic-embed-text`:
+paraphrase recall 0.0 → 1.0, gated stays 1.0. Default embed model on and
+fail-open (`PIONIR_EMBED_MODEL`, "" or "off" to disable). Still to do:
+consolidation (fold conversations into episodes), the `lessons` namespace and the
+recall-before-act hook, and rolling it into the voice and the rest of Pionir.
+
 **Bram/Psyche is off-limits — copy patterns, never touch her.** `C:\src\psyche`
 (engine) and `C:\src\BramData` (her data) are Ian's solo project, his to upgrade
 alone. We read her source to copy the structures Pionir wants and reimplement

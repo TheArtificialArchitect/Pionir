@@ -197,11 +197,15 @@ def default_probes() -> tuple[RecallProbe, ...]:
     )
 
 
-def run(probes: Sequence[RecallProbe] | None = None) -> RecallCheck:
-    """Seed a fresh in-memory store per probe, query it, score recall@k."""
+def run(probes: Sequence[RecallProbe] | None = None, *, embedder=None) -> RecallCheck:
+    """Seed a fresh in-memory store per probe, query it, score recall@k.
+
+    With no embedder the score is the lexical floor - the CI-safe default, no
+    model required. Pass an embedder to measure the hybrid lift: the paraphrase
+    probes, which lexical structurally misses, should then land."""
     results: list[RecallProbeResult] = []
     for probe in probes or default_probes():
-        cortex = Cortex(":memory:")
+        cortex = Cortex(":memory:", embedder=embedder)
         try:
             cortex.remember_many(probe.corpus)
             hits = cortex.recall(probe.query, k=probe.k)

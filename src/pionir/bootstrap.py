@@ -16,7 +16,7 @@ from .adapters import (
 from .adapters.theo import resolve_served_model
 from .audit import JsonlAuditSink
 from .config import PionirSettings
-from .cortex import Cortex
+from .cortex import Cortex, OllamaEmbedder
 from .reliability import CircuitBreaker
 from .runtime import Executive, SpecialistAdapter
 from .scheduler import ModelLeaseScheduler
@@ -67,7 +67,12 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
             recovery_seconds=configured.circuit_recovery_seconds,
         ),
     )
-    runtime = PionirRuntime(configured, executive, {}, Cortex(configured.cortex_path))
+    embedder = (
+        OllamaEmbedder(configured.embed_model) if configured.embed_model else None
+    )
+    runtime = PionirRuntime(
+        configured, executive, {}, Cortex(configured.cortex_path, embedder=embedder)
+    )
     runtime.register(
         AtaniCliAdapter(AtaniCliSettings(command=configured.atani_command))
     )
