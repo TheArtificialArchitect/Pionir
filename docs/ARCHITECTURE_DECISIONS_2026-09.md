@@ -110,11 +110,19 @@ Both are the estate's most expensive, best-documented failures.
 The core store is built, wired, and driveable from the CLI. These are the next
 pieces, none urgent, none needing the strip:
 
-- **A recall eval (`recall-check`).** Like `route-check`, but for memory:
-  known-answer probes measuring recall@k. It is the instrument that decides the
-  lexical-vs-semantic question for real, and the guard that catches an import
-  regression (a memory system read 97% then 81% on one bad batch — HEAD 3.13).
-  Build this before trusting recall quality by feel.
+- **A recall eval (`recall-check`).** BUILT 2026-09-09. Known-answer probes,
+  recall@k, split so *exact* and *buried* are gated and *paraphrase* is measured
+  but not gated (a paraphrase miss is the semantic-need signal, not a bug). First
+  real run: **gated recall 1.0, paraphrase 0.0.** Two findings it surfaced on day
+  one, both feeding the lexical-vs-semantic call:
+  - **No stemming.** A query "governs the resources" missed "resource governor" —
+    BM25 does not bridge morphology. Light suffix-stemming is a cheap, model-free
+    improvement to weigh *before* semantic recall, and would lift near-miss cases.
+  - **Paraphrase with zero shared words is a structural miss** (0/2, so weak n but
+    a clear mechanism: no overlapping tokens, nothing for BM25 to score). This is
+    the real ceiling of lexical, and the case only an embedding model can reach.
+  The data-side guard — probes against the live store to catch a bad import
+  (HEAD 3.13) — is still a later addition; this one guards the code.
 - **Link expansion.** `recall()` returning one hop of `[[slug]]`-linked memories
   alongside the direct hits. Slugs and links are already stored; the expansion is
   the unbuilt half.

@@ -11,7 +11,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import benchmark, routecheck
+from . import benchmark, recallcheck, routecheck
 from .adapters import TheoAdapter
 from .bootstrap import PionirRuntime, build_runtime
 from .contracts import Task
@@ -153,6 +153,15 @@ def _parser() -> argparse.ArgumentParser:
     recall.add_argument("query", nargs="+", help="what to recall about")
     recall.add_argument("-k", type=int, default=8, help="how many to return (default 8)")
     recall.add_argument("--namespace", default=None, help="scope to one stream (default: all)")
+
+    commands.add_parser(
+        "recall-check",
+        help=(
+            "measure the memory engine's recall against known-answer probes; "
+            "gates exact/buried recall, reports paraphrase recall as the "
+            "lexical-vs-semantic signal. No model, no GPU."
+        ),
+    )
     return parser
 
 
@@ -445,6 +454,11 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
             }
         )
         return 0
+    if args.command == "recall-check":
+        result = recallcheck.run()
+        _print(result.to_dict())
+        # Non-zero when gated recall falls below the floor, so CI can gate on it.
+        return 0 if result.passed else 1
     return 2
 
 
