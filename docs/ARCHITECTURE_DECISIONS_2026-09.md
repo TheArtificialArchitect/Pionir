@@ -105,6 +105,44 @@ Both are the estate's most expensive, best-documented failures.
   documented addition that re-ranks the same candidate set, not a rewrite — added
   only if measured recall quality asks for it.
 
+## Direction (Ian, 2026-09-09): adopt Psyche's memory, and make lessons shared
+
+Psyche/Bram (built from `the-voice-founding-brief.md`) solved conversational
+forgetting with **hybrid recall** — BM25 fused with local embeddings by
+reciprocal-rank, then weighted by recency and salience — plus **consolidation**
+of a conversation into episodes as it scrolls out. It is a better memory system
+than Pionir's lexical-only core, and its embedder is cheap: `nomic-embed-text` at
+**0.32 GB**, co-resident with the 12B, measured. That overturns the "semantic
+costs a model on the card" deferral — the embedder is tiny, only the speaker is
+big.
+
+Ian's direction, and the reason it matters more than a feature:
+
+1. **Copy Psyche's structure into Pionir's voice** (Galatea) when she is wired.
+2. **Make it Pionir-wide.** Every bot uses the one memory engine.
+3. **The point is shared learning.** *"Our biggest struggle is we make the same
+   mistakes."* If every bot recalls from one memory, a lesson learned once is
+   available to all of them — the failure catalog (HEAD §3) stops being a
+   document someone must remember to read and becomes something a bot recalls
+   before it acts.
+
+The design that delivers that without flattening everything into one pool — and
+`cortex.py`'s namespaces already support it:
+
+- **Shared engine, private namespaces.** One memory engine; each bot keeps its
+  own namespace for its own conversation and continuity. Bram's chat is not
+  Atani's business.
+- **A shared `lessons` namespace every bot reads.** A mistake, a correction, a
+  "this failed before and here is why" is written once into `lessons` and
+  recalled by any bot whose current task is relevant to it. That is the shared
+  half; personal memory stays private. This is the estate's biggest struggle
+  addressed structurally rather than by discipline.
+
+Sequencing: Pionir's lexical core and `recall-check` are the floor. Adopt
+Psyche's hybrid recall + consolidation onto that core (its reference is proven),
+then add the `lessons` namespace and the recall-before-act hook. None of this
+needs the strip; it is additive.
+
 ## Memory engine — open items (built core, deferred by choice)
 
 The core store is built, wired, and driveable from the CLI. These are the next
