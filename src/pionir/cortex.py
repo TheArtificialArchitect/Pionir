@@ -56,6 +56,7 @@ RRF_K = 60
 # The kinds a memory can be. Not enforced as an enum - a caller may coin a new
 # one - but these are the ones recall weights by default salience for.
 KIND_SALIENCE: dict[str, float] = {
+    "lesson": 8.0,    # a mistake or correction, meant to be recalled before acting
     "episode": 5.0,   # a consolidated conversation
     "fact": 6.0,      # something durable about a person or the world
     "canon": 6.0,     # something the agent has said is true about itself
@@ -64,6 +65,11 @@ KIND_SALIENCE: dict[str, float] = {
     "thought": 3.0,   # an idle interior thought
 }
 _DEFAULT_SALIENCE = 4.0
+
+# The shared namespace of lessons every bot reads before it acts. Private
+# per-bot memory lives in its own namespace; this one is common ground, so a
+# mistake learned once is recalled by all of them (docs/ARCHITECTURE_DECISIONS).
+LESSONS_NAMESPACE = "lessons"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -138,6 +144,7 @@ class Memory:
     links: tuple[str, ...] = ()
     meta: dict[str, Any] = field(default_factory=dict)
     score: float = 0.0  # set by recall; 0 outside a recall
+    via: str = ""       # empty for a direct hit; the slug it was linked from otherwise
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +335,7 @@ class Cortex:
         namespace: str | Sequence[str] | None = None,
         kinds: Sequence[str] | None = None,
         budget_chars: int | None = None,
+        expand_links: bool = False,
     ) -> list[Memory]:
         """The heart of it: the memories most relevant to `query`, newest-weighted.
 
@@ -341,7 +349,12 @@ class Cortex:
         `namespace` scopes the recall (one, several, or all); `kinds` filters by
         type. `budget_chars`, if given, trims the result so the injected block
         fits a window budget - trim the recalled block, never the identity ahead
-        of it, because a model silently drops the front of an over-length prompt."""
+        of it, because a model silently drops the front of an over-length prompt.
+
+        `expand_links` follows one hop of `[[slug]]` links from the direct hits
+        and appends the memories they point at - a lesson that references another
+        lesson pulls it in too. Expansion stays inside the same namespace scope,
+        so it can never surface one bot's private memory in another's recall."""
         q = tokens(query)
         if not q:
             return []
@@ -359,12 +372,53 @@ class Cortex:
 
         out: list[Memory] = []
         used = 0
+
+        def _append(memory: Memory) -> bool:
+            nonlocal used
+            if budget_chars is not None and used + len(memory.text) > budget_chars and out:
+                return False
+            out.append(memory)
+            used += len(memory.text)
+            return True
+
         for score, row in ranked[: max(k, 0)]:
-            if budget_chars is not None and used + len(row["text"]) > budget_chars and out:
+            if not _append(self._row_to_memory(row, score=score)):
                 break
-            out.append(self._row_to_memory(row, score=score))
-            used += len(row["text"])
+
+        if expand_links and out:
+            have = {m.id for m in out}
+            # slug pointed at -> slug of the direct hit that pointed at it (its
+            # provenance). First referrer wins if two hits link the same slug.
+            referrer: dict[str, str] = {}
+            for m in out:
+                for slug in m.links:
+                    if slug:
+                        referrer.setdefault(slug, m.slug or "link")
+            if referrer:
+                linked = self._by_slugs(list(referrer), namespace, exclude=have)
+                for row in sorted(linked, key=lambda r: self._weight(r, now), reverse=True):
+                    via = referrer.get(row["slug"], "link")
+                    if not _append(
+                        self._row_to_memory(row, score=self._weight(row, now), via=via)
+                    ):
+                        break
         return out
+
+    def _by_slugs(
+        self, slugs: Sequence[str], namespace, exclude: set[int]
+    ) -> list[sqlite3.Row]:
+        """Active memories carrying one of these slugs, inside the same namespace
+        scope as the recall (never across it - that would leak a private memory)."""
+        where = ["active = 1", f"slug IN ({','.join('?' * len(slugs))})"]
+        params: list[Any] = list(slugs)
+        if namespace is not None:
+            names = [namespace] if isinstance(namespace, str) else list(namespace)
+            where.append(f"namespace IN ({','.join('?' * len(names))})")
+            params.extend(names)
+        rows = self._db.execute(
+            "SELECT * FROM memories WHERE " + " AND ".join(where), params
+        )
+        return [r for r in rows if r["id"] not in exclude]
 
     def _bm25_scored(
         self, q: list[str], candidates: list[sqlite3.Row]
@@ -519,7 +573,7 @@ class Cortex:
         return list(self._db.execute(sql, params))
 
     @staticmethod
-    def _row_to_memory(row: sqlite3.Row, *, score: float = 0.0) -> Memory:
+    def _row_to_memory(row: sqlite3.Row, *, score: float = 0.0, via: str = "") -> Memory:
         return Memory(
             id=row["id"],
             ts=row["ts"],
@@ -531,6 +585,41 @@ class Cortex:
             links=tuple(json.loads(row["links"])),
             meta=json.loads(row["meta"]),
             score=score,
+            via=via,
+        )
+
+    # ---------------------------------------------------------------- lessons
+    def record_lesson(
+        self,
+        text: str,
+        *,
+        slug: str | None = None,
+        links: Sequence[str] = (),
+        salience: float = 8.0,
+        meta: dict[str, Any] | None = None,
+    ) -> int:
+        """Write a lesson into the shared `lessons` namespace - a mistake, a
+        correction, a "this failed before and here is why". High salience by
+        default, because a lesson is meant to outrank ordinary recall when it is
+        relevant. Every bot reads this namespace; that is the whole point."""
+        return self.remember(
+            "lesson",
+            text,
+            namespace=LESSONS_NAMESPACE,
+            salience=salience,
+            slug=slug,
+            links=links,
+            meta=meta,
+        )
+
+    def lessons_for(self, context: str, k: int = 3) -> list[Memory]:
+        """The recall-before-act hook: the lessons relevant to what is about to
+        happen. Call it with the intent - the task, the plan, the thing being
+        considered - and heed what comes back before doing it. Scoped to the
+        shared lessons namespace and link-expanded, so a lesson pulls in the
+        related ones it points at."""
+        return self.recall(
+            context, k=k, namespace=LESSONS_NAMESPACE, expand_links=True
         )
 
 

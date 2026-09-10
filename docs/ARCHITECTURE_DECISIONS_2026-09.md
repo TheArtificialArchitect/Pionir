@@ -149,9 +149,23 @@ or a dead one silently falls back to lexical), embeddings batched and best-effor
 on write with `reindex-memory` to backfill, one embedding space at a time.
 `recall-check --embed` measured the lift live through `nomic-embed-text`:
 paraphrase recall 0.0 → 1.0, gated stays 1.0. Default embed model on and
-fail-open (`PIONIR_EMBED_MODEL`, "" or "off" to disable). Still to do:
-consolidation (fold conversations into episodes), the `lessons` namespace and the
-recall-before-act hook, and rolling it into the voice and the rest of Pionir.
+fail-open (`PIONIR_EMBED_MODEL`, "" or "off" to disable).
+
+**Lessons namespace + recall-before-act hook BUILT 2026-09-09.** `record_lesson`
+writes into the shared `lessons` namespace at high salience (8.0, above ordinary
+facts); `lessons_for(intent)` is the hook - recall scoped to that namespace and
+link-expanded, called with what is about to happen so a bot heeds it before
+acting. CLI: `pionir lesson "..."` and `pionir lessons "<intent>"`. Lessons are
+common ground every bot reads; private per-bot conversation stays in its own
+namespace and is never pulled into a lessons recall (nor vice-versa). **Link
+expansion BUILT** the same day: `recall(..., expand_links=True)` follows one hop
+of `[[slug]]` links from the direct hits, strictly inside the same namespace
+scope so it can never leak one bot's private memory into another's recall;
+provenance is recorded on each expanded hit (`Memory.via`).
+
+Still to do: consolidation (fold conversations into episodes - needs a writer),
+and rolling the engine into the voice and the rest of Pionir so the lessons
+namespace is actually shared across bots rather than available to one.
 
 **Bram/Psyche is off-limits — copy patterns, never touch her.** `C:\src\psyche`
 (engine) and `C:\src\BramData` (her data) are Ian's solo project, his to upgrade

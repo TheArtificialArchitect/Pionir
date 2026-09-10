@@ -154,6 +154,22 @@ def _parser() -> argparse.ArgumentParser:
     recall.add_argument("-k", type=int, default=8, help="how many to return (default 8)")
     recall.add_argument("--namespace", default=None, help="scope to one stream (default: all)")
 
+    lesson = commands.add_parser(
+        "lesson",
+        help="record a lesson into the shared namespace every bot reads before acting",
+    )
+    lesson.add_argument("text", nargs="+", help="the lesson: a mistake, a correction, a warning")
+    lesson.add_argument("--slug", default=None, help="a name so other lessons can [[link]] to it")
+    lesson.add_argument("--link", action="append", dest="links", default=[],
+                        help="a slug this lesson points at; repeat for several")
+
+    lessons = commands.add_parser(
+        "lessons",
+        help="recall the lessons relevant to what you're about to do (the recall-before-act hook)",
+    )
+    lessons.add_argument("intent", nargs="+", help="the task or plan you're considering")
+    lessons.add_argument("-k", type=int, default=3, help="how many lessons (default 3)")
+
     commands.add_parser(
         "reindex-memory",
         help="embed any memories that lack a vector for the current model (hybrid recall backfill)",
@@ -457,6 +473,28 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
                         "namespace": memory.namespace,
                         "score": round(memory.score, 3),
                         "text": memory.text,
+                    }
+                    for memory in hits
+                ],
+            }
+        )
+        return 0
+    if args.command == "lesson":
+        lesson_id = runtime.cortex.record_lesson(
+            " ".join(args.text), slug=args.slug, links=tuple(args.links)
+        )
+        _print({"recorded_lesson": lesson_id, "stats": runtime.cortex.stats()})
+        return 0
+    if args.command == "lessons":
+        hits = runtime.cortex.lessons_for(" ".join(args.intent), k=args.k)
+        _print(
+            {
+                "before you act on": " ".join(args.intent),
+                "lessons": [
+                    {
+                        "text": memory.text,
+                        "score": round(memory.score, 3),
+                        "via": memory.via or "direct",
                     }
                     for memory in hits
                 ],
