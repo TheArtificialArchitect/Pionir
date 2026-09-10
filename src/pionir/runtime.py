@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from contextlib import nullcontext
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from uuid import UUID
 from .contracts import AgentManifest, Task, TaskResult
 from .errors import CircuitOpen, ResourceUnavailable
 from .registry import CapabilityRegistry
-from .reliability import CircuitBreaker
+from .reliability import CircuitBreaker, CircuitState
 from .scheduler import ModelLeaseScheduler
 
 
@@ -63,6 +64,7 @@ class Executive:
         scheduler: ModelLeaseScheduler | None = None,
         audit_sink: AuditSink | None = None,
         circuit_factory: Callable[[], CircuitBreaker] | None = None,
+        on_lesson: Callable[[str], None] | None = None,
     ) -> None:
         self.registry = registry or CapabilityRegistry()
         self.scheduler = scheduler or ModelLeaseScheduler()
@@ -70,6 +72,11 @@ class Executive:
         self._adapters: dict[str, SpecialistAdapter] = {}
         self._circuit_factory = circuit_factory or CircuitBreaker
         self._circuits: dict[str, CircuitBreaker] = {}
+        # Called with a one-line lesson when a specialist's circuit opens. The
+        # shell learning from its own repeated failures - decoupled from cortex,
+        # so the executive stays a scheduler and this is just a callback. bootstrap
+        # wires it to cortex.record_lesson.
+        self._on_lesson = on_lesson
 
     def register(self, adapter: SpecialistAdapter) -> None:
         self.registry.register(adapter.manifest)
@@ -112,7 +119,15 @@ class Executive:
                 circuit.record_unattempted()
             elif not isinstance(error, CircuitOpen):
                 # A rejected call holds no probe slot, so there is nothing to return.
+                was_open = circuit.snapshot().state is CircuitState.OPEN
                 circuit.record_failure()
+                if not was_open and circuit.snapshot().state is CircuitState.OPEN:
+                    # It just tripped: a repeated failure, not a blip. That is a
+                    # real lesson - recorded once per trip, so it never floods.
+                    self._record_lesson(
+                        f"{route.agent_id} circuit opened after repeated failures; "
+                        f"last error {type(error).__name__}: {error}"
+                    )
             self._record("task.failed", task, route.agent_id, type(error).__name__)
             raise
 
@@ -122,6 +137,16 @@ class Executive:
 
     def circuit(self, agent_id: str) -> CircuitBreaker:
         return self._circuits[agent_id]
+
+    def _record_lesson(self, text: str) -> None:
+        """Best-effort: a lesson sink must never take a task down (§3.18 - but
+        logged, not swallowed silently, if it ever raises)."""
+        if self._on_lesson is None:
+            return
+        try:
+            self._on_lesson(text)
+        except Exception as error:  # noqa: BLE001
+            logging.getLogger(__name__).warning("lesson sink failed: %s", error)
 
     def _record(
         self,

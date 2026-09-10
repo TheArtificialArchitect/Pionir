@@ -56,6 +56,10 @@ def _theo_settings(configured: PionirSettings) -> TheoSettings:
 def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
     configured = settings or PionirSettings.from_environment()
     configured.initialize_runtime()
+    embedder = (
+        OllamaEmbedder(configured.embed_model) if configured.embed_model else None
+    )
+    cortex = Cortex(configured.cortex_path, embedder=embedder)
     executive = Executive(
         scheduler=ModelLeaseScheduler(
             configured.resource_budget,
@@ -66,13 +70,11 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
             failure_threshold=configured.circuit_failure_threshold,
             recovery_seconds=configured.circuit_recovery_seconds,
         ),
+        # A circuit opening is the shell's own repeated-failure lesson; record it
+        # into the shared lessons namespace so it is recalled before acting later.
+        on_lesson=cortex.record_lesson,
     )
-    embedder = (
-        OllamaEmbedder(configured.embed_model) if configured.embed_model else None
-    )
-    runtime = PionirRuntime(
-        configured, executive, {}, Cortex(configured.cortex_path, embedder=embedder)
-    )
+    runtime = PionirRuntime(configured, executive, {}, cortex)
     runtime.register(
         AtaniCliAdapter(AtaniCliSettings(command=configured.atani_command))
     )

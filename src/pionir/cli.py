@@ -170,6 +170,16 @@ def _parser() -> argparse.ArgumentParser:
     lessons.add_argument("intent", nargs="+", help="the task or plan you're considering")
     lessons.add_argument("-k", type=int, default=3, help="how many lessons (default 3)")
 
+    consolidate = commands.add_parser(
+        "consolidate",
+        help="fold a conversation's raw turns in a namespace into a durable episode",
+    )
+    consolidate.add_argument("namespace", help="the conversation namespace to fold")
+    consolidate.add_argument("--model", default=None,
+                            help="chat model to distil with (default: the configured embed/voice model)")
+    consolidate.add_argument("--min-turns", type=int, default=None,
+                            help="minimum un-consolidated turns before folding")
+
     commands.add_parser(
         "reindex-memory",
         help="embed any memories that lack a vector for the current model (hybrid recall backfill)",
@@ -500,6 +510,28 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
                 ],
             }
         )
+        return 0
+    if args.command == "consolidate":
+        from .consolidate import DEFAULT_MIN_TURNS, Consolidator, OllamaDistiller
+
+        model = args.model or runtime.settings.embed_model
+        if not model:
+            raise ValueError("no distil model; pass --model or set PIONIR_EMBED_MODEL")
+        consolidator = Consolidator(runtime.cortex, OllamaDistiller(model))
+        outcome = consolidator.consolidate(
+            args.namespace, min_turns=args.min_turns or DEFAULT_MIN_TURNS
+        )
+        if outcome is None:
+            _print({"consolidated": False, "reason": "not enough turns, or the distiller declined"})
+        else:
+            _print(
+                {
+                    "consolidated": True,
+                    "episode_id": outcome.episode_id,
+                    "facts": len(outcome.fact_ids),
+                    "folded_turns": outcome.folded_turns,
+                }
+            )
         return 0
     if args.command == "reindex-memory":
         filled = runtime.cortex.reindex()

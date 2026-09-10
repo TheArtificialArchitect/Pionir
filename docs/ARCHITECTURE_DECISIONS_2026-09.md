@@ -163,9 +163,26 @@ of `[[slug]]` links from the direct hits, strictly inside the same namespace
 scope so it can never leak one bot's private memory into another's recall;
 provenance is recorded on each expanded hit (`Memory.via`).
 
-Still to do: consolidation (fold conversations into episodes - needs a writer),
-and rolling the engine into the voice and the rest of Pionir so the lessons
-namespace is actually shared across bots rather than available to one.
+**Consolidation BUILT 2026-09-09** (`consolidate.py`). Raw turns (kind `message`)
+in a namespace are folded into a durable `episode` plus extracted `fact`s and the
+turns are retired from recall - the window forgets, the store keeps the summary.
+Model-free core with an injected `Distiller`; `OllamaDistiller` is the production
+one, a fake drives the tests, and distilling is fail-open (a model hiccup leaves
+the turns for a later pass, never loses them). `pionir consolidate <namespace>`.
+Verified live through gemma3:12b: 6 turns → 1 episode + 4 facts, and a later
+query recalled the episode though its raw turns were gone.
+
+**First rolling-engine step BUILT:** the executive records a lesson into the
+shared `lessons` namespace when a specialist's circuit opens - the shell learning
+from its own repeated failures, once per trip so it never floods, via a decoupled
+`on_lesson` callback (the executive stays a scheduler; bootstrap wires it to
+`cortex.record_lesson`).
+
+Still to do, and this is the part blocked on other work: rolling the one engine
+across the *other* bots so the lessons namespace is genuinely shared. That needs
+the bots wired into Pionir (the strip and the promotions), and several live in
+other trees. Within Pionir the engine is ready and shared-by-namespace; the
+cross-bot rollout waits on the wiring, not on the memory.
 
 **Bram/Psyche is off-limits — copy patterns, never touch her.** `C:\src\psyche`
 (engine) and `C:\src\BramData` (her data) are Ian's solo project, his to upgrade

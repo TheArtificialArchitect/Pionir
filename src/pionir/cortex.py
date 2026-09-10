@@ -63,6 +63,7 @@ KIND_SALIENCE: dict[str, float] = {
     "note": 4.0,      # a passing self-note
     "lookup": 5.0,    # something fetched from the web and worth keeping
     "thought": 3.0,   # an idle interior thought
+    "message": 2.0,   # a raw conversation turn, awaiting consolidation into an episode
 }
 _DEFAULT_SALIENCE = 4.0
 
@@ -514,6 +515,23 @@ class Cortex:
         ]
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return scored
+
+    def memories(
+        self, namespace: str, *, kind: str | None = None, limit: int = 1000
+    ) -> list[Memory]:
+        """Active memories in a namespace, oldest first - a plain listing, not a
+        relevance recall. Consolidation reads a conversation's raw turns this way,
+        in order, rather than by how well they match a query."""
+        where = ["active = 1", "namespace = ?"]
+        params: list[Any] = [namespace]
+        if kind is not None:
+            where.append("kind = ?")
+            params.append(kind)
+        rows = self._db.execute(
+            "SELECT * FROM memories WHERE " + " AND ".join(where) + " ORDER BY id ASC LIMIT ?",
+            [*params, limit],
+        )
+        return [self._row_to_memory(r) for r in rows]
 
     def stats(self) -> dict[str, Any]:
         """Counts, so a caller can prove the store is not empty - the wired-but-inert
