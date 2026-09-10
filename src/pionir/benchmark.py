@@ -340,12 +340,14 @@ def benchmark_model(
             base_url=base_url,
         )
         resident, foreign = _residency(model, base_url)
-        loaded = read_gpu_memory()
         result.foreign_resident = foreign
         if resident is None:
             # The model answered and was gone by the time residency was read: on
             # a full card the daemon evicts to satisfy the next caller, so this
-            # is a capacity result, not a failed measurement.
+            # is a capacity result, not a failed measurement. This verdict comes
+            # from residency alone - do NOT read the GPU first, or a machine
+            # without nvidia-smi (CI) throws here and the eviction is recorded as
+            # a plain failure instead of contention.
             result.evicted_by_contention = True
             result.error = (
                 model
@@ -354,6 +356,7 @@ def benchmark_model(
             )
             return result
 
+        loaded = read_gpu_memory()
         result.resident_vram_mb = resident.size_vram_mb
         result.driver_delta_mb = loaded.used_mb - floor.used_mb
         result.fully_on_gpu = resident.fully_on_gpu
