@@ -169,6 +169,18 @@ def default_probes() -> tuple[RecallProbe, ...]:
             "Daedalus",
         ),
         RecallProbe(
+            # Every shared word differs only by inflection - reclaim/reclaims,
+            # resource/resources, throttle/throttles, lease/leases - and no word
+            # is shared un-inflected. Without the stemmer there is zero token
+            # overlap and this misses entirely; with it, an exact hit. The probe
+            # that justifies the stemmer, and the guard against removing it.
+            "inflection: plural and third-person",
+            "exact",
+            (_mem("the daemon reclaims resources and throttles leases"),) + weather[:20],
+            "does it reclaim a resource or throttle a lease",
+            "reclaims resources",
+        ),
+        RecallProbe(
             "paraphrase: different words, same meaning",
             "paraphrase",
             (_mem("Galatea samples several replies and sends the lowest-penalty one"),) + weather[:15],

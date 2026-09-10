@@ -98,6 +98,27 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(len(hits), 1)  # one fits the budget; never returns zero on a real match
 
 
+class StemmingTests(unittest.TestCase):
+    def test_recall_bridges_plural_and_third_person(self) -> None:
+        c = _mem()
+        c.remember("fact", "the daemon reclaims resources and throttles leases")
+        # Query uses the base forms; without stemming there is zero token overlap.
+        hits = c.recall("does it reclaim a resource or throttle a lease")
+        self.assertTrue(hits)
+        self.assertIn("reclaims resources", hits[0].text)
+
+    def test_the_stemmer_stays_conservative(self) -> None:
+        from pionir.cortex import _stem
+
+        self.assertEqual(_stem("resources"), "resource")
+        self.assertEqual(_stem("governs"), "govern")
+        self.assertEqual(_stem("replies"), "reply")
+        # Left alone on purpose: -ss, short words, and derivational -or.
+        self.assertEqual(_stem("address"), "address")
+        self.assertEqual(_stem("gas"), "gas")
+        self.assertEqual(_stem("governor"), "governor")
+
+
 class ForgetTests(unittest.TestCase):
     def test_forget_removes_from_recall_but_is_recoverable(self) -> None:
         c = _mem()

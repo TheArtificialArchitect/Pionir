@@ -80,8 +80,32 @@ _STOP = frozenset(
 )
 
 
+def _stem(word: str) -> str:
+    """A deliberately conservative inflectional stemmer.
+
+    It bridges the cases the recall eval caught - plurals and third-person -s
+    (resources/resource, governs/govern, commits/commit) and -ies/-y
+    (replies/reply) - and nothing more. It does NOT touch -ing, -ed, or
+    derivational suffixes like -or (governs still will not reach governor),
+    because undoubling and derivational rules are where a light stemmer starts
+    inventing false matches. The recall eval is the guard: widen this only with a
+    probe that shows the widening helps and `recall-check` still green.
+    """
+    if len(word) <= 3 or word.endswith("ss"):
+        return word
+    if word.endswith("ies"):
+        return word[:-3] + "y"
+    if word.endswith("s"):
+        return word[:-1]
+    return word
+
+
 def tokens(text: str) -> list[str]:
-    return [t for t in _WORD.findall((text or "").lower()) if t not in _STOP and len(t) > 1]
+    return [
+        _stem(t)
+        for t in _WORD.findall((text or "").lower())
+        if t not in _STOP and len(t) > 1
+    ]
 
 
 @dataclass(frozen=True, slots=True)
