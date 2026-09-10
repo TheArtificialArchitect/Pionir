@@ -143,6 +143,12 @@ Psyche's hybrid recall + consolidation onto that core (its reference is proven),
 then add the `lessons` namespace and the recall-before-act hook. None of this
 needs the strip; it is additive.
 
+**Bram/Psyche is off-limits — copy patterns, never touch her.** `C:\src\psyche`
+(engine) and `C:\src\BramData` (her data) are Ian's solo project, his to upgrade
+alone. We read her source to copy the structures Pionir wants and reimplement
+them in Pionir's tree; we never edit hers. Reviewing is fine; any change to her
+comes to Ian first, the same boundary as the Theo estate.
+
 ## Memory engine — open items (built core, deferred by choice)
 
 The core store is built, wired, and driveable from the CLI. These are the next
