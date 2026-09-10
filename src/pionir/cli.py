@@ -62,6 +62,8 @@ def _parser() -> argparse.ArgumentParser:
     atani_plan.add_argument("request_file", type=Path)
 
     commands.add_parser("bryo-status", help="read Bryo's non-mutating status snapshot")
+    commands.add_parser("nyx-status", help="read Nyx's redacted offensive-security health")
+    commands.add_parser("voodoo-status", help="read Voodoo's redacted defensive posture")
 
     route = commands.add_parser(
         "route",
@@ -213,6 +215,16 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
         specialists["bryo"] = {
             "status": "not_configured",
             "message": "set PIONIR_BRYO_STATUS_COMMAND_JSON",
+        }
+    if "nyx" not in runtime.adapters:
+        specialists["nyx"] = {
+            "status": "not_configured",
+            "message": "set PIONIR_NYX_STATUS_COMMAND_JSON",
+        }
+    if "voodoo" not in runtime.adapters:
+        specialists["voodoo"] = {
+            "status": "not_configured",
+            "message": "set PIONIR_VOODOO_STATUS_COMMAND_JSON",
         }
     recorded = routecheck.load(runtime.settings.routing_check_path)
     if recorded is None:
@@ -369,6 +381,16 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
             )
         result = runtime.executive.execute(Task("organism.bryo_status", {}))
         _print(result.output)
+        return 0
+    if args.command == "nyx-status":
+        if "nyx" not in runtime.adapters:
+            raise ValueError("Nyx is not configured; set PIONIR_NYX_STATUS_COMMAND_JSON")
+        _print(runtime.executive.execute(Task("security.nyx_status", {})).output)
+        return 0
+    if args.command == "voodoo-status":
+        if "voodoo" not in runtime.adapters:
+            raise ValueError("Voodoo is not configured; set PIONIR_VOODOO_STATUS_COMMAND_JSON")
+        _print(runtime.executive.execute(Task("security.voodoo_status", {})).output)
         return 0
     if args.command == "route":
         router = IntentRouter(

@@ -9,6 +9,10 @@ from .adapters import (
     AtaniCliSettings,
     BryoStatusAdapter,
     BryoStatusSettings,
+    NyxStatusAdapter,
+    NyxStatusSettings,
+    VoodooStatusAdapter,
+    VoodooStatusSettings,
     load_stdio_adapters,
 )
 from .audit import JsonlAuditSink
@@ -61,6 +65,16 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         runtime.register(
             BryoStatusAdapter(
                 BryoStatusSettings(command=configured.bryo_status_command)
+            )
+        )
+    if configured.nyx_status_command is not None:
+        runtime.register(
+            NyxStatusAdapter(NyxStatusSettings(command=configured.nyx_status_command))
+        )
+    if configured.voodoo_status_command is not None:
+        runtime.register(
+            VoodooStatusAdapter(
+                VoodooStatusSettings(command=configured.voodoo_status_command)
             )
         )
     if configured.specialists_file is not None:

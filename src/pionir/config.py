@@ -85,6 +85,8 @@ class PionirSettings:
 
     atani_command: tuple[str, ...] = ("atani",)
     bryo_status_command: tuple[str, ...] | None = None
+    nyx_status_command: tuple[str, ...] | None = None
+    voodoo_status_command: tuple[str, ...] | None = None
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
     # The local embedding model for hybrid recall. Default on: it is ~0.32 GB and
@@ -104,6 +106,12 @@ class PionirSettings:
             or any(not part for part in self.bryo_status_command)
         ):
             raise ValueError("Bryo status command cannot be empty")
+        for label, command in (
+            ("Nyx", self.nyx_status_command),
+            ("Voodoo", self.voodoo_status_command),
+        ):
+            if command is not None and (not command or any(not part for part in command)):
+                raise ValueError(f"{label} status command cannot be empty")
         # Reuse the scheduler's complete budget validation.
         _ = self.resource_budget
 
@@ -176,6 +184,10 @@ class PionirSettings:
             or _declared("atani_command"),
             bryo_status_command=_command_from_json(
                 "PIONIR_BRYO_STATUS_COMMAND_JSON", None
+            ),
+            nyx_status_command=_command_from_json("PIONIR_NYX_STATUS_COMMAND_JSON", None),
+            voodoo_status_command=_command_from_json(
+                "PIONIR_VOODOO_STATUS_COMMAND_JSON", None
             ),
             embed_model=_embed_model_from_env(),
             specialists_file=(
