@@ -1,22 +1,20 @@
-# Pionir launcher. Foreground only: the brain is awake while this window is open.
+# Pionir launcher. Foreground only: the brain is awake while its window is open.
 # Nothing here installs a task, a service, a Run key or a Startup item.
 #
-#   .\pionir.ps1                 wake the whole stack and open the dashboard
+#   .\pionir.ps1                 wake the whole stack in ONE window, a pane per bridge
 #   .\pionir.ps1 -Shortcut       put a "Pionir" launcher icon on the Desktop
 #   .\pionir.ps1 -NoVoice        don't wake Galatea
 #   .\pionir.ps1 -NoSpecialists  don't start Daedalus/Melete; reach whoever's already up
-#   .\pionir.ps1 -NoBrowser      don't open a browser (the URL is printed)
+#   .\pionir.ps1 -NoBrowser      don't open the dashboard in a browser
 #   .\pionir.ps1 -Port 8781      a different dashboard port
-#   .\pionir.ps1 -Stop           stop the dashboard and the specialists it started
+#   .\pionir.ps1 -Stop           stop the whole stack from anywhere
 #
-# The Desktop icon (-Shortcut) is a shortcut only: double-clicking it runs this
-# launcher in its own window. Nothing starts on its own; it is not a Startup item.
-#
-# "Whole stack, one launch". Theo is retired, so Daedalus (the coder, :8771) and
-# Melete (the tool-executor, :8770) are Pionir's own services now: this starts
-# them directly - their standalone FastAPI servers, no Theo backend - each in its
-# own window you can see and close, and wakes Galatea (:8799) the same way.
-# Everything stops when its window closes; -Stop tears the services down from here.
+# One window, every bridge a pane: with Windows Terminal (wt.exe) the dashboard
+# server, Galatea, Daedalus and Melete each get a titled pane in a single window.
+# Closing that window brings the whole stack down - wt kills every pane's process
+# tree on close (verified: ports free afterwards, no orphans). If wt.exe is not
+# present the launcher falls back to one window per bridge. It is a foreground
+# launcher Ian runs; it is never a service, autostart or Startup entry (rule 3).
 param(
     [switch]$Shortcut,
     [switch]$NoVoice,
@@ -31,31 +29,31 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
 if ($Shortcut) {
-    # A Desktop icon that runs this launcher in its own window. Shortcut only -
-    # nothing is added to Startup, no task, no service (estate rule 3).
+    # A Desktop icon that runs this launcher. Shortcut only - nothing is added to
+    # Startup, no task, no service (rule 3). Hidden so the only window that shows
+    # is the one Windows Terminal opens with the panes.
     $desktop = [Environment]::GetFolderPath("Desktop")
     $lnk = Join-Path $desktop "Pionir.lnk"
     $shell = New-Object -ComObject WScript.Shell
     $sc = $shell.CreateShortcut($lnk)
     $sc.TargetPath = "powershell.exe"
-    $sc.Arguments = "-NoExit -ExecutionPolicy Bypass -File `"$root\pionir.ps1`""
+    $sc.Arguments = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$root\pionir.ps1`""
     $sc.WorkingDirectory = $root
-    $sc.Description = "Pionir - the brain. Awake while the window is open."
+    $sc.Description = "Pionir - the brain. Awake while its window is open."
     $sc.IconLocation = "%SystemRoot%\System32\shell32.dll,15"
     $sc.Save()
     Write-Host "Desktop icon written: $lnk" -ForegroundColor Cyan
-    Write-Host "Double-click it to bring up the stack and the dashboard. It starts nothing on its own."
+    Write-Host "Double-click it to bring the whole stack up in one window. It starts nothing on its own."
     exit 0
 }
 
-$py = Join-Path $root ".venv\Scripts\python.exe"
-if (-not (Test-Path $py)) { $py = "python" }
-$env:PYTHONPATH = Join-Path $root "src"
-
-# Where the specialists' code lives. Overridable in case they are relocated out
-# of the (retired) Tech-Support tree later.
+# Bridge code lives here. The specialist dirs are overridable in case they move
+# out of the (retired) Tech-Support tree later.
+$galateaDir  = Join-Path (Split-Path -Parent $root) "Galatea"
 $daedalusDir = if ($env:PIONIR_DAEDALUS_DIR) { $env:PIONIR_DAEDALUS_DIR } else { "C:\src\Tech-Support\daedalus" }
 $meleteDir   = if ($env:PIONIR_MELETE_DIR)   { $env:PIONIR_MELETE_DIR }   else { "C:\src\Tech-Support\melete" }
+$srcDir      = Join-Path $root "src"
+$wt          = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\wt.exe"
 
 function Test-Port([int]$p) {
     try { (New-Object Net.Sockets.TcpClient).Connect("127.0.0.1", $p); return $true }
@@ -64,64 +62,120 @@ function Test-Port([int]$p) {
 
 function Stop-Port([int]$p, [string]$label) {
     $c = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue
-    if ($c) { Stop-Process -Id $c.OwningProcess -Force; Write-Host "  stopped $label on $p." }
+    if ($c) {
+        $c | Select-Object -Expand OwningProcess -Unique | ForEach-Object {
+            Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host "  stopped $label on $p."
+    }
 }
 
-function Start-Specialist([string]$label, [int]$p, [string]$dir, [string]$module) {
-    if (Test-Port $p) { Write-Host "  $label already up on $p." -ForegroundColor DarkCyan; return }
-    if (-not (Test-Path $dir)) { Write-Host "  ! $label not found at $dir; skipping." -ForegroundColor Yellow; return }
-    Write-Host "  starting $label on $p (its own window)..." -ForegroundColor DarkCyan
-    $cmd = "`$host.UI.RawUI.WindowTitle = '$label :$p'; Set-Location '$dir'; & '$py' -m $module"
-    Start-Process powershell -ArgumentList @("-NoExit", "-ExecutionPolicy", "Bypass", "-Command", $cmd) -WorkingDirectory $dir
+# One pane = one process tree wt kills on close. The command sets the pane's
+# title, moves to the bridge's directory and runs it, base64-encoded so no
+# quoting or ';' can be mangled by wt's own command-line parser.
+function Enc([string]$command) {
+    return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+}
+function Pane-Cmd([string]$title, [string]$dir, [string]$run, [string]$prelude) {
+    $body = "`$host.UI.RawUI.WindowTitle='$title'; Set-Location '$dir'; $prelude$run"
+    return @("powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-EncodedCommand", (Enc $body))
 }
 
 if ($Stop) {
     Stop-Port $Port "dashboard"
+    Stop-Port 8799 "Galatea"
     Stop-Port 8771 "Daedalus"
     Stop-Port 8770 "Melete"
-    Write-Host "  (Galatea is left running; use galatea.ps1 -Stop to sleep her.)"
+    Write-Host "  stack stopped. (Closing the Pionir window does the same thing.)"
     exit 0
 }
 
-# Ollama is what every specialist's model runs on; a down daemon is not fatal to
-# the dashboard but every routed turn would fail, so say so plainly.
+# Ollama runs every specialist's model; a down daemon is not fatal to the
+# dashboard but every routed turn would fail, so say so plainly.
 if (-not (Test-Port 11434)) {
     Write-Host "  ! Ollama is not answering on 127.0.0.1:11434 - start it, or routed turns will fail." -ForegroundColor Yellow
 }
+$env:PIONIR_GALATEA_URL = "http://127.0.0.1:8799"
 
-# The specialists Pionir now owns.
-if (-not $NoSpecialists) {
-    Start-Specialist "Daedalus" 8771 $daedalusDir "daedalus.server"
-    Start-Specialist "Melete"   8770 $meleteDir   "melete.server"
+# Decide which bridges this launch brings up: skip any already listening (do not
+# double-start and collide on the port), and honour the flags.
+$browserFlag = ""
+if ($NoBrowser) { $browserFlag = " --no-browser" }
+$pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://127.0.0.1:8799'; "
+
+$panes = @()   # ordered: dashboard, voice, then the doers
+$ports = @()   # the ports this launch is responsible for verifying
+if (-not (Test-Port $Port)) {
+    $panes += ,(Pane-Cmd "Pionir :$Port" $root "python -m pionir server --port $Port$browserFlag" $pionirPrelude)
+    $ports += $Port
+} else { Write-Host "  dashboard already up on $Port." -ForegroundColor DarkCyan }
+
+if (-not $NoVoice) {
+    if (Test-Port 8799) { Write-Host "  Galatea already awake on 8799." -ForegroundColor DarkCyan }
+    elseif (Test-Path $galateaDir) {
+        $panes += ,(Pane-Cmd "Galatea :8799" $galateaDir "python -m galatea wake --port 8799 --no-browser" "")
+        $ports += 8799
+    } else { Write-Host "  ! Galatea not found at $galateaDir; skipping the voice." -ForegroundColor Yellow }
 }
 
-# The voice, in her own window.
-$galatea = Join-Path (Split-Path -Parent $root) "Galatea\galatea.ps1"
-if (-not $NoVoice) {
-    $env:PIONIR_GALATEA_URL = "http://127.0.0.1:8799"
-    if (-not (Test-Port 8799)) {
-        if (Test-Path $galatea) {
-            Write-Host "  waking Galatea (no separate tab; she lives in the dashboard)..." -ForegroundColor DarkCyan
-            # -NoBrowser: do not pop her own UI tab. Her glass is baked into the
-            # Pionir dashboard's Voice view instead, so there is one window, not two.
-            Start-Process powershell -ArgumentList @(
-                "-NoExit", "-ExecutionPolicy", "Bypass", "-File", $galatea, "-NoBrowser"
-            ) -WorkingDirectory (Split-Path -Parent $galatea)
-        } else {
-            Write-Host "  ! Galatea's launcher was not found at $galatea; skipping the voice." -ForegroundColor Yellow
-        }
-    } else {
-        Write-Host "  Galatea is already awake on 8799." -ForegroundColor DarkCyan
+if (-not $NoSpecialists) {
+    if (Test-Port 8771) { Write-Host "  Daedalus already up on 8771." -ForegroundColor DarkCyan }
+    elseif (Test-Path $daedalusDir) {
+        $panes += ,(Pane-Cmd "Daedalus :8771" $daedalusDir "python -m daedalus.server" "")
+        $ports += 8771
+    } else { Write-Host "  ! Daedalus not found at $daedalusDir; skipping." -ForegroundColor Yellow }
+    if (Test-Port 8770) { Write-Host "  Melete already up on 8770." -ForegroundColor DarkCyan }
+    elseif (Test-Path $meleteDir) {
+        $panes += ,(Pane-Cmd "Melete :8770" $meleteDir "python -m melete.server" "")
+        $ports += 8770
+    } else { Write-Host "  ! Melete not found at $meleteDir; skipping." -ForegroundColor Yellow }
+}
+
+if ($panes.Count -eq 0) {
+    Write-Host "  everything is already up; nothing to start." -ForegroundColor DarkCyan
+    if (-not $NoBrowser -and (Test-Port $Port)) { Start-Process "http://127.0.0.1:$Port/" }
+    exit 0
+}
+
+$usedWt = $false
+if (Test-Path $wt) {
+    # Assemble one window: first pane is a new-tab, the rest split it into a grid.
+    # -w new forces a dedicated window rather than a tab in an existing one.
+    $wtArgs = @("-w", "new", "new-tab") + $panes[0]
+    $splitDirs = @("-V", "-H", "-H")   # right, then down each side -> a 2x2 for four
+    for ($i = 1; $i -lt $panes.Count; $i++) {
+        if ($i -eq 2) { $wtArgs += @(";", "move-focus", "left") }
+        if ($i -eq 3) { $wtArgs += @(";", "move-focus", "right") }
+        $wtArgs += @(";", "split-pane", $splitDirs[$i - 1]) + $panes[$i]
+    }
+    Start-Process $wt -ArgumentList $wtArgs
+    $usedWt = $true
+    Write-Host ""
+    Write-Host "  PIONIR" -ForegroundColor Cyan
+    Write-Host "  one window, a pane per bridge. Close it to bring the whole stack down." -ForegroundColor DarkCyan
+} else {
+    # Fallback: no Windows Terminal on this machine, so one window per bridge.
+    Write-Host "  ! wt.exe not found; falling back to one window per bridge." -ForegroundColor Yellow
+    foreach ($pane in $panes) {
+        # $pane is a full command line ("powershell" -NoExit ... -EncodedCommand b64);
+        # element 0 is the exe, the rest are its arguments.
+        Start-Process $pane[0] -ArgumentList $pane[1..($pane.Count - 1)]
     }
 }
 
-Write-Host ""
-Write-Host "  PIONIR" -ForegroundColor Cyan
-Write-Host "  the brain is awake while this window is open; close it or Ctrl+C to stop." -ForegroundColor DarkCyan
-Write-Host "  (the specialists keep their own windows; .\pionir.ps1 -Stop tears them down.)" -ForegroundColor DarkGray
-Write-Host ""
-
-$argv = @("-m", "pionir", "server", "--port", "$Port")
-if ($NoBrowser) { $argv += "--no-browser" }
-& $py @argv
-exit $LASTEXITCODE
+# Verify the artifact, not the window (HEAD 3.16): a drawn pane is not a live
+# server. Wait for each port this launch started to actually answer.
+Write-Host "  verifying bridges are actually up..." -ForegroundColor DarkGray
+$deadline = (Get-Date).AddSeconds(30)
+$pending = [System.Collections.ArrayList]@($ports)
+while ($pending.Count -gt 0 -and (Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 800
+    @($pending) | ForEach-Object { if (Test-Port $_) { [void]$pending.Remove($_) } }
+}
+foreach ($p in $ports) {
+    if (Test-Port $p) { Write-Host ("  up   :{0}" -f $p) -ForegroundColor Green }
+    else { Write-Host ("  DOWN :{0} - did not answer in time" -f $p) -ForegroundColor Red }
+}
+if (-not $NoBrowser -and (Test-Port $Port)) { Start-Process "http://127.0.0.1:$Port/" }
+Write-Host "  ready." -ForegroundColor DarkCyan
+exit 0
