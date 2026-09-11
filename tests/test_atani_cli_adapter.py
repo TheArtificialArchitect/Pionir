@@ -1,20 +1,35 @@
 import json
 import unittest
 
-from pionir.adapters.atani_cli import AtaniCliAdapter, AtaniCliSettings
+from pionir.adapters.atani_cli import AtaniCliAdapter, AtaniCliSettings, CommandResult
 from pionir.contracts import Task
-from pionir.errors import AdapterProtocolError
+from pionir.errors import AdapterProtocolError, AdapterUnavailable
 
 
 class FakeRunner:
-    def __init__(self, document) -> None:
-        self.document = document
+    def __init__(
+        self,
+        document=None,
+        *,
+        stdout: str | None = None,
+        returncode: int = 0,
+        stderr: str = "",
+    ) -> None:
+        if stdout is not None:
+            self.stdout = stdout
+        elif document is not None:
+            self.stdout = json.dumps(document)
+        else:
+            self.stdout = ""
+        self.returncode = returncode
+        self.stderr = stderr
         self.calls: list[tuple[tuple[str, ...], int]] = []
+        self.input_text = None
 
-    def run(self, arguments, *, timeout_seconds: int, input_text=None) -> str:
+    def run(self, arguments, *, timeout_seconds: int, input_text=None) -> CommandResult:
         self.calls.append((tuple(arguments), timeout_seconds))
         self.input_text = input_text
-        return json.dumps(self.document)
+        return CommandResult(self.returncode, self.stdout, self.stderr)
 
 
 class AtaniCliAdapterTests(unittest.TestCase):
@@ -90,6 +105,59 @@ class AtaniCliAdapterTests(unittest.TestCase):
             adapter.execute(
                 Task("executive.atani_run", {"protocol": "unknown"})
             )
+
+    def test_a_failed_outcome_survives_a_nonzero_exit(self) -> None:
+        # Verified against the real CLI (2026-09-10): a legitimately failed goal
+        # is written to stdout while the process exits 1. Reading the exit code
+        # first turned that real outcome - its goal_id, its reason - into a bare
+        # "Atani is unavailable". The outcome on stdout is authoritative.
+        runner = FakeRunner(
+            {
+                "status": "failed",
+                "goal_id": "goal-9",
+                "reason": "bounded executive limit reached",
+                "steps": 1,
+            },
+            returncode=1,
+        )
+        adapter = AtaniCliAdapter(runner=runner)
+        result = adapter.execute(
+            Task(
+                "executive.atani_run",
+                {"protocol": "atani.executive.v1", "goal_id": "goal-9", "steps": []},
+                frozenset({"atani.executive"}),
+            )
+        )
+        self.assertEqual(result.output["status"], "failed")
+        self.assertEqual(result.output["reason"], "bounded executive limit reached")
+        self.assertEqual(result.evidence, ("atani:goal:goal-9",))
+
+    def test_an_executive_error_surfaces_atanis_own_reason(self) -> None:
+        # Empty stdout with a non-zero exit is a genuine failure - and Atani's
+        # stderr says why. Reporting "run atani doctor" instead would throw the
+        # actual reason away (a swallowed diagnosis, HEAD 3.18).
+        runner = FakeRunner(
+            stdout="",
+            returncode=1,
+            stderr="Atani error: protocol must be atani.executive.v1",
+        )
+        adapter = AtaniCliAdapter(runner=runner)
+        with self.assertRaises(AdapterUnavailable) as caught:
+            adapter.execute(
+                Task(
+                    "executive.atani_run",
+                    {"protocol": "atani.executive.v1", "goal_id": "g", "steps": []},
+                    frozenset({"atani.executive"}),
+                )
+            )
+        self.assertIn("protocol must be", str(caught.exception))
+
+    def test_a_chat_failure_surfaces_atanis_own_reason(self) -> None:
+        runner = FakeRunner(stdout="", returncode=1, stderr="Atani error: model not pulled")
+        adapter = AtaniCliAdapter(runner=runner)
+        with self.assertRaises(AdapterUnavailable) as caught:
+            adapter.execute(Task("reasoning.atani_answer", {"content": "hi"}))
+        self.assertIn("model not pulled", str(caught.exception))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,22 @@ from pionir.scheduler import kv_cache_vram_mb
 
 MAX_OUTPUT_CHARS = 2_000_000
 
+# The executive's four legitimate outcomes. A response carrying one of these on
+# stdout is a real Manager result and authoritative over the process exit code -
+# Atani exits non-zero for a failed or paused goal while still writing the whole
+# outcome out, so reading the exit code first would turn a real outcome into a
+# bare "unavailable" and throw its goal_id and reason away.
+_EXECUTIVE_STATUSES = frozenset(
+    {"completed", "waiting_approval", "paused", "failed"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CommandResult:
+    returncode: int
+    stdout: str
+    stderr: str
+
 
 class CommandRunner(Protocol):
     def run(
@@ -29,7 +45,7 @@ class CommandRunner(Protocol):
         *,
         timeout_seconds: int,
         input_text: str | None = None,
-    ) -> str: ...
+    ) -> CommandResult: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,7 +71,12 @@ class SubprocessCommandRunner:
         *,
         timeout_seconds: int,
         input_text: str | None = None,
-    ) -> str:
+    ) -> CommandResult:
+        # The exit code is deliberately not judged here. Whether a non-zero exit
+        # is fatal is a per-command decision - fatal for chat and status, but not
+        # for the executive, whose outcome lives on stdout regardless - so that
+        # policy belongs in the adapter, not in a runner that cannot tell the
+        # commands apart.
         try:
             process = subprocess.run(
                 [*self._command, *arguments],
@@ -71,13 +92,13 @@ class SubprocessCommandRunner:
             raise AdapterUnavailable("Atani's configured executable was not found") from error
         except subprocess.TimeoutExpired as error:
             raise AdapterUnavailable("Atani did not finish before its timeout") from error
-        if process.returncode != 0:
-            raise AdapterUnavailable(
-                f"Atani exited with status {process.returncode}; run `atani doctor` locally"
-            )
         if len(process.stdout) > MAX_OUTPUT_CHARS:
             raise AdapterProtocolError("Atani's JSON response exceeded the size limit")
-        return process.stdout
+        return CommandResult(
+            returncode=process.returncode,
+            stdout=process.stdout,
+            stderr=process.stderr or "",
+        )
 
 
 class AtaniCliAdapter:
@@ -179,17 +200,20 @@ class AtaniCliAdapter:
     def manifest(self) -> AgentManifest:
         return self._manifest
 
-    def _json(
+    def _run(
         self,
         arguments: Sequence[str],
         *,
         input_text: str | None = None,
-    ) -> Mapping[str, Any]:
-        raw = self._runner.run(
+    ) -> CommandResult:
+        return self._runner.run(
             arguments,
             timeout_seconds=self.settings.timeout_seconds,
             input_text=input_text,
         )
+
+    @staticmethod
+    def _parse_object(raw: str) -> Mapping[str, Any]:
         try:
             document = json.loads(raw)
         except json.JSONDecodeError as error:
@@ -197,6 +221,56 @@ class AtaniCliAdapter:
         if not isinstance(document, dict):
             raise AdapterProtocolError("Atani returned a non-object JSON response")
         return document
+
+    @staticmethod
+    def _unavailable(result: CommandResult) -> AdapterUnavailable:
+        """Atani's own reason for a non-zero exit, not a generic pointer.
+
+        The far side writes "Atani error: <why>" to stderr; discarding it and
+        saying only "run atani doctor" turned a specific, actionable failure into
+        a shrug. Surface the reason it actually gave.
+        """
+
+        reason = result.stderr.strip().splitlines()[-1] if result.stderr.strip() else ""
+        detail = reason or f"Atani exited with status {result.returncode}; run `atani doctor` locally"
+        return AdapterUnavailable(detail)
+
+    def _json(
+        self,
+        arguments: Sequence[str],
+        *,
+        input_text: str | None = None,
+    ) -> Mapping[str, Any]:
+        """A plain JSON command (chat, status) where a non-zero exit is fatal."""
+
+        result = self._run(arguments, input_text=input_text)
+        if result.returncode != 0:
+            raise self._unavailable(result)
+        return self._parse_object(result.stdout)
+
+    def _executive_outcome(self, result: CommandResult) -> Mapping[str, Any]:
+        """The executive's structured outcome, read from stdout before the exit code.
+
+        A failed or paused goal is a real Manager result, not an unavailable
+        specialist, and Atani writes it to stdout while exiting non-zero. So the
+        outcome is honoured whenever stdout carries a known status; only when
+        stdout holds no outcome at all is the non-zero exit treated as a failure,
+        and then with Atani's own stderr reason rather than a generic one.
+        """
+
+        stdout = result.stdout.strip()
+        if stdout:
+            try:
+                document = json.loads(stdout)
+            except json.JSONDecodeError:
+                document = None
+            if isinstance(document, dict) and document.get("status") in _EXECUTIVE_STATUSES:
+                return document
+        if result.returncode != 0:
+            raise self._unavailable(result)
+        # Exit 0 but no recognisable outcome is a contract break, not a downed
+        # specialist: the call ran and produced something Pionir cannot read.
+        raise AdapterProtocolError("Atani returned no executive outcome")
 
     def status(self) -> Mapping[str, Any]:
         return self._json(("status",))
@@ -211,15 +285,12 @@ class AtaniCliAdapter:
             serialized = json.dumps(request, ensure_ascii=False)
             if len(serialized) > 250_000:
                 raise AdapterProtocolError("Atani executive request exceeds 250000 characters")
-            document = self._json(("executive",), input_text=serialized)
+            document = self._executive_outcome(
+                self._run(("executive",), input_text=serialized)
+            )
             goal_id = str(document.get("goal_id") or "").strip()
             status = str(document.get("status") or "").strip()
-            if not goal_id or status not in {
-                "completed",
-                "waiting_approval",
-                "paused",
-                "failed",
-            }:
+            if not goal_id or status not in _EXECUTIVE_STATUSES:
                 raise AdapterProtocolError("Atani returned an invalid executive outcome")
             return TaskResult(
                 task_id=task.task_id,

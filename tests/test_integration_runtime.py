@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pionir.adapters.atani_cli import AtaniCliAdapter
+from pionir.adapters.atani_cli import AtaniCliAdapter, CommandResult
 from pionir.adapters.bryo_status import BryoStatusAdapter, BryoStatusSettings
 from pionir.audit import JsonlAuditSink
 from pionir.contracts import Task
@@ -12,9 +12,11 @@ from pionir.scheduler import ModelLeaseScheduler
 
 
 class AtaniRunner:
-    def run(self, arguments, *, timeout_seconds: int, input_text=None) -> str:
+    def run(self, arguments, *, timeout_seconds: int, input_text=None) -> CommandResult:
         del input_text
-        return json.dumps({"answer": "Atani answer", "cycle_id": "sim-1"})
+        return CommandResult(
+            0, json.dumps({"answer": "Atani answer", "cycle_id": "sim-1"}), ""
+        )
 
 
 class BryoRunner:
