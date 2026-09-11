@@ -155,7 +155,10 @@ class UiTests(unittest.TestCase):
     def test_dashboard_html_ships_and_names_itself(self) -> None:
         body = _ui_bytes()
         self.assertIn(b"<title>Pionir</title>", body)
-        self.assertIn(b"/api/route", body)
+        # the observatory reads live state, the ledger and health; it no longer
+        # drives the brain (Ian talks to Moss, who routes here).
+        self.assertIn(b"/api/state", body)
+        self.assertIn(b"/api/audit", body)
 
 
 if __name__ == "__main__":
