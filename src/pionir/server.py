@@ -32,6 +32,13 @@ from .scheduler import observed_free_vram_mb
 MAX_REQUEST_BYTES = 1_000_000
 _UI_PATH = Path(__file__).parent / "web" / "dashboard.html"
 
+# What the voice may trigger on her own through /api/intent. Reasoning has no
+# side effect; Daedalus is allowed only in dry_run (plans, lands nothing).
+# Everything else - Melete's shell, the executive, landing code - is gated to
+# Ian's approval. See PionirApp.intent.
+_VOICE_REASONING = frozenset({"reasoning.atani_answer", "reasoning.atani_depth"})
+_VOICE_DRYRUN_CODING = "coding.daedalus_solve"
+
 
 def _decision_json(decision: RoutingDecision) -> dict[str, Any]:
     return {
@@ -189,6 +196,58 @@ class PionirApp:
             "evidence": list(result.evidence),
         }
 
+    def intent(self, request: str) -> dict[str, Any]:
+        """The voice's hands: turn an intent Galatea formed into a real action.
+
+        This is the Brain->doer seam, and it is deliberately narrow. Galatea is a
+        language model that will narrate an action it never took, so what she may
+        trigger on her own is only what has no side effect: Atani reasoning, and
+        Daedalus in dry_run - a real coding run that plans and shows its work but
+        lands nothing. Anything that touches the world - Melete's shell, the
+        Atani executive, or landing code - is returned as needs_approval and is
+        NOT run; Ian grants those from the dashboard. The safety lives here, on
+        the server, not in whatever permissions the caller sends, so the voice
+        cannot widen her own reach.
+        """
+
+        decision = self.router.classify(request)
+        base = {"decision": _decision_json(decision)}
+        if not decision.resolved:
+            return {**base, "status": "unclear", "question": decision.question()}
+        cap = decision.capability
+        if cap == "conversation.galatea_reply":
+            return {**base, "status": "self", "note": "that routes back to the voice - answer it yourself"}
+        if cap in _VOICE_REASONING:
+            return self._run_intent(cap, {"content": request}, frozenset({"atani.chat"}), decision)
+        if cap == _VOICE_DRYRUN_CODING:
+            return self._run_intent(
+                cap, {"content": request, "dry_run": True}, frozenset({"daedalus.solve"}), decision, planned=True
+            )
+        return {
+            **base,
+            "status": "needs_approval",
+            "capability": cap,
+            "note": "this acts on the world (shell, files, or landing changes); it needs Ian's approval and was not run",
+        }
+
+    def _run_intent(self, capability, payload, permissions, decision, *, planned=False):
+        try:
+            result = self.runtime.executive.execute(Task(capability, payload, permissions))
+        except Exception as error:  # noqa: BLE001 - returned to the voice as data
+            return {
+                "decision": _decision_json(decision),
+                "status": "error",
+                "error": {"type": type(error).__name__, "message": str(error)},
+            }
+        return {
+            "decision": _decision_json(decision),
+            "status": "planned" if planned else "done",
+            "planned": planned,
+            "agent_id": result.agent_id,
+            "result": _jsonable(result.output),
+            "evidence": list(result.evidence),
+        }
+
     def run_task(
         self,
         capability: str,
@@ -291,6 +350,12 @@ def _make_handler(app: PionirApp):
                             execute=bool(body.get("execute", True)),
                         )
                     )
+                elif route.path == "/api/intent":
+                    request = str(body.get("request", "") or body.get("intent", "")).strip()
+                    if not request:
+                        self._send({"error": "intent is required"}, 400)
+                        return
+                    self._send(app.intent(request))
                 elif route.path == "/api/task":
                     capability = str(body.get("capability", "")).strip()
                     if not capability:

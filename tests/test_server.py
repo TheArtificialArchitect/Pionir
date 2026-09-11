@@ -18,9 +18,18 @@ from pionir.server import PionirApp, _ui_bytes
 
 
 def _runtime(tmp: str):
-    # Galatea is opt-in (unset here); Atani, Daedalus and Melete register by
-    # default. None is probed at bootstrap, so this builds offline.
-    return build_runtime(PionirSettings(state_root=Path(tmp)))
+    # Hermetic: every specialist registers, but Daedalus/Melete point at dead
+    # ports and Galatea's model is pinned (no /health probe), so bootstrap does
+    # no network and an executed intent fails fast instead of running for real.
+    return build_runtime(
+        PionirSettings(
+            state_root=Path(tmp),
+            galatea_url="http://127.0.0.1:8799",
+            galatea_model_id="stub-model",
+            daedalus_url="http://127.0.0.1:9998",
+            melete_url="http://127.0.0.1:9999",
+        )
+    )
 
 
 class PionirAppTests(unittest.TestCase):
@@ -83,6 +92,34 @@ class PionirAppTests(unittest.TestCase):
         self.assertEqual(audit["integrity"], "verified")
         self.assertEqual(audit["events_total"], 1)
         self.assertEqual(audit["events"][0]["agent_id"], "atani")
+
+    def test_intent_gates_shell_and_the_executive_to_approval(self) -> None:
+        # The voice must NOT be able to run Melete's shell or the Atani executive
+        # on her own - these act on the world. They come back needs_approval and
+        # are not executed.
+        shell = self.app.intent("run a shell command to list files")
+        self.assertEqual(shell["status"], "needs_approval")
+        self.assertEqual(shell["decision"]["capability"], "tools.melete_invoke")
+        plan = self.app.intent("run this versioned plan through the executive")
+        self.assertEqual(plan["status"], "needs_approval")
+
+    def test_intent_hands_conversation_back_to_the_voice(self) -> None:
+        out = self.app.intent("let's just chat for a while")
+        self.assertEqual(out["status"], "self")
+
+    def test_intent_asks_when_it_cannot_tell(self) -> None:
+        out = self.app.intent("photosynthesis in tomato plants")
+        self.assertEqual(out["status"], "unclear")
+
+    def test_a_coding_intent_takes_the_dryrun_path_not_approval(self) -> None:
+        # "write code..." must route to Daedalus in dry_run, never to the
+        # needs_approval gate. Daedalus is unreachable in this test runtime, so it
+        # surfaces as error - but the point is the branch: it tried to run
+        # plan-only Daedalus, it did not refuse as a world-changing action.
+        out = self.app.intent("refactor this function and implement the fix")
+        self.assertEqual(out["decision"]["capability"], "coding.daedalus_solve")
+        self.assertNotEqual(out["status"], "needs_approval")
+        self.assertIn(out["status"], {"planned", "error"})
 
     def test_gpu_view_never_raises_without_a_card(self) -> None:
         gpu = self.app.gpu()
