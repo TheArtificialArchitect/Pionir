@@ -47,6 +47,13 @@ def _parser() -> argparse.ArgumentParser:
         description="Resource-aware orchestration for Ian's specialist AI agents",
     )
     commands = parser.add_subparsers(dest="command", required=True)
+    server = commands.add_parser(
+        "server", help="run the Pionir dashboard: see the brain and drive it"
+    )
+    server.add_argument("--port", type=int, default=8780)
+    server.add_argument(
+        "--no-browser", action="store_true", help="do not open the dashboard in a browser"
+    )
     commands.add_parser("doctor", help="check state integrity and specialist reachability")
     commands.add_parser("capabilities", help="show registered specialist contracts")
     commands.add_parser("audit-verify", help="verify the durable audit hash chain")
@@ -350,6 +357,12 @@ def _capabilities(runtime: PionirRuntime) -> list[dict[str, Any]]:
 
 
 def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
+    if args.command == "server":
+        # Imported here, not at module load: server imports this module, so a
+        # top-level import would be circular.
+        from .server import serve
+
+        return serve(runtime, port=args.port, open_browser=not args.no_browser)
     if args.command == "doctor":
         report = _doctor(runtime)
         _print(report)

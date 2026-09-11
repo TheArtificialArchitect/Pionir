@@ -61,6 +61,33 @@ class JsonlAuditSink:
             self._sequence = int(body["sequence"])
             self._last_hash = digest
 
+    def recent(self, limit: int = 50) -> list[dict[str, Any]]:
+        """The last ``limit`` ledger events, newest first, for a live view.
+
+        Read-only and best-effort: the dashboard polls this often and a display
+        must never take the ledger's integrity down, so a read error yields an
+        empty list rather than raising - ``verify()`` is the call that judges
+        integrity, not this one. Events are already metadata-only by design.
+        """
+
+        if limit <= 0 or not self.path.exists():
+            return []
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            return []
+        events: list[dict[str, Any]] = []
+        for line in reversed(lines):
+            if len(events) >= limit:
+                break
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                events.append(record)
+        return events
+
     def verify(self) -> tuple[int, str]:
         """Return the final sequence/hash, or fail on truncation, edits, or reordering."""
 

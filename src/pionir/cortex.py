@@ -35,12 +35,14 @@ Psyche/Bram, reimplemented here; Bram's own tree is untouched.
 from __future__ import annotations
 
 import array
+import functools
 import json
 import urllib.error
 import urllib.request
 import math
 import re
 import sqlite3
+import threading
 import time
 from collections import Counter
 from dataclasses import dataclass, field
@@ -199,6 +201,23 @@ def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     return dot / math.sqrt(na * nb)
 
 
+def _synchronized(method):
+    """Hold the cortex lock for a whole public method.
+
+    The lock is reentrant, so a guarded method may call another (``remember`` ->
+    ``remember_many``) without deadlock, and the whole call - all its statements
+    and its commit - is one critical section rather than a race between threads
+    sharing the one connection.
+    """
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class Cortex:
     """SQLite-backed relevance memory: lexical BM25, optionally fused with a
     semantic embedding recall when an Embedder is supplied. Stdlib only; the
@@ -212,12 +231,20 @@ class Cortex:
         self.path = Path(path)
         if self.path.parent and str(self.path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(str(self.path))
+        # check_same_thread=False plus a reentrant lock (see _synchronized): the
+        # CLI is single-threaded, but the dashboard's ThreadingHTTPServer touches
+        # the store from per-request threads (doctor reads stats, a tripped
+        # circuit records a lesson). The lock is held for whole methods, not
+        # single statements, so a multi-statement transaction stays atomic
+        # instead of interleaving with another thread's write.
+        self._lock = threading.RLock()
+        self._db = sqlite3.connect(str(self.path), check_same_thread=False)
         self._db.row_factory = sqlite3.Row
         self._db.executescript(_SCHEMA)
         self._db.commit()
 
     # ------------------------------------------------------------------ write
+    @_synchronized
     def remember(
         self,
         kind: str,
@@ -235,6 +262,7 @@ class Cortex:
         )
         return ids[0]
 
+    @_synchronized
     def remember_many(self, items: Iterable[NewMemory]) -> list[int]:
         """Batch write. The whole point of batching lives here: one transaction,
         no per-row indexing work, so importing twelve thousand rows is twelve
@@ -294,6 +322,7 @@ class Cortex:
         self._db.commit()
         return len(ids)
 
+    @_synchronized
     def reindex(self) -> int:
         """Embed every active memory that lacks a vector for the current model,
         in batches. Run after enabling an embedder on an existing store, or after
@@ -316,6 +345,7 @@ class Cortex:
             done += self._embed_and_store([r["id"] for r in batch], [r["text"] for r in batch])
         return done
 
+    @_synchronized
     def forget(self, memory_id: int) -> bool:
         """Retire a memory. Soft delete - a one-way hard delete is a door with no
         way back (HEAD 3.2); active=0 keeps it recoverable and out of recall."""
@@ -324,10 +354,12 @@ class Cortex:
         return cur.rowcount > 0
 
     # ------------------------------------------------------------------ read
+    @_synchronized
     def get(self, memory_id: int) -> Memory | None:
         row = self._db.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
         return self._row_to_memory(row) if row else None
 
+    @_synchronized
     def recall(
         self,
         query: str,
@@ -516,6 +548,7 @@ class Cortex:
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return scored
 
+    @_synchronized
     def memories(
         self, namespace: str, *, kind: str | None = None, limit: int = 1000
     ) -> list[Memory]:
@@ -533,6 +566,7 @@ class Cortex:
         )
         return [self._row_to_memory(r) for r in rows]
 
+    @_synchronized
     def stats(self) -> dict[str, Any]:
         """Counts, so a caller can prove the store is not empty - the wired-but-inert
         check (HEAD 3.1): a memory system that recalls nothing looks identical to one
@@ -570,6 +604,7 @@ class Cortex:
             "embedded": embedded,
         }
 
+    @_synchronized
     def close(self) -> None:
         self._db.close()
 
@@ -607,6 +642,7 @@ class Cortex:
         )
 
     # ---------------------------------------------------------------- lessons
+    @_synchronized
     def record_lesson(
         self,
         text: str,
@@ -630,6 +666,7 @@ class Cortex:
             meta=meta,
         )
 
+    @_synchronized
     def lessons_for(self, context: str, k: int = 3) -> list[Memory]:
         """The recall-before-act hook: the lessons relevant to what is about to
         happen. Call it with the intent - the task, the plan, the thing being

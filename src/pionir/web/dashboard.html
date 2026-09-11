@@ -1,0 +1,396 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pionir</title>
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#111823; --panel2:#0d141d; --edge:#1e2a3a;
+    --ink:#c7d3e0; --dim:#7d8da0; --faint:#4a5a6e;
+    --cyan:#39d0d8; --cyan-dim:#1f6b70; --green:#3ecf8e; --amber:#e6b64c;
+    --red:#e5484d; --violet:#9d7be0; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 600px at 70% -10%,#12202c 0%,var(--bg) 60%);
+    color:var(--ink);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;min-height:100vh}
+  a{color:var(--cyan)}
+  .wrap{max-width:1240px;margin:0 auto;padding:22px 16px 60px}
+  header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+  h1{font:600 22px/1 var(--mono);letter-spacing:3px;margin:0;color:#fff}
+  h1 .dot{color:var(--cyan)}
+  .sub{color:var(--dim);font-size:12.5px}
+  .statusline{margin:8px 0 20px;color:var(--dim);font-family:var(--mono);font-size:12px;
+    display:flex;gap:18px;flex-wrap:wrap}
+  .statusline b{color:var(--ink);font-weight:600}
+  .grid{display:grid;grid-template-columns:1.35fr 1fr;gap:18px}
+  @media(max-width:880px){.grid{grid-template-columns:1fr}}
+  .panel{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--edge);
+    border-radius:12px;padding:16px}
+  .panel h2{font:600 11px/1 var(--mono);letter-spacing:2px;text-transform:uppercase;
+    color:var(--dim);margin:0 0 14px}
+  /* console */
+  .console textarea{width:100%;min-height:74px;resize:vertical;background:#08111a;color:var(--ink);
+    border:1px solid var(--edge);border-radius:9px;padding:11px 12px;font:14px/1.5 var(--mono);outline:none}
+  .console textarea:focus{border-color:var(--cyan-dim)}
+  .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:10px}
+  button{background:#15202e;color:var(--ink);border:1px solid var(--edge);border-radius:8px;
+    padding:8px 14px;font:600 13px/1 system-ui;cursor:pointer}
+  button:hover{border-color:var(--cyan-dim);color:#fff}
+  button.go{background:linear-gradient(180deg,#16b6bf,#0f8f97);border-color:#0f8f97;color:#04171a}
+  button.go:hover{filter:brightness(1.08)}
+  button.warn{background:#2a1a10;border-color:#5a3a20;color:var(--amber)}
+  button.warn:hover{border-color:var(--amber)}
+  button:disabled{opacity:.5;cursor:default}
+  .spacer{flex:1}
+  .hint{color:var(--faint);font-size:12px}
+  /* decision */
+  .decision{margin-top:16px;border:1px solid var(--edge);border-radius:10px;padding:14px;background:#0b1420;display:none}
+  .decision.show{display:block}
+  .routed{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+  .routed .to{font:600 16px/1 var(--mono);color:#fff}
+  .routed .to.ask{color:var(--amber)}
+  .agent-badge{font:600 10px/1 var(--mono);letter-spacing:1px;text-transform:uppercase;padding:3px 7px;
+    border-radius:5px;background:#0f2a2c;color:var(--cyan);border:1px solid var(--cyan-dim)}
+  .conf{margin:11px 0 6px;height:7px;border-radius:4px;background:#0a1119;overflow:hidden}
+  .conf > i{display:block;height:100%;background:linear-gradient(90deg,var(--cyan),var(--green))}
+  .conf.ask > i{background:linear-gradient(90deg,#7a5a1a,var(--amber))}
+  .why{color:var(--dim);font-size:12.5px;font-family:var(--mono)}
+  .cands{margin-top:9px;display:flex;flex-direction:column;gap:3px}
+  .cand{display:flex;justify-content:space-between;gap:10px;font-family:var(--mono);font-size:11.5px;color:var(--faint)}
+  .cand b{color:var(--dim);font-weight:500}
+  /* result */
+  .result{margin-top:14px;border-left:2px solid var(--cyan-dim);padding:2px 0 2px 13px;display:none}
+  .result.show{display:block}
+  .reply{white-space:pre-wrap;font-size:14.5px;color:#e8eef5}
+  pre{white-space:pre-wrap;word-break:break-word;font:12px/1.5 var(--mono);color:var(--dim);
+    background:#08111a;border:1px solid var(--edge);border-radius:8px;padding:11px;margin:8px 0 0;max-height:340px;overflow:auto}
+  .evidence{margin-top:8px;color:var(--faint);font:11px/1.4 var(--mono)}
+  .err{color:var(--red);font-family:var(--mono);font-size:13px}
+  .confirm{margin-top:12px;border:1px solid #5a3a20;background:#1c1206;border-radius:9px;padding:12px;display:none}
+  .confirm.show{display:block}
+  .confirm p{margin:0 0 9px;color:var(--amber);font-size:13px}
+  /* side panels */
+  .stack{display:flex;flex-direction:column;gap:18px}
+  .spec{border:1px solid var(--edge);border-radius:9px;padding:10px 12px;margin-bottom:9px;background:#0b1420}
+  .spec:last-child{margin-bottom:0}
+  .spec .top{display:flex;align-items:center;gap:8px}
+  .hd{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none;box-shadow:0 0 0 0 transparent}
+  .hd.up{background:var(--green);box-shadow:0 0 8px 0 rgba(62,207,142,.6)}
+  .hd.down{background:var(--red)}
+  .hd.na{background:var(--faint)}
+  .spec .id{font:600 13px/1 var(--mono);color:#fff;flex:1}
+  .spec .model{font:11px/1 var(--mono);color:var(--faint)}
+  .caps{margin:8px 0 0;display:flex;flex-direction:column;gap:5px}
+  .cap{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11.5px;color:var(--dim)}
+  .risk{font-size:9px;letter-spacing:.5px;padding:2px 5px;border-radius:4px;text-transform:uppercase;font-weight:700}
+  .risk.read_only{background:#0f2320;color:var(--green)}
+  .risk.reversible_write{background:#0f1e2a;color:var(--cyan)}
+  .risk.privileged{background:#2a1220;color:#e07b9d;border:1px solid #5a2438}
+  /* gpu */
+  .bar{height:20px;border-radius:6px;background:#0a1119;border:1px solid var(--edge);overflow:hidden;position:relative}
+  .bar > i{display:block;height:100%;background:linear-gradient(90deg,var(--cyan-dim),var(--cyan))}
+  .bar > span{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    font:11px/1 var(--mono);color:#cfe;text-shadow:0 1px 2px #000}
+  .kv{display:flex;justify-content:space-between;font-family:var(--mono);font-size:12px;color:var(--dim);margin-top:8px}
+  .kv b{color:var(--ink);font-weight:600}
+  .resident{margin-top:9px;display:flex;flex-direction:column;gap:4px}
+  .resident .m{font:11px/1.3 var(--mono);color:var(--faint)}
+  .resident .m b{color:var(--cyan);font-weight:500}
+  /* ledger */
+  .ledger{display:flex;flex-direction:column;gap:0;max-height:300px;overflow:auto;font-family:var(--mono)}
+  .ev{display:grid;grid-template-columns:64px 1fr auto;gap:9px;padding:6px 0;border-top:1px solid #131d29;font-size:11.5px}
+  .ev:first-child{border-top:0}
+  .ev .t{color:var(--faint)}
+  .ev .who{color:var(--ink)}
+  .ev .what{color:var(--dim);text-align:right;white-space:nowrap}
+  .ev .what.routed{color:var(--cyan)}
+  .ev .what.completed{color:var(--green)}
+  .ev .what.failed{color:var(--red)}
+  details{margin-top:18px}
+  summary{cursor:pointer;color:var(--dim);font:600 11px/1 var(--mono);letter-spacing:2px;text-transform:uppercase}
+  .adv{margin-top:12px;display:flex;flex-direction:column;gap:9px}
+  .adv input,.adv select,.adv textarea{background:#08111a;color:var(--ink);border:1px solid var(--edge);
+    border-radius:7px;padding:8px 10px;font:12px/1.4 var(--mono);width:100%}
+  label.perm{display:inline-flex;align-items:center;gap:6px;font:11px/1 var(--mono);color:var(--dim);
+    padding:6px 9px;border:1px solid var(--edge);border-radius:7px;cursor:pointer;user-select:none}
+  label.perm input{accent-color:var(--cyan)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>PIONIR<span class="dot">.</span></h1>
+    <span class="sub">the brain — routing, resource-aware, gated</span>
+  </header>
+  <div class="statusline" id="statusline">
+    <span>server <b id="s-server">…</b></span>
+    <span>specialists <b id="s-count">—</b></span>
+    <span>ledger <b id="s-ledger">—</b></span>
+    <span>free VRAM <b id="s-vram">—</b></span>
+  </div>
+
+  <div class="grid">
+    <section class="panel console">
+      <h2>Console — talk to the brain</h2>
+      <textarea id="req" placeholder="Say something to Moss, ask Atani to reason, tell Daedalus to fix a bug, hand Melete a tool… Pionir decides who answers."></textarea>
+      <div class="row">
+        <button class="go" id="route">Route ▶</button>
+        <button id="explain">Explain only</button>
+        <span class="spacer"></span>
+        <span class="hint">Ctrl+Enter routes</span>
+      </div>
+      <div class="row" id="perms" style="margin-top:8px"></div>
+
+      <div class="decision" id="decision">
+        <div class="routed">
+          <span class="to" id="routed-to">—</span>
+          <span class="agent-badge" id="routed-agent" style="display:none"></span>
+          <span class="spacer"></span>
+          <span class="why" id="conf-num"></span>
+        </div>
+        <div class="conf" id="conf-bar"><i style="width:0"></i></div>
+        <div class="why" id="reason"></div>
+        <div class="cands" id="cands"></div>
+        <div class="confirm" id="confirm">
+          <p id="confirm-msg"></p>
+          <button class="warn" id="confirm-run">Grant &amp; run</button>
+          <button id="confirm-cancel">Cancel</button>
+        </div>
+      </div>
+
+      <div class="result" id="result">
+        <div class="reply" id="reply"></div>
+        <div id="result-json"></div>
+        <div class="evidence" id="evidence"></div>
+      </div>
+
+      <details>
+        <summary>Advanced — invoke a capability directly</summary>
+        <div class="adv">
+          <select id="adv-cap"></select>
+          <textarea id="adv-payload" rows="4" placeholder='{"content":"…"}  or an executive goal object'></textarea>
+          <div class="row">
+            <button class="warn" id="adv-run">Run capability</button>
+            <span class="hint">privileged capabilities run with their permission granted</span>
+          </div>
+          <div id="adv-out"></div>
+        </div>
+      </details>
+    </section>
+
+    <div class="stack">
+      <section class="panel">
+        <h2>Roster</h2>
+        <div id="roster"></div>
+      </section>
+      <section class="panel">
+        <h2>GPU · VRAM</h2>
+        <div class="bar" id="vram-bar"><i style="width:0"></i><span id="vram-text">—</span></div>
+        <div class="kv"><span>observed free</span><b id="vram-free">—</b></div>
+        <div class="kv"><span>usable budget</span><b id="vram-budget">—</b></div>
+        <div class="resident" id="resident"></div>
+      </section>
+      <section class="panel">
+        <h2>Audit ledger</h2>
+        <div class="ledger" id="ledger"></div>
+      </section>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const PERMS = ["atani.chat","atani.executive","daedalus.solve","melete.invoke"];
+let ROSTER = [], HEALTH = {}, RISK = {};
+
+async function jget(u){ const r = await fetch(u); return r.json(); }
+async function jpost(u,b){ const r = await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}); return r.json(); }
+
+function grantedPerms(){ return PERMS.filter(p => { const el = document.getElementById("perm-"+p); return el && el.checked; }); }
+
+function renderPerms(){
+  const box = $("#perms"); box.innerHTML = "";
+  for(const p of PERMS){
+    const priv = p !== "atani.chat";
+    const l = document.createElement("label"); l.className="perm";
+    l.innerHTML = `<input type="checkbox" id="perm-${p}" ${priv?"":"checked"}> ${p}`;
+    box.appendChild(l);
+  }
+}
+
+function fmtMB(v){ return v==null? "—" : (v>=1024 ? (v/1024).toFixed(1)+" GB" : v+" MB"); }
+
+function renderDecision(d, opts={}){
+  $("#decision").classList.add("show");
+  const ask = !d.resolved;
+  const to = $("#routed-to"); to.textContent = d.capability || "ASK — no confident route"; to.className = "to"+(ask?" ask":"");
+  const conf = Math.round((d.confidence||0)*100);
+  $("#conf-bar").className = "conf"+(ask?" ask":""); $("#conf-bar").firstElementChild.style.width = conf+"%";
+  $("#conf-num").textContent = "confidence " + conf + "%";
+  $("#reason").textContent = "reason: " + d.reason + (d.runner_up? "  ·  runner-up: "+d.runner_up : "");
+  const c = $("#cands"); c.innerHTML = "";
+  for(const cand of (d.candidates||[])){
+    const row = document.createElement("div"); row.className="cand";
+    row.innerHTML = `<b>${cand.capability}</b><span>${(cand.matched||[]).join(" ")||"·"} · ${cand.score}</span>`;
+    c.appendChild(row);
+  }
+  const agent = $("#routed-agent");
+  agent.style.display = "none";
+}
+
+function renderResult(res){
+  $("#result").classList.add("show");
+  const reply = $("#reply"), rjson = $("#result-json"), ev = $("#evidence");
+  reply.textContent=""; rjson.innerHTML=""; ev.textContent="";
+  $("#routed-agent").textContent = res.agent_id||""; $("#routed-agent").style.display = res.agent_id? "inline-block":"none";
+  const out = res.result || {};
+  if(typeof out.reply === "string"){ reply.textContent = out.reply; }
+  else if(typeof out.answer === "string"){ reply.textContent = out.answer; }
+  else if(typeof out.result === "string"){ reply.textContent = out.result; }
+  const pre = document.createElement("pre"); pre.textContent = JSON.stringify(out,null,2); rjson.appendChild(pre);
+  if(res.evidence && res.evidence.length) ev.textContent = "evidence: " + res.evidence.join("  ·  ");
+}
+
+function renderError(e){
+  $("#result").classList.add("show");
+  $("#reply").innerHTML = `<span class="err">${e.type}: ${e.message}</span>`;
+  $("#result-json").innerHTML=""; $("#evidence").textContent="";
+}
+
+let PENDING = null; // a privileged request awaiting confirm
+
+async function doRoute(execute){
+  const request = $("#req").value.trim(); if(!request) return;
+  $("#confirm").classList.remove("show"); $("#result").classList.remove("show");
+  const res = await jpost("/api/route",{request, permissions:grantedPerms(), execute});
+  renderDecision(res.decision);
+  if(!execute){ $("#result").classList.remove("show"); return; }
+  if(res.error){
+    if(res.error.type === "PermissionDenied"){
+      // full control, behind a confirm: offer to grant the needed permission and rerun
+      const cap = res.decision.capability;
+      PENDING = {request, cap};
+      $("#confirm-msg").textContent = `${cap} is a privileged action and needs its permission. Grant it and run?`;
+      $("#confirm").classList.add("show");
+      return;
+    }
+    renderError(res.error); return;
+  }
+  if(res.executed){ renderResult(res); }
+  else if(res.question){ $("#reply").textContent=""; $("#result-json").innerHTML=`<pre>${res.question}</pre>`; $("#result").classList.add("show"); }
+}
+
+function neededPermFor(cap){
+  if(cap==="reasoning.atani_answer"||cap==="reasoning.atani_depth") return "atani.chat";
+  if(cap==="executive.atani_run") return "atani.executive";
+  if(cap==="coding.daedalus_solve") return "daedalus.solve";
+  if(cap==="tools.melete_invoke") return "melete.invoke";
+  return null;
+}
+
+$("#confirm-run").onclick = async () => {
+  if(!PENDING) return;
+  const perm = neededPermFor(PENDING.cap);
+  const perms = grantedPerms(); if(perm && !perms.includes(perm)) perms.push(perm);
+  $("#confirm").classList.remove("show");
+  const res = await jpost("/api/route",{request:PENDING.request, permissions:perms, execute:true});
+  renderDecision(res.decision);
+  if(res.error) renderError(res.error); else if(res.executed) renderResult(res);
+  PENDING=null;
+};
+$("#confirm-cancel").onclick = () => { $("#confirm").classList.remove("show"); PENDING=null; };
+$("#route").onclick = () => doRoute(true);
+$("#explain").onclick = () => doRoute(false);
+$("#req").addEventListener("keydown", e => { if(e.key==="Enter" && (e.ctrlKey||e.metaKey)) doRoute(true); });
+
+$("#adv-run").onclick = async () => {
+  const cap = $("#adv-cap").value; let payload={};
+  try{ payload = JSON.parse($("#adv-payload").value || "{}"); }catch(err){ $("#adv-out").innerHTML=`<span class="err">payload is not valid JSON</span>`; return; }
+  const perm = neededPermFor(cap); const perms = perm? [perm]:[];
+  const res = await jpost("/api/task",{capability:cap, payload, permissions:perms});
+  const pre = document.createElement("pre"); pre.textContent = JSON.stringify(res,null,2);
+  $("#adv-out").innerHTML=""; $("#adv-out").appendChild(pre);
+};
+
+function renderRoster(){
+  const box = $("#roster"); box.innerHTML="";
+  const byAgent = {};
+  for(const c of ROSTER){ (byAgent[c.agent_id] = byAgent[c.agent_id] || {version:c.agent_version, caps:[]}).caps.push(c); }
+  const advCap = $("#adv-cap"); const advNow = advCap.value; advCap.innerHTML="";
+  for(const [agent, info] of Object.entries(byAgent)){
+    const h = HEALTH[agent];
+    const hd = h==="ok"?"up": h==="unavailable"?"down": h==="not_configured"?"na":"na";
+    const div = document.createElement("div"); div.className="spec";
+    let caps = "";
+    for(const c of info.caps){
+      RISK[c.name]=c.risk;
+      caps += `<div class="cap"><span class="risk ${c.risk}">${c.risk.replace("_"," ")}</span>${c.name}</div>`;
+      const o=document.createElement("option"); o.value=c.name; o.textContent=c.name; advCap.appendChild(o);
+    }
+    const model = info.caps.map(c=>c.model&&c.model.id).find(Boolean) || "";
+    div.innerHTML = `<div class="top"><span class="hd ${hd}"></span><span class="id">${agent}</span>
+      <span class="model">${model}</span></div><div class="caps">${caps}</div>`;
+    box.appendChild(div);
+  }
+  if(advNow) advCap.value = advNow;
+}
+
+async function pollState(){
+  try{
+    const s = await jget("/api/state");
+    ROSTER = s.roster||[];
+    $("#s-count").textContent = new Set(ROSTER.map(c=>c.agent_id)).size;
+    const g = s.gpu||{};
+    $("#s-vram").textContent = fmtMB(g.observed_free_mb);
+    $("#vram-free").textContent = fmtMB(g.observed_free_mb);
+    $("#vram-budget").textContent = fmtMB(g.budget && g.budget.usable_mb);
+    if(g.total_mb){
+      const pct = Math.min(100, Math.round((g.used_mb/g.total_mb)*100));
+      $("#vram-bar").firstElementChild.style.width = pct+"%";
+      $("#vram-text").textContent = fmtMB(g.used_mb)+" / "+fmtMB(g.total_mb);
+    } else { $("#vram-text").textContent = "no GPU reading"; }
+    const rz = $("#resident"); rz.innerHTML="";
+    for(const m of (g.resident||[])){
+      const d=document.createElement("div"); d.className="m";
+      d.innerHTML = `<b>${m.fully_on_gpu?"●":"◍"}</b> ${m.name}`; rz.appendChild(d);
+    }
+    $("#s-server").textContent = "up"; $("#s-server").style.color="var(--green)";
+    renderRoster();
+  }catch(e){ $("#s-server").textContent="down"; $("#s-server").style.color="var(--red)"; }
+}
+
+async function pollAudit(){
+  try{
+    const a = await jget("/api/audit?n=60");
+    $("#s-ledger").textContent = (a.integrity==="verified"? a.events_total+" · verified" : a.integrity);
+    $("#s-ledger").style.color = a.integrity==="verified"? "var(--green)":"var(--red)";
+    const box = $("#ledger"); box.innerHTML="";
+    for(const e of (a.events||[])){
+      const type = (e.event_type||"").replace("task.","");
+      const t = (e.occurred_at||"").slice(11,19);
+      const div=document.createElement("div"); div.className="ev";
+      div.innerHTML = `<span class="t">${t}</span><span class="who">${e.agent_id||""}</span>
+        <span class="what ${type}">${type}</span>`;
+      box.appendChild(div);
+    }
+  }catch(e){}
+}
+
+async function pollDoctor(){
+  try{
+    const d = await jget("/api/doctor");
+    HEALTH = {};
+    for(const [k,v] of Object.entries(d.specialists||{})) HEALTH[k]=v.status;
+    renderRoster();
+  }catch(e){}
+}
+
+renderPerms();
+pollState(); pollAudit(); pollDoctor();
+setInterval(pollState, 4000);
+setInterval(pollAudit, 5000);
+setInterval(pollDoctor, 20000);
+</script>
+</body>
+</html>
