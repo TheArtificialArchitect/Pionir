@@ -109,6 +109,10 @@ class PionirApp:
         return {
             "roster": self.roster(),
             "gpu": self.gpu(),
+            # The voice's own URL, so the dashboard can embed her glass as its
+            # Voice view rather than opening her in a separate tab. None when no
+            # voice is configured, and the dashboard hides the view.
+            "voice_url": self.runtime.settings.galatea_url,
             "generated_at": datetime.now(UTC).isoformat(),
         }
 

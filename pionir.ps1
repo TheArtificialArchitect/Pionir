@@ -78,9 +78,11 @@ if (-not $NoVoice) {
     $env:PIONIR_GALATEA_URL = "http://127.0.0.1:8799"
     if (-not (Test-Port 8799)) {
         if (Test-Path $galatea) {
-            Write-Host "  waking Galatea in her own window..." -ForegroundColor DarkCyan
+            Write-Host "  waking Galatea (no separate tab; she lives in the dashboard)..." -ForegroundColor DarkCyan
+            # -NoBrowser: do not pop her own UI tab. Her glass is baked into the
+            # Pionir dashboard's Voice view instead, so there is one window, not two.
             Start-Process powershell -ArgumentList @(
-                "-NoExit", "-ExecutionPolicy", "Bypass", "-File", $galatea
+                "-NoExit", "-ExecutionPolicy", "Bypass", "-File", $galatea, "-NoBrowser"
             ) -WorkingDirectory (Split-Path -Parent $galatea)
         } else {
             Write-Host "  ! Galatea's launcher was not found at $galatea; skipping the voice." -ForegroundColor Yellow

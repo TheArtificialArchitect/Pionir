@@ -23,6 +23,14 @@
   .statusline{margin:8px 0 20px;color:var(--dim);font-family:var(--mono);font-size:12px;
     display:flex;gap:18px;flex-wrap:wrap}
   .statusline b{color:var(--ink);font-weight:600}
+  .tabs{display:flex;gap:2px;margin:0 0 18px;border-bottom:1px solid var(--edge)}
+  .tab{background:none;border:0;border-bottom:2px solid transparent;border-radius:0;
+    color:var(--dim);padding:9px 16px;font:600 11px/1 var(--mono);letter-spacing:2px;text-transform:uppercase}
+  .tab:hover{color:var(--ink)}
+  .tab.active{color:var(--cyan);border-bottom-color:var(--cyan)}
+  #view-voice{height:80vh;border:1px solid var(--edge);border-radius:12px;overflow:hidden;background:var(--panel)}
+  #voice-frame{width:100%;height:100%;border:0;display:block}
+  .voice-empty{padding:56px 24px;text-align:center;color:var(--dim);font-family:var(--mono);font-size:13px}
   .grid{display:grid;grid-template-columns:1.35fr 1fr;gap:18px}
   @media(max-width:880px){.grid{grid-template-columns:1fr}}
   .panel{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--edge);
@@ -130,6 +138,16 @@
     <span>free VRAM <b id="s-vram">—</b></span>
   </div>
 
+  <div class="tabs">
+    <button class="tab active" data-view="brain">Brain</button>
+    <button class="tab" data-view="voice" id="tab-voice" style="display:none">Voice · the glass</button>
+  </div>
+
+  <div id="view-voice" hidden>
+    <iframe id="voice-frame" title="Galatea"></iframe>
+  </div>
+
+  <div id="view-brain">
   <div class="grid">
     <section class="panel console">
       <h2>Console — talk to the brain</h2>
@@ -197,12 +215,26 @@
       </section>
     </div>
   </div>
+  </div><!-- view-brain -->
 </div>
 
 <script>
 const $ = s => document.querySelector(s);
 const PERMS = ["atani.chat","atani.executive","daedalus.solve","melete.invoke"];
-let ROSTER = [], HEALTH = {}, RISK = {};
+let ROSTER = [], HEALTH = {}, RISK = {}, VOICE_URL = null, VIEW = "brain";
+
+function setView(v){
+  VIEW = v;
+  document.getElementById("view-brain").hidden = v!=="brain";
+  document.getElementById("view-voice").hidden = v!=="voice";
+  document.querySelectorAll(".tab").forEach(t=>t.classList.toggle("active", t.dataset.view===v));
+  if(v==="voice"){
+    const f = document.getElementById("voice-frame");
+    if(VOICE_URL){ if(f.getAttribute("src")!==VOICE_URL) f.setAttribute("src", VOICE_URL); }
+    else { document.getElementById("view-voice").innerHTML = '<div class="voice-empty">No voice is wired in. Set PIONIR_GALATEA_URL and wake her.</div>'; }
+  }
+}
+document.querySelectorAll(".tab").forEach(t => t.onclick = () => setView(t.dataset.view));
 
 async function jget(u){ const r = await fetch(u); return r.json(); }
 async function jpost(u,b){ const r = await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}); return r.json(); }
@@ -340,6 +372,8 @@ async function pollState(){
   try{
     const s = await jget("/api/state");
     ROSTER = s.roster||[];
+    VOICE_URL = s.voice_url || null;
+    $("#tab-voice").style.display = VOICE_URL ? "" : "none";
     $("#s-count").textContent = new Set(ROSTER.map(c=>c.agent_id)).size;
     const g = s.gpu||{};
     $("#s-vram").textContent = fmtMB(g.observed_free_mb);
