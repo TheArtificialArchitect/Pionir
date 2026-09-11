@@ -5,20 +5,23 @@
 #   .\pionir.ps1 -Shortcut       put a "Pionir" launcher icon on the Desktop
 #   .\pionir.ps1 -NoVoice        don't wake Galatea
 #   .\pionir.ps1 -NoSpecialists  don't start Daedalus/Melete; reach whoever's already up
+#   .\pionir.ps1 -NoBryo         don't start Bryo, the observer organism
 #   .\pionir.ps1 -NoBrowser      don't open the dashboard in a browser
 #   .\pionir.ps1 -Port 8781      a different dashboard port
 #   .\pionir.ps1 -Stop           stop the whole stack from anywhere
 #
 # One window, every bridge a pane: with Windows Terminal (wt.exe) the dashboard
-# server, Galatea, Daedalus and Melete each get a titled pane in a single window.
-# Closing that window brings the whole stack down - wt kills every pane's process
-# tree on close (verified: ports free afterwards, no orphans). If wt.exe is not
-# present the launcher falls back to one window per bridge. It is a foreground
-# launcher Ian runs; it is never a service, autostart or Startup entry (rule 3).
+# server, Galatea, Daedalus, Melete and Bryo each get a titled pane in a single
+# window. Closing that window brings the whole stack down - wt kills every pane's
+# process tree on close (verified: ports free afterwards, no orphans). If wt.exe
+# is not present the launcher falls back to one window per bridge. It is a
+# foreground launcher Ian runs; it is never a service, autostart or Startup entry
+# (rule 3) - Bryo used to run from a logon-triggered task, and this replaces it.
 param(
     [switch]$Shortcut,
     [switch]$NoVoice,
     [switch]$NoSpecialists,
+    [switch]$NoBryo,
     [switch]$NoBrowser,
     [switch]$Stop,
     [int]$Port = 8780
@@ -52,6 +55,7 @@ if ($Shortcut) {
 $galateaDir  = Join-Path (Split-Path -Parent $root) "Galatea"
 $daedalusDir = if ($env:PIONIR_DAEDALUS_DIR) { $env:PIONIR_DAEDALUS_DIR } else { "C:\src\Tech-Support\daedalus" }
 $meleteDir   = if ($env:PIONIR_MELETE_DIR)   { $env:PIONIR_MELETE_DIR }   else { "C:\src\Tech-Support\melete" }
+$terrariumDir = if ($env:PIONIR_TERRARIUM_DIR) { $env:PIONIR_TERRARIUM_DIR } else { "C:\src\terrarium" }
 $srcDir      = Join-Path $root "src"
 $wt          = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\wt.exe"
 
@@ -70,6 +74,24 @@ function Stop-Port([int]$p, [string]$label) {
     }
 }
 
+function Stop-Bryo {
+    # Bryo has no port; he honours a KILL file at his repo root by checkpointing
+    # and exiting cleanly (heartbeat.py: governor.kill_requested -> _die). Write
+    # it, wait for the organism (not the viewer) to go, then remove it so the
+    # next launch isn't blocked.
+    $org = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match '-m bryo(\s|$)' -and $_.CommandLine -notmatch 'viewer' }
+    if (-not $org) { return }
+    $kill = Join-Path $terrariumDir "KILL"
+    Set-Content -Path $kill -Value "pionir.ps1 -Stop" -Encoding UTF8
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 700
+        if (-not (Get-Process -Id $org.ProcessId -ErrorAction SilentlyContinue)) { break }
+    }
+    Remove-Item $kill -ErrorAction SilentlyContinue
+    Write-Host "  stopped Bryo (clean checkpoint + exit)."
+}
+
 # One pane = one process tree wt kills on close. The command sets the pane's
 # title, moves to the bridge's directory and runs it, base64-encoded so no
 # quoting or ';' can be mangled by wt's own command-line parser.
@@ -86,6 +108,7 @@ if ($Stop) {
     Stop-Port 8799 "Galatea"
     Stop-Port 8771 "Daedalus"
     Stop-Port 8770 "Melete"
+    Stop-Bryo
     Write-Host "  stack stopped. (Closing the Pionir window does the same thing.)"
     exit 0
 }
@@ -131,6 +154,24 @@ if (-not $NoSpecialists) {
     } else { Write-Host "  ! Melete not found at $meleteDir; skipping." -ForegroundColor Yellow }
 }
 
+# Bryo, the observer organism. Foreground pane now, not a logon task: he lives
+# while the window is open and stops when it closes (crash-safe - he checkpoints
+# every tick and replays on restart). He takes a singleton pidfile lock, so skip
+# if one is already running. He has no port; he perceives Pionir by reading the
+# pulse the dashboard writes, so he only truly observes when the server is up too.
+$bryoStarted = $false
+if (-not $NoBryo) {
+    $bryoRunning = [bool](Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -match '-m bryo(\s|$)' -and $_.CommandLine -notmatch 'viewer' })
+    if ($bryoRunning) { Write-Host "  Bryo already alive; leaving him be." -ForegroundColor DarkCyan }
+    elseif (Test-Path $terrariumDir) {
+        # Clear a stale KILL so he doesn't checkpoint-and-exit the moment he boots.
+        Remove-Item (Join-Path $terrariumDir "KILL") -ErrorAction SilentlyContinue
+        $panes += ,(Pane-Cmd "Bryo (organism)" $terrariumDir "python -m bryo" "")
+        $bryoStarted = $true
+    } else { Write-Host "  ! terrarium not found at $terrariumDir; no Bryo this run." -ForegroundColor Yellow }
+}
+
 if ($panes.Count -eq 0) {
     Write-Host "  everything is already up; nothing to start." -ForegroundColor DarkCyan
     if (-not $NoBrowser -and (Test-Port $Port)) { Start-Process "http://127.0.0.1:$Port/" }
@@ -139,14 +180,18 @@ if ($panes.Count -eq 0) {
 
 $usedWt = $false
 if (Test-Path $wt) {
-    # Assemble one window: first pane is a new-tab, the rest split it into a grid.
-    # -w new forces a dedicated window rather than a tab in an existing one.
+    # Assemble one window: first pane is a new-tab; the second splits it into two
+    # columns; the rest fill down, alternating columns. Four panes -> a 2x2; five
+    # or more keep tiling without any fixed-size table. -w new forces a dedicated
+    # window rather than a tab grafted onto an existing one.
     $wtArgs = @("-w", "new", "new-tab") + $panes[0]
-    $splitDirs = @("-V", "-H", "-H")   # right, then down each side -> a 2x2 for four
     for ($i = 1; $i -lt $panes.Count; $i++) {
-        if ($i -eq 2) { $wtArgs += @(";", "move-focus", "left") }
-        if ($i -eq 3) { $wtArgs += @(";", "move-focus", "right") }
-        $wtArgs += @(";", "split-pane", $splitDirs[$i - 1]) + $panes[$i]
+        if ($i -eq 1) {
+            $wtArgs += @(";", "split-pane", "-V") + $panes[$i]      # two columns
+        } else {
+            $side = if ($i % 2 -eq 0) { "left" } else { "right" }  # fill each column down
+            $wtArgs += @(";", "move-focus", $side, ";", "split-pane", "-H") + $panes[$i]
+        }
     }
     Start-Process $wt -ArgumentList $wtArgs
     $usedWt = $true
@@ -175,6 +220,18 @@ while ($pending.Count -gt 0 -and (Get-Date) -lt $deadline) {
 foreach ($p in $ports) {
     if (Test-Port $p) { Write-Host ("  up   :{0}" -f $p) -ForegroundColor Green }
     else { Write-Host ("  DOWN :{0} - did not answer in time" -f $p) -ForegroundColor Red }
+}
+if ($bryoStarted) {
+    # Bryo has no port; verify the organism process actually came up.
+    $alive = $false
+    for ($i = 0; $i -lt 25; $i++) {
+        Start-Sleep -Milliseconds 800
+        $alive = [bool](Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -match '-m bryo(\s|$)' -and $_.CommandLine -notmatch 'viewer' })
+        if ($alive) { break }
+    }
+    if ($alive) { Write-Host "  up   :Bryo (organism alive)" -ForegroundColor Green }
+    else { Write-Host "  DOWN :Bryo - organism did not come up" -ForegroundColor Red }
 }
 if (-not $NoBrowser -and (Test-Port $Port)) { Start-Process "http://127.0.0.1:$Port/" }
 Write-Host "  ready." -ForegroundColor DarkCyan
