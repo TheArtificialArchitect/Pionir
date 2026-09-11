@@ -18,6 +18,7 @@ not refuse it here, the silent CPU fallback is what ships.
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -150,11 +151,23 @@ class ModelLeaseScheduler:
         *,
         vram_probe: Callable[[], int | None] | None = observed_free_vram_mb,
         residency_probe: Callable[[str], bool] | None = model_already_resident,
+        evict_to_fit: bool = True,
+        evictor: Callable[[str], None] | None = None,
+        loaded_probe: Callable[[], list[str]] | None = None,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.budget = budget or ResourceBudget()
         self.shared_gpu_lock = shared_gpu_lock
         self.vram_probe = vram_probe
         self.residency_probe = residency_probe
+        # When a needed model does not fit, evict idle resident models to make
+        # room (a 12B voice and a 7B doer cannot share a 12 GB card). Only done
+        # while holding the shared GPU lock, so a model in active use by a
+        # lock-holding participant is never pulled out from under it.
+        self.evict_to_fit = evict_to_fit
+        self.evictor = evictor
+        self.loaded_probe = loaded_probe
+        self._sleep = sleep
         self._active: dict[UUID, ModelRequirement] = {}
         self._lock = Lock()
 
@@ -169,6 +182,51 @@ class ModelLeaseScheduler:
             return requirement.context_vram_mb
         return requirement.total_vram_mb
 
+    def _make_room(self, needed_mb: int, target_model: str) -> int | None:
+        """Evict idle resident models other than the target until it fits.
+
+        Only reached while the shared GPU lock is held, so any tenant that
+        cooperates by holding the lock while it works is never touched - what is
+        sidelined is an idle model no one is generating against right now (the
+        voice's big model between turns, say). The driver frees the memory a
+        moment after Ollama unloads, so each eviction is followed by a short
+        settle before the space is believed.
+        """
+
+        # Eviction acts on the real daemon, so it is opt-in: it happens only when
+        # an evictor and a resident-model probe have been injected (bootstrap
+        # wires the real ones). A scheduler built without them - every test -
+        # never unloads anything, so running the suite cannot touch live models.
+        if (
+            not self.evict_to_fit
+            or self.vram_probe is None
+            or self.evictor is None
+            or self.loaded_probe is None
+        ):
+            return self.vram_probe() if self.vram_probe is not None else None
+        evict = self.evictor
+        try:
+            resident = list(self.loaded_probe())
+        except BenchmarkError:
+            return self.vram_probe()
+        target = canonical_model(target_model)
+        free = self.vram_probe()
+        for name in resident:
+            if free is not None and free >= needed_mb:
+                break
+            if canonical_model(name) == target:
+                continue
+            try:
+                evict(name)
+            except Exception:  # noqa: BLE001, S112 - a failed eviction just means no room freed
+                continue
+            for _ in range(10):  # settle: the driver frees VRAM shortly after unload
+                self._sleep(0.5)
+                free = self.vram_probe()
+                if free is not None and free >= needed_mb:
+                    break
+        return free
+
     def acquire(self, requirement: ModelRequirement) -> ModelLease:
         if requirement.requires_gpu and requirement.total_vram_mb > self.budget.usable_vram_mb:
             raise ResourceUnavailable(
@@ -176,37 +234,42 @@ class ModelLeaseScheduler:
                 f"budget allows {self.budget.usable_vram_mb} MB"
             )
 
-        # Probed before the mutex so a subprocess call is not held across it.
-        # With max_gpu_leases at one the shared lock is the real serialiser, so
-        # the window this opens is narrower than the reading is accurate.
-        if requirement.requires_gpu and self.vram_probe is not None:
-            free_mb = self.vram_probe()
-            needed_mb = self._marginal_vram_mb(requirement)
-            if free_mb is not None and needed_mb > free_mb:
+        # The shared GPU lock is taken before the VRAM check, not after: making
+        # room means sidelining another tenant's model, and that is only safe
+        # while holding the lock, which is what says no cooperating participant
+        # is using the card right now.
+        shared_lease: SharedGpuLease | None = None
+        if requirement.requires_gpu and self.shared_gpu_lock is not None:
+            shared_lease = self.shared_gpu_lock.try_acquire(
+                owner="pionir", purpose=requirement.model_id
+            )
+            if shared_lease is None:
                 raise ResourceUnavailable(
-                    f"{requirement.model_id} needs {needed_mb} MB VRAM; the card has "
-                    f"{free_mb} MB free right now. VRAM held by processes outside "
-                    f"Pionir does not take the shared lock, so the lease count "
-                    f"cannot see it."
+                    "GPU is leased by another Pionir-compatible process"
                 )
-
-        with self._lock:
-            gpu_leases = sum(item.requires_gpu for item in self._active.values())
-            if requirement.requires_gpu and gpu_leases >= self.budget.max_gpu_leases:
-                raise ResourceUnavailable("all GPU model leases are in use")
-            shared_lease = None
-            if requirement.requires_gpu and self.shared_gpu_lock is not None:
-                shared_lease = self.shared_gpu_lock.try_acquire(
-                    owner="pionir",
-                    purpose=requirement.model_id,
-                )
-                if shared_lease is None:
+        try:
+            if requirement.requires_gpu and self.vram_probe is not None:
+                needed_mb = self._marginal_vram_mb(requirement)
+                free_mb = self.vram_probe()
+                if free_mb is not None and needed_mb > free_mb:
+                    # Sideline idle resident models to make room, then look again.
+                    free_mb = self._make_room(needed_mb, requirement.model_id)
+                if free_mb is not None and needed_mb > free_mb:
                     raise ResourceUnavailable(
-                        "GPU is leased by another Pionir-compatible process"
+                        f"{requirement.model_id} needs {needed_mb} MB VRAM; only "
+                        f"{free_mb} MB free even after sidelining what could be freed."
                     )
-            lease = ModelLease(self, requirement, shared_lease)
-            self._active[lease.lease_id] = requirement
-        return lease
+            with self._lock:
+                gpu_leases = sum(item.requires_gpu for item in self._active.values())
+                if requirement.requires_gpu and gpu_leases >= self.budget.max_gpu_leases:
+                    raise ResourceUnavailable("all GPU model leases are in use")
+                lease = ModelLease(self, requirement, shared_lease)
+                self._active[lease.lease_id] = requirement
+            return lease
+        except BaseException:
+            if shared_lease is not None:
+                shared_lease.release()
+            raise
 
     def release(self, lease_id: UUID) -> None:
         with self._lock:

@@ -187,3 +187,64 @@ class ModelNameTests(unittest.TestCase):
             self.assertTrue(model_already_resident("theo-local-v25-q4"))
             # And a different build must still not match.
             self.assertFalse(model_already_resident("theo-local-v17-q4"))
+
+
+class EvictionTests(unittest.TestCase):
+    """Sidelining an idle resident model to make room for an on-demand doer.
+
+    Everything is injected - no real daemon is touched - so the suite can prove
+    the policy without ever unloading a live model.
+    """
+
+    def _budget(self) -> ResourceBudget:
+        return ResourceBudget(total_vram_mb=12_288, reserved_vram_mb=1_830, max_gpu_leases=1)
+
+    def test_sidelines_an_idle_model_to_make_room(self) -> None:
+        evicted: list[str] = []
+        state = {"free": 1_000}  # the card is full of the voice's big model
+
+        def evict(name: str) -> None:
+            evicted.append(name)
+            state["free"] = 8_000  # freeing it opens the room
+
+        scheduler = ModelLeaseScheduler(
+            self._budget(),
+            vram_probe=lambda: state["free"],
+            residency_probe=lambda model: False,
+            evict_to_fit=True,
+            evictor=evict,
+            loaded_probe=lambda: ["gemma3:12b", "qwen2.5:7b-instruct"],
+            sleep=lambda _s: None,
+        )
+        lease = scheduler.acquire(ModelRequirement("qwen2.5:7b-instruct", 4_500, 345))
+        # The target model is never evicted; the idle voice model is.
+        self.assertEqual(evicted, ["gemma3:12b"])
+        lease.release()
+
+    def test_refuses_when_sidelining_cannot_free_enough(self) -> None:
+        scheduler = ModelLeaseScheduler(
+            self._budget(),
+            vram_probe=lambda: 1_000,
+            residency_probe=lambda model: False,
+            evict_to_fit=True,
+            evictor=lambda name: None,  # frees nothing
+            loaded_probe=lambda: ["something-small"],
+            sleep=lambda _s: None,
+        )
+        with self.assertRaises(ResourceUnavailable):
+            scheduler.acquire(ModelRequirement("qwen2.5:7b-instruct", 4_500, 345))
+
+    def test_never_evicts_when_the_flag_is_off(self) -> None:
+        evicted: list[str] = []
+        scheduler = ModelLeaseScheduler(
+            self._budget(),
+            vram_probe=lambda: 1_000,
+            residency_probe=lambda model: False,
+            evict_to_fit=False,
+            evictor=lambda name: evicted.append(name),
+            loaded_probe=lambda: ["gemma3:12b"],
+            sleep=lambda _s: None,
+        )
+        with self.assertRaises(ResourceUnavailable):
+            scheduler.acquire(ModelRequirement("qwen2.5:7b-instruct", 4_500, 345))
+        self.assertEqual(evicted, [])

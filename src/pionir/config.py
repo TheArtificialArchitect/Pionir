@@ -100,6 +100,10 @@ class PionirSettings:
     reserved_vram_mb: int = 1_830
     circuit_failure_threshold: int = 3
     circuit_recovery_seconds: float = 30.0
+    # Sideline an idle resident model to make room for an on-demand doer (a 12B
+    # voice and a 7B coder cannot share a 12 GB card). On in production; tests
+    # set it off so the suite never unloads a live model.
+    evict_to_fit: bool = True
 
     atani_command: tuple[str, ...] = ("atani",)
     bryo_status_command: tuple[str, ...] | None = None
@@ -212,6 +216,8 @@ class PionirSettings:
                     _declared("circuit_recovery_seconds"),
                 )
             ),
+            evict_to_fit=(os.environ.get("PIONIR_EVICT_TO_FIT", "1").strip().lower()
+                          not in {"0", "off", "false", "no"}),
             atani_command=_command_from_json(
                 "PIONIR_ATANI_COMMAND_JSON", _declared("atani_command")
             )

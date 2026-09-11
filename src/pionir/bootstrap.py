@@ -23,6 +23,7 @@ from .adapters import (
 )
 from .adapters.galatea import resolve_served_model
 from .audit import JsonlAuditSink
+from .benchmark import read_loaded_models, unload
 from .config import PionirSettings
 from .cortex import Cortex, OllamaEmbedder
 from .reliability import CircuitBreaker
@@ -71,6 +72,13 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         scheduler=ModelLeaseScheduler(
             configured.resource_budget,
             shared_gpu_lock=SharedGpuLock(configured.gpu_lock_path),
+            # Wire the real daemon here, not in the scheduler's defaults, so a
+            # test never unloads a live model: on-demand doers can sideline an
+            # idle resident model (the voice's big one between turns) to fit.
+            # Gated by evict_to_fit, which tests turn off.
+            evict_to_fit=configured.evict_to_fit,
+            evictor=unload,
+            loaded_probe=lambda: [item.name for item in read_loaded_models()],
         ),
         audit_sink=JsonlAuditSink(configured.audit_path),
         circuit_factory=lambda: CircuitBreaker(
