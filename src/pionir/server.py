@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .bootstrap import PionirRuntime
 from .cli import _capabilities, _doctor, _jsonable
-from .contracts import Task
+from .contracts import RiskLevel, Task
 from .errors import PionirError, RoutingAmbiguous
 from .router import Candidate, IntentRouter, RoutingDecision
 from .scheduler import observed_free_vram_mb
@@ -219,6 +219,10 @@ class PionirApp:
         if cap in _VOICE_REASONING:
             # Asking Atani to think: Atani answers her directly, no doer involved.
             return self._run_intent(cap, {"content": request}, frozenset({"atani.chat"}), decision)
+        if self._capability_risk(cap) is RiskLevel.READ_ONLY:
+            # She may view, read and look for herself (Bryo's vitals, a status
+            # snapshot); that is not tasking a doer, so it runs directly.
+            return self._run_intent(cap, {"content": request}, frozenset(), decision)
         # Everything else names a doer's job. The voice does not task doers - she
         # asks Atani, and Atani tasks the right bot through Pionir. Hand the whole
         # request to Atani the manager; it decides, tasks, waits, and returns what
@@ -230,6 +234,13 @@ class PionirApp:
             frozenset({"atani.manage"}),
             decision,
         )
+
+    def _capability_risk(self, name: str) -> RiskLevel | None:
+        for manifest in self.runtime.executive.registry.manifests():
+            for capability in manifest.capabilities:
+                if capability.name == name:
+                    return capability.risk
+        return None
 
     def _run_intent(self, capability, payload, permissions, decision, *, planned=False):
         try:

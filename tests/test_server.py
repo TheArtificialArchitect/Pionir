@@ -114,6 +114,19 @@ class PionirAppTests(unittest.TestCase):
             self.assertNotIn(out["status"], {"via_manager", "self", "done", "planned"}, request)
             self.assertEqual(out["status"], "error", request)
 
+    def test_capability_risk_gates_view_from_task(self) -> None:
+        # Read-only capabilities run directly (she may view/read); privileged ones
+        # are a doer's job routed to Atani. The risk lookup is what decides.
+        from pionir.contracts import RiskLevel
+
+        self.assertIs(
+            self.app._capability_risk("conversation.galatea_reply"), RiskLevel.READ_ONLY
+        )
+        self.assertIs(
+            self.app._capability_risk("coding.daedalus_solve"), RiskLevel.PRIVILEGED
+        )
+        self.assertIsNone(self.app._capability_risk("no.such.capability"))
+
     def test_intent_hands_conversation_back_to_the_voice(self) -> None:
         out = self.app.intent("let's just chat for a while")
         self.assertEqual(out["status"], "self")
