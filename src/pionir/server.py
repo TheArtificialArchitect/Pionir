@@ -219,18 +219,17 @@ class PionirApp:
         if cap in _VOICE_REASONING:
             # Asking Atani to think: Atani answers her directly, no doer involved.
             return self._run_intent(cap, {"content": request}, frozenset({"atani.chat"}), decision)
-        # Everything else names a doer's job. The voice does not task doers; that
-        # is Atani's. Hand it to Atani rather than running it here.
-        return {
-            **base,
-            "status": "via_manager",
-            "capability": cap,
-            "note": (
-                "the voice does not task the doers directly - Atani does. This is "
-                "for Atani to dispatch, and Atani tasking the doers is not wired "
-                "yet, so it was not run."
-            ),
-        }
+        # Everything else names a doer's job. The voice does not task doers - she
+        # asks Atani, and Atani tasks the right bot through Pionir. Hand the whole
+        # request to Atani the manager; it decides, tasks, waits, and returns what
+        # actually happened. manager.atani_manage holds no GPU lease of its own,
+        # so the doer's task can take the single lease.
+        return self._run_intent(
+            "manager.atani_manage",
+            {"content": request},
+            frozenset({"atani.manage"}),
+            decision,
+        )
 
     def _run_intent(self, capability, payload, permissions, decision, *, planned=False):
         try:

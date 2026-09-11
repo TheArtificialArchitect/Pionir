@@ -201,6 +201,18 @@ class AtaniCliAdapter:
                     routing_hints=frozenset({"plan", "execute", "workflow", "ledger"}),
                     priority=110,
                 ),
+                Capability(
+                    # Atani the manager, doing what Moss asks: it decides and
+                    # tasks the right doer (through Pionir, so the sideline and
+                    # gates hold). No model here on purpose - manage holds no GPU
+                    # lease, so the doer's own task can take the single lease.
+                    # Invoked directly by /api/intent, never NL-routed.
+                    name="manager.atani_manage",
+                    description="Atani deciding and tasking the right bot for what the voice asks",
+                    risk=RiskLevel.PRIVILEGED,
+                    required_permissions=frozenset({"atani.manage"}),
+                    priority=90,
+                ),
             ),
         )
 
@@ -284,6 +296,22 @@ class AtaniCliAdapter:
         return self._json(("status",))
 
     def execute(self, task: Task) -> TaskResult:
+        if task.capability == "manager.atani_manage":
+            content = str(task.payload.get("content") or task.payload.get("request") or "").strip()
+            if not content:
+                raise AdapterProtocolError("manager request is required")
+            if len(content) > 8_000:
+                raise AdapterProtocolError("manager request exceeds Pionir's 8000-character limit")
+            # `atani manage <request>` reasons, decides, and tasks the doer via
+            # Pionir; it exits 0 with its outcome object (ok may be false - that
+            # is a real manager verdict, not a crash).
+            document = self._json(("manage", content))
+            return TaskResult(
+                task_id=task.task_id,
+                agent_id=self.manifest.agent_id,
+                output=document,
+                evidence=("atani:manage",),
+            )
         if task.capability == "executive.atani_run":
             request = dict(task.payload)
             if request.get("protocol") != "atani.executive.v1":

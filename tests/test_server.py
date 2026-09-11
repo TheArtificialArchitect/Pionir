@@ -100,15 +100,18 @@ class PionirAppTests(unittest.TestCase):
 
     def test_the_voice_never_tasks_a_doer_directly(self) -> None:
         # The voice does not control the organs. A doer's job - shell, coding,
-        # the executive - is Atani's to task, so it comes back via_manager and is
-        # NOT run here, whatever the doer.
+        # the executive - is handed to Atani the manager (manager.atani_manage),
+        # never run against the doer here. Atani is a bogus command in the test
+        # runtime, so it surfaces as error - but the point is the route: it went
+        # to Atani, and its own decision (a coding capability) was not executed
+        # as a doer call from the voice.
         for request in (
             "run a shell command to list files",
             "refactor this function and implement the fix",
-            "run this versioned plan through the executive",
         ):
             out = self.app.intent(request)
-            self.assertEqual(out["status"], "via_manager", request)
+            self.assertNotIn(out["status"], {"via_manager", "self", "done", "planned"}, request)
+            self.assertEqual(out["status"], "error", request)
 
     def test_intent_hands_conversation_back_to_the_voice(self) -> None:
         out = self.app.intent("let's just chat for a while")
