@@ -226,6 +226,11 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
             "status": "not_configured",
             "message": "set PIONIR_VOODOO_STATUS_COMMAND_JSON",
         }
+    if "galatea" not in runtime.adapters:
+        specialists["galatea"] = {
+            "status": "not_configured",
+            "message": "set PIONIR_GALATEA_URL to wire in the voice",
+        }
     recorded = routecheck.load(runtime.settings.routing_check_path)
     if recorded is None:
         # Never measured is reported, not omitted. An absent row is the state

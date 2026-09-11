@@ -87,6 +87,13 @@ class PionirSettings:
     bryo_status_command: tuple[str, ...] | None = None
     nyx_status_command: tuple[str, ...] | None = None
     voodoo_status_command: tuple[str, ...] | None = None
+    # Galatea, Pionir's conversational voice. Opt-in: unset means no voice is
+    # registered and plain conversation asks rather than routes, exactly as the
+    # other specialists register only when configured. The URL is her loopback
+    # server; the model id is an optional pin, otherwise resolved live from her
+    # /api/settings so a promotion never leaves Pionir's VRAM figure stale.
+    galatea_url: str | None = None
+    galatea_model_id: str | None = None
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
     # The local embedding model for hybrid recall. Default on: it is ~0.32 GB and
@@ -189,6 +196,9 @@ class PionirSettings:
             voodoo_status_command=_command_from_json(
                 "PIONIR_VOODOO_STATUS_COMMAND_JSON", None
             ),
+            galatea_url=(os.environ.get("PIONIR_GALATEA_URL") or "").strip() or None,
+            galatea_model_id=(os.environ.get("PIONIR_GALATEA_MODEL_ID") or "").strip()
+            or None,
             embed_model=_embed_model_from_env(),
             specialists_file=(
                 Path(os.environ["PIONIR_SPECIALISTS_FILE"])

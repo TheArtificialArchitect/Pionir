@@ -57,6 +57,13 @@ class Probe:
     probe is unanswerable when its target is not configured. Either way the
     honest result is to skip it and say so, not to score it as a failure.
     """
+    forbid: tuple[str, ...] = ()
+    """Capabilities whose presence makes this probe meaningless.
+
+    The mirror of ``requires``. "chat with someone must ASK" is only true while
+    no voice is registered; once Galatea is wired the same request should route
+    to her, so this probe is skipped rather than scored as an under-ask.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,12 +200,23 @@ def default_probes() -> tuple[Probe, ...]:
             "organism.bryo_status",
             ("organism.bryo_status",),
         ),
-        # No conversational capability is registered any more - Theo was removed
-        # and the voice (Galatea) is not wired yet - so plain conversation has no
-        # right answer and must ASK rather than misroute to Atani's reasoning. The
-        # capability rename (atani_answer, not atani_chat) is what keeps "chat"
-        # from pulling this to Atani; this probe holds that.
-        Probe("chat with someone", ASK, ("reasoning.atani_answer",)),
+        # Plain conversation is Galatea's, the voice. "chat" belongs to her
+        # capability alone - Atani's rename to atani_answer is what keeps it from
+        # pulling reasoning's way - so a conversational request must reach her and
+        # not misroute to Atani. These hold that the voice actually catches it.
+        Probe(
+            "chat with someone",
+            "conversation.galatea_reply",
+            ("conversation.galatea_reply",),
+        ),
+        Probe(
+            "just talk to me for a while",
+            "conversation.galatea_reply",
+            ("conversation.galatea_reply",),
+        ),
+        # With no voice registered, that same request has no right answer and
+        # must ASK rather than misroute to Atani's reasoning.
+        Probe("chat with someone", ASK, ("reasoning.atani_answer",), forbid=("conversation.galatea_reply",)),
         # Nothing registered does this, and inventing a route would be worse
         # than saying so.
         Probe("photosynthesis in tomato plants", ASK),
@@ -230,6 +248,12 @@ def run(router: IntentRouter, probes: tuple[Probe, ...] | None = None) -> Routin
         missing = [name for name in probe.requires if name not in registered]
         if missing:
             skipped.append(f"{probe.expected}: not registered ({', '.join(sorted(missing))})")
+            continue
+        present = [name for name in probe.forbid if name in registered]
+        if present:
+            skipped.append(
+                f"{probe.expected}: not applicable ({', '.join(sorted(present))} registered)"
+            )
             continue
         decision = router.classify(probe.request)
         actual = decision.capability or ASK

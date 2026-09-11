@@ -99,10 +99,12 @@ class AtaniCliAdapter:
                 Capability(
                     # Renamed from reasoning.atani_chat on 2026-08-30. The
                     # router scores a capability's own name as vocabulary, so
-                    # "chat" in the name kept Atani tied with Theo on any plain
-                    # conversational request no matter what the hints said - and
-                    # the name had become untrue anyway once chat became Theo's.
-                    # Ledger entries from before the rename carry the old name.
+                    # "chat" in the name kept Atani tied with the voice on any
+                    # plain conversational request no matter what the hints said -
+                    # and the name had become untrue anyway once chat became the
+                    # voice's. Ledger entries from before the rename carry the old
+                    # name. The voice is Galatea now (was Theo); Atani stays the
+                    # reasoner either way, which is the point of the rename.
                     name="reasoning.atani_answer",
                     description="Atani's bounded reasoning over a question",
                     risk=RiskLevel.REVERSIBLE_WRITE,
@@ -113,12 +115,12 @@ class AtaniCliAdapter:
                         4_500,
                         kv_cache_vram_mb(16_384),
                     ),
-                    # "chat" is deliberately absent. Ian decided on 2026-08-30
-                    # that Theo is Pionir's voice, so plain conversation is
-                    # Theo's and Atani keeps the reasoning vocabulary. Encoding
-                    # that here rather than as a special case inside the router
-                    # is the whole point of capabilities declaring their own
-                    # words: the decision is visible where it applies.
+                    # "chat" is deliberately absent. Plain conversation is the
+                    # voice's (Galatea's), and Atani keeps the reasoning
+                    # vocabulary. Encoding that here rather than as a special
+                    # case inside the router is the whole point of capabilities
+                    # declaring their own words: the decision is visible where it
+                    # applies.
                     routing_hints=frozenset(
                         {"atani", "reason", "reasoning", "think", "answer"}
                     ),

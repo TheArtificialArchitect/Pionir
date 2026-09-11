@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .adapters import (
     AtaniCliAdapter,
     AtaniCliSettings,
     BryoStatusAdapter,
     BryoStatusSettings,
+    GalateaAdapter,
+    GalateaSettings,
     NyxStatusAdapter,
     NyxStatusSettings,
     VoodooStatusAdapter,
     VoodooStatusSettings,
     load_stdio_adapters,
 )
+from .adapters.galatea import resolve_served_model
 from .audit import JsonlAuditSink
 from .config import PionirSettings
 from .cortex import Cortex, OllamaEmbedder
@@ -34,6 +37,23 @@ class PionirRuntime:
     def register(self, adapter: SpecialistAdapter) -> None:
         self.executive.register(adapter)
         self.adapters[adapter.manifest.agent_id] = adapter
+
+
+def _galatea_settings(configured: PionirSettings) -> GalateaSettings:
+    """Pin the model if Pionir was told to, otherwise ask Galatea which she serves.
+
+    The id drives the VRAM admission discount, and she is promoted like any
+    other local model. A pinned id is honoured as given; otherwise the live one
+    is read once at boot to have it right. Galatea being down is the ordinary
+    case at boot and the declared default covers it - doctor shows the
+    declaration against what she reports either way.
+    """
+
+    settings = GalateaSettings(base_url=str(configured.galatea_url))
+    if configured.galatea_model_id:
+        return replace(settings, model_id=configured.galatea_model_id)
+    served = resolve_served_model(settings)
+    return replace(settings, model_id=served) if served else settings
 
 
 def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
@@ -77,6 +97,8 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
                 VoodooStatusSettings(command=configured.voodoo_status_command)
             )
         )
+    if configured.galatea_url is not None:
+        runtime.register(GalateaAdapter(_galatea_settings(configured)))
     if configured.specialists_file is not None:
         for adapter in load_stdio_adapters(configured.specialists_file):
             runtime.register(adapter)
