@@ -2,11 +2,15 @@
 # Nothing here installs a task, a service, a Run key or a Startup item.
 #
 #   .\pionir.ps1                 wake the whole stack and open the dashboard
+#   .\pionir.ps1 -Shortcut       put a "Pionir" launcher icon on the Desktop
 #   .\pionir.ps1 -NoVoice        don't wake Galatea
 #   .\pionir.ps1 -NoSpecialists  don't start Daedalus/Melete; reach whoever's already up
 #   .\pionir.ps1 -NoBrowser      don't open a browser (the URL is printed)
 #   .\pionir.ps1 -Port 8781      a different dashboard port
 #   .\pionir.ps1 -Stop           stop the dashboard and the specialists it started
+#
+# The Desktop icon (-Shortcut) is a shortcut only: double-clicking it runs this
+# launcher in its own window. Nothing starts on its own; it is not a Startup item.
 #
 # "Whole stack, one launch". Theo is retired, so Daedalus (the coder, :8771) and
 # Melete (the tool-executor, :8770) are Pionir's own services now: this starts
@@ -14,6 +18,7 @@
 # own window you can see and close, and wakes Galatea (:8799) the same way.
 # Everything stops when its window closes; -Stop tears the services down from here.
 param(
+    [switch]$Shortcut,
     [switch]$NoVoice,
     [switch]$NoSpecialists,
     [switch]$NoBrowser,
@@ -24,6 +29,24 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
+
+if ($Shortcut) {
+    # A Desktop icon that runs this launcher in its own window. Shortcut only -
+    # nothing is added to Startup, no task, no service (estate rule 3).
+    $desktop = [Environment]::GetFolderPath("Desktop")
+    $lnk = Join-Path $desktop "Pionir.lnk"
+    $shell = New-Object -ComObject WScript.Shell
+    $sc = $shell.CreateShortcut($lnk)
+    $sc.TargetPath = "powershell.exe"
+    $sc.Arguments = "-NoExit -ExecutionPolicy Bypass -File `"$root\pionir.ps1`""
+    $sc.WorkingDirectory = $root
+    $sc.Description = "Pionir - the brain. Awake while the window is open."
+    $sc.IconLocation = "%SystemRoot%\System32\shell32.dll,15"
+    $sc.Save()
+    Write-Host "Desktop icon written: $lnk" -ForegroundColor Cyan
+    Write-Host "Double-click it to bring up the stack and the dashboard. It starts nothing on its own."
+    exit 0
+}
 
 $py = Join-Path $root ".venv\Scripts\python.exe"
 if (-not (Test-Path $py)) { $py = "python" }
