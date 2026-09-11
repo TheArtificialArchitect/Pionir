@@ -106,31 +106,50 @@ class AtaniCliAdapterTests(unittest.TestCase):
                 Task("executive.atani_run", {"protocol": "unknown"})
             )
 
-    def test_a_failed_outcome_survives_a_nonzero_exit(self) -> None:
-        # Verified against the real CLI (2026-09-10): a legitimately failed goal
-        # is written to stdout while the process exits 1. Reading the exit code
-        # first turned that real outcome - its goal_id, its reason - into a bare
-        # "Atani is unavailable". The outcome on stdout is authoritative.
-        runner = FakeRunner(
-            {
-                "status": "failed",
-                "goal_id": "goal-9",
-                "reason": "bounded executive limit reached",
-                "steps": 1,
-            },
-            returncode=1,
-        )
-        adapter = AtaniCliAdapter(runner=runner)
-        result = adapter.execute(
+    def _run_executive(self, runner: "FakeRunner"):
+        return AtaniCliAdapter(runner=runner).execute(
             Task(
                 "executive.atani_run",
                 {"protocol": "atani.executive.v1", "goal_id": "goal-9", "steps": []},
                 frozenset({"atani.executive"}),
             )
         )
-        self.assertEqual(result.output["status"], "failed")
-        self.assertEqual(result.output["reason"], "bounded executive limit reached")
-        self.assertEqual(result.evidence, ("atani:goal:goal-9",))
+
+    def test_a_produced_outcome_is_read_from_stdout_whatever_the_exit_code(self) -> None:
+        # Atani's exit code is a three-band signal (0 completed / 2 produced-not-
+        # completed / 1 no-outcome), and an earlier binary emitted a failed goal
+        # at exit 1. The adapter reads stdout first, so a real outcome survives
+        # any non-zero exit rather than being turned into "Atani is unavailable"
+        # and losing its goal_id and reason. Both bands are covered here.
+        for returncode in (2, 1):
+            runner = FakeRunner(
+                {
+                    "status": "failed",
+                    "goal_id": "goal-9",
+                    "reason": "bounded executive limit reached",
+                    "steps": 1,
+                },
+                returncode=returncode,
+            )
+            result = self._run_executive(runner)
+            self.assertEqual(result.output["status"], "failed", returncode)
+            self.assertEqual(result.output["reason"], "bounded executive limit reached")
+            self.assertEqual(result.evidence, ("atani:goal:goal-9",))
+
+    def test_a_waiting_approval_outcome_at_exit_2_is_returned(self) -> None:
+        # exit 2 is the produced-but-not-completed band; waiting_approval is a
+        # real Manager outcome the caller must see (its approval_id), not a fault.
+        runner = FakeRunner(
+            {
+                "status": "waiting_approval",
+                "goal_id": "goal-9",
+                "approval_id": "appr-1",
+            },
+            returncode=2,
+        )
+        result = self._run_executive(runner)
+        self.assertEqual(result.output["status"], "waiting_approval")
+        self.assertEqual(result.output["approval_id"], "appr-1")
 
     def test_an_executive_error_surfaces_atanis_own_reason(self) -> None:
         # Empty stdout with a non-zero exit is a genuine failure - and Atani's

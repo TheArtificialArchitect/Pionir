@@ -22,10 +22,18 @@ from pionir.scheduler import kv_cache_vram_mb
 MAX_OUTPUT_CHARS = 2_000_000
 
 # The executive's four legitimate outcomes. A response carrying one of these on
-# stdout is a real Manager result and authoritative over the process exit code -
-# Atani exits non-zero for a failed or paused goal while still writing the whole
-# outcome out, so reading the exit code first would turn a real outcome into a
-# bare "unavailable" and throw its goal_id and reason away.
+# stdout is a real Manager result and authoritative over the process exit code.
+#
+# Atani's exit code is a three-band signal (confirmed with her session,
+# 2026-09-10, TheArtificialArchitect/Atani 0ad93ec): 0 = completed (the only
+# success, so a shell `&&` fires on nothing else); 2 = a produced-but-not-
+# completed verdict - failed, paused, or waiting_approval - a real outcome on
+# stdout, not an error; 1 = no outcome produced (malformed request or
+# exception), stdout empty, reason on stderr. So exit 1 alone means "read
+# stderr" and 0/2 mean "read the status on stdout". Reading the exit code first
+# would turn a real failed/paused outcome into a bare "unavailable" and throw
+# its goal_id and reason away - and an earlier binary emitted the same outcomes
+# at exit 1, so this adapter reads stdout first and is robust to either.
 _EXECUTIVE_STATUSES = frozenset(
     {"completed", "waiting_approval", "paused", "failed"}
 )
