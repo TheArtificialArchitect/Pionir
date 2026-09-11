@@ -9,8 +9,12 @@ from .adapters import (
     AtaniCliSettings,
     BryoStatusAdapter,
     BryoStatusSettings,
+    DaedalusAdapter,
+    DaedalusSettings,
     GalateaAdapter,
     GalateaSettings,
+    MeleteAdapter,
+    MeleteSettings,
     NyxStatusAdapter,
     NyxStatusSettings,
     VoodooStatusAdapter,
@@ -99,6 +103,24 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         )
     if configured.galatea_url is not None:
         runtime.register(GalateaAdapter(_galatea_settings(configured)))
+    if configured.daedalus_url is not None:
+        runtime.register(
+            DaedalusAdapter(
+                DaedalusSettings(
+                    base_url=configured.daedalus_url,
+                    token=configured.daedalus_token or "",
+                )
+            )
+        )
+    if configured.melete_url is not None:
+        runtime.register(
+            MeleteAdapter(
+                MeleteSettings(
+                    base_url=configured.melete_url,
+                    token=configured.melete_token or "",
+                )
+            )
+        )
     if configured.specialists_file is not None:
         for adapter in load_stdio_adapters(configured.specialists_file):
             runtime.register(adapter)

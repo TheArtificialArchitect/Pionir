@@ -61,6 +61,24 @@ def _command_from_json(
     return tuple(document)
 
 
+def _optional_url(name: str, default: str | None) -> str | None:
+    """A loopback service URL, or None to leave it unregistered.
+
+    Unset keeps the default (the service is wired in at its known port); an
+    empty value or "off"/"none" turns it off. Used for the specialists that are
+    on by default - Daedalus and Melete - so the whole roster is present without
+    env fiddling, but any of them can be switched off.
+    """
+
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    raw = raw.strip()
+    if raw == "" or raw.lower() in {"off", "none", "false", "0"}:
+        return None
+    return raw
+
+
 def _embed_model_from_env(default: str = "nomic-embed-text") -> str | None:
     """PIONIR_EMBED_MODEL: a model name, or "" / "off" / "none" to disable
     hybrid recall entirely. Unset keeps the default (embeddings on, fail-open)."""
@@ -94,6 +112,15 @@ class PionirSettings:
     # /api/settings so a promotion never leaves Pionir's VRAM figure stale.
     galatea_url: str | None = None
     galatea_model_id: str | None = None
+    # Daedalus (coder) and Melete (tool-executor) are Theo's own HTTP services,
+    # wired in by default at their known loopback ports so the whole roster is
+    # present; each shows unavailable in doctor when its server is not running,
+    # and either can be turned off with PIONIR_DAEDALUS_URL / PIONIR_MELETE_URL
+    # set to "off". Tokens are read only if those services were started with one.
+    daedalus_url: str | None = "http://127.0.0.1:8771"
+    daedalus_token: str | None = None
+    melete_url: str | None = "http://127.0.0.1:8770"
+    melete_token: str | None = None
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
     # The local embedding model for hybrid recall. Default on: it is ~0.32 GB and
@@ -199,6 +226,10 @@ class PionirSettings:
             galatea_url=(os.environ.get("PIONIR_GALATEA_URL") or "").strip() or None,
             galatea_model_id=(os.environ.get("PIONIR_GALATEA_MODEL_ID") or "").strip()
             or None,
+            daedalus_url=_optional_url("PIONIR_DAEDALUS_URL", _declared("daedalus_url")),
+            daedalus_token=(os.environ.get("PIONIR_DAEDALUS_TOKEN") or "").strip() or None,
+            melete_url=_optional_url("PIONIR_MELETE_URL", _declared("melete_url")),
+            melete_token=(os.environ.get("PIONIR_MELETE_TOKEN") or "").strip() or None,
             embed_model=_embed_model_from_env(),
             specialists_file=(
                 Path(os.environ["PIONIR_SPECIALISTS_FILE"])
