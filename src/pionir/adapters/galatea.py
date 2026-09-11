@@ -46,7 +46,6 @@ from urllib.parse import urlencode, urlparse
 
 from pionir.contracts import AgentManifest, Capability, ModelRequirement, Task, TaskResult
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
-from pionir.scheduler import kv_cache_vram_mb
 
 MAX_RESPONSE_BYTES = 4_000_000
 
@@ -83,14 +82,10 @@ class GalateaSettings:
     # /api/settings, which reports the model her client actually resolved. Her
     # own config resolves file, then env, then this default, and her README is
     # explicit that the file wins over the environment; never read GALATEA_MODEL.
+    # It is observability only: her turn declares no VRAM (see the manifest), so
+    # this id never drives an admission decision - it only lets doctor name the
+    # brain she is on. She has been seen on gemma3:12b as well as this.
     model_id: str = "qwen2.5:7b-instruct"
-    # qwen2.5:7b-instruct is what Atani's answer path measured resident at 4423
-    # MB (4096 ctx); declared 4500 to sit above that, plus a KV cache computed
-    # for her actual window. See docs/PHASE0_BENCHMARK.md.
-    estimated_model_vram_mb: int = 4_500
-    # Her Ollama client defaults to num_ctx 8192 (galatea/ollama.py), the window
-    # that reaches the daemon, so the KV cache is sized for 8192 not a guess.
-    context_length: int = 8_192
 
     def __post_init__(self) -> None:
         parsed = urlparse(self.base_url)
@@ -214,10 +209,24 @@ class GalateaAdapter:
                 Capability(
                     name="conversation.galatea_reply",
                     description="Galatea speaking - Pionir's conversational voice",
+                    # Galatea hosts her own model in her own process and holds it
+                    # resident with a KV cache already allocated for her fixed
+                    # context, so a turn Pionir routes to her loads nothing and
+                    # adds nothing to the card. Declaring weights or a KV cache
+                    # here made the voice - which must always answer - refuse a
+                    # turn that costs the card nothing: seen 2026-09-10, a routed
+                    # turn rejected with "gemma3:12b needs 345 MB, 253 MB free"
+                    # while her model was already resident and the turn added
+                    # zero. So the marginal cost is zero and, like the elastic
+                    # depth tier, she needs no GPU lease from Pionir - she already
+                    # holds the card. Her real footprint is not lost: it is in
+                    # the observed free VRAM that prices any Pionir-direct load
+                    # running alongside her. The model id stays for observability.
                     model=ModelRequirement(
                         model_id=self.settings.model_id,
-                        estimated_vram_mb=self.settings.estimated_model_vram_mb,
-                        context_vram_mb=kv_cache_vram_mb(self.settings.context_length),
+                        estimated_vram_mb=0,
+                        context_vram_mb=0,
+                        requires_gpu=False,
                     ),
                     # "chat" is Galatea's alone now: Atani deliberately dropped it
                     # so plain conversation reaches the voice, not the reasoner.
