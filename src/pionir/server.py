@@ -14,6 +14,7 @@ machine, the same trust boundary as the specialists it front-ends.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import webbrowser
 from datetime import UTC, datetime
@@ -389,6 +390,42 @@ def _make_handler(app: PionirApp):
     return Handler
 
 
+def _start_pulse(app: PionirApp) -> tuple[threading.Thread | None, threading.Event]:
+    """Bryo's pulse: while the server is up, write Pionir's live state where his
+    sensors read it. A daemon thread, so it lives exactly as long as the server
+    and needs no separate process (estate rule 3). Only runs when the cache's
+    directory already exists - it never creates a stray terrarium tree - and can
+    be turned off with PIONIR_BRYO_FEED=off."""
+    from . import bryofeed
+
+    stop = threading.Event()
+    if os.environ.get("PIONIR_BRYO_FEED", "").strip().lower() in {"off", "none", "false", "0"}:
+        return None, stop
+    path = Path(os.environ.get("PIONIR_BRYO_FEED_PATH", bryofeed.DEFAULT_OUT))
+    if not path.parent.exists():
+        # No terrarium here: nothing to feed, and we don't invent his state dir.
+        return None, stop
+    try:
+        interval = max(1.0, float(os.environ.get("PIONIR_BRYO_FEED_INTERVAL", bryofeed.DEFAULT_INTERVAL)))
+    except ValueError:
+        interval = bryofeed.DEFAULT_INTERVAL
+
+    def pump() -> None:
+        prev: int | None = None
+        while not stop.is_set():
+            try:
+                audit = app.audit(1)
+                snap, prev = bryofeed.shape(app.state(), audit.get("events_total"), prev)
+                bryofeed.write(path, snap)
+            except Exception:  # noqa: BLE001 - a bad poll must never take the server down
+                pass
+            stop.wait(interval)
+
+    thread = threading.Thread(target=pump, name="pionir-bryo-pulse", daemon=True)
+    thread.start()
+    return thread, stop
+
+
 def serve(
     runtime: PionirRuntime,
     *,
@@ -405,8 +442,11 @@ def serve(
     app = PionirApp(runtime)
     httpd = ThreadingHTTPServer(("127.0.0.1", port), _make_handler(app))
     url = f"http://127.0.0.1:{port}/"
+    pulse_thread, pulse_stop = _start_pulse(app)
     print("  PIONIR")
     print(f"  the brain is visible at {url}")
+    if pulse_thread is not None:
+        print("  Bryo's pulse is beating (Pionir's state written where he can feel it).")
     print("  awake while this window is open; Ctrl+C stops it.")
     if open_browser:
         threading.Thread(target=lambda: webbrowser.open(url), daemon=True).start()
@@ -415,6 +455,7 @@ def serve(
     except KeyboardInterrupt:
         print("\nstopping.")
     finally:
+        pulse_stop.set()
         httpd.shutdown()
         httpd.server_close()
     return 0

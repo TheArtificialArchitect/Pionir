@@ -11,7 +11,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Sequence
 
-from . import benchmark, recallcheck, routecheck
+from . import benchmark, bryofeed, recallcheck, routecheck
 from .bootstrap import PionirRuntime, build_runtime
 from .contracts import Task
 from .errors import PionirError, RoutingAmbiguous
@@ -67,6 +67,16 @@ def _parser() -> argparse.ArgumentParser:
         help="run a versioned JSON plan through Atani's bounded executive",
     )
     atani_plan.add_argument("request_file", type=Path)
+
+    feed = commands.add_parser(
+        "bryo-feed",
+        help="write Pionir's live pulse to a cache file Bryo's sensors read (a foreground pane)",
+    )
+    feed.add_argument("--url", default=bryofeed.DEFAULT_URL, help="the running Pionir server")
+    feed.add_argument("--out", default=bryofeed.DEFAULT_OUT, help="cache file Bryo reads")
+    feed.add_argument("--interval", type=float, default=bryofeed.DEFAULT_INTERVAL,
+                      help="seconds between polls")
+    feed.add_argument("--once", action="store_true", help="write one snapshot and exit (for checks)")
 
     commands.add_parser("bryo-status", help="read Bryo's non-mutating status snapshot")
     commands.add_parser("nyx-status", help="read Nyx's redacted offensive-security health")
@@ -576,6 +586,10 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "bryo-feed":
+        # A standalone poller: it reads the running server over HTTP and needs no
+        # runtime of its own (no Cortex, no GPU lock), so it short-circuits here.
+        return bryofeed.run_feed(url=args.url, out=args.out, interval=args.interval, once=args.once)
     try:
         return _execute(args, build_runtime())
     except (PionirError, ValueError, OSError, json.JSONDecodeError) as error:
