@@ -24,6 +24,10 @@ def _runtime(tmp: str):
     return build_runtime(
         PionirSettings(
             state_root=Path(tmp),
+            # A bogus command and dead ports: every specialist registers, but
+            # executing one fails fast instead of invoking the real Atani CLI or
+            # a live model. Routing/policy is what these tests exercise.
+            atani_command=("pionir-test-no-such-binary",),
             galatea_url="http://127.0.0.1:8799",
             galatea_model_id="stub-model",
             daedalus_url="http://127.0.0.1:9998",
@@ -94,15 +98,17 @@ class PionirAppTests(unittest.TestCase):
         self.assertEqual(audit["events_total"], 1)
         self.assertEqual(audit["events"][0]["agent_id"], "atani")
 
-    def test_intent_gates_shell_and_the_executive_to_approval(self) -> None:
-        # The voice must NOT be able to run Melete's shell or the Atani executive
-        # on her own - these act on the world. They come back needs_approval and
-        # are not executed.
-        shell = self.app.intent("run a shell command to list files")
-        self.assertEqual(shell["status"], "needs_approval")
-        self.assertEqual(shell["decision"]["capability"], "tools.melete_invoke")
-        plan = self.app.intent("run this versioned plan through the executive")
-        self.assertEqual(plan["status"], "needs_approval")
+    def test_the_voice_never_tasks_a_doer_directly(self) -> None:
+        # The voice does not control the organs. A doer's job - shell, coding,
+        # the executive - is Atani's to task, so it comes back via_manager and is
+        # NOT run here, whatever the doer.
+        for request in (
+            "run a shell command to list files",
+            "refactor this function and implement the fix",
+            "run this versioned plan through the executive",
+        ):
+            out = self.app.intent(request)
+            self.assertEqual(out["status"], "via_manager", request)
 
     def test_intent_hands_conversation_back_to_the_voice(self) -> None:
         out = self.app.intent("let's just chat for a while")
@@ -112,15 +118,14 @@ class PionirAppTests(unittest.TestCase):
         out = self.app.intent("photosynthesis in tomato plants")
         self.assertEqual(out["status"], "unclear")
 
-    def test_a_coding_intent_takes_the_dryrun_path_not_approval(self) -> None:
-        # "write code..." must route to Daedalus in dry_run, never to the
-        # needs_approval gate. Daedalus is unreachable in this test runtime, so it
-        # surfaces as error - but the point is the branch: it tried to run
-        # plan-only Daedalus, it did not refuse as a world-changing action.
-        out = self.app.intent("refactor this function and implement the fix")
-        self.assertEqual(out["decision"]["capability"], "coding.daedalus_solve")
-        self.assertNotEqual(out["status"], "needs_approval")
-        self.assertIn(out["status"], {"planned", "error"})
+    def test_asking_atani_to_reason_is_the_one_thing_the_voice_runs(self) -> None:
+        # Asking Atani to think has no doer and no side effect, so the voice may
+        # run it. Atani is unreachable in this test runtime, so it surfaces as
+        # error - but the branch is what matters: it tried to run, it was not
+        # deferred to the manager.
+        out = self.app.intent("think it over deliberately and thoroughly, the careful deep way")
+        self.assertEqual(out["decision"]["capability"], "reasoning.atani_depth")
+        self.assertNotEqual(out["status"], "via_manager")
 
     def test_gpu_view_never_raises_without_a_card(self) -> None:
         gpu = self.app.gpu()

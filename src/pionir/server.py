@@ -32,12 +32,10 @@ from .scheduler import observed_free_vram_mb
 MAX_REQUEST_BYTES = 1_000_000
 _UI_PATH = Path(__file__).parent / "web" / "dashboard.html"
 
-# What the voice may trigger on her own through /api/intent. Reasoning has no
-# side effect; Daedalus is allowed only in dry_run (plans, lands nothing).
-# Everything else - Melete's shell, the executive, landing code - is gated to
-# Ian's approval. See PionirApp.intent.
+# The only thing the voice runs on her own through /api/intent: asking Atani to
+# think (no doer, no side effect). Everything else is a doer's job, which only
+# Atani tasks - see PionirApp.intent.
 _VOICE_REASONING = frozenset({"reasoning.atani_answer", "reasoning.atani_depth"})
-_VOICE_DRYRUN_CODING = "coding.daedalus_solve"
 
 
 def _decision_json(decision: RoutingDecision) -> dict[str, Any]:
@@ -197,17 +195,18 @@ class PionirApp:
         }
 
     def intent(self, request: str) -> dict[str, Any]:
-        """The voice's hands: turn an intent Galatea formed into a real action.
+        """The voice's one seam for getting something done - and it reaches only
+        Atani, never a doer.
 
-        This is the Brain->doer seam, and it is deliberately narrow. Galatea is a
-        language model that will narrate an action it never took, so what she may
-        trigger on her own is only what has no side effect: Atani reasoning, and
-        Daedalus in dry_run - a real coding run that plans and shows its work but
-        lands nothing. Anything that touches the world - Melete's shell, the
-        Atani executive, or landing code - is returned as needs_approval and is
-        NOT run; Ian grants those from the dashboard. The safety lives here, on
-        the server, not in whatever permissions the caller sends, so the voice
-        cannot widen her own reach.
+        The design (Ian, 2026-09-11): the voice does not control the organs
+        directly. She views and reads, and she may ask Atani for a specific bot,
+        but only Atani tasks the doers. So this hands her intent to Atani and
+        nothing else. Atani reasoning answers her outright. A request that needs
+        a doer (Daedalus, Melete) is Atani's to dispatch - and Atani tasking the
+        doers is the next piece, being built on Atani's side; until it lands,
+        such a request comes back as via_manager, unrun, naming who it is for.
+        Anti-confabulation still holds: what she reports is what actually came
+        back, and 'not wired yet' is reported as exactly that.
         """
 
         decision = self.router.classify(request)
@@ -218,16 +217,19 @@ class PionirApp:
         if cap == "conversation.galatea_reply":
             return {**base, "status": "self", "note": "that routes back to the voice - answer it yourself"}
         if cap in _VOICE_REASONING:
+            # Asking Atani to think: Atani answers her directly, no doer involved.
             return self._run_intent(cap, {"content": request}, frozenset({"atani.chat"}), decision)
-        if cap == _VOICE_DRYRUN_CODING:
-            return self._run_intent(
-                cap, {"content": request, "dry_run": True}, frozenset({"daedalus.solve"}), decision, planned=True
-            )
+        # Everything else names a doer's job. The voice does not task doers; that
+        # is Atani's. Hand it to Atani rather than running it here.
         return {
             **base,
-            "status": "needs_approval",
+            "status": "via_manager",
             "capability": cap,
-            "note": "this acts on the world (shell, files, or landing changes); it needs Ian's approval and was not run",
+            "note": (
+                "the voice does not task the doers directly - Atani does. This is "
+                "for Atani to dispatch, and Atani tasking the doers is not wired "
+                "yet, so it was not run."
+            ),
         }
 
     def _run_intent(self, capability, payload, permissions, decision, *, planned=False):
