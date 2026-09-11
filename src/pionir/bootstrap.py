@@ -96,7 +96,10 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
     if configured.bryo_status_command is not None:
         runtime.register(
             BryoStatusAdapter(
-                BryoStatusSettings(command=configured.bryo_status_command)
+                BryoStatusSettings(
+                    command=configured.bryo_status_command,
+                    cwd=configured.bryo_status_cwd,
+                )
             )
         )
     if configured.nyx_status_command is not None:

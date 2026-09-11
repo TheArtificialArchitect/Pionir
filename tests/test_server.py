@@ -32,6 +32,7 @@ def _runtime(tmp: str):
             galatea_model_id="stub-model",
             daedalus_url="http://127.0.0.1:9998",
             melete_url="http://127.0.0.1:9999",
+            bryo_status_command=None,  # no real subprocess from a test
             evict_to_fit=False,  # never unload a live model from a test
         )
     )

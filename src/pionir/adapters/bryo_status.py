@@ -20,6 +20,9 @@ class BryoStatusSettings:
     command: tuple[str, ...]
     timeout_seconds: int = 15
     version: str = "terrarium/build"
+    # `python -m bryo.status` only resolves the bryo package from the terrarium
+    # tree, and Bryo is not installed, so the status command runs there.
+    cwd: str | None = None
 
     def __post_init__(self) -> None:
         if not self.command or any(not part for part in self.command):
@@ -29,8 +32,9 @@ class BryoStatusSettings:
 
 
 class SubprocessTextRunner:
-    def __init__(self, command: Sequence[str]) -> None:
+    def __init__(self, command: Sequence[str], *, cwd: str | None = None) -> None:
         self._command = tuple(command)
+        self._cwd = cwd
 
     def run(self, *, timeout_seconds: int) -> str:
         try:
@@ -42,6 +46,7 @@ class SubprocessTextRunner:
                 errors="replace",
                 shell=False,
                 timeout=timeout_seconds,
+                cwd=self._cwd,
             )
         except FileNotFoundError as error:
             raise AdapterUnavailable(
@@ -64,7 +69,7 @@ class BryoStatusAdapter:
         runner: TextCommandRunner | None = None,
     ) -> None:
         self.settings = settings
-        self._runner = runner or SubprocessTextRunner(settings.command)
+        self._runner = runner or SubprocessTextRunner(settings.command, cwd=settings.cwd)
         self._manifest = AgentManifest(
             agent_id="bryo",
             version=settings.version,

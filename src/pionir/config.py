@@ -106,7 +106,13 @@ class PionirSettings:
     evict_to_fit: bool = True
 
     atani_command: tuple[str, ...] = ("atani",)
-    bryo_status_command: tuple[str, ...] | None = None
+    # Bryo is Pionir's now: the organism is wired in by default as its read-only
+    # observer organ. `python -m bryo.status` resolves the package only from the
+    # terrarium tree (Bryo is not installed), so the command runs there; doctor
+    # shows him unavailable if the tree or process is gone. Turn off with
+    # PIONIR_BRYO_STATUS_COMMAND_JSON set to "off".
+    bryo_status_command: tuple[str, ...] | None = ("python", "-m", "bryo.status")
+    bryo_status_cwd: str = r"C:\src\terrarium"
     nyx_status_command: tuple[str, ...] | None = None
     voodoo_status_command: tuple[str, ...] | None = None
     # Galatea, Pionir's conversational voice. Opt-in: unset means no voice is
@@ -222,8 +228,17 @@ class PionirSettings:
                 "PIONIR_ATANI_COMMAND_JSON", _declared("atani_command")
             )
             or _declared("atani_command"),
-            bryo_status_command=_command_from_json(
-                "PIONIR_BRYO_STATUS_COMMAND_JSON", None
+            bryo_status_command=(
+                None
+                if (os.environ.get("PIONIR_BRYO_STATUS_COMMAND_JSON", "").strip().lower()
+                    in {"off", "none", "false", "0"})
+                else _command_from_json(
+                    "PIONIR_BRYO_STATUS_COMMAND_JSON",
+                    _declared("bryo_status_command"),
+                )
+            ),
+            bryo_status_cwd=(
+                os.environ.get("PIONIR_BRYO_STATUS_CWD") or _declared("bryo_status_cwd")
             ),
             nyx_status_command=_command_from_json("PIONIR_NYX_STATUS_COMMAND_JSON", None),
             voodoo_status_command=_command_from_json(
