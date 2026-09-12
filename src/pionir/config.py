@@ -121,6 +121,13 @@ class PionirSettings:
     nyx_status_command: tuple[str, ...] | None = ("nyx", "status")
     voodoo_status_command: tuple[str, ...] | None = ("python", "-m", "voodoo", "status")
     voodoo_status_cwd: str = r"C:\src\voodoo\src"
+    # Taskable actions: Atani may invoke one of these (privileged, so it lands in
+    # the approval queue and never fires on the voice's own initiative). The
+    # action is a first token from the allowlist; its args are argv, never a shell.
+    nyx_run_prefix: tuple[str, ...] = ("nyx",)
+    nyx_run_actions: tuple[str, ...] = ("research", "fingerprint", "cert", "scan", "crawl", "specialists")
+    voodoo_run_prefix: tuple[str, ...] = ("python", "-m", "voodoo")
+    voodoo_run_actions: tuple[str, ...] = ("defend", "scan", "headers", "cert", "hunt", "vpn")
     # Galatea, Pionir's conversational voice. Opt-in: unset means no voice is
     # registered and plain conversation asks rather than routes, exactly as the
     # other specialists register only when configured. The URL is her loopback
