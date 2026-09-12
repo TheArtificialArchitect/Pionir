@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import webbrowser
 from datetime import UTC, datetime
@@ -38,6 +39,13 @@ _UI_PATH = Path(__file__).parent / "web" / "dashboard.html"
 # think (no doer, no side effect). Everything else is a doer's job, which only
 # Atani tasks - see PionirApp.intent.
 _VOICE_REASONING = frozenset({"reasoning.atani_answer", "reasoning.atani_depth"})
+
+# When she names a bot (or clearly means security work) but phrases it loosely,
+# the classifier can come back unsure. That is exactly Atani's job to sort out, so
+# such a request goes to the manager rather than dead-ending as "unclear".
+_NAMES_A_DOER = re.compile(
+    r"\b(nyx|voodoo|daedalus|melete|atani|recon|reconnaissance|pentest)\b", re.I
+)
 
 
 def _decision_json(decision: RoutingDecision) -> dict[str, Any]:
@@ -215,6 +223,13 @@ class PionirApp:
         decision = self.router.classify(request)
         base = {"decision": _decision_json(decision)}
         if not decision.resolved:
+            if _NAMES_A_DOER.search(request):
+                # she named a bot; the classifier just wasn't sure. Hand it to
+                # Atani, who decides which organ and tasks it, rather than asking.
+                return self._run_intent(
+                    "manager.atani_manage", {"content": request},
+                    frozenset({"atani.manage"}), decision,
+                )
             return {**base, "status": "unclear", "question": decision.question()}
         cap = decision.capability
         if cap == "conversation.galatea_reply":

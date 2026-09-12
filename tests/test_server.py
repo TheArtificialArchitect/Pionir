@@ -137,6 +137,15 @@ class PionirAppTests(unittest.TestCase):
         out = self.app.intent("photosynthesis in tomato plants")
         self.assertEqual(out["status"], "unclear")
 
+    def test_naming_a_bot_reaches_atani_even_when_unsure(self) -> None:
+        # a loosely-phrased request that names a bot no longer dead-ends as
+        # "unclear" - it goes to Atani, whose job is to sort out which organ.
+        # Atani is a bogus command in the test runtime, so it surfaces as error;
+        # the point is the route went to the manager, not that it ran.
+        out = self.app.intent("get nyx to do a recon thing for me somehow")
+        self.assertNotEqual(out["status"], "unclear")
+        self.assertEqual(out["status"], "error")
+
     def test_asking_atani_to_reason_is_the_one_thing_the_voice_runs(self) -> None:
         # Asking Atani to think has no doer and no side effect, so the voice may
         # run it. Atani is unreachable in this test runtime, so it surfaces as
