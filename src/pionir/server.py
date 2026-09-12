@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .approvals import ApprovalQueue
 from .bootstrap import PionirRuntime
 from .cli import _capabilities, _doctor, _jsonable
 from .contracts import RiskLevel, Task
@@ -66,6 +67,7 @@ class PionirApp:
     def __init__(self, runtime: PionirRuntime) -> None:
         self.runtime = runtime
         self.router = IntentRouter(runtime.executive)
+        self.approvals = ApprovalQueue(runtime.settings.state_root / "approvals" / "queue.json")
 
     # ---- read-only views -------------------------------------------------
     def roster(self) -> list[dict[str, Any]]:
@@ -261,6 +263,36 @@ class PionirApp:
             "evidence": list(result.evidence),
         }
 
+    def _cap_and_agent(self, name: str):
+        for manifest in self.runtime.executive.registry.manifests():
+            for capability in manifest.capabilities:
+                if capability.name == name:
+                    return manifest.agent_id, capability
+        return None, None
+
+    def _needs_approval(self, capability: str, granted: list[str]) -> bool:
+        """A privileged action arriving without the permission it needs is held
+        for Ian, not refused. Anything read-only or already-permitted just runs."""
+        _agent, cap = self._cap_and_agent(capability)
+        if cap is None:
+            return False   # unknown capability: let execute() report it as it always has
+        return (cap.risk is RiskLevel.PRIVILEGED
+                and not set(cap.required_permissions).issubset(set(granted)))
+
+    def _summarize(self, capability: str, payload: dict[str, Any]) -> str:
+        agent, _cap = self._cap_and_agent(capability)
+        who = agent or capability.split(".")[0]
+        gist = ""
+        for key in ("content", "task", "goal", "command", "target", "request", "action"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                gist = value.strip()
+                break
+            if isinstance(value, (dict, list)):
+                gist = json.dumps(value)[:160]
+                break
+        return f"{who} · {capability}" + (f" — {gist[:160]}" if gist else "")
+
     def run_task(
         self,
         capability: str,
@@ -268,12 +300,27 @@ class PionirApp:
         *,
         permissions: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Invoke one named capability directly - the executive-goal path and any
-        deliberate call that does not go through natural-language routing."""
+        """Invoke one named capability directly. A privileged action without its
+        permission is parked in the approval queue and does NOT run - it waits for
+        Ian's yes; everything else runs as before."""
 
+        granted = list(permissions or ())
+        if self._needs_approval(capability, granted):
+            _agent, cap = self._cap_and_agent(capability)
+            summary = self._summarize(capability, payload)
+            approval_id = self.approvals.enqueue(
+                capability, payload, sorted(cap.required_permissions), summary=summary
+            )
+            return {
+                "ok": False,
+                "status": "pending_approval",
+                "approval_id": approval_id,
+                "summary": summary,
+                "note": "held for Ian's approval - it has not run",
+            }
         try:
             result = self.runtime.executive.execute(
-                Task(capability, payload, frozenset(permissions or ()))
+                Task(capability, payload, frozenset(granted))
             )
         except Exception as error:  # noqa: BLE001 - returned as data
             return {"ok": False, "error": {"type": type(error).__name__, "message": str(error)}}
@@ -283,6 +330,28 @@ class PionirApp:
             "result": _jsonable(result.output),
             "evidence": list(result.evidence),
         }
+
+    # ---- approvals: Ian's yes/no on a parked privileged action ----------
+    def approvals_view(self) -> dict[str, Any]:
+        return {"pending": self.approvals.pending(), "recent": self.approvals.recent(20)}
+
+    def approve(self, approval_id: str) -> dict[str, Any]:
+        record = self.approvals.get(approval_id)
+        if record is None:
+            return {"ok": False, "error": {"type": "NotFound", "message": "no such approval"}}
+        if record["status"] != "pending":
+            return {"ok": False, "error": {"type": "AlreadyResolved",
+                                           "message": f"already {record['status']}"}}
+        # run it with exactly the permission it needed - never wider
+        outcome = self.run_task(record["capability"], record["payload"],
+                                permissions=record["permissions"])
+        self.approvals.resolve(approval_id, "approved", outcome)
+        return {"ok": True, "status": "approved", "approval_id": approval_id, "result": outcome}
+
+    def deny(self, approval_id: str) -> dict[str, Any]:
+        if self.approvals.resolve(approval_id, "denied"):
+            return {"ok": True, "status": "denied", "approval_id": approval_id}
+        return {"ok": False, "error": {"type": "AlreadyResolved", "message": "not pending"}}
 
 
 def _ui_bytes() -> bytes:
@@ -339,6 +408,8 @@ def _make_handler(app: PionirApp):
                 elif route.path == "/api/audit":
                     n = int(parse_qs(route.query).get("n", ["60"])[0] or 60)
                     self._send(app.audit(min(max(n, 1), 500)))
+                elif route.path == "/api/approvals":
+                    self._send(app.approvals_view())
                 else:
                     self._send({"error": "not found"}, 404)
             except Exception as error:  # noqa: BLE001
@@ -382,6 +453,12 @@ def _make_handler(app: PionirApp):
                             permissions=[str(p) for p in body.get("permissions", [])],
                         )
                     )
+                elif route.path == "/api/approvals/approve":
+                    aid = str(body.get("id", "")).strip()
+                    self._send(app.approve(aid) if aid else {"error": "id required"})
+                elif route.path == "/api/approvals/deny":
+                    aid = str(body.get("id", "")).strip()
+                    self._send(app.deny(aid) if aid else {"error": "id required"})
                 else:
                     self._send({"error": "not found"}, 404)
             except Exception as error:  # noqa: BLE001
