@@ -282,16 +282,22 @@ class PionirApp:
     def _summarize(self, capability: str, payload: dict[str, Any]) -> str:
         agent, _cap = self._cap_and_agent(capability)
         who = agent or capability.split(".")[0]
-        gist = ""
-        for key in ("content", "task", "goal", "command", "target", "request", "action"):
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                gist = value.strip()
-                break
-            if isinstance(value, (dict, list)):
-                gist = json.dumps(value)[:160]
-                break
-        return f"{who} · {capability}" + (f" — {gist[:160]}" if gist else "")
+        action = payload.get("action")
+        if isinstance(action, str) and action.strip():
+            # a tool action: show the whole command so Ian decides on the real thing
+            args = payload.get("args")
+            gist = " ".join([action, *[str(a) for a in args]]) if isinstance(args, list) else action
+        else:
+            gist = ""
+            for key in ("content", "task", "goal", "command", "target", "request", "intent"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    gist = value.strip()
+                    break
+                if isinstance(value, (dict, list)):
+                    gist = json.dumps(value)[:160]
+                    break
+        return f"{who} · {capability}" + (f" — {gist[:200]}" if gist else "")
 
     def run_task(
         self,
