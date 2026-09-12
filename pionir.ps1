@@ -136,7 +136,9 @@ if (-not (Test-Port $Port)) {
 if (-not $NoVoice) {
     if (Test-Port 8799) { Write-Host "  Galatea already awake on 8799." -ForegroundColor DarkCyan }
     elseif (Test-Path $galateaDir) {
-        $panes += ,(Pane-Cmd "Galatea :8799" $galateaDir "python -m galatea wake --port 8799 --no-browser" "")
+        # --phone binds 0.0.0.0 so Ian can reach her from his phone over Tailscale;
+        # her token gates every non-loopback request, so this fails closed.
+        $panes += ,(Pane-Cmd "Galatea :8799" $galateaDir "python -m galatea wake --port 8799 --no-browser --phone" "")
         $ports += 8799
     } else { Write-Host "  ! Galatea not found at $galateaDir; skipping the voice." -ForegroundColor Yellow }
 }
