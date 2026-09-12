@@ -113,8 +113,14 @@ class PionirSettings:
     # PIONIR_BRYO_STATUS_COMMAND_JSON set to "off".
     bryo_status_command: tuple[str, ...] | None = ("python", "-m", "bryo.status")
     bryo_status_cwd: str = r"C:\src\terrarium"
-    nyx_status_command: tuple[str, ...] | None = None
-    voodoo_status_command: tuple[str, ...] | None = None
+    # Nyx (offensive) and Voodoo (defensive), Pionir's read-only security organs.
+    # Wired in by default: `nyx status` is an installed console script; Voodoo's
+    # editable install isn't importable, so `python -m voodoo status` runs from
+    # its src tree. Each shows unavailable in doctor if its tree/CLI is gone, and
+    # either is turned off with PIONIR_NYX/VOODOO_STATUS_COMMAND_JSON set to "off".
+    nyx_status_command: tuple[str, ...] | None = ("nyx", "status")
+    voodoo_status_command: tuple[str, ...] | None = ("python", "-m", "voodoo", "status")
+    voodoo_status_cwd: str = r"C:\src\voodoo\src"
     # Galatea, Pionir's conversational voice. Opt-in: unset means no voice is
     # registered and plain conversation asks rather than routes, exactly as the
     # other specialists register only when configured. The URL is her loopback
@@ -240,9 +246,24 @@ class PionirSettings:
             bryo_status_cwd=(
                 os.environ.get("PIONIR_BRYO_STATUS_CWD") or _declared("bryo_status_cwd")
             ),
-            nyx_status_command=_command_from_json("PIONIR_NYX_STATUS_COMMAND_JSON", None),
-            voodoo_status_command=_command_from_json(
-                "PIONIR_VOODOO_STATUS_COMMAND_JSON", None
+            nyx_status_command=(
+                None
+                if (os.environ.get("PIONIR_NYX_STATUS_COMMAND_JSON", "").strip().lower()
+                    in {"off", "none", "false", "0"})
+                else _command_from_json(
+                    "PIONIR_NYX_STATUS_COMMAND_JSON", _declared("nyx_status_command")
+                )
+            ),
+            voodoo_status_command=(
+                None
+                if (os.environ.get("PIONIR_VOODOO_STATUS_COMMAND_JSON", "").strip().lower()
+                    in {"off", "none", "false", "0"})
+                else _command_from_json(
+                    "PIONIR_VOODOO_STATUS_COMMAND_JSON", _declared("voodoo_status_command")
+                )
+            ),
+            voodoo_status_cwd=(
+                os.environ.get("PIONIR_VOODOO_STATUS_CWD") or _declared("voodoo_status_cwd")
             ),
             galatea_url=(os.environ.get("PIONIR_GALATEA_URL") or "").strip() or None,
             galatea_model_id=(os.environ.get("PIONIR_GALATEA_MODEL_ID") or "").strip()

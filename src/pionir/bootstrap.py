@@ -109,7 +109,10 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
     if configured.voodoo_status_command is not None:
         runtime.register(
             VoodooStatusAdapter(
-                VoodooStatusSettings(command=configured.voodoo_status_command)
+                VoodooStatusSettings(
+                    command=configured.voodoo_status_command,
+                    cwd=configured.voodoo_status_cwd,
+                )
             )
         )
     if configured.galatea_url is not None:

@@ -33,6 +33,8 @@ def _runtime(tmp: str):
             daedalus_url="http://127.0.0.1:9998",
             melete_url="http://127.0.0.1:9999",
             bryo_status_command=None,  # no real subprocess from a test
+            nyx_status_command=None,  # ditto: don't invoke the real nyx/voodoo CLIs
+            voodoo_status_command=None,
             evict_to_fit=False,  # never unload a live model from a test
         )
     )

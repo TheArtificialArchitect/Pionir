@@ -35,6 +35,9 @@ class VoodooStatusSettings:
     command: tuple[str, ...]
     timeout_seconds: int = 20
     version: str = "voodoo/0.2"
+    # `python -m voodoo status` resolves the voodoo package only from its src
+    # tree (its editable install is not importable), so the status runs there.
+    cwd: str | None = None
 
     def __post_init__(self) -> None:
         if not self.command or any(not part for part in self.command):
@@ -44,8 +47,9 @@ class VoodooStatusSettings:
 
 
 class SubprocessTextRunner:
-    def __init__(self, command: Sequence[str]) -> None:
+    def __init__(self, command: Sequence[str], *, cwd: str | None = None) -> None:
         self._command = tuple(command)
+        self._cwd = cwd
 
     def run(self, *, timeout_seconds: int) -> str:
         try:
@@ -57,6 +61,7 @@ class SubprocessTextRunner:
                 errors="replace",
                 shell=False,
                 timeout=timeout_seconds,
+                cwd=self._cwd,
             )
         except FileNotFoundError as error:
             raise AdapterUnavailable("Voodoo's configured executable was not found") from error
@@ -89,7 +94,7 @@ class VoodooStatusAdapter:
 
     def __init__(self, settings: VoodooStatusSettings, *, runner: TextCommandRunner | None = None) -> None:
         self.settings = settings
-        self._runner = runner or SubprocessTextRunner(settings.command)
+        self._runner = runner or SubprocessTextRunner(settings.command, cwd=settings.cwd)
         self._manifest = AgentManifest(
             agent_id="voodoo",
             version=settings.version,
