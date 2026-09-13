@@ -125,11 +125,14 @@ $env:PIONIR_GALATEA_URL = "http://127.0.0.1:8799"
 $browserFlag = ""
 if ($NoBrowser) { $browserFlag = " --no-browser" }
 # Atani is not a pane - Pionir shells `atani ...` per call, so the subprocess
-# inherits this pane's env. Pin its model here: a lean 4B instruct for the
-# manager/router, and the same small model for its deliberate path (no heavy
-# depth tier - it was a 0-VRAM CPU model, so dropping it frees no GPU, but it
-# keeps the roster lean and lets the 25GB nemotron be deleted if wanted).
-$pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://127.0.0.1:8799'; `$env:ATANI_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_DELIBERATE_MODEL='qwen3:4b-instruct-2507-q4_K_M'; "
+# inherits this pane's env. Pin ALL THREE of Atani's model slots to the lean 4B
+# instruct: default (its internal reasoning/routing), deliberate (the retired
+# depth path), AND teacher (verified 2026-09-13: `atani chat` REPLIES with the
+# teacher/voice model, not the default - by default theo-local-v17-q4, a 5.2GB
+# GPU tenant that would compete with the voice for the card, which is exactly
+# what we are avoiding). All three on the 4B means nothing heavy ever loads for
+# Atani and Moss keeps the GPU.
+$pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://127.0.0.1:8799'; `$env:ATANI_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_DELIBERATE_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_TEACHER_MODEL='qwen3:4b-instruct-2507-q4_K_M'; "
 
 $panes = @()   # ordered: dashboard, voice, then the doers
 $ports = @()   # the ports this launch is responsible for verifying
