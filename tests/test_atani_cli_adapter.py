@@ -71,7 +71,7 @@ class AtaniCliAdapterTests(unittest.TestCase):
             for capability in adapter.manifest.capabilities
             if capability.model is not None
         }
-        self.assertEqual(models["reasoning.atani_answer"], "qwen3:4b-instruct-2507")
+        self.assertEqual(models["reasoning.atani_answer"], "qwen3:4b-instruct-2507-q4_K_M")
         self.assertNotIn("reasoning.atani_depth", models)
 
     def test_executive_plan_uses_versioned_stdin_contract(self) -> None:

@@ -129,7 +129,7 @@ if ($NoBrowser) { $browserFlag = " --no-browser" }
 # manager/router, and the same small model for its deliberate path (no heavy
 # depth tier - it was a 0-VRAM CPU model, so dropping it frees no GPU, but it
 # keeps the roster lean and lets the 25GB nemotron be deleted if wanted).
-$pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://127.0.0.1:8799'; `$env:ATANI_MODEL='qwen3:4b-instruct-2507'; `$env:ATANI_DELIBERATE_MODEL='qwen3:4b-instruct-2507'; "
+$pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://127.0.0.1:8799'; `$env:ATANI_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_DELIBERATE_MODEL='qwen3:4b-instruct-2507-q4_K_M'; "
 
 $panes = @()   # ordered: dashboard, voice, then the doers
 $ports = @()   # the ports this launch is responsible for verifying

@@ -139,7 +139,7 @@ class AtaniCliAdapter:
                     risk=RiskLevel.REVERSIBLE_WRITE,
                     required_permissions=permission,
                     model=ModelRequirement(
-                        "qwen3:4b-instruct-2507",
+                        "qwen3:4b-instruct-2507-q4_K_M",
                         # A lean 4B instruct for the manager/router: strong
                         # instruction-following and tool selection at a fraction
                         # of the footprint, leaving the card to the voice. The
