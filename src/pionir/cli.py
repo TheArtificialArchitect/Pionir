@@ -60,7 +60,6 @@ def _parser() -> argparse.ArgumentParser:
 
     atani = commands.add_parser("ask-atani", help="run Atani's bounded reasoning pipeline")
     atani.add_argument("text", nargs="+")
-    atani.add_argument("--depth", action="store_true")
 
     atani_plan = commands.add_parser(
         "run-atani-plan",
@@ -389,10 +388,9 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
         _print({"status": "verified", "events": sequence, "head_sha256": digest})
         return 0
     if args.command == "ask-atani":
-        capability = "reasoning.atani_depth" if args.depth else "reasoning.atani_answer"
         result = runtime.executive.execute(
             Task(
-                capability,
+                "reasoning.atani_answer",
                 {"content": " ".join(args.text)},
                 frozenset({"atani.chat"}),
             )

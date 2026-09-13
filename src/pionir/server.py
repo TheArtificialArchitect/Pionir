@@ -38,7 +38,7 @@ _UI_PATH = Path(__file__).parent / "web" / "dashboard.html"
 # The only thing the voice runs on her own through /api/intent: asking Atani to
 # think (no doer, no side effect). Everything else is a doer's job, which only
 # Atani tasks - see PionirApp.intent.
-_VOICE_REASONING = frozenset({"reasoning.atani_answer", "reasoning.atani_depth"})
+_VOICE_REASONING = frozenset({"reasoning.atani_answer"})
 
 # When she names a bot (or clearly means security work) but phrases it loosely,
 # the classifier can come back unsure. That is exactly Atani's job to sort out, so

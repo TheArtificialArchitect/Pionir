@@ -48,35 +48,31 @@ class AtaniCliAdapterTests(unittest.TestCase):
         self.assertEqual(result.evidence, ("atani:reasoning-cycle:cycle-1",))
         self.assertEqual(runner.calls[0][0], ("chat", "--json", "Think about this"))
 
-    def test_depth_uses_explicit_depth_flag(self) -> None:
-        runner = FakeRunner({"answer": "Deep answer", "cycle_id": "cycle-2"})
-        adapter = AtaniCliAdapter(runner=runner)
-        adapter.execute(
-            Task(
-                "reasoning.atani_depth",
-                {"content": "Go deep"},
-                frozenset({"atani.chat"}),
+    def test_the_retired_depth_capability_is_gone(self) -> None:
+        # The separate reasoning.atani_depth tier (a 30B CPU model) was dropped
+        # 2026-09-13; a request for it is no longer a capability the adapter runs.
+        adapter = AtaniCliAdapter(runner=FakeRunner({"answer": "x", "cycle_id": "c"}))
+        names = {c.name for c in adapter.manifest.capabilities}
+        self.assertNotIn("reasoning.atani_depth", names)
+        with self.assertRaises(AdapterProtocolError):
+            adapter.execute(
+                Task("reasoning.atani_depth", {"content": "Go deep"}, frozenset({"atani.chat"}))
             )
-        )
-        self.assertEqual(
-            runner.calls[0][0],
-            ("chat", "--json", "--depth", "Go deep"),
-        )
 
     def test_requires_answer_in_response(self) -> None:
         adapter = AtaniCliAdapter(runner=FakeRunner({"cycle_id": "cycle-3"}))
         with self.assertRaises(AdapterProtocolError):
             adapter.execute(Task("reasoning.atani_answer", {"content": "hello"}))
 
-    def test_manifest_separates_default_and_depth_models(self) -> None:
+    def test_reasoning_runs_on_the_lean_instruct_model(self) -> None:
         adapter = AtaniCliAdapter(AtaniCliSettings(command=("atani",)))
         models = {
             capability.name: capability.model.model_id
             for capability in adapter.manifest.capabilities
             if capability.model is not None
         }
-        self.assertEqual(models["reasoning.atani_answer"], "qwen2.5:7b-instruct")
-        self.assertIn("nemotron", models["reasoning.atani_depth"])
+        self.assertEqual(models["reasoning.atani_answer"], "qwen3:4b-instruct-2507")
+        self.assertNotIn("reasoning.atani_depth", models)
 
     def test_executive_plan_uses_versioned_stdin_contract(self) -> None:
         runner = FakeRunner(

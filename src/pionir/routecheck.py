@@ -186,9 +186,12 @@ def default_probes() -> tuple[Probe, ...]:
             ("reasoning.atani_answer",),
         ),
         Probe(
+            # The deep/thorough vocabulary folded into atani_answer when the
+            # separate depth tier was dropped (2026-09-13); a deliberate-reasoning
+            # request must still land on Atani, now on the one lean model.
             "think deeply and carefully about this, take a thorough look",
-            "reasoning.atani_depth",
-            ("reasoning.atani_depth",),
+            "reasoning.atani_answer",
+            ("reasoning.atani_answer",),
         ),
         Probe(
             "run this versioned plan through the executive",

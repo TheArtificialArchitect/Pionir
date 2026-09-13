@@ -35,7 +35,6 @@ from pionir.contracts import (
     TaskResult,
 )
 from pionir.errors import AdapterProtocolError
-from pionir.scheduler import kv_cache_vram_mb
 
 MAX_INTENT_CHARS = 8_000
 
@@ -46,10 +45,11 @@ class DaedalusSettings(LoopbackHttpSettings):
     # A real coding job - worktree, edits, a test run, repairs - is minutes, not
     # seconds. Generous against that tail rather than tuned to a median.
     timeout_seconds: int = 600
-    # Observability and the VRAM discount only; resolved live from /health at
-    # boot. Daedalus shares qwen2.5:7b-instruct with Melete and Atani via the one
-    # local Ollama daemon, so when it is hot the residency discount applies.
-    model_id: str = "qwen2.5:7b-instruct"
+    # Observability only; resolved live from /health at boot. Daedalus runs
+    # qwen3-coder:30b - a code-specialist MoE that Ollama runs on the CPU at ~0
+    # VRAM, so it takes no GPU lease and never competes with the voice for the
+    # card (see the capability's ModelRequirement below).
+    model_id: str = "qwen3-coder:30b"
 
 
 class DaedalusAdapter:
@@ -74,13 +74,19 @@ class DaedalusAdapter:
                     required_permissions=frozenset({"daedalus.solve"}),
                     model=ModelRequirement(
                         model_id=self.settings.model_id,
-                        # On-demand qwen 7b loaded by Daedalus's own daemon, so
-                        # unlike the always-resident voice this declares the real
-                        # load: Pionir should not invoke it when the card cannot
-                        # fit qwen. The residency discount covers the common case
-                        # where Atani or Genesis already holds qwen hot.
-                        estimated_vram_mb=4_500,
-                        context_vram_mb=kv_cache_vram_mb(8_192),
+                        # qwen3-coder:30b is a mixture-of-experts (~3B active) that
+                        # Ollama runs on the CPU on this 12GB card - the same
+                        # elastic behaviour as the nemotron depth tier. The zeros
+                        # are a statement about leases, not a claim of no memory:
+                        # it needs no GPU lease because it never fails to run for
+                        # want of the card, and declaring it a GPU tenant would
+                        # take the single lease it does not need and make it
+                        # unadmittable whenever the voice holds the card. Admission
+                        # reads free VRAM at lease time, so whatever it does take is
+                        # already priced in.
+                        estimated_vram_mb=0,
+                        context_vram_mb=0,
+                        requires_gpu=False,
                     ),
                     routing_hints=frozenset(
                         {"daedalus", "code", "coding", "refactor", "implement", "patch"}

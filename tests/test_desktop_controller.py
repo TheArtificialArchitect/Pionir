@@ -33,12 +33,10 @@ class DesktopControllerTests(unittest.TestCase):
         self.assertEqual(task.capability, "reasoning.atani_answer")
         self.assertEqual(task.granted_permissions, frozenset({"atani.chat"}))
 
-    def test_depth_is_an_explicit_route(self) -> None:
-        self.controller.ask("Atani · depth", "Think")
-        self.assertEqual(
-            [task.capability for task in self.executive.tasks],
-            ["reasoning.atani_depth"],
-        )
+    def test_the_retired_depth_route_is_rejected(self) -> None:
+        # The "Atani · depth" route went with the depth tier (2026-09-13).
+        with self.assertRaises(ValueError):
+            self.controller.ask("Atani · depth", "Think")
 
 
 

@@ -150,9 +150,10 @@ class PionirAppTests(unittest.TestCase):
         # Asking Atani to think has no doer and no side effect, so the voice may
         # run it. Atani is unreachable in this test runtime, so it surfaces as
         # error - but the branch is what matters: it tried to run, it was not
-        # deferred to the manager.
+        # deferred to the manager. The deep/deliberate vocabulary now lands on
+        # atani_answer (the separate depth tier was retired 2026-09-13).
         out = self.app.intent("think it over deliberately and thoroughly, the careful deep way")
-        self.assertEqual(out["decision"]["capability"], "reasoning.atani_depth")
+        self.assertEqual(out["decision"]["capability"], "reasoning.atani_answer")
         self.assertNotEqual(out["status"], "via_manager")
 
     def test_gpu_view_never_raises_without_a_card(self) -> None:

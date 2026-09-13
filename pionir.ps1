@@ -124,7 +124,12 @@ $env:PIONIR_GALATEA_URL = "http://127.0.0.1:8799"
 # double-start and collide on the port), and honour the flags.
 $browserFlag = ""
 if ($NoBrowser) { $browserFlag = " --no-browser" }
-$pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://127.0.0.1:8799'; "
+# Atani is not a pane - Pionir shells `atani ...` per call, so the subprocess
+# inherits this pane's env. Pin its model here: a lean 4B instruct for the
+# manager/router, and the same small model for its deliberate path (no heavy
+# depth tier - it was a 0-VRAM CPU model, so dropping it frees no GPU, but it
+# keeps the roster lean and lets the 25GB nemotron be deleted if wanted).
+$pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://127.0.0.1:8799'; `$env:ATANI_MODEL='qwen3:4b-instruct-2507'; `$env:ATANI_DELIBERATE_MODEL='qwen3:4b-instruct-2507'; "
 
 $panes = @()   # ordered: dashboard, voice, then the doers
 $ports = @()   # the ports this launch is responsible for verifying
@@ -146,7 +151,12 @@ if (-not $NoVoice) {
 if (-not $NoSpecialists) {
     if (Test-Port 8771) { Write-Host "  Daedalus already up on 8771." -ForegroundColor DarkCyan }
     elseif (Test-Path $daedalusDir) {
-        $panes += ,(Pane-Cmd "Daedalus :8771" $daedalusDir "python -m daedalus.server" "")
+        # Daedalus runs qwen3-coder:30b - a code-specialist MoE (~3B active) that
+        # Ollama runs on the CPU at 0 VRAM, so the coder never competes with the
+        # voice for the card. Slower per token than a GPU 7B, but a far stronger
+        # coder and it leaves the whole GPU to Moss. Daedalus's own config reads
+        # DAEDALUS_MODEL, so pinning it here is all it takes (no Tech-Support edit).
+        $panes += ,(Pane-Cmd "Daedalus :8771" $daedalusDir "python -m daedalus.server" "`$env:DAEDALUS_MODEL='qwen3-coder:30b'; ")
         $ports += 8771
     } else { Write-Host "  ! Daedalus not found at $daedalusDir; skipping." -ForegroundColor Yellow }
     if (Test-Port 8770) { Write-Host "  Melete already up on 8770." -ForegroundColor DarkCyan }

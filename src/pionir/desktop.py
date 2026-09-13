@@ -45,12 +45,6 @@ class DesktopController:
                 {"content": message},
                 frozenset({"atani.chat"}),
             )
-        elif route == "Atani · depth":
-            task = Task(
-                "reasoning.atani_depth",
-                {"content": message},
-                frozenset({"atani.chat"}),
-            )
         else:
             raise ValueError(f"Unknown desktop route: {route}")
         return dict(self.runtime.executive.execute(task).output)
@@ -114,8 +108,9 @@ class PionirDesktop:
             route_row,
             state="readonly",
             # Atani is the only conversational-ish route until the voice (Galatea)
-            # is wired in; Theo was removed from Pionir.
-            values=("Atani", "Atani · depth"),
+            # is wired in; Theo was removed from Pionir. The separate depth route
+            # was dropped when the heavy depth tier was retired (2026-09-13).
+            values=("Atani",),
             width=24,
         )
         self.route.current(0)
@@ -236,10 +231,7 @@ class PionirDesktop:
         self._busy = False
         self.send_button.configure(state="normal")
         if kind == "ok":
-            target = self.transcript if label in {
-                "Atani",
-                "Atani · depth",
-            } else self.system_output
+            target = self.transcript if label in {"Atani"} else self.system_output
             self._append(target, label, value)
             self.status.set("Ready")
         else:

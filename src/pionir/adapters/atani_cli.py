@@ -139,9 +139,15 @@ class AtaniCliAdapter:
                     risk=RiskLevel.REVERSIBLE_WRITE,
                     required_permissions=permission,
                     model=ModelRequirement(
-                        "qwen2.5:7b-instruct",
-                        # Measured resident at 4096 context: 4423 MB.
-                        4_500,
+                        "qwen3:4b-instruct-2507",
+                        # A lean 4B instruct for the manager/router: strong
+                        # instruction-following and tool selection at a fraction
+                        # of the footprint, leaving the card to the voice. The
+                        # figure is an estimate for a 4B q4 (~2.5-3 GB weights)
+                        # pending a `python -m pionir benchmark` re-measure once
+                        # it is pulled; conservative-but-not-inflated so admission
+                        # is neither falsely refused nor falsely granted.
+                        3_000,
                         kv_cache_vram_mb(16_384),
                     ),
                     # "chat" is deliberately absent. Plain conversation is the
@@ -150,43 +156,20 @@ class AtaniCliAdapter:
                     # case inside the router is the whole point of capabilities
                     # declaring their own words: the decision is visible where it
                     # applies.
+                    # The deep/deliberate vocabulary lives here now. There was a
+                    # separate reasoning.atani_depth tier on a 30B CPU model;
+                    # dropped 2026-09-13 at Ian's call ("does she really need
+                    # depth? Moss needs the space more"). It was already a 0-VRAM
+                    # CPU tenant, so removing it frees no GPU - the win is a leaner
+                    # roster on one small model, and the 25GB nemotron can be
+                    # deleted. A "think it through carefully" request still reaches
+                    # Atani; she just answers with the same lean 4B rather than
+                    # escalating to a heavyweight.
                     routing_hints=frozenset(
-                        {"atani", "reason", "reasoning", "think", "answer"}
-                    ),
-                    priority=100,
-                ),
-                Capability(
-                    name="reasoning.atani_depth",
-                    description="Atani's slower deliberate reasoning path",
-                    risk=RiskLevel.REVERSIBLE_WRITE,
-                    required_permissions=permission,
-                    model=ModelRequirement(
-                        "nemotron-3.5-lightning:30b-a3b-q4_K_M",
-                        # This model is an elastic tenant, and the zeros are a
-                        # statement about leases rather than about VRAM.
-                        #
-                        # Measured twice on the same card and the same daemon:
-                        # 0 MB resident on 2026-08-27, and 2611 MB on 2026-08-30.
-                        # Ollama partial-offloads whatever happens to fit and
-                        # runs the rest on the CPU, so there is no fixed
-                        # footprint to declare and any number written here would
-                        # be wrong by the next reading.
-                        #
-                        # It needs no GPU lease because it never fails to run -
-                        # a mixture-of-experts with ~3B active parameters still
-                        # returned 30.4 tok/s with nothing on the card at all.
-                        # Declaring it a GPU tenant took the single lease it did
-                        # not need and made it unadmittable whenever anything
-                        # else held the card. What makes the elastic
-                        # consumption safe is that admission reads free VRAM at
-                        # lease time rather than summing these declarations, so
-                        # whatever this model has taken is already priced in.
-                        0,
-                        0,
-                        requires_gpu=False,
-                    ),
-                    routing_hints=frozenset(
-                        {"deep", "deeply", "careful", "deliberate", "thorough", "analyse"}
+                        {
+                            "atani", "reason", "reasoning", "think", "answer",
+                            "deep", "deeply", "careful", "deliberate", "thorough", "analyse",
+                        }
                     ),
                     priority=100,
                 ),
@@ -334,17 +317,14 @@ class AtaniCliAdapter:
                 output=document,
                 evidence=(f"atani:goal:{goal_id}",),
             )
-        if task.capability not in {"reasoning.atani_answer", "reasoning.atani_depth"}:
+        if task.capability != "reasoning.atani_answer":
             raise AdapterProtocolError(f"unsupported Atani capability: {task.capability}")
         content = str(task.payload.get("content") or "").strip()
         if not content:
             raise AdapterProtocolError("Atani chat content is required")
         if len(content) > 8_000:
             raise AdapterProtocolError("Atani chat content exceeds Pionir's 8000-character limit")
-        arguments = ["chat", "--json"]
-        if task.capability == "reasoning.atani_depth":
-            arguments.append("--depth")
-        arguments.append(content)
+        arguments = ["chat", "--json", content]
         document = self._json(arguments)
         answer = document.get("answer")
         if not isinstance(answer, str) or not answer.strip():
