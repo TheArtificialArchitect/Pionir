@@ -301,6 +301,40 @@ class PermissionTests(unittest.TestCase):
         self.assertEqual(len(adapters["atani"].calls), 1)
 
 
+class RoutableTests(unittest.TestCase):
+    def test_a_non_routable_capability_is_never_classified(self) -> None:
+        # A capability marked routable=False is reached only by name (as
+        # /api/intent reaches manager.atani_manage), never chosen from a request -
+        # even when the request names it outright and it would otherwise win.
+        executive = _executive()
+        executive.register(
+            _Adapter(
+                AgentManifest(
+                    "manager", "1",
+                    (
+                        _capability(
+                            "manager.atani_manage",
+                            "Atani deciding and tasking the right bot",
+                            routing_hints=frozenset({"manage", "atani", "dispatch"}),
+                            routable=False,
+                        ),
+                        _capability(
+                            "reasoning.atani_answer",
+                            "Atani's bounded reasoning",
+                            routing_hints=frozenset({"reason", "think"}),
+                        ),
+                    ),
+                )
+            )
+        )
+        decision = IntentRouter(executive).classify("atani manage and dispatch this")
+        self.assertNotEqual(decision.capability, "manager.atani_manage")
+        self.assertNotIn(
+            "manager.atani_manage",
+            {candidate.capability for candidate in decision.candidates},
+        )
+
+
 class ExecutionTests(unittest.TestCase):
     def test_the_request_reaches_the_specialist_as_its_payload(self) -> None:
         executive, adapters = _estate()

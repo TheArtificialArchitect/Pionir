@@ -296,5 +296,80 @@ class PersistenceTests(unittest.TestCase):
         self.assertEqual(document["results"][0]["outcome"], "misroute")
 
 
+def _adapter(agent_id: str, name: str, routable: bool = True) -> _Adapter:
+    return _Adapter(
+        AgentManifest(
+            agent_id, "1",
+            (Capability(name=name, description=f"{name} thing", routable=routable),),
+        )
+    )
+
+
+class FingerprintTests(unittest.TestCase):
+    """The saved check is stale when the routable capability set has changed,
+    detected by a fingerprint, not only by its age."""
+
+    def _router_with(self, *adapters: _Adapter) -> IntentRouter:
+        executive = Executive(scheduler=offline_scheduler())
+        for adapter in adapters:
+            executive.register(adapter)
+        return IntentRouter(executive)
+
+    def test_the_fingerprint_changes_when_a_capability_is_added(self) -> None:
+        one = self._router_with(_adapter("a", "x.one"))
+        two = self._router_with(_adapter("a", "x.one"), _adapter("b", "x.two"))
+        self.assertNotEqual(
+            routecheck.registry_fingerprint(one),
+            routecheck.registry_fingerprint(two),
+        )
+
+    def test_a_non_routable_capability_does_not_change_the_fingerprint(self) -> None:
+        without = self._router_with(_adapter("a", "x.one"))
+        with_hidden = self._router_with(
+            _adapter("a", "x.one"), _adapter("m", "manager.hidden", routable=False)
+        )
+        self.assertEqual(
+            routecheck.registry_fingerprint(without),
+            routecheck.registry_fingerprint(with_hidden),
+        )
+
+    def test_the_fingerprint_survives_a_json_round_trip(self) -> None:
+        check = routecheck.run(self._router_with(_adapter("a", "x.one")))
+        restored = RoutingCheck.from_json(check.to_json())
+        self.assertEqual(restored.registry_hash, check.registry_hash)
+        self.assertTrue(restored.registry_hash)
+
+
+class DoctorStalenessTests(unittest.TestCase):
+    def test_doctor_marks_a_check_stale_when_the_capability_set_changed(self) -> None:
+        from pionir.bootstrap import build_runtime
+        from pionir.cli import _doctor
+        from pionir.config import PionirSettings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = build_runtime(
+                PionirSettings(
+                    state_root=Path(tmp),
+                    atani_command=("pionir-test-no-such-binary",),
+                    bryo_status_command=None, nyx_status_command=None,
+                    voodoo_status_command=None, daedalus_url=None,
+                    melete_url=None, galatea_url=None, evict_to_fit=False,
+                    embed_model=None,
+                )
+            )
+            try:
+                check = routecheck.run(IntentRouter(runtime.executive))
+                routecheck.save(runtime.settings.routing_check_path, check)
+                fresh = _doctor(runtime)["routing_aim"]
+                self.assertNotIn("stale", fresh)  # just measured, set unchanged
+
+                runtime.executive.registry.unregister("atani")  # the set changed
+                stale = _doctor(runtime)["routing_aim"]
+                self.assertIn("stale", stale)
+                self.assertIn("capability set", stale["stale"])
+            finally:
+                runtime.cortex.close()
+
+
 if __name__ == "__main__":
     unittest.main()

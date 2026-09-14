@@ -229,6 +229,7 @@ class IntentRouter:
             (manifest.agent_id, capability, capability_vocabulary(manifest.agent_id, capability))
             for manifest in self.executive.registry.manifests()
             for capability in manifest.capabilities
+            if capability.routable
         ]
 
     def classify(self, request: str) -> RoutingDecision:

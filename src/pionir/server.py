@@ -19,9 +19,10 @@ import os
 import re
 import tempfile
 import threading
+import time
 import uuid
 import webbrowser
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -218,6 +219,27 @@ def _job_status(result: dict[str, Any]) -> str:
     return "done"
 
 
+def _outcome_ok(output: Any) -> bool:
+    """Whether a specialist's own output reports success.
+
+    An adapter can return normally and still carry a failing verdict: Daedalus a
+    refused solve (``ok: false``), a security run a non-zero ``returncode``. The
+    executive routed and ran it, so it never raised - but reporting that as
+    ``ok: true`` recorded a failed action as a success (both approved rows in
+    queue.json were actually failures). So the outer ok is false whenever the
+    inner result says ``ok: false`` or a non-zero return code.
+    """
+
+    if isinstance(output, Mapping):
+        if output.get("ok") is False:
+            return False
+        for key in ("returncode", "rc", "exit_code"):
+            code = output.get(key)
+            if isinstance(code, int) and not isinstance(code, bool) and code != 0:
+                return False
+    return True
+
+
 def _clamp_wait(wait: Any) -> float:
     try:
         value = float(DEFAULT_WAIT_SECONDS if wait is None else wait)
@@ -320,7 +342,13 @@ class PionirApp:
         threading.Thread(target=worker, name=f"pionir-job-{tid[:8]}", daemon=True).start()
         if self.jobs.wait(tid, wait) and "response" in box:
             return box["response"]
-        return {**(known or {}), "status": "running", "task_id": tid}
+        # A still-running job carries an explicit ``running: True`` alongside the
+        # status and task id. A client that gave up before ``wait`` and only
+        # checked for ``ok`` used to read its absence as failure ("Daedalus
+        # couldn't: no reason given") while the job ran on; this flag is the
+        # unambiguous signal it cannot misread. galatea/hands.py still keys on
+        # status=="running" + task_id, so it is untouched.
+        return {**(known or {}), "status": "running", "running": True, "task_id": tid}
 
     def job(self, task_id: str) -> dict[str, Any] | None:
         return self.jobs.get(task_id)
@@ -582,6 +610,30 @@ class PionirApp:
                     return manifest.agent_id, capability
         return None, None
 
+    def _validation_error(
+        self, capability: str, payload: dict[str, Any], granted: list[str]
+    ) -> dict[str, Any] | None:
+        """The adapter's own argument check, run before queuing an approval.
+
+        Returns an error detail if the request is malformed (and so must not be
+        parked for Ian), or None if it is well-formed or the adapter has no
+        pre-execution validator. Only structural validation - permissions and
+        execution still happen later, unchanged.
+        """
+
+        agent_id, _cap = self._cap_and_agent(capability)
+        if agent_id is None:
+            return None
+        adapter = self.runtime.adapters.get(agent_id)
+        validate = getattr(adapter, "validate", None)
+        if validate is None:
+            return None
+        try:
+            validate(Task(capability, payload, frozenset(granted)))
+        except PionirError as error:
+            return {"type": type(error).__name__, "message": str(error)}
+        return None
+
     def _needs_approval(self, capability: str, granted: list[str]) -> bool:
         """A privileged action arriving without the permission it needs is held
         for Ian, not refused. Anything read-only or already-permitted just runs."""
@@ -632,6 +684,16 @@ class PionirApp:
         granted = list(permissions or ())
         body = {"capability": capability, "payload": payload, "permissions": granted,
                 "deferrable": deferrable}
+        # Validate the action's arguments BEFORE anything is parked for approval.
+        # Argument validation used to live only in the adapter's execute(), which
+        # runs after Ian approves - so he could be asked to approve a request that
+        # can never run (a bad host, a disallowed flag). Check it now instead.
+        invalid = self._validation_error(capability, payload, granted)
+        if invalid is not None:
+            response = {"ok": False, "status": "error", "error": invalid}
+            record = self.jobs.create("task", body)
+            self.jobs.finish(record["task_id"], "error", result=response)
+            return {**response, "task_id": record["task_id"]}
         if self._needs_approval(capability, granted):
             _agent, cap = self._cap_and_agent(capability)
             summary = self._summarize(capability, payload)
@@ -659,18 +721,81 @@ class PionirApp:
         *, deferrable: bool = False,
     ) -> dict[str, Any]:
         """The synchronous core: run it now, on this thread, and report as data."""
+        self._recall_lessons(capability, payload)
         try:
             result = self.runtime.executive.execute(
                 Task(capability, payload, frozenset(granted)), deferrable=deferrable
             )
         except Exception as error:  # noqa: BLE001 - returned as data
-            return {"ok": False, "error": {"type": type(error).__name__, "message": str(error)}}
-        return {
-            "ok": True,
+            response = {"ok": False, "error": {"type": type(error).__name__, "message": str(error)}}
+            self._learn_from_failure(capability, payload, response)
+            return response
+        # The adapter can return normally and still carry a failing verdict; the
+        # outer ok reflects that, so a refused solve or a non-zero action is not
+        # recorded as a success (item 3). approve()'s finish reads this ok to mark
+        # the row approved vs approved_failed.
+        ok = _outcome_ok(result.output)
+        response = {
+            "ok": ok,
             "agent_id": result.agent_id,
             "result": _jsonable(result.output),
             "evidence": list(result.evidence),
         }
+        if not ok:
+            self._learn_from_failure(capability, payload, response)
+        return response
+
+    def _recall_lessons(self, capability: str, payload: dict[str, Any]) -> None:
+        """Consult the shared lessons namespace before tasking a doer, and note
+        what was recalled in the ledger, so a mistake learned once is in front of
+        the next similar action (the recall-before-act hook, previously only wired
+        into the CLI)."""
+
+        cortex = getattr(self.runtime, "cortex", None)
+        if cortex is None:
+            return
+        context = self._summarize(capability, payload)
+        try:
+            lessons = cortex.lessons_for(context)
+        except Exception:  # noqa: BLE001 - memory must never fail a task
+            return
+        if not lessons:
+            return
+        try:
+            self.runtime.executive.audit_sink.record(
+                AuditEvent(
+                    event_type="task.recalled_lessons",
+                    task_id=uuid.uuid4(),
+                    agent_id=capability.split(".")[0],
+                    occurred_at=datetime.now(UTC),
+                    detail=f"capability={capability} lessons={len(lessons)}",
+                )
+            )
+        except Exception:  # noqa: BLE001
+            _log.warning("recording recalled-lessons event failed", exc_info=True)
+
+    def _learn_from_failure(
+        self, capability: str, payload: dict[str, Any], response: dict[str, Any]
+    ) -> None:
+        """Record a failed task or approval as a lesson in the shared namespace,
+        so the circuit-breaker path is not the only thing that ever writes one and
+        a repeated mistake surfaces on the next similar request."""
+
+        cortex = getattr(self.runtime, "cortex", None)
+        if cortex is None:
+            return
+        error = response.get("error")
+        why = ""
+        if isinstance(error, Mapping):
+            why = str(error.get("message") or error.get("type") or "")
+        elif isinstance(response.get("result"), Mapping):
+            why = str(response["result"].get("error") or "")
+        summary = self._summarize(capability, payload)
+        text = f"{summary} failed" + (f": {why[:300]}" if why else "")
+        try:
+            cortex.record_lesson(text, slug=f"failure:{capability}")
+        except Exception:  # noqa: BLE001 - a lesson write must never fail a task
+            _log.warning("recording failure lesson failed", exc_info=True)
 
     # ---- approvals: Ian's yes/no on a parked privileged action ----------
     def approvals_view(self) -> dict[str, Any]:
@@ -901,6 +1026,36 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
     return Handler
 
 
+class _RateLimitedErrors:
+    """Log recurring errors at most once per interval, counting the suppressed ones.
+
+    The pulse thread runs every second or two; a persistent fault (a bad poll,
+    the state dir vanishing) would flood the log if every failure logged. It used
+    to swallow them all with ``except Exception: pass`` - which hid the fault
+    entirely. This logs the first, then one line per interval with how many were
+    suppressed, so a real problem is visible without drowning the log."""
+
+    def __init__(
+        self, logger: logging.Logger, *, interval: float = 60.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._log = logger
+        self._interval = interval
+        self._clock = clock
+        self._last: float | None = None
+        self._suppressed = 0
+
+    def note(self, error: BaseException, message: str) -> None:
+        now = self._clock()
+        if self._last is None or now - self._last >= self._interval:
+            extra = f" ({self._suppressed} similar suppressed)" if self._suppressed else ""
+            self._log.warning("%s: %s: %s%s", message, type(error).__name__, error, extra)
+            self._last = now
+            self._suppressed = 0
+        else:
+            self._suppressed += 1
+
+
 def _start_pulse(app: PionirApp) -> tuple[threading.Thread | None, threading.Event]:
     """Bryo's pulse: while the server is up, write Pionir's live state where his
     sensors read it. A daemon thread, so it lives exactly as long as the server
@@ -921,6 +1076,8 @@ def _start_pulse(app: PionirApp) -> tuple[threading.Thread | None, threading.Eve
     except ValueError:
         interval = bryofeed.DEFAULT_INTERVAL
 
+    errors = _RateLimitedErrors(_log)
+
     def pump() -> None:
         prev: int | None = None
         while not stop.is_set():
@@ -928,8 +1085,8 @@ def _start_pulse(app: PionirApp) -> tuple[threading.Thread | None, threading.Eve
                 audit = app.audit(1)
                 snap, prev = bryofeed.shape(app.state(), audit.get("events_total"), prev)
                 bryofeed.write(path, snap)
-            except Exception:  # noqa: BLE001 - a bad poll must never take the server down
-                pass
+            except Exception as error:  # noqa: BLE001 - a bad poll must never take the server down
+                errors.note(error, "Bryo pulse poll failed")
             stop.wait(interval)
 
     thread = threading.Thread(target=pump, name="pionir-bryo-pulse", daemon=True)

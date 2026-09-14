@@ -145,6 +145,11 @@ class DaedalusAdapter:
                         estimated_vram_mb=10_000,
                         context_vram_mb=0,
                         requires_gpu=True,
+                        # The 30B coder fills the card; making room for it may
+                        # evict even the protected voice model, but only once the
+                        # shared lease is held (she has stood down) and the lease's
+                        # release re-warms hers. No other tenant declares this.
+                        exclusive_card=True,
                     ),
                     routing_hints=frozenset(
                         {"daedalus", "code", "coding", "refactor", "implement", "patch"}

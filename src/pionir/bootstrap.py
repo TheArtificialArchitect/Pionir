@@ -28,7 +28,7 @@ from .bryo_pressure import BryoPressureReader
 from .config import PionirSettings
 from .cortex import Cortex, OllamaEmbedder
 from .reliability import CircuitBreaker
-from .runtime import Executive, SpecialistAdapter
+from .runtime import AuditEvent, Executive, SpecialistAdapter
 from .scheduler import ModelLeaseScheduler
 from .shared_gpu import SharedGpuLock
 
@@ -39,6 +39,10 @@ class PionirRuntime:
     executive: Executive
     adapters: dict[str, SpecialistAdapter]
     cortex: Cortex
+    # Bryo's pressure reader, when he is wired in. Exposed so a one-shot CLI run
+    # can prime it with a synchronous read before executing - peek() alone would
+    # be neutral for the whole short-lived process (see BryoPressureReader.read_now).
+    pressure_reader: object | None = None
 
     def register(self, adapter: SpecialistAdapter) -> None:
         self.executive.register(adapter)
@@ -69,6 +73,25 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         OllamaEmbedder(configured.embed_model) if configured.embed_model else None
     )
     cortex = Cortex(configured.cortex_path, embedder=embedder)
+    # Built here (before the scheduler) so the scheduler can audit a wait for the
+    # shared GPU lease through the same ledger everything else uses.
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    audit_sink = JsonlAuditSink(configured.audit_path)
+
+    def _audit_card_wait(note: str) -> None:
+        # A GPU task held back because Bryo's governor has the card: recorded as a
+        # first-class event so the wait is visible, not silent.
+        audit_sink.record(
+            AuditEvent(
+                event_type="task.waiting_for_card",
+                task_id=uuid4(),
+                agent_id="scheduler",
+                occurred_at=datetime.now(UTC),
+                detail=note,
+            )
+        )
     # The body: Bryo's felt pressure, consulted before heavy GPU work. Built only
     # when Bryo is wired in at all, so a runtime without him (every test) never
     # starts a subprocess. peek() never blocks and fails open.
@@ -94,8 +117,12 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
             # unloads the job's model and re-warms hers.
             protected_models=configured.protected_models,
             rewarmer=warm,
+            # Wait for Bryo's governor to let go of the card rather than refusing
+            # a GPU task the instant the lock is held; audit that the wait happened.
+            lock_wait_seconds=configured.gpu_lock_wait_seconds,
+            on_wait=_audit_card_wait,
         ),
-        audit_sink=JsonlAuditSink(configured.audit_path),
+        audit_sink=audit_sink,
         circuit_factory=lambda: CircuitBreaker(
             failure_threshold=configured.circuit_failure_threshold,
             recovery_seconds=configured.circuit_recovery_seconds,
@@ -105,7 +132,7 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         on_lesson=cortex.record_lesson,
         pressure_probe=pressure_reader.peek if pressure_reader is not None else None,
     )
-    runtime = PionirRuntime(configured, executive, {}, cortex)
+    runtime = PionirRuntime(configured, executive, {}, cortex, pressure_reader=pressure_reader)
     runtime.register(
         AtaniCliAdapter(AtaniCliSettings(command=configured.atani_command))
     )

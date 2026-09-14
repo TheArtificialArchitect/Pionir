@@ -137,7 +137,10 @@ class VoodooStatusAdapter:
             raise AdapterProtocolError("Voodoo returned an empty status")
         return _redact(raw)
 
-    def run_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _validated(self, payload: dict[str, Any]) -> tuple[str, tuple[str, ...]]:
+        """The allowlist + argument-shape checks, with no side effect, so a request
+        can be rejected before it is parked for approval rather than after Ian has
+        already said yes to something that can never run."""
         action = normalise_action(payload.get("action"))
         allowed = {normalise_action(item) for item in self.settings.run_actions}
         if not action or action not in allowed:
@@ -150,6 +153,15 @@ class VoodooStatusAdapter:
         args = validate_action_args(
             "Voodoo", action, [str(a) for a in raw_args], VOODOO_ACTION_SHAPES
         )
+        return action, args
+
+    def validate(self, task: Task) -> None:
+        """Check a run task's arguments without executing (used by the approval gate)."""
+        if task.capability == "security.voodoo_run":
+            self._validated(dict(task.payload))
+
+    def run_action(self, payload: dict[str, Any]) -> dict[str, Any]:
+        action, args = self._validated(payload)
         command = [*self.settings.run_prefix, *action.split(), *args]
         result = run_action(
             "Voodoo",

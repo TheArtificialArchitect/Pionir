@@ -26,6 +26,7 @@ Three failure kinds are counted separately, because they are not equally bad:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -75,11 +76,31 @@ class ProbeResult:
     outcome: str
 
 
+def registry_fingerprint(router: IntentRouter) -> str:
+    """A short hash of the routable capabilities currently registered.
+
+    A saved check is only evidence about the registry it was taken against. When
+    a specialist is added or dropped, the old accuracy figure is stale no matter
+    how recent it is - the router is answering a different question. Hashing the
+    routable capability set makes that detectable, where a 30-day age alone
+    cannot. Non-routable capabilities are excluded: they never take part in a
+    classification, so adding one changes nothing the check measured."""
+
+    names = sorted(
+        capability.name
+        for manifest in router.executive.registry.manifests()
+        for capability in manifest.capabilities
+        if capability.routable
+    )
+    return hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()[:16]
+
+
 @dataclass(frozen=True, slots=True)
 class RoutingCheck:
     taken_at: str
     results: tuple[ProbeResult, ...]
     skipped: tuple[str, ...] = ()
+    registry_hash: str = ""
 
     @property
     def total(self) -> int:
@@ -136,6 +157,7 @@ class RoutingCheck:
         return json.dumps(
             {
                 "taken_at": self.taken_at,
+                "registry_hash": self.registry_hash,
                 "skipped": list(self.skipped),
                 "results": [
                     {
@@ -168,6 +190,7 @@ class RoutingCheck:
                 for item in parsed["results"]
             ),
             skipped=tuple(str(item) for item in parsed.get("skipped", ())),
+            registry_hash=str(parsed.get("registry_hash", "")),
         )
 
 
@@ -202,6 +225,29 @@ def default_probes() -> tuple[Probe, ...]:
             "how is bryo doing, check the terrarium vitals",
             "organism.bryo_status",
             ("organism.bryo_status",),
+        ),
+        # The doers, each behind its own distinctive name, so route-check covers
+        # the whole roster rather than only Atani and Bryo. Each is skipped when
+        # its capability is not registered (the service is off).
+        Probe(
+            "have daedalus write a function to parse this file",
+            "coding.daedalus_solve",
+            ("coding.daedalus_solve",),
+        ),
+        Probe(
+            "get melete to run a shell command and list the files",
+            "tools.melete_invoke",
+            ("tools.melete_invoke",),
+        ),
+        Probe(
+            "check nyx's offensive security status",
+            "security.nyx_status",
+            ("security.nyx_status",),
+        ),
+        Probe(
+            "read voodoo's defensive posture, scopes and leases",
+            "security.voodoo_status",
+            ("security.voodoo_status",),
         ),
         # Plain conversation is Galatea's, the voice. "chat" belongs to her
         # capability alone - Atani's rename to atani_answer is what keeps it from
@@ -244,6 +290,7 @@ def run(router: IntentRouter, probes: tuple[Probe, ...] | None = None) -> Routin
         capability.name
         for manifest in router.executive.registry.manifests()
         for capability in manifest.capabilities
+        if capability.routable
     }
     results: list[ProbeResult] = []
     skipped: list[str] = []
@@ -273,6 +320,7 @@ def run(router: IntentRouter, probes: tuple[Probe, ...] | None = None) -> Routin
         taken_at=datetime.now(UTC).isoformat(),
         results=tuple(results),
         skipped=tuple(skipped),
+        registry_hash=registry_fingerprint(router),
     )
 
 

@@ -130,7 +130,11 @@ class Executive:
         try:
             circuit.before_call()
             model = route.capability.model
-            if model is not None and model.requires_gpu:
+            # Consult the body before ANY model-backed work, not only GPU work: a
+            # CPU model still loads and competes for the machine, and a deferrable
+            # background job should yield to a stressed organism whatever card the
+            # model wants. A model-free capability (a pure status read) is never paced.
+            if model is not None:
                 self._consult_body(task, route.agent_id, deferrable=deferrable)
             # The purpose names the tenant as well as the model, so the lock's
             # holder record reads "daedalus: qwen3-coder:30b" to anyone who

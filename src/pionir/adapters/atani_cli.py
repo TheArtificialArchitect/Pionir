@@ -223,6 +223,11 @@ class AtaniCliAdapter:
                     risk=RiskLevel.PRIVILEGED,
                     required_permissions=frozenset({"atani.manage"}),
                     priority=90,
+                    # Invoked directly by /api/intent, never classified from a
+                    # request - keeping it out of the router's vocabulary stops it
+                    # tying a route it should never take (doctor's route-check
+                    # caught it at 0.50).
+                    routable=False,
                 ),
             ),
         )

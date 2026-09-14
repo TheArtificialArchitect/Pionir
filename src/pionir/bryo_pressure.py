@@ -151,6 +151,20 @@ class BryoPressureReader:
             return neutral("reading too old")
         return reading
 
+    def read_now(self) -> PressureReading:
+        """One synchronous, bounded read - for a one-shot CLI run.
+
+        ``peek`` never blocks: on the first call it returns neutral ("no reading
+        yet") and kicks a background refresh. In a long-running server that fills
+        in within a poll or two, but a one-shot ``pionir route ...`` process exits
+        before the background thread ever finishes, so pressure could never defer
+        anything from the CLI - the first read was always neutral. This does the
+        read on the calling thread instead, bounded by the reader's own timeout,
+        and caches it so a following ``peek`` sees it. Still fail-open."""
+
+        self._refresh()
+        return self.peek()
+
     def _refresh(self) -> None:
         reading = neutral("refresh interrupted")
         try:

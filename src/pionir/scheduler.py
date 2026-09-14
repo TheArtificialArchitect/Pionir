@@ -192,9 +192,24 @@ class ModelLeaseScheduler:
         protected_models: Iterable[str] = (),
         rewarmer: Callable[[str], None] | None = None,
         background: Callable[[Callable[[], None]], None] | None = None,
+        lock_wait_seconds: float = 0.0,
+        lock_poll_seconds: float = 5.0,
+        on_wait: Callable[[str], None] | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.budget = budget or ResourceBudget()
         self.shared_gpu_lock = shared_gpu_lock
+        # When another Pionir-compatible process (Bryo's governor) holds the
+        # cross-process GPU lease, wait up to this long for it rather than
+        # refusing at once - the worker thread stays blocked here, so the job
+        # keeps its "running" status and 202/poll clients see progress. 0 keeps
+        # the old fail-fast behaviour (every test, unless it opts in). ``on_wait``
+        # is called once with the lock's holder when the waiting begins, so the
+        # wait can be audited.
+        self.lock_wait_seconds = max(0.0, lock_wait_seconds)
+        self.lock_poll_seconds = max(0.1, lock_poll_seconds)
+        self.on_wait = on_wait
+        self._monotonic = monotonic
         self.vram_probe = vram_probe
         self.residency_probe = residency_probe
         # Models that are not evicted to make room for a caller without the
@@ -232,7 +247,8 @@ class ModelLeaseScheduler:
         return requirement.total_vram_mb
 
     def _make_room(
-        self, needed_mb: int, target_model: str, *, under_lease: bool = False
+        self, needed_mb: int, target_model: str, *,
+        under_lease: bool = False, exclusive: bool = False,
     ) -> int | None:
         """Evict idle resident models other than the target until it fits.
 
@@ -244,9 +260,13 @@ class ModelLeaseScheduler:
         space is believed.
 
         ``under_lease`` says this caller holds the shared cross-process lease.
-        Then even a protected model may go: the voice honours that lease and
-        has stood down, so evicting her model is the planned swap, and the
-        lease's release loads it back. Without the lease, protection stands.
+        ``exclusive`` says this caller's model needs the whole card to itself
+        (``ModelRequirement.exclusive_card``). Only when BOTH hold may a
+        protected model go: the voice honours the lease and has stood down, so
+        evicting her model is the planned swap, and the lease's release loads it
+        back. A lease-holder that is not exclusive must fit beside the protected
+        models or be refused - it never displaces one. Without the lease,
+        protection always stands.
         """
 
         # Eviction acts on the real daemon, so it is opt-in: it happens only when
@@ -273,7 +293,9 @@ class ModelLeaseScheduler:
                 break
             if canonical_model(name) == target:
                 continue
-            if canonical_model(name) in self.protected_models and not under_lease:
+            if canonical_model(name) in self.protected_models and not (
+                under_lease and exclusive
+            ):
                 spared.append(name)
                 continue
             try:
@@ -360,9 +382,12 @@ class ModelLeaseScheduler:
         # is using the card right now.
         shared_lease: SharedGpuLease | None = None
         if requirement.requires_gpu and self.shared_gpu_lock is not None:
+            hold_purpose = purpose or requirement.model_id
             shared_lease = self.shared_gpu_lock.try_acquire(
-                owner="pionir", purpose=purpose or requirement.model_id
+                owner="pionir", purpose=hold_purpose
             )
+            if shared_lease is None and self.lock_wait_seconds > 0:
+                shared_lease = self._wait_for_lock(hold_purpose)
             if shared_lease is None:
                 raise ResourceUnavailable(
                     "GPU is leased by another Pionir-compatible process "
@@ -378,7 +403,9 @@ class ModelLeaseScheduler:
                 if free_mb is not None and needed_mb > free_mb:
                     # Sideline idle resident models to make room, then look again.
                     free_mb = self._make_room(
-                        needed_mb, requirement.model_id, under_lease=shared_lease is not None
+                        needed_mb, requirement.model_id,
+                        under_lease=shared_lease is not None,
+                        exclusive=requirement.exclusive_card,
                     )
                 if free_mb is not None and needed_mb > free_mb:
                     raise ResourceUnavailable(
@@ -400,6 +427,29 @@ class ModelLeaseScheduler:
             if handback is not None and handback.rewarm:
                 self._rewarm_quietly(handback.rewarm)
             raise
+
+    def _wait_for_lock(self, purpose: str) -> SharedGpuLease | None:
+        """Poll for the shared GPU lease up to ``lock_wait_seconds``.
+
+        Returns the lease once it is free, or None if the wait runs out. The
+        caller's worker thread blocks here, so the job stays "running" and a
+        202/poll client keeps seeing progress rather than an immediate refusal.
+        ``on_wait`` fires once, with the current holder, so the wait is audited.
+        """
+
+        assert self.shared_gpu_lock is not None
+        if self.on_wait is not None:
+            try:
+                self.on_wait(f"waiting for the card: {self.shared_gpu_lock.describe_holder()}")
+            except Exception as error:  # noqa: BLE001 - auditing the wait must never wedge it
+                _log.warning("on_wait callback failed: %s", error)
+        deadline = self._monotonic() + self.lock_wait_seconds
+        while self._monotonic() < deadline:
+            self._sleep(min(self.lock_poll_seconds, max(0.0, deadline - self._monotonic())))
+            lease = self.shared_gpu_lock.try_acquire(owner="pionir", purpose=purpose)
+            if lease is not None:
+                return lease
+        return None
 
     def release(self, lease_id: UUID) -> None:
         with self._lock:

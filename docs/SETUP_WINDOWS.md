@@ -56,9 +56,11 @@ To add a `Pionir` shortcut to the current user's Windows desktop:
 ```
 
 The launcher supplies the standard `C:\src\Atani` and `C:\src\terrarium` paths. Override the
-launcher parameters if those checkouts live elsewhere. The shell exposes Atani normal/depth
-routes plus doctor, capabilities, and Bryo status. A conversational voice (Galatea) is not
-wired in yet, so plain conversation has no route and the router asks rather than guessing.
+launcher parameters if those checkouts live elsewhere. The shell exposes Atani's reasoning
+(`reasoning.atani_answer`, one lean 4B - the separate depth tier was dropped 2026-09-13) plus
+doctor, capabilities, and Bryo status. The conversational voice, Galatea, is wired in when
+`PIONIR_GALATEA_URL` is set: plain conversation then routes to her (`conversation.galatea_reply`);
+with no voice configured it has no route and the router asks rather than guessing.
 
 ## First bounded calls
 

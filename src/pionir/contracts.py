@@ -41,6 +41,12 @@ class ModelRequirement:
     estimated_vram_mb: int
     context_vram_mb: int = 0
     requires_gpu: bool = True
+    # This model needs the whole card to itself, so making room for it may evict
+    # even a protected model (the voice's) once the shared lease is held. Default
+    # False: an ordinary GPU tenant must fit beside protected models or be
+    # refused, never displace one. Set True only on a capability that genuinely
+    # fills the card (Daedalus's 30B coder). See scheduler._make_room.
+    exclusive_card: bool = False
 
     def __post_init__(self) -> None:
         if not self.model_id:
@@ -69,6 +75,15 @@ class Capability:
     here rather than in a table inside the router is what lets a specialist
     become routable by registering, without an edit anywhere else.
     """
+    routable: bool = True
+    """Whether plain-language routing may choose this capability.
+
+    Some capabilities are only ever invoked by name, never classified from a
+    request - ``manager.atani_manage`` is reached directly by /api/intent, never
+    NL-routed. Leaving such a capability in the router's vocabulary lets it win
+    or tie a classification it should never take part in (it tied at 0.50 in a
+    fresh route-check). Non-routable capabilities are excluded from classification
+    and from route-check's probe set; they still resolve and execute by name."""
 
     def __post_init__(self) -> None:
         if not self.name or any(char.isspace() for char in self.name):

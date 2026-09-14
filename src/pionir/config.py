@@ -180,8 +180,16 @@ class PionirSettings:
     # mid-sentence cuts her off. PIONIR_PROTECTED_MODELS is a comma list; set it
     # to "" to protect nothing.
     protected_models: tuple[str, ...] = ("gemma3:12b",)
+    # When another Pionir-compatible process (Bryo's governor) holds the shared
+    # GPU lease, wait up to this long for it before refusing a GPU task, rather
+    # than refusing at once. The worker stays blocked, so the job keeps its
+    # "running" status and 202/poll clients see progress. PIONIR_GPU_LOCK_WAIT_SECONDS
+    # overrides; 0 restores the old immediate refusal.
+    gpu_lock_wait_seconds: float = 600.0
 
     def __post_init__(self) -> None:
+        if self.gpu_lock_wait_seconds < 0:
+            raise ValueError("gpu_lock_wait_seconds cannot be negative")
         if self.circuit_failure_threshold < 1:
             raise ValueError("circuit failure threshold must be at least one")
         if self.circuit_recovery_seconds < 0:
@@ -324,5 +332,10 @@ class PionirSettings:
                 Path(os.environ["PIONIR_GPU_LOCK_FILE"])
                 if os.environ.get("PIONIR_GPU_LOCK_FILE")
                 else None
+            ),
+            gpu_lock_wait_seconds=float(
+                os.environ.get(
+                    "PIONIR_GPU_LOCK_WAIT_SECONDS", _declared("gpu_lock_wait_seconds")
+                )
             ),
         )

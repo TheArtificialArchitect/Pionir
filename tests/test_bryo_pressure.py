@@ -91,6 +91,19 @@ class ReaderTests(unittest.TestCase):
         self.assertFalse(rd.peek().alive, "nothing is known until a read completes")
         self.assertEqual(len(spawned), 1)
 
+    def test_read_now_reads_synchronously_for_a_one_shot_cli(self) -> None:
+        # peek() is neutral until a background read completes - fine for the
+        # long-running server, useless for a one-shot process that exits first.
+        # read_now() does the read on the calling thread (item 4).
+        runner = FakeRunner(vitals(pressure=0.7, advisory={"defer_heavy_work": True, "note": "busy"}))
+        rd = BryoPressureReader(("python", "-m", "bryo.status"), runner=runner,
+                                clock=FakeClock(), spawn=lambda fn: None)  # no background thread
+        reading = rd.read_now()
+        self.assertTrue(reading.alive)
+        self.assertEqual(reading.pressure, 0.7)
+        self.assertTrue(reading.defer_heavy_work)
+        self.assertGreaterEqual(runner.calls, 1)
+
     def test_it_appends_json_to_the_configured_command(self) -> None:
         rd = BryoPressureReader(("python", "-m", "bryo.status"), cwd=r"C:\src\terrarium")
         self.assertEqual(rd._runner._command, ("python", "-m", "bryo.status", "--json"))
@@ -235,13 +248,24 @@ class ExecutiveBodyTests(unittest.TestCase):
         ex.execute(Task("research.deep", {}), deferrable=True)
         self.assertEqual(adapter.calls, 1)
 
-    def test_only_gpu_work_consults_the_body(self) -> None:
+    def test_any_model_backed_work_consults_the_body_model_less_does_not(self) -> None:
+        # Fixed 2026-09-14 (audit item 4): a CPU model still loads and competes
+        # for the machine, so it is consulted too; only a model-less capability
+        # (a pure status read) is never paced.
         consulted = []
-        ex, sink, adapter = executive(lambda: consulted.append(1) or STRESSED)
+        ex, _sink, adapter = executive(lambda: consulted.append(1) or CALM)
         ex.execute(Task("research.cpu", {}), deferrable=True)
+        self.assertEqual(consulted, [1], "CPU model work now consults the body")
         ex.execute(Task("research.none", {}), deferrable=True)
+        self.assertEqual(consulted, [1], "model-less work still never waits on the body")
         self.assertEqual(adapter.calls, 2)
-        self.assertEqual(consulted, [], "CPU and model-less work never waits on the body")
+
+    def test_deferrable_cpu_model_work_is_held_when_stressed(self) -> None:
+        ex, sink, adapter = executive(lambda: STRESSED)
+        with self.assertRaises(BodyDeferred):
+            ex.execute(Task("research.cpu", {}), deferrable=True)
+        self.assertEqual(adapter.calls, 0, "a stressed body defers CPU model work too")
+        self.assertIn("task.deferred", kinds(sink))
 
 
 if __name__ == "__main__":

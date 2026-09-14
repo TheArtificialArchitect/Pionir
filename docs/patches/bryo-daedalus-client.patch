@@ -1,0 +1,175 @@
+Proposed change to terrarium's bryo/upgrade/daedalus_client.py (+ its test).
+
+WHY THIS IS A PATCH AND NOT A COMMIT (BRYO RULE):
+A probation was OPEN when this was written (2026-09-14). Verified read-only from
+terrarium/state/bryo.db: kv key "probation" = {"active": true, "origin":
+"template", "until_tick": 748709, ...} with the live heartbeat around tick
+~747,731 (state/heartbeat). terrarium is live and judged by its probation system,
+so it was NOT edited. Apply this only once probation is definitely closed:
+    cd C:\src\terrarium
+    git apply docs/../  # (path to this file)
+    git apply <this-file>            # or `git apply --check` first
+Then run: python -m pytest tests/upgrade/test_daedalus_client.py
+
+WHAT IT FIXES (audit items 1 and 4):
+* item 1 - a long hand-off is no longer reported as failure. _solve now sends a
+  server-side `wait` (just under its own budget, capped at Pionir's 600 s max) and,
+  on a 202/"running" answer, polls GET /api/task/<id>?wait=60 until the job finishes
+  or its deadline passes, returning the real result. Bryo had 0 upgrade_authored
+  because its one attempt died at exactly Pionir's 600 s limit and it then read an
+  empty diff. Mirrors galatea/hands.py's poll-on-running client logic.
+* item 4 - the authoring run marks itself `deferrable: true`, so a stressed Bryo can
+  pace it (deferrable had no callers before).
+
+This is the smallest change confined to daedalus_client.py + its test; no refactor.
+It also relies on the Pionir-side fix that a running response now carries an explicit
+`running: true` field (server.py), which _running() reads.
+
+--- a/bryo/upgrade/daedalus_client.py	2026-09-14 13:54:01.478893300 -0700
++++ b/bryo/upgrade/daedalus_client.py	2026-09-14 13:54:32.059064100 -0700
+@@ -48,6 +48,17 @@
+ # from policy.TIMEOUT_SECONDS (which is Ring-0 immutable and governs the gate, not this).
+ DEFAULT_SOLVE_TIMEOUT_SEC = 1800.0
+ 
++# A hand-off that outlives Pionir's own wait is answered 202 {"status":"running",
++# "running":true,"task_id"} while the job runs on -- and reading an empty diff at that
++# point is exactly what left Bryo with 0 upgrade_authored (its one attempt died at
++# Pionir's 600 s limit). So send a server-side wait just under our own budget, and on a
++# still-running answer poll the task to completion rather than aborting. Values are
++# clamped to Pionir's own MAX_WAIT_SECONDS (600).
++_PIONIR_MAX_WAIT_SEC = 600.0
++_SERVER_WAIT_MARGIN_SEC = 30.0
++_REQUEST_MARGIN_SEC = 30.0
++_POLL_WAIT_SEC = 60.0
++
+ 
+ def _sandbox() -> bool:
+     return os.environ.get("BRYO_SANDBOX") == "1"
+@@ -107,6 +118,48 @@
+         return json.loads(resp.read().decode("utf-8"))
+ 
+ 
++def _get(path: str, timeout: float) -> dict:
++    """A GET, for polling a running job. Named like _post so a test can neutralise it."""
++    req = urllib.request.Request(f"{_pionir_url()}{path}", method="GET")
++    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - loopback only
++        return json.loads(resp.read().decode("utf-8"))
++
++
++def _running(resp: dict) -> bool:
++    """Pionir's unambiguous 'still working' signal: the explicit `running` flag, or the
++    status token galatea/hands.py also keys on. Reading a missing `ok` as failure is the
++    exact bug this backend had."""
++    return bool(resp.get("running")) or str(resp.get("status") or "") == "running"
++
++
++def _await_result(resp: dict, deadline: float) -> dict:
++    """Follow a still-running hand-off to its real result.
++
++    A 202 answer carries a task id and keeps working; GET /api/task/<id>?wait=60 returns
++    the job record, and once it is no longer running its ``result`` is the same object a
++    client that stayed connected would have got. Until then Daedalus is committing to the
++    forge -- which is what the diff is cut from -- so we wait for it up to our own
++    deadline instead of reading an empty diff and aborting.
++    """
++    if not _running(resp):
++        return resp
++    task_id = str(resp.get("task_id") or "")
++    if not task_id:
++        return resp
++    while time.monotonic() < deadline:
++        remaining = deadline - time.monotonic()
++        poll = max(1, int(min(_POLL_WAIT_SEC, remaining)))
++        try:
++            record = _get(f"/api/task/{task_id}?wait={poll}", poll + _REQUEST_MARGIN_SEC)
++        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
++            continue  # a dropped poll is not the verdict; keep waiting until the deadline
++        if str(record.get("status") or "") == "running":
++            continue
++        result = record.get("result")
++        return result if isinstance(result, dict) else record
++    return resp  # our deadline passed with it still running: read as running, not a crash
++
++
+ def _prepare_forge() -> str | None:
+     """Bring the forge to the live repo's exact current HEAD, and return that sha.
+ 
+@@ -174,13 +227,22 @@
+     Atani' seam relays, but cannot target a specific clone -- probed live, it defaulted
+     to the wrong repo -- so precise repo control wins here.
+     """
+-    return _post(
++    deadline = time.monotonic() + timeout
++    server_wait = max(30.0, min(timeout - _SERVER_WAIT_MARGIN_SEC, _PIONIR_MAX_WAIT_SEC))
++    resp = _post(
+         "/api/task",
+         {"capability": "coding.daedalus_solve",
+          "payload": {"content": instruction, "repo": _forge_dir(), "dry_run": False},
+-         "permissions": ["daedalus.solve"]},
+-        timeout,
++         "permissions": ["daedalus.solve"],
++         # This authoring run can wait its turn behind the voice: mark it deferrable so a
++         # stressed organism can pace it (audit item 4; deferrable had no callers before).
++         "deferrable": True,
++         # Answer in full within this wait when it can; otherwise 202 + task id, which
++         # _await_result polls to completion instead of aborting on an empty diff.
++         "wait": server_wait},
++        server_wait + _REQUEST_MARGIN_SEC,
+     )
++    return _await_result(resp, deadline)
+ 
+ 
+ def _solve_timeout() -> float:
+--- a/tests/upgrade/test_daedalus_client.py	2026-09-14 13:54:01.499562800 -0700
++++ b/tests/upgrade/test_daedalus_client.py	2026-09-14 13:54:48.363592200 -0700
+@@ -89,6 +89,50 @@
+     assert seen["body"]["permissions"] == ["daedalus.solve"]
+ 
+ 
++def test_solve_sends_a_bounded_wait_and_marks_the_job_deferrable(monkeypatch):
++    """Audit item 1 + 4: a hand-off sends a server-side wait (so a long job is
++    answered in full when it can be) and marks itself deferrable (so a stressed
++    Bryo can pace it). Both were absent, which is why a long hand-off was reported
++    as failure and pressure never deferred."""
++    seen = {}
++    monkeypatch.setattr(dc, "_post", lambda path, body, t: seen.update(body=body, t=t) or {})
++    dc._solve("do the thing", 660.0)
++    assert seen["body"]["deferrable"] is True
++    assert 0 < seen["body"]["wait"] <= dc._PIONIR_MAX_WAIT_SEC
++    # our own request timeout must sit above the server-side wait, never below it
++    assert seen["t"] > seen["body"]["wait"]
++
++
++def test_a_running_handoff_is_polled_to_completion(monkeypatch):
++    """Audit item 1: on a 202 running answer Bryo polls the task rather than reading
++    an empty diff and aborting (its one attempt died at Pionir's 600 s limit)."""
++    monkeypatch.setattr(dc, "_post", lambda path, body, t:
++                        {"status": "running", "running": True, "task_id": "abc123"})
++    polls = []
++
++    def fake_get(path, timeout):
++        polls.append(path)
++        if len(polls) < 2:
++            return {"task_id": "abc123", "status": "running", "result": None}
++        return {"task_id": "abc123", "status": "done",
++                "result": {"ok": True, "commit": "deadbeef"}}
++
++    monkeypatch.setattr(dc, "_get", fake_get)
++    out = dc._solve("do the thing", 660.0)
++    assert out == {"ok": True, "commit": "deadbeef"}
++    assert len(polls) >= 2 and polls[0].startswith("/api/task/abc123?wait=")
++
++
++def test_a_finished_handoff_is_returned_without_polling(monkeypatch):
++    """When Pionir answers in full inside the wait there is nothing to poll."""
++    monkeypatch.setattr(dc, "_post", lambda path, body, t:
++                        {"ok": True, "result": {"ok": True, "commit": "x"}})
++    monkeypatch.setattr(dc, "_get", lambda path, timeout:
++                        (_ for _ in ()).throw(AssertionError("must not poll a finished job")))
++    out = dc._solve("do the thing", 660.0)
++    assert out["result"]["commit"] == "x"
++
++
+ def test_instruction_carries_the_ring1_boundaries():
+     instr = dc._instruction(_RFC())
+     assert "bryo/mind/" in instr and "Ring-1" in instr

@@ -278,6 +278,14 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
         }
         if age > routecheck.STALE_DAYS:
             aim["stale"] = f"last measured {age:.0f} days ago"
+        # Stale isn't only about age: a check taken against a different set of
+        # routable capabilities is measuring a different router. If the registered
+        # set has changed since, say so and count it stale regardless of age.
+        current_hash = routecheck.registry_fingerprint(IntentRouter(runtime.executive))
+        if recorded.registry_hash and recorded.registry_hash != current_hash:
+            aim["stale"] = (
+                "the registered capability set has changed since this was measured"
+            )
     return {
         "runtime": "ok",
         "state_root": str(runtime.settings.state_root),
@@ -441,6 +449,16 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
         if args.explain:
             _print(router.classify(request))
             return 0
+        # One-shot CLI run: prime Bryo's pressure with a single synchronous read
+        # before executing, so a stressed organism can actually pace this. peek()
+        # alone would be neutral for the whole short-lived process.
+        reader = getattr(runtime, "pressure_reader", None)
+        read_now = getattr(reader, "read_now", None)
+        if callable(read_now):
+            try:
+                read_now()
+            except Exception:  # noqa: BLE001 - the body is advisory, never load-bearing
+                pass
         try:
             decision, result = router.route(
                 request, granted_permissions=frozenset(args.permissions or ())

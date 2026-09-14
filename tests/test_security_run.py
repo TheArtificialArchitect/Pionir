@@ -75,5 +75,28 @@ class RunActionTests(unittest.TestCase):
             _voodoo().run_action({"action": "defend posture", "args": "posture"})
 
 
+class ValidateWithoutRunningTests(unittest.TestCase):
+    """validate() runs the allowlist + shape checks with no side effect, so the
+    approval gate can refuse a malformed request before parking it for Ian."""
+
+    def test_validate_refuses_a_malformed_action_without_executing(self):
+        with self.assertRaises(AdapterProtocolError):
+            _nyx().validate(Task(
+                "security.nyx_run", {"action": "research", "args": ["http://example.com"]},
+                frozenset(),
+            ))
+        with self.assertRaises(AdapterProtocolError):
+            _voodoo().validate(Task(
+                "security.voodoo_run", {"action": "wipe", "args": []}, frozenset(),
+            ))
+
+    def test_validate_accepts_a_well_formed_action(self):
+        # No raise, and (unlike run_action) nothing is executed.
+        _nyx().validate(Task(
+            "security.nyx_run", {"action": "research", "args": ["https://example.com"]},
+            frozenset(),
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()

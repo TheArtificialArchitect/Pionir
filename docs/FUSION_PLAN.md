@@ -11,7 +11,8 @@ databases, personalities, or histories.
 | System | Intended role | Integration status |
 |---|---|---|
 | Atani | Executive policy, planning, approvals, verification, event ledger | Working CLI adapter and bounded plan surface |
-| ~~Theo / Tech-Support~~ | ~~Human-facing personality, conversation~~ | **Removed from Pionir 2026-09-10.** Was a placeholder voice only; the voice is Galatea (not yet wired). See SOURCE_AUDIT.md. |
+| ~~Theo / Tech-Support~~ | ~~Human-facing personality, conversation~~ | **Removed from Pionir 2026-09-10.** Was a placeholder voice only; the voice is Galatea, wired in via `PIONIR_GALATEA_URL` (capability `conversation.galatea_reply`). See SOURCE_AUDIT.md. |
+| Galatea | Human-facing conversational voice; views and delegates through Pionir | Working HTTP adapter; registers and routes when `PIONIR_GALATEA_URL` is set |
 | Bryo / Terrarium | Resource governor, CPU-first learning, experiment gate | Working read-only status and shared GPU lease |
 | ~~Probability~~ | ~~Measured autonomy, cumulative memory, gene evolution~~ | **Retired 2026-09-09.** Adapter removed from Pionir; its consolidation/memory ideas were harvested into the memory engine. See ARCHITECTURE_DECISIONS_2026-09.md. |
 | ~~Autogenesis~~ | ~~Deterministic curriculum, candidate generation, transactional lineage~~ | **Retired 2026-09-09.** Adapter removed; harvested for parts. |
@@ -67,7 +68,9 @@ No agent may directly promote its own code, weights, policy, or permissions.
 - Hardware baseline: 64 GB system RAM and 12 GB VRAM.
 - Default GPU concurrency: one heavyweight inference or training lease.
 - Training and interactive inference do not overlap.
-- Large depth models are cold-loaded only for explicit depth tasks.
+- On-demand doers (e.g. Daedalus's 30B coder) are cold-loaded under the shared
+  GPU lease and hand the card back on release; the separate Atani depth tier was
+  dropped 2026-09-13, so there are no longer normal/depth reasoning routes.
 - CPU-first background learning yields to interactive work.
 - Every model declares estimated VRAM plus context overhead before admission.
 
