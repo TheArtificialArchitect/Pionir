@@ -17,7 +17,9 @@ not refuse it here, the silent CPU fallback is what ships.
 
 from __future__ import annotations
 
+import logging
 import math
+import threading
 import time
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
@@ -29,6 +31,13 @@ from .benchmark import BenchmarkError, read_gpu_memory, read_loaded_models
 from .contracts import ModelRequirement
 from .errors import ResourceUnavailable
 from .shared_gpu import SharedGpuLease, SharedGpuLock
+
+_log = logging.getLogger(__name__)
+
+
+def _run_in_thread(work: Callable[[], None]) -> None:
+    threading.Thread(target=work, name="pionir-rewarm", daemon=True).start()
+
 
 # Measured KV growth on the target card by reloading each 7B at 4096 and at
 # 16384 context: 30.75 MB per 1024 tokens for two of them, 43.08 for the third.
@@ -115,27 +124,52 @@ class ResourceBudget:
         return self.total_vram_mb - self.reserved_vram_mb
 
 
+@dataclass(frozen=True, slots=True)
+class _Handback:
+    """What a GPU lease must put back when it ends.
+
+    ``unload`` is the job's own model, when it was not already resident before
+    the lease (someone else's warm copy is left alone). ``rewarm`` is every
+    protected model that was on the card when the lease began - the voice's
+    model the planned swap sidelined, or that the job's own load pushed out.
+    """
+
+    unload: str | None = None
+    rewarm: tuple[str, ...] = ()
+
+
 class ModelLease(AbstractContextManager["ModelLease"]):
     def __init__(
         self,
         scheduler: "ModelLeaseScheduler",
         requirement: ModelRequirement,
         shared_gpu_lease: SharedGpuLease | None = None,
+        handback: _Handback | None = None,
     ) -> None:
         self.lease_id: UUID = uuid4()
         self.requirement = requirement
         self._scheduler = scheduler
         self._shared_gpu_lease = shared_gpu_lease
+        self._handback = handback
         self._released = False
 
     def release(self) -> None:
         if not self._released:
             try:
+                # Clean handback. The job's model is unloaded while the shared
+                # lock is still held, so nothing that waits on the lock (the
+                # voice) resumes against a card still full of the coder. The
+                # re-warm runs after the lock is let go: it is a load of tens of
+                # seconds and must not delay the job's result or the next lease.
+                if self._handback is not None and self._handback.unload:
+                    self._scheduler._unload_quietly(self._handback.unload)
                 if self._shared_gpu_lease is not None:
                     self._shared_gpu_lease.release()
             finally:
                 self._scheduler.release(self.lease_id)
                 self._released = True
+                if self._handback is not None and self._handback.rewarm:
+                    self._scheduler._rewarm_quietly(self._handback.rewarm)
 
     def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         self.release()
@@ -156,15 +190,25 @@ class ModelLeaseScheduler:
         loaded_probe: Callable[[], list[str]] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         protected_models: Iterable[str] = (),
+        rewarmer: Callable[[str], None] | None = None,
+        background: Callable[[Callable[[], None]], None] | None = None,
     ) -> None:
         self.budget = budget or ResourceBudget()
         self.shared_gpu_lock = shared_gpu_lock
         self.vram_probe = vram_probe
         self.residency_probe = residency_probe
-        # Models that are never evicted to make room. The voice (Galatea) never
-        # takes the shared lock, so the lock cannot protect her model from being
-        # pulled out mid-sentence; naming it here does.
+        # Models that are not evicted to make room for a caller without the
+        # shared lease. The voice (Galatea) never takes the lock - she only
+        # honours it, standing down while someone holds it - so without a lease
+        # nothing says she is not mid-sentence, and naming her model here keeps
+        # it. Under the lease she has stood down, and the eviction is the
+        # planned swap (see _make_room).
         self.protected_models = frozenset(canonical_model(m) for m in protected_models if m.strip())
+        # Loads a protected model back after a lease that displaced it ends.
+        # Injected (bootstrap wires benchmark.warm), like the evictor, so a test
+        # never loads a real model.
+        self.rewarmer = rewarmer
+        self._background = background or _run_in_thread
         # When a needed model does not fit, evict idle resident models to make
         # room (a 12B voice and a 7B doer cannot share a 12 GB card). Only done
         # while holding the shared GPU lock, so a model in active use by a
@@ -187,15 +231,22 @@ class ModelLeaseScheduler:
             return requirement.context_vram_mb
         return requirement.total_vram_mb
 
-    def _make_room(self, needed_mb: int, target_model: str) -> int | None:
+    def _make_room(
+        self, needed_mb: int, target_model: str, *, under_lease: bool = False
+    ) -> int | None:
         """Evict idle resident models other than the target until it fits.
 
-        Only reached while the shared GPU lock is held, so any tenant that
-        cooperates by holding the lock while it works is never touched - what is
-        sidelined is an idle model no one is generating against right now (the
-        voice's big model between turns, say). The driver frees the memory a
-        moment after Ollama unloads, so each eviction is followed by a short
-        settle before the space is believed.
+        Reached while the shared GPU lock is held when there is one, so any
+        tenant that cooperates by holding the lock while it works is never
+        touched - what is sidelined is an idle model no one is generating
+        against right now. The driver frees the memory a moment after Ollama
+        unloads, so each eviction is followed by a short settle before the
+        space is believed.
+
+        ``under_lease`` says this caller holds the shared cross-process lease.
+        Then even a protected model may go: the voice honours that lease and
+        has stood down, so evicting her model is the planned swap, and the
+        lease's release loads it back. Without the lease, protection stands.
         """
 
         # Eviction acts on the real daemon, so it is opt-in: it happens only when
@@ -222,7 +273,7 @@ class ModelLeaseScheduler:
                 break
             if canonical_model(name) == target:
                 continue
-            if canonical_model(name) in self.protected_models:
+            if canonical_model(name) in self.protected_models and not under_lease:
                 spared.append(name)
                 continue
             try:
@@ -243,7 +294,60 @@ class ModelLeaseScheduler:
             )
         return free
 
-    def acquire(self, requirement: ModelRequirement) -> ModelLease:
+    def _unload_quietly(self, model: str) -> None:
+        """Best effort: a failed unload is logged, never raised - the job is over."""
+
+        if self.evictor is None:
+            return
+        try:
+            self.evictor(model)
+        except Exception as error:  # noqa: BLE001 - handback must never fail a finished job
+            _log.warning("handback: unloading %s failed: %s", model, error)
+
+    def _rewarm_quietly(self, models: Iterable[str]) -> None:
+        """Best effort, off the caller's thread: load the displaced protected
+        models back so the voice's next turn does not pay the cold load."""
+
+        rewarm = self.rewarmer
+        if rewarm is None:
+            return
+        names = tuple(models)
+
+        def work() -> None:
+            for name in names:
+                try:
+                    rewarm(name)
+                except Exception as error:  # noqa: BLE001 - logged, never raised
+                    _log.warning("handback: re-warming %s failed: %s", name, error)
+
+        try:
+            self._background(work)
+        except Exception as error:  # noqa: BLE001
+            _log.warning("handback: could not schedule re-warm of %s: %s", names, error)
+
+    def _plan_handback(self, requirement: ModelRequirement) -> _Handback | None:
+        """Snapshot the card before a leased GPU job: what to unload and what to
+        re-warm when it ends. Needs the injected daemon hooks, like eviction,
+        so a scheduler built without them (every test by default) touches
+        nothing on release."""
+
+        if not self.evict_to_fit or self.evictor is None or self.loaded_probe is None:
+            return None
+        try:
+            resident = {canonical_model(name) for name in self.loaded_probe()}
+        except BenchmarkError:
+            resident = set()
+        target = canonical_model(requirement.model_id)
+        return _Handback(
+            unload=None if target in resident else requirement.model_id,
+            rewarm=tuple(sorted(m for m in self.protected_models if m in resident and m != target)),
+        )
+
+    def acquire(self, requirement: ModelRequirement, *, purpose: str | None = None) -> ModelLease:
+        """Admit one model use. ``purpose`` is what the shared lock's holder
+        record says (e.g. ``"daedalus: qwen3-coder:30b"``), so a process that
+        honours the lock - the voice - can say who has the card."""
+
         if requirement.requires_gpu and requirement.total_vram_mb > self.budget.usable_vram_mb:
             raise ResourceUnavailable(
                 f"{requirement.model_id} needs {requirement.total_vram_mb} MB VRAM; "
@@ -257,20 +361,25 @@ class ModelLeaseScheduler:
         shared_lease: SharedGpuLease | None = None
         if requirement.requires_gpu and self.shared_gpu_lock is not None:
             shared_lease = self.shared_gpu_lock.try_acquire(
-                owner="pionir", purpose=requirement.model_id
+                owner="pionir", purpose=purpose or requirement.model_id
             )
             if shared_lease is None:
                 raise ResourceUnavailable(
                     "GPU is leased by another Pionir-compatible process "
                     f"({self.shared_gpu_lock.describe_holder()})"
                 )
+        handback: _Handback | None = None
         try:
+            if shared_lease is not None:
+                handback = self._plan_handback(requirement)
             if requirement.requires_gpu and self.vram_probe is not None:
                 needed_mb = self._marginal_vram_mb(requirement)
                 free_mb = self.vram_probe()
                 if free_mb is not None and needed_mb > free_mb:
                     # Sideline idle resident models to make room, then look again.
-                    free_mb = self._make_room(needed_mb, requirement.model_id)
+                    free_mb = self._make_room(
+                        needed_mb, requirement.model_id, under_lease=shared_lease is not None
+                    )
                 if free_mb is not None and needed_mb > free_mb:
                     raise ResourceUnavailable(
                         f"{requirement.model_id} needs {needed_mb} MB VRAM; only "
@@ -280,12 +389,16 @@ class ModelLeaseScheduler:
                 gpu_leases = sum(item.requires_gpu for item in self._active.values())
                 if requirement.requires_gpu and gpu_leases >= self.budget.max_gpu_leases:
                     raise ResourceUnavailable("all GPU model leases are in use")
-                lease = ModelLease(self, requirement, shared_lease)
+                lease = ModelLease(self, requirement, shared_lease, handback)
                 self._active[lease.lease_id] = requirement
             return lease
         except BaseException:
             if shared_lease is not None:
                 shared_lease.release()
+            # A refused lease may already have sidelined a protected model on the
+            # way to refusing; put it back rather than leave the voice cold.
+            if handback is not None and handback.rewarm:
+                self._rewarm_quietly(handback.rewarm)
             raise
 
     def release(self, lease_id: UUID) -> None:

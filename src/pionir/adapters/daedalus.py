@@ -83,9 +83,10 @@ class DaedalusSettings(LoopbackHttpSettings):
     request_timeout_seconds: int = 30
     poll_interval_seconds: float = 3.0
     # Observability only; resolved live from /health at boot. Daedalus runs
-    # qwen3-coder:30b - a code-specialist MoE that Ollama runs on the CPU at ~0
-    # VRAM, so it takes no GPU lease and never competes with the voice for the
-    # card (see the capability's ModelRequirement below).
+    # qwen3-coder:30b - a code-specialist MoE. It is NOT a CPU tenant: measured
+    # 2026-09-13, Ollama loads it at ~18-19 GB with ~10 GB on the card, and the
+    # load evicted gemma3:12b. So a coding job takes the GPU lease (see the
+    # capability's ModelRequirement below).
     model_id: str = "qwen3-coder:30b"
 
     def __post_init__(self) -> None:
@@ -124,19 +125,26 @@ class DaedalusAdapter:
                     required_permissions=frozenset({"daedalus.solve"}),
                     model=ModelRequirement(
                         model_id=self.settings.model_id,
-                        # qwen3-coder:30b is a mixture-of-experts (~3B active) that
-                        # Ollama runs on the CPU on this 12GB card - the same
-                        # elastic behaviour as the nemotron depth tier. The zeros
-                        # are a statement about leases, not a claim of no memory:
-                        # it needs no GPU lease because it never fails to run for
-                        # want of the card, and declaring it a GPU tenant would
-                        # take the single lease it does not need and make it
-                        # unadmittable whenever the voice holds the card. Admission
-                        # reads free VRAM at lease time, so whatever it does take is
-                        # already priced in.
-                        estimated_vram_mb=0,
+                        # Measured 2026-09-13 (pionir.ps1, commit 484a6c0): Ollama
+                        # loads qwen3-coder:30b at ~18-19 GB, ~10 GB of it on the
+                        # card and the rest in system RAM, and the load evicted
+                        # gemma3:12b. The old 0 / requires_gpu=False claimed a CPU
+                        # tenant; it was false, and it meant a coding job took no
+                        # lease while it filled the card.
+                        #
+                        # 10_000 is the measured on-card share, and it admits: the
+                        # budget allows 12_288 - 1_830 = 10_458 MB, and an emptied
+                        # card shows ~10_450 free. Ollama spills the rest to RAM
+                        # rather than refusing, so declaring the whole 18-19 GB
+                        # would be unadmittable for a model that does run here.
+                        # Context is 0 on purpose: raising DAEDALUS_NUM_CTX to
+                        # 32768 measured +0.83 GB system RAM per +16K and VRAM
+                        # unchanged. Fitting means sidelining the voice's model -
+                        # allowed only under the lease, while she has stood down,
+                        # and put back when the lease ends (scheduler handback).
+                        estimated_vram_mb=10_000,
                         context_vram_mb=0,
-                        requires_gpu=False,
+                        requires_gpu=True,
                     ),
                     routing_hints=frozenset(
                         {"daedalus", "code", "coding", "refactor", "implement", "patch"}

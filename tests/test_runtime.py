@@ -20,7 +20,7 @@ class FakeClock:
 class RefusingScheduler(ModelLeaseScheduler):
     """Stands in for a GPU already leased by Bryo or another Pionir process."""
 
-    def acquire(self, requirement):  # type: ignore[override]
+    def acquire(self, requirement, *, purpose=None):  # type: ignore[override]
         raise ResourceUnavailable("GPU is leased by another Pionir-compatible process")
 
 

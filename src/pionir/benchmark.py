@@ -237,6 +237,22 @@ def unload(model: str, base_url: str = DEFAULT_OLLAMA_URL) -> None:
     )
 
 
+def warm(model: str, base_url: str = DEFAULT_OLLAMA_URL, *, keep_alive: str = "30m") -> None:
+    """Load one model back onto the card without generating anything.
+
+    An empty prompt makes Ollama load the model and return; ``keep_alive`` keeps
+    it resident. Used to hand the card back after a lease displaced the voice's
+    model, so her next turn does not pay the cold load. 30m matches the voice's
+    own keep_alive (galatea/ollama.py).
+    """
+
+    _request(
+        base_url + "/api/generate",
+        {"model": model, "prompt": "", "keep_alive": keep_alive, "stream": False},
+        timeout=180,
+    )
+
+
 def unload_all(base_url: str = DEFAULT_OLLAMA_URL) -> list[str]:
     """Evict every resident model and return the names that were evicted."""
 

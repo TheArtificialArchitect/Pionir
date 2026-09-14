@@ -23,7 +23,7 @@ from .adapters import (
 )
 from .adapters.galatea import resolve_served_model
 from .audit import JsonlAuditSink
-from .benchmark import read_loaded_models, unload
+from .benchmark import read_loaded_models, unload, warm
 from .bryo_pressure import BryoPressureReader
 from .config import PionirSettings
 from .cortex import Cortex, OllamaEmbedder
@@ -88,8 +88,12 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
             evict_to_fit=configured.evict_to_fit,
             evictor=unload,
             loaded_probe=lambda: [item.name for item in read_loaded_models()],
-            # Never evict the voice's model: she does not take the shared lock.
+            # The voice's model is not evicted for a caller without the shared
+            # lease. Under the lease the voice has stood down (she honours the
+            # lock), so evicting it is the planned swap, and the lease's release
+            # unloads the job's model and re-warms hers.
             protected_models=configured.protected_models,
+            rewarmer=warm,
         ),
         audit_sink=JsonlAuditSink(configured.audit_path),
         circuit_factory=lambda: CircuitBreaker(

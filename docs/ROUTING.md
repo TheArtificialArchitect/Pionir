@@ -25,6 +25,27 @@ the POST returned or would have returned. For the voice: POST with a `wait`
 under her own timeout, and on a 202 poll `GET /api/task/<task_id>?wait=60` until
 `status` leaves `running`.
 
+### The GPU hand-off (Daedalus has the card)
+
+Daedalus runs `qwen3-coder:30b`. It is not a CPU tenant: measured 2026-09-13,
+Ollama loads it at ~18-19 GB with ~10 GB on the card, and the load evicts
+`gemma3:12b` (the voice). Its capability declares `requires_gpu=True`,
+`estimated_vram_mb=10_000`, `context_vram_mb=0` - the on-card share, which fits
+the budget (12 288 - 1 830 = 10 458 MB); declaring the whole 18-19 GB would make
+a model that does run here unadmittable, and raising its context measured RAM,
+not VRAM. So a coding job takes the shared GPU lease, whose holder record reads
+`owner=pionir purpose="daedalus: qwen3-coder:30b"`.
+
+`protected_models` (default `gemma3:12b`) are not evicted for a caller without
+the lease - that refusal still stands. Under the lease they are: the voice
+honours the lock (Galatea `gpu.py`) and has stood down, so evicting her model is
+the planned swap. When the lease is released the scheduler unloads the job's
+model (keep_alive 0, while still holding the lock, unless it was already
+resident before) and then re-warms the protected models that were on the card
+(`benchmark.warm`, on a background thread). Handback failures are logged, never
+raised. A voice running code older than this does not honour the lock, so
+relaunch her before Pionir.
+
 Every POST must carry `Content-Type: application/json` and a local `Host`; a
 browser `Origin`, if sent, must be `http://<Host>`. Anything else is **403**
 `{"error":"forbidden"}` - a cross-site page cannot drive the admin surface.

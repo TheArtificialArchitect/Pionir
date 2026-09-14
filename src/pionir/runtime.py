@@ -132,9 +132,14 @@ class Executive:
             model = route.capability.model
             if model is not None and model.requires_gpu:
                 self._consult_body(task, route.agent_id, deferrable=deferrable)
+            # The purpose names the tenant as well as the model, so the lock's
+            # holder record reads "daedalus: qwen3-coder:30b" to anyone who
+            # honours it (the voice uses it to say who has the card).
             lease_context = (
-                self.scheduler.acquire(route.capability.model)
-                if route.capability.model is not None
+                self.scheduler.acquire(
+                    model, purpose=f"{route.agent_id}: {model.model_id}"
+                )
+                if model is not None
                 else nullcontext()
             )
             with lease_context:
