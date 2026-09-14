@@ -154,12 +154,22 @@ if (-not $NoVoice) {
 if (-not $NoSpecialists) {
     if (Test-Port 8771) { Write-Host "  Daedalus already up on 8771." -ForegroundColor DarkCyan }
     elseif (Test-Path $daedalusDir) {
-        # Daedalus runs qwen3-coder:30b - a code-specialist MoE (~3B active) that
-        # Ollama runs on the CPU at 0 VRAM, so the coder never competes with the
-        # voice for the card. Slower per token than a GPU 7B, but a far stronger
-        # coder and it leaves the whole GPU to Moss. Daedalus's own config reads
-        # DAEDALUS_MODEL, so pinning it here is all it takes (no Tech-Support edit).
-        $panes += ,(Pane-Cmd "Daedalus :8771" $daedalusDir "python -m daedalus.server" "`$env:DAEDALUS_MODEL='qwen3-coder:30b'; ")
+        # Daedalus runs qwen3-coder:30b - a code-specialist MoE (~3B active),
+        # a far stronger coder than a GPU 7B. It is NOT 0 VRAM: measured
+        # 2026-09-13, Ollama loads it at ~18-19GB with ~10GB on the card, and
+        # loading it evicted gemma3:12b. Daedalus's own config reads these env
+        # vars, so pinning them here is all it takes (no Tech-Support edit).
+        #
+        # The headroom knobs (measured/explained in the daedalus package):
+        #   NUM_CTX 32768  - +0.83GB system RAM per +16K, VRAM unchanged, ~8% slower prompt eval
+        #   MAX_STEPS 32   - a multi-file change ran out at 16
+        #   REPAIRS 4      - one gate rejection used to be the whole recovery
+        #   TEMPERATURE .35
+        #   THINK 1        - only sent to a model that reports "thinking"; qwen3-coder
+        #                    does not (think=true is a 400), so it is inert until the
+        #                    model changes. /health brain.thinking_active is the truth.
+        $daedalusEnv = "`$env:DAEDALUS_MODEL='qwen3-coder:30b'; `$env:DAEDALUS_NUM_CTX='32768'; `$env:DAEDALUS_MAX_STEPS='32'; `$env:DAEDALUS_REPAIRS='4'; `$env:DAEDALUS_TEMPERATURE='0.35'; `$env:DAEDALUS_THINK='1'; "
+        $panes += ,(Pane-Cmd "Daedalus :8771" $daedalusDir "python -m daedalus.server" $daedalusEnv)
         $ports += 8771
     } else { Write-Host "  ! Daedalus not found at $daedalusDir; skipping." -ForegroundColor Yellow }
     if (Test-Port 8770) { Write-Host "  Melete already up on 8770." -ForegroundColor DarkCyan }
