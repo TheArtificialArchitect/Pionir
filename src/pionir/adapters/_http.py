@@ -32,6 +32,20 @@ from pionir.errors import (
 MAX_RESPONSE_BYTES = 4_000_000
 
 
+class HttpStatusError(AdapterProtocolError):
+    """A non-2xx answer, carrying the status so a caller can branch on it.
+
+    Daedalus's adapter needs to tell a 404 on POST /jobs (an older server
+    without the job routes - fall back to /solve) from any other refusal
+    (report it). Parsing the number back out of the message would be the
+    string-matching this module exists to avoid.
+    """
+
+    def __init__(self, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 @dataclass(frozen=True, slots=True)
 class LoopbackHttpSettings:
     """Connection details common to a loopback HTTP specialist."""
@@ -86,17 +100,21 @@ class LoopbackJsonClient:
             headers["Authorization"] = f"Bearer {self._token}"
         return headers
 
-    def _open(self, request: urllib.request.Request) -> Mapping[str, Any]:
+    def _open(
+        self, request: urllib.request.Request, timeout_seconds: float | None = None
+    ) -> Mapping[str, Any]:
+        timeout = self._timeout if timeout_seconds is None else timeout_seconds
         try:
-            with self._opener.open(request, timeout=self._timeout) as response:
+            with self._opener.open(request, timeout=timeout) as response:
                 raw = response.read(MAX_RESPONSE_BYTES + 1)
         except urllib.error.HTTPError as error:
             if error.code in {401, 403}:
                 raise AdapterAuthenticationError(
                     f"{self._label} rejected Pionir's token ({error.code})"
                 ) from error
-            raise AdapterProtocolError(
-                f"{self._label} answered HTTP {error.code}{self._reason(error)}"
+            raise HttpStatusError(
+                f"{self._label} answered HTTP {error.code}{self._reason(error)}",
+                status=error.code,
             ) from error
         except (urllib.error.URLError, TimeoutError, OSError) as error:
             raise AdapterUnavailable(
@@ -112,14 +130,24 @@ class LoopbackJsonClient:
             raise AdapterProtocolError(f"{self._label} returned a non-object response")
         return document
 
-    def get(self, path: str) -> Mapping[str, Any]:
+    # `timeout_seconds` overrides the settings' timeout for one call. A polling
+    # adapter needs a short per-request timeout and a long overall deadline;
+    # these are different numbers and only the caller knows which is which.
+    def get(self, path: str, *, timeout_seconds: float | None = None) -> Mapping[str, Any]:
         return self._open(
             urllib.request.Request(
                 f"{self._base_url}{path}", headers=self._headers(), method="GET"
-            )
+            ),
+            timeout_seconds,
         )
 
-    def post(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    def post(
+        self,
+        path: str,
+        payload: Mapping[str, Any],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> Mapping[str, Any]:
         body = json.dumps(dict(payload)).encode("utf-8")
         return self._open(
             urllib.request.Request(
@@ -127,7 +155,8 @@ class LoopbackJsonClient:
                 data=body,
                 headers=self._headers(),
                 method="POST",
-            )
+            ),
+            timeout_seconds,
         )
 
 

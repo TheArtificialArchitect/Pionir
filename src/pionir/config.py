@@ -91,6 +91,15 @@ def _embed_model_from_env(default: str = "nomic-embed-text") -> str | None:
     return raw
 
 
+def _protected_models_from_env(default: tuple[str, ...]) -> tuple[str, ...]:
+    """PIONIR_PROTECTED_MODELS: comma-separated model names the scheduler never
+    evicts. Unset keeps the default; an empty value protects nothing."""
+    raw = os.environ.get("PIONIR_PROTECTED_MODELS")
+    if raw is None:
+        return default
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 @dataclass(frozen=True, slots=True)
 class PionirSettings:
     state_root: Path = field(default_factory=_default_state_root)
@@ -113,6 +122,9 @@ class PionirSettings:
     # PIONIR_BRYO_STATUS_COMMAND_JSON set to "off".
     bryo_status_command: tuple[str, ...] | None = ("python", "-m", "bryo.status")
     bryo_status_cwd: str = r"C:\src\terrarium"
+    # Consult Bryo's felt pressure before heavy GPU work (advisory, fail-open, never
+    # blocking). Needs bryo_status_command. Turn off with PIONIR_BRYO_PRESSURE=off.
+    bryo_pressure: bool = True
     # Nyx (offensive) and Voodoo (defensive), Pionir's read-only security organs.
     # Wired in by default: `nyx status` is an installed console script; Voodoo's
     # editable install isn't importable, so `python -m voodoo status` runs from
@@ -123,11 +135,20 @@ class PionirSettings:
     voodoo_status_cwd: str = r"C:\src\voodoo\src"
     # Taskable actions: Atani may invoke one of these (privileged, so it lands in
     # the approval queue and never fires on the voice's own initiative). The
-    # action is a first token from the allowlist; its args are argv, never a shell.
+    # action is an allowlisted subcommand (one token, or the explicit two-token
+    # `defend <sub>` for Voodoo); its args are shape-checked argv, never a shell.
+    # Verified against the real CLIs' --help (2026-09-14): Nyx's top-level
+    # offensive commands are research/crawl/fingerprint/cert (`scan` is `nyx
+    # improve scan`, `specialists` needs list|run); Voodoo's `hunt` is `defend
+    # hunt`, and bare `defend` errors, so each defend posture is spelled out.
     nyx_run_prefix: tuple[str, ...] = ("nyx",)
-    nyx_run_actions: tuple[str, ...] = ("research", "fingerprint", "cert", "scan", "crawl", "specialists")
+    nyx_run_actions: tuple[str, ...] = ("research", "crawl", "fingerprint", "cert")
     voodoo_run_prefix: tuple[str, ...] = ("python", "-m", "voodoo")
-    voodoo_run_actions: tuple[str, ...] = ("defend", "scan", "headers", "cert", "hunt", "vpn")
+    voodoo_run_actions: tuple[str, ...] = field(default=(
+        "scan", "headers", "cert", "vpn",
+        "defend posture", "defend baseline", "defend drift",
+        "defend secrets", "defend triage", "defend hunt",
+    ), repr=False)
     # Galatea, Pionir's conversational voice. Opt-in: unset means no voice is
     # registered and plain conversation asks rather than routes, exactly as the
     # other specialists register only when configured. The URL is her loopback
@@ -141,15 +162,24 @@ class PionirSettings:
     # and either can be turned off with PIONIR_DAEDALUS_URL / PIONIR_MELETE_URL
     # set to "off". Tokens are read only if those services were started with one.
     daedalus_url: str | None = "http://127.0.0.1:8771"
-    daedalus_token: str | None = None
+    daedalus_token: str | None = field(default=None, repr=False)
     melete_url: str | None = "http://127.0.0.1:8770"
-    melete_token: str | None = None
+    melete_token: str | None = field(default=None, repr=False)
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
     # The local embedding model for hybrid recall. Default on: it is ~0.32 GB and
     # fail-open, so if it is not pulled or Ollama is down, recall silently uses
     # BM25 alone. Set PIONIR_EMBED_MODEL to "" or "off" to disable it outright.
     embed_model: str | None = "nomic-embed-text"
+    # The chat model `pionir consolidate` distils turns with. It must be a model
+    # that can chat: the embed model above cannot, and defaulting to it meant
+    # consolidation silently never happened. PIONIR_DISTIL_MODEL overrides.
+    distil_model: str = "qwen3:4b-instruct-2507-q4_K_M"
+    # Resident models the scheduler must never evict to make room - the voice's
+    # model above all, since Galatea never takes the shared lock and an eviction
+    # mid-sentence cuts her off. PIONIR_PROTECTED_MODELS is a comma list; set it
+    # to "" to protect nothing.
+    protected_models: tuple[str, ...] = ("gemma3:12b",)
 
     def __post_init__(self) -> None:
         if self.circuit_failure_threshold < 1:
@@ -253,6 +283,8 @@ class PionirSettings:
             bryo_status_cwd=(
                 os.environ.get("PIONIR_BRYO_STATUS_CWD") or _declared("bryo_status_cwd")
             ),
+            bryo_pressure=(os.environ.get("PIONIR_BRYO_PRESSURE", "1").strip().lower()
+                           not in {"0", "off", "false", "no"}),
             nyx_status_command=(
                 None
                 if (os.environ.get("PIONIR_NYX_STATUS_COMMAND_JSON", "").strip().lower()
@@ -280,6 +312,9 @@ class PionirSettings:
             melete_url=_optional_url("PIONIR_MELETE_URL", _declared("melete_url")),
             melete_token=(os.environ.get("PIONIR_MELETE_TOKEN") or "").strip() or None,
             embed_model=_embed_model_from_env(),
+            distil_model=(os.environ.get("PIONIR_DISTIL_MODEL") or "").strip()
+            or _declared("distil_model"),
+            protected_models=_protected_models_from_env(_declared("protected_models")),
             specialists_file=(
                 Path(os.environ["PIONIR_SPECIALISTS_FILE"])
                 if os.environ.get("PIONIR_SPECIALISTS_FILE")

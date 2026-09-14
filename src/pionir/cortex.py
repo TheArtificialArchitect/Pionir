@@ -353,6 +353,60 @@ class Cortex:
         self._db.commit()
         return cur.rowcount > 0
 
+    @_synchronized
+    def fold(
+        self,
+        namespace: str,
+        ids: Sequence[int],
+        episode: str,
+        facts: Sequence[str] = (),
+        *,
+        meta: dict[str, Any] | None = None,
+    ) -> tuple[int, list[int]]:
+        """Consolidate: write one episode (+ facts) and retire the folded turns in
+        ONE transaction. Either the episode exists and the turns are gone from
+        recall, or nothing changed - never an episode with its turns still live,
+        or turns retired with no episode to show for them. Returns
+        (episode_id, fact_ids)."""
+        text = (episode or "").strip()
+        if not text:
+            raise ValueError("an episode needs text")
+        kept = [f.strip() for f in facts if f and f.strip()]
+        sql = (
+            "INSERT INTO memories(ts,namespace,kind,text,salience,slug,links,meta) "
+            "VALUES(?,?,?,?,?,?,?,?)"
+        )
+        try:
+            episode_id = self._db.execute(
+                sql,
+                (self._now(), namespace, "episode", text,
+                 float(KIND_SALIENCE.get("episode", _DEFAULT_SALIENCE)),
+                 None, "[]", json.dumps(meta or {})),
+            ).lastrowid
+            fact_ids = [
+                self._db.execute(
+                    sql,
+                    (self._now(), namespace, "fact", fact,
+                     float(KIND_SALIENCE.get("fact", _DEFAULT_SALIENCE)), None, "[]", "{}"),
+                ).lastrowid
+                for fact in kept
+            ]
+            if ids:
+                marks = ",".join("?" * len(ids))
+                self._db.execute(
+                    f"UPDATE memories SET active=0 "
+                    f"WHERE namespace=? AND kind='message' AND active=1 "
+                    f"AND id IN ({marks})",
+                    [namespace, *ids],
+                )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+        # Vectors are best-effort and outside the transaction, as in remember_many.
+        self._embed_and_store([episode_id, *fact_ids], [text, *kept])
+        return int(episode_id), [int(i) for i in fact_ids]
+
     # ------------------------------------------------------------------ read
     @_synchronized
     def get(self, memory_id: int) -> Memory | None:
@@ -550,11 +604,12 @@ class Cortex:
 
     @_synchronized
     def memories(
-        self, namespace: str, *, kind: str | None = None, limit: int = 1000
+        self, namespace: str, *, kind: str | None = None, limit: int | None = 1000
     ) -> list[Memory]:
         """Active memories in a namespace, oldest first - a plain listing, not a
         relevance recall. Consolidation reads a conversation's raw turns this way,
-        in order, rather than by how well they match a query."""
+        in order, rather than by how well they match a query. ``limit=None``
+        lists them all."""
         where = ["active = 1", "namespace = ?"]
         params: list[Any] = [namespace]
         if kind is not None:
@@ -562,7 +617,7 @@ class Cortex:
             params.append(kind)
         rows = self._db.execute(
             "SELECT * FROM memories WHERE " + " AND ".join(where) + " ORDER BY id ASC LIMIT ?",
-            [*params, limit],
+            [*params, -1 if limit is None else limit],
         )
         return [self._row_to_memory(r) for r in rows]
 

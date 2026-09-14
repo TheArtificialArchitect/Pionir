@@ -60,8 +60,12 @@ $srcDir      = Join-Path $root "src"
 $wt          = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\wt.exe"
 
 function Test-Port([int]$p) {
-    try { (New-Object Net.Sockets.TcpClient).Connect("127.0.0.1", $p); return $true }
+    # Dispose the client either way: a connected socket left open holds the
+    # port's accept queue slot until the GC gets to it.
+    $c = New-Object Net.Sockets.TcpClient
+    try { $c.Connect("127.0.0.1", $p); return $true }
     catch { return $false }
+    finally { $c.Dispose() }
 }
 
 function Stop-Port([int]$p, [string]$label) {
@@ -132,7 +136,9 @@ if ($NoBrowser) { $browserFlag = " --no-browser" }
 # GPU tenant that would compete with the voice for the card, which is exactly
 # what we are avoiding). All three on the 4B means nothing heavy ever loads for
 # Atani and Moss keeps the GPU.
-$pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://127.0.0.1:8799'; `$env:ATANI_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_DELIBERATE_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_TEACHER_MODEL='qwen3:4b-instruct-2507-q4_K_M'; "
+# ATANI_PIONIR_URL: Atani's callback into Pionir (it tasks the doers through
+# /api/task). Without it a -Port other than 8780 leaves Atani calling a dead port.
+$pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://127.0.0.1:8799'; `$env:ATANI_PIONIR_URL='http://127.0.0.1:$Port'; `$env:ATANI_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_DELIBERATE_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_TEACHER_MODEL='qwen3:4b-instruct-2507-q4_K_M'; "
 
 $panes = @()   # ordered: dashboard, voice, then the doers
 $ports = @()   # the ports this launch is responsible for verifying

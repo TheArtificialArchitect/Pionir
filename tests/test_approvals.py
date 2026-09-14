@@ -78,8 +78,18 @@ class GateTests(unittest.TestCase):
     def test_approve_runs_it_then_cannot_run_twice(self):
         aid = self.app.run_task("coding.daedalus_solve", {"content": "x"})["approval_id"]
         res = self.app.approve(aid)
-        self.assertEqual(res["status"], "approved")
-        self.assertEqual(self.app.approvals.get(aid)["status"], "approved")
+        # Claimed and running as a job: the answer comes back at once with the
+        # job's id; the approval record settles when the job ends.
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["status"], "running")
+        self.assertFalse(self.app.approve(aid)["ok"])       # already claimed: no re-run
+        self.assertTrue(self.app.jobs.wait(res["task_id"], 30))
+        # daedalus is a dead port here, so it ran and failed: approved_failed,
+        # with the outcome on the record - never silently "approved".
+        record = self.app.approvals.get(aid)
+        self.assertEqual(record["status"], "approved_failed")
+        self.assertEqual(record["task_id"], res["task_id"])
+        self.assertFalse(record["result"]["ok"])
         self.assertFalse(self.app.approve(aid)["ok"])       # already resolved
 
     def test_deny_never_runs_it(self):

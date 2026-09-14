@@ -9,20 +9,30 @@ Two capabilities on one agent:
     Ian says yes. Nyx's own gates still apply underneath (the offensive kill
     switch, Tor/ProtonVPN) - two layers, not one.
 
-The action is one of a fixed allowlist and its arguments are passed as argv to
-`nyx`, never through a shell, so nothing in a request can inject a command.
+The action is one of a fixed allowlist of Nyx's real top-level subcommands
+(research, crawl, fingerprint, cert - `scan` lives under `nyx improve` and
+`specialists` needs a sub-subcommand, so neither belongs here), and its
+arguments are checked by shape (see ``_actions``) before being passed as argv
+to `nyx`, never through a shell: no flag the operator did not allow, no
+positional that is not the URL or host the subcommand takes.
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from pionir.adapters._actions import (
+    NYX_ACTION_SHAPES,
+    normalise_action,
+    run_action,
+    validate_action_args,
+)
+from pionir.adapters._proc import run_process, unavailable
 from pionir.contracts import AgentManifest, Capability, RiskLevel, Task, TaskResult
-from pionir.errors import AdapterProtocolError, AdapterUnavailable
+from pionir.errors import AdapterProtocolError
 
 
 class TextCommandRunner(Protocol):
@@ -34,8 +44,8 @@ class NyxStatusSettings:
     command: tuple[str, ...]
     timeout_seconds: int = 20
     version: str = "nyx/0.1"
-    # The prefix a run action is appended to (e.g. ("nyx",) -> `nyx scan HOST`),
-    # the allowlist of first tokens it may use, and how long an action may take.
+    # The prefix a run action is appended to (e.g. ("nyx",) -> `nyx cert HOST`),
+    # the allowlist of actions it may use, and how long an action may take.
     run_prefix: tuple[str, ...] = ()
     run_actions: tuple[str, ...] = ()
     run_timeout_seconds: int = 300
@@ -54,43 +64,12 @@ class SubprocessTextRunner:
         self._cwd = cwd
 
     def run(self, *, timeout_seconds: int) -> str:
-        try:
-            process = subprocess.run(
-                self._command, capture_output=True, check=False, encoding="utf-8",
-                errors="replace", shell=False, timeout=timeout_seconds, cwd=self._cwd,
-            )
-        except FileNotFoundError as error:
-            raise AdapterUnavailable("Nyx's configured executable was not found") from error
-        except subprocess.TimeoutExpired as error:
-            raise AdapterUnavailable("Nyx status timed out") from error
-        if process.returncode != 0:
-            raise AdapterUnavailable(f"Nyx status exited with code {process.returncode}")
-        return process.stdout
-
-
-def _shell(command: Sequence[str], *, cwd: str | None, timeout: int) -> dict[str, Any]:
-    """Run a bot action and return its outcome as data - a non-zero exit is a
-    real answer (e.g. 'offensive disabled'), captured, not raised."""
-    try:
-        proc = subprocess.run(
-            list(command), capture_output=True, check=False, encoding="utf-8",
-            errors="replace", shell=False, timeout=timeout, cwd=cwd,
+        process = run_process(
+            self._command, label="Nyx status", timeout_seconds=timeout_seconds, cwd=self._cwd
         )
-    except FileNotFoundError as error:
-        raise AdapterUnavailable("Nyx's configured executable was not found") from error
-    except subprocess.TimeoutExpired as error:
-        raise AdapterUnavailable("Nyx action timed out") from error
-    out = (proc.stdout or "").strip()
-    try:
-        parsed: Any = json.loads(out)
-    except (json.JSONDecodeError, ValueError):
-        parsed = out[:4000]
-    return {
-        "ok": proc.returncode == 0,
-        "returncode": proc.returncode,
-        "output": parsed,
-        "stderr": (proc.stderr or "").strip()[:1000] or None,
-    }
+        if process.returncode != 0:
+            raise unavailable("Nyx status", process)
+        return process.stdout
 
 
 def _redact(raw: str) -> dict[str, Any]:
@@ -151,18 +130,24 @@ class NyxStatusAdapter:
         return _redact(raw)
 
     def run_action(self, payload: dict[str, Any]) -> dict[str, Any]:
-        action = str(payload.get("action", "")).strip()
-        if action not in self.settings.run_actions:
+        action = normalise_action(payload.get("action"))
+        allowed = {normalise_action(item) for item in self.settings.run_actions}
+        if not action or action not in allowed:
             raise AdapterProtocolError(
-                f"Nyx action {action!r} is not allowed; permitted: {sorted(self.settings.run_actions)}"
+                f"Nyx action {action!r} is not allowed; permitted: {sorted(allowed)}"
             )
         raw_args = payload.get("args") or []
         if not isinstance(raw_args, list):
             raise AdapterProtocolError("Nyx run args must be a list")
-        args = [str(a) for a in raw_args]
-        command = list(self.settings.run_prefix) + [action] + args
-        result = _shell(command, cwd=self.settings.cwd, timeout=self.settings.run_timeout_seconds)
-        result["action"] = " ".join([action, *args])
+        args = validate_action_args("Nyx", action, [str(a) for a in raw_args], NYX_ACTION_SHAPES)
+        command = [*self.settings.run_prefix, *action.split(), *args]
+        result = run_action(
+            "Nyx", command, cwd=self.settings.cwd, timeout_seconds=self.settings.run_timeout_seconds
+        )
+        # The full argv, so the ledger and the approval summary show exactly what
+        # ran - not just the verb.
+        result["action"] = " ".join([*action.split(), *args])
+        result["argv"] = command
         return result
 
     def execute(self, task: Task) -> TaskResult:

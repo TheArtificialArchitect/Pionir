@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, Protocol
 
+from pionir.adapters._proc import MAX_OUTPUT_CHARS, run_process
+from pionir.adapters.daedalus import DaedalusSettings
+from pionir.adapters.melete import MeleteSettings
 from pionir.contracts import (
     AgentManifest,
     Capability,
@@ -19,7 +21,30 @@ from pionir.contracts import (
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
 from pionir.scheduler import kv_cache_vram_mb
 
-MAX_OUTPUT_CHARS = 2_000_000
+# `atani manage` calls back into Pionir's /api/task, which runs the doer under
+# the doer's own adapter timeout (Daedalus 600s, Melete 300s). The manage
+# timeout must sit above the longest of those plus a margin, or Pionir kills
+# `atani manage` while the doer is still working - and then reports failure
+# to the voice as Daedalus lands the commit anyway (seen in the ledger).
+MANAGE_TIMEOUT_MARGIN_SECONDS = 60
+
+
+def _declared_timeout(settings_type: type) -> int:
+    """A loopback adapter's declared default timeout, read without building one."""
+
+    for item in fields(settings_type):
+        if item.name == "timeout_seconds":
+            return int(item.default)
+    raise KeyError("timeout_seconds")
+
+
+def minimum_manage_timeout_seconds() -> int:
+    """The floor for the manage timeout: the slowest doer Atani can task, plus margin."""
+
+    return (
+        max(_declared_timeout(DaedalusSettings), _declared_timeout(MeleteSettings))
+        + MANAGE_TIMEOUT_MARGIN_SECONDS
+    )
 
 # The executive's four legitimate outcomes. A response carrying one of these on
 # stdout is a real Manager result and authoritative over the process exit code.
@@ -59,7 +84,10 @@ class CommandRunner(Protocol):
 @dataclass(frozen=True, slots=True)
 class AtaniCliSettings:
     command: tuple[str, ...] = ("atani",)
+    # chat / status / executive: Atani's own reasoning, no nested doer.
     timeout_seconds: int = 240
+    # manage only: it nests a whole doer run (see MANAGE_TIMEOUT_MARGIN_SECONDS).
+    manage_timeout_seconds: int = 660
     version: str = "1.2"
 
     def __post_init__(self) -> None:
@@ -67,6 +95,13 @@ class AtaniCliSettings:
             raise ValueError("Atani command cannot be empty")
         if self.timeout_seconds < 30:
             raise ValueError("Atani timeout must be at least 30 seconds")
+        floor = minimum_manage_timeout_seconds()
+        if self.manage_timeout_seconds < floor:
+            raise ValueError(
+                f"Atani manage timeout must be at least {floor} seconds: the doers it "
+                f"tasks (Daedalus, Melete) run under their own timeouts plus a "
+                f"{MANAGE_TIMEOUT_MARGIN_SECONDS}-second margin"
+            )
 
 
 class SubprocessCommandRunner:
@@ -86,26 +121,19 @@ class SubprocessCommandRunner:
         # policy belongs in the adapter, not in a runner that cannot tell the
         # commands apart.
         try:
-            process = subprocess.run(
+            process = run_process(
                 [*self._command, *arguments],
-                capture_output=True,
-                check=False,
-                encoding="utf-8",
-                errors="replace",
-                shell=False,
-                timeout=timeout_seconds,
-                input=input_text,
+                label="Atani",
+                timeout_seconds=timeout_seconds,
+                input_text=input_text,
+                max_output_chars=MAX_OUTPUT_CHARS,
             )
-        except FileNotFoundError as error:
-            raise AdapterUnavailable("Atani's configured executable was not found") from error
-        except subprocess.TimeoutExpired as error:
-            raise AdapterUnavailable("Atani did not finish before its timeout") from error
-        if len(process.stdout) > MAX_OUTPUT_CHARS:
-            raise AdapterProtocolError("Atani's JSON response exceeded the size limit")
+        except AdapterProtocolError as error:
+            raise AdapterProtocolError("Atani's JSON response exceeded the size limit") from error
         return CommandResult(
             returncode=process.returncode,
             stdout=process.stdout,
-            stderr=process.stderr or "",
+            stderr=process.stderr,
         )
 
 
@@ -208,10 +236,13 @@ class AtaniCliAdapter:
         arguments: Sequence[str],
         *,
         input_text: str | None = None,
+        timeout_seconds: int | None = None,
     ) -> CommandResult:
         return self._runner.run(
             arguments,
-            timeout_seconds=self.settings.timeout_seconds,
+            timeout_seconds=(
+                self.settings.timeout_seconds if timeout_seconds is None else timeout_seconds
+            ),
             input_text=input_text,
         )
 
@@ -243,10 +274,11 @@ class AtaniCliAdapter:
         arguments: Sequence[str],
         *,
         input_text: str | None = None,
+        timeout_seconds: int | None = None,
     ) -> Mapping[str, Any]:
         """A plain JSON command (chat, status) where a non-zero exit is fatal."""
 
-        result = self._run(arguments, input_text=input_text)
+        result = self._run(arguments, input_text=input_text, timeout_seconds=timeout_seconds)
         if result.returncode != 0:
             raise self._unavailable(result)
         return self._parse_object(result.stdout)
@@ -287,8 +319,11 @@ class AtaniCliAdapter:
                 raise AdapterProtocolError("manager request exceeds Pionir's 8000-character limit")
             # `atani manage <request>` reasons, decides, and tasks the doer via
             # Pionir; it exits 0 with its outcome object (ok may be false - that
-            # is a real manager verdict, not a crash).
-            document = self._json(("manage", content))
+            # is a real manager verdict, not a crash). It nests the doer's whole
+            # run, so it gets the longer manage timeout, never the chat one.
+            document = self._json(
+                ("manage", content), timeout_seconds=self.settings.manage_timeout_seconds
+            )
             return TaskResult(
                 task_id=task.task_id,
                 agent_id=self.manifest.agent_id,

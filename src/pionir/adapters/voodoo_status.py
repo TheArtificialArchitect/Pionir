@@ -1,12 +1,14 @@
 """Read-only observability adapter for Voodoo, the defensive companion.
 
 Voodoo watches the machine from the inside - integrity baselines, secret
-scanning, IOC hunting, scope and lease control. Only its **status** is exposed
-through Pionir: what scopes and leases exist and whether a VPN is up. None of the
-acting surface - scanning, baselining, granting a lease, connecting a VPN - is
-reachable here; those stay Voodoo's own, behind its operator approval, until an
-authorization boundary through Pionir's gates exists (the mirror of why Theo's
-tool path was kept out).
+scanning, IOC hunting, scope and lease control. Its **status** is exposed
+through Pionir: what scopes and leases exist and whether a VPN is up. When a
+run prefix is configured, one allowlisted action is taskable too, PRIVILEGED
+and gated: `scan`, `headers`, `cert`, `vpn`, or an explicit two-token
+`defend <posture|baseline|drift|secrets|triage|hunt>` (bare `defend` is not
+a command - the CLI errors on it - so it is never an allowlist entry). Lease
+grants and scope edits stay Voodoo's own, behind its operator approval.
+Arguments are checked by shape (see ``_actions``) before they become argv.
 
 `voodoo status` prints a JSON object to stdout: `{scopes, active_leases,
 proton_vpn}`. Lease and scope records can name a client or carry a ticket
@@ -17,42 +19,23 @@ the reasons.
 from __future__ import annotations
 
 import json
-import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from pionir.adapters._actions import (
+    VOODOO_ACTION_SHAPES,
+    normalise_action,
+    run_action,
+    validate_action_args,
+)
+from pionir.adapters._proc import run_process, unavailable
 from pionir.contracts import AgentManifest, Capability, RiskLevel, Task, TaskResult
-from pionir.errors import AdapterProtocolError, AdapterUnavailable
+from pionir.errors import AdapterProtocolError
 
 
 class TextCommandRunner(Protocol):
     def run(self, *, timeout_seconds: int) -> str: ...
-
-
-def _shell(command: Sequence[str], *, cwd: str | None, timeout: int) -> dict[str, Any]:
-    """Run a Voodoo action and return its outcome as data - a non-zero exit
-    (a policy refusal, say) is captured, not raised."""
-    try:
-        proc = subprocess.run(
-            list(command), capture_output=True, check=False, encoding="utf-8",
-            errors="replace", shell=False, timeout=timeout, cwd=cwd,
-        )
-    except FileNotFoundError as error:
-        raise AdapterUnavailable("Voodoo's configured executable was not found") from error
-    except subprocess.TimeoutExpired as error:
-        raise AdapterUnavailable("Voodoo action timed out") from error
-    out = (proc.stdout or "").strip()
-    try:
-        parsed: Any = json.loads(out)
-    except (json.JSONDecodeError, ValueError):
-        parsed = out[:4000]
-    return {
-        "ok": proc.returncode == 0,
-        "returncode": proc.returncode,
-        "output": parsed,
-        "stderr": (proc.stderr or "").strip()[:1000] or None,
-    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,8 +46,9 @@ class VoodooStatusSettings:
     # `python -m voodoo status` resolves the voodoo package only from its src
     # tree (its editable install is not importable), so the status runs there.
     cwd: str | None = None
-    # A run action is `run_prefix + [action] + args`; only allowlisted first
-    # tokens are permitted, argv only (never a shell).
+    # A run action is `run_prefix + action tokens + args`; only allowlisted
+    # actions (one token, or two for `defend <sub>`) are permitted, argv only
+    # (never a shell), and the args are shape-checked.
     run_prefix: tuple[str, ...] = ()
     run_actions: tuple[str, ...] = ()
     run_timeout_seconds: int = 300
@@ -82,23 +66,14 @@ class SubprocessTextRunner:
         self._cwd = cwd
 
     def run(self, *, timeout_seconds: int) -> str:
-        try:
-            process = subprocess.run(
-                self._command,
-                capture_output=True,
-                check=False,
-                encoding="utf-8",
-                errors="replace",
-                shell=False,
-                timeout=timeout_seconds,
-                cwd=self._cwd,
-            )
-        except FileNotFoundError as error:
-            raise AdapterUnavailable("Voodoo's configured executable was not found") from error
-        except subprocess.TimeoutExpired as error:
-            raise AdapterUnavailable("Voodoo status timed out") from error
+        process = run_process(
+            self._command,
+            label="Voodoo status",
+            timeout_seconds=timeout_seconds,
+            cwd=self._cwd,
+        )
         if process.returncode != 0:
-            raise AdapterUnavailable(f"Voodoo status exited with code {process.returncode}")
+            raise unavailable("Voodoo status", process)
         return process.stdout
 
 
@@ -139,7 +114,7 @@ class VoodooStatusAdapter:
             capabilities.append(
                 Capability(
                     name="security.voodoo_run",
-                    description="Run one allowlisted Voodoo action (posture/scan/hunt/defend) - gated",
+                    description="Run one allowlisted Voodoo action (scan/headers/cert/vpn/defend <sub>) - gated",
                     risk=RiskLevel.PRIVILEGED,
                     required_permissions=frozenset({"voodoo.run"}),
                     routing_hints=frozenset(
@@ -163,18 +138,29 @@ class VoodooStatusAdapter:
         return _redact(raw)
 
     def run_action(self, payload: dict[str, Any]) -> dict[str, Any]:
-        action = str(payload.get("action", "")).strip()
-        if action not in self.settings.run_actions:
+        action = normalise_action(payload.get("action"))
+        allowed = {normalise_action(item) for item in self.settings.run_actions}
+        if not action or action not in allowed:
             raise AdapterProtocolError(
-                f"Voodoo action {action!r} is not allowed; permitted: {sorted(self.settings.run_actions)}"
+                f"Voodoo action {action!r} is not allowed; permitted: {sorted(allowed)}"
             )
         raw_args = payload.get("args") or []
         if not isinstance(raw_args, list):
             raise AdapterProtocolError("Voodoo run args must be a list")
-        args = [str(a) for a in raw_args]
-        command = list(self.settings.run_prefix) + [action] + args
-        result = _shell(command, cwd=self.settings.cwd, timeout=self.settings.run_timeout_seconds)
-        result["action"] = " ".join([action, *args])
+        args = validate_action_args(
+            "Voodoo", action, [str(a) for a in raw_args], VOODOO_ACTION_SHAPES
+        )
+        command = [*self.settings.run_prefix, *action.split(), *args]
+        result = run_action(
+            "Voodoo",
+            command,
+            cwd=self.settings.cwd,
+            timeout_seconds=self.settings.run_timeout_seconds,
+        )
+        # The full argv, so the ledger and the approval summary show exactly what
+        # ran - not just the verb.
+        result["action"] = " ".join([*action.split(), *args])
+        result["argv"] = command
         return result
 
     def execute(self, task: Task) -> TaskResult:

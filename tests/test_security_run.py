@@ -15,12 +15,13 @@ STATUS = ("python", "-c", "print('{}')")
 
 def _nyx(run: bool = True) -> NyxStatusAdapter:
     return NyxStatusAdapter(NyxStatusSettings(
-        command=STATUS, run_prefix=ECHO if run else (), run_actions=("scan", "research")))
+        command=STATUS, run_prefix=ECHO if run else (), run_actions=("research", "cert")))
 
 
 def _voodoo(run: bool = True) -> VoodooStatusAdapter:
     return VoodooStatusAdapter(VoodooStatusSettings(
-        command=STATUS, run_prefix=ECHO if run else (), run_actions=("defend", "hunt")))
+        command=STATUS, run_prefix=ECHO if run else (),
+        run_actions=("defend posture", "defend hunt")))
 
 
 class RunCapabilityTests(unittest.TestCase):
@@ -39,10 +40,18 @@ class RunCapabilityTests(unittest.TestCase):
 
 class RunActionTests(unittest.TestCase):
     def test_allowed_action_is_passed_as_argv(self):
-        out = _nyx().run_action({"action": "scan", "args": ["example.com", "--fast"]})
+        out = _nyx().run_action({"action": "research", "args": ["https://example.com"]})
         self.assertTrue(out["ok"])
-        self.assertEqual(out["output"], ["scan", "example.com", "--fast"])
-        self.assertEqual(out["action"], "scan example.com --fast")
+        self.assertEqual(out["output"], ["research", "https://example.com"])
+        self.assertEqual(out["action"], "research https://example.com")
+
+    def test_unapproved_flags_and_insecure_urls_are_refused(self):
+        with self.assertRaises(AdapterProtocolError):
+            _nyx().run_action(
+                {"action": "research", "args": ["https://example.com", "--fast"]}
+            )
+        with self.assertRaises(AdapterProtocolError):
+            _nyx().run_action({"action": "research", "args": ["http://example.com"]})
 
     def test_disallowed_action_is_refused(self):
         with self.assertRaises(AdapterProtocolError):
@@ -51,15 +60,19 @@ class RunActionTests(unittest.TestCase):
             _voodoo().run_action({"action": "shell", "args": []})
 
     def test_execute_dispatches_run_and_status(self):
-        res = _nyx().execute(Task("security.nyx_run", {"action": "research", "args": ["http://x"]}, frozenset()))
+        res = _nyx().execute(Task(
+            "security.nyx_run",
+            {"action": "research", "args": ["https://example.com"]},
+            frozenset(),
+        ))
         self.assertEqual(res.agent_id, "nyx")
-        self.assertEqual(res.output["output"], ["research", "http://x"])
+        self.assertEqual(res.output["output"], ["research", "https://example.com"])
         # the read-only status capability still works on the same adapter
         self.assertEqual(_voodoo().execute(Task("security.voodoo_status", {}, frozenset())).agent_id, "voodoo")
 
     def test_args_must_be_a_list(self):
         with self.assertRaises(AdapterProtocolError):
-            _voodoo().run_action({"action": "defend", "args": "posture"})
+            _voodoo().run_action({"action": "defend posture", "args": "posture"})
 
 
 if __name__ == "__main__":

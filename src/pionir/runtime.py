@@ -7,11 +7,11 @@ from contextlib import nullcontext
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import UUID
 
 from .contracts import AgentManifest, Task, TaskResult
-from .errors import CircuitOpen, ResourceUnavailable
+from .errors import BodyDeferred, CircuitOpen, ResourceUnavailable
 from .registry import CapabilityRegistry
 from .reliability import CircuitBreaker, CircuitState
 from .scheduler import ModelLeaseScheduler
@@ -65,6 +65,7 @@ class Executive:
         audit_sink: AuditSink | None = None,
         circuit_factory: Callable[[], CircuitBreaker] | None = None,
         on_lesson: Callable[[str], None] | None = None,
+        pressure_probe: Callable[[], Any] | None = None,
     ) -> None:
         self.registry = registry or CapabilityRegistry()
         self.scheduler = scheduler or ModelLeaseScheduler()
@@ -77,13 +78,35 @@ class Executive:
         # so the executive stays a scheduler and this is just a callback. bootstrap
         # wires it to cortex.record_lesson.
         self._on_lesson = on_lesson
+        # Bryo's felt pressure: the body the spine consults before heavy GPU work.
+        # Advisory only - a probe returning an organism that is not alive, or no
+        # probe at all, is "no opinion" and changes nothing. bootstrap wires it to a
+        # BryoPressureReader.peek, which never blocks.
+        self._pressure_probe = pressure_probe
+
+    def body_reading(self) -> Any | None:
+        """Bryo's current advisory reading, or None. Never raises, never blocks."""
+
+        if self._pressure_probe is None:
+            return None
+        try:
+            return self._pressure_probe()
+        except Exception as error:  # noqa: BLE001 - the body is advisory, never load-bearing
+            logging.getLogger(__name__).warning("pressure probe failed: %s", error)
+            return None
 
     def register(self, adapter: SpecialistAdapter) -> None:
         self.registry.register(adapter.manifest)
         self._adapters[adapter.manifest.agent_id] = adapter
         self._circuits[adapter.manifest.agent_id] = self._circuit_factory()
 
-    def execute(self, task: Task, *, routing_detail: str | None = None) -> TaskResult:
+    def execute(
+        self,
+        task: Task,
+        *,
+        routing_detail: str | None = None,
+        deferrable: bool = False,
+    ) -> TaskResult:
         """Run one task through the permission, resource, and audit gates.
 
         ``routing_detail`` is metadata about how this task's capability was
@@ -91,6 +114,12 @@ class Executive:
         against ``task.routed`` so the ledger shows not just where a task went
         but how sure anything was about sending it there. It must stay
         payload-free; the ledger excludes task content by design.
+
+        ``deferrable`` marks work that can wait. Before any GPU lease the body is
+        consulted: its advice is always recorded (``task.paced``), and only a
+        deferrable task is actually held back (``task.deferred``) when Bryo is alive
+        and advises deferring. It defaults to False, so every existing caller - the
+        voice above all - behaves exactly as before.
         """
 
         route = self.registry.resolve(task)
@@ -100,6 +129,9 @@ class Executive:
 
         try:
             circuit.before_call()
+            model = route.capability.model
+            if model is not None and model.requires_gpu:
+                self._consult_body(task, route.agent_id, deferrable=deferrable)
             lease_context = (
                 self.scheduler.acquire(route.capability.model)
                 if route.capability.model is not None
@@ -137,6 +169,20 @@ class Executive:
 
     def circuit(self, agent_id: str) -> CircuitBreaker:
         return self._circuits[agent_id]
+
+    def _consult_body(self, task: Task, agent_id: str, *, deferrable: bool) -> None:
+        """Ask the body before heavy GPU work. Raises BodyDeferred only when the task
+        is deferrable AND a living Bryo advises deferring; otherwise records the
+        advice and returns. A silent or dead organism is no opinion at all."""
+
+        reading = self.body_reading()
+        if reading is None or getattr(reading, "alive", False) is not True:
+            return
+        detail = str(getattr(reading, "detail", "bryo"))
+        if deferrable and getattr(reading, "defer_heavy_work", False) is True:
+            self._record("task.deferred", task, agent_id, detail)
+            raise BodyDeferred(f"Bryo advises deferring heavy work: {detail}")
+        self._record("task.paced", task, agent_id, detail)
 
     def _record_lesson(self, text: str) -> None:
         """Best-effort: a lesson sink must never take a task down (§3.18 - but

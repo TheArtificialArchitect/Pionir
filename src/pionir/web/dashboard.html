@@ -172,6 +172,7 @@
       <div class="stat"><span class="k">organs</span><span class="v" id="s-organs">—</span></div>
       <div class="stat"><span class="k">ledger</span><span class="v" id="s-ledger">—</span></div>
       <div class="stat"><span class="k">free vram</span><span class="v" id="s-vram">—</span></div>
+      <div class="stat" title="Bryo's felt pressure - the body the spine consults before heavy GPU work"><span class="k">body</span><span class="v" id="s-body">—</span></div>
       <div class="heartbeat"><span class="bd"></span><span id="s-beat">always on</span></div>
     </div>
   </div>
@@ -410,6 +411,16 @@ async function pollState(){
     $id("tab-voice").style.display = VOICE_URL ? "" : "none";
     $id("s-organs").textContent = new Set(ROSTER.map(c=>c.agent_id)).size;
     $id("s-vram").textContent = fmtMB(GPU.observed_free_mb);
+    // the body: Bryo's pressure. Silent or dead reads as no opinion ("—"), never alarm.
+    const B=s.bryo, sb=$id("s-body");
+    if(B && B.alive){
+      sb.textContent = B.pressure.toFixed(2) + (B.defer_heavy_work ? " · defer" : "");
+      sb.className = "v " + (B.defer_heavy_work ? "bad" : "good");
+      sb.parentElement.title = "Bryo: " + (B.note||"") ;
+    } else {
+      sb.textContent = "—"; sb.className = "v";
+      sb.parentElement.title = "Bryo silent" + (B && B.note ? " (" + B.note + ")" : "") + " - no opinion, nothing held";
+    }
     $id("s-server").textContent="up"; $id("s-server").className="v good";
     renderRail();
   }catch(e){ $id("s-server").textContent="down"; $id("s-server").className="v bad"; }

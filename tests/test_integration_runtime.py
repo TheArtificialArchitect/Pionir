@@ -20,7 +20,7 @@ class AtaniRunner:
 
 
 class BryoRunner:
-    def run(self, *, timeout_seconds: int) -> str:
+    def run(self, *, timeout_seconds: int, arguments=()) -> str:
         return json.dumps({"stage": "grown", "concepts": 12})
 
 

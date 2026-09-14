@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-import subprocess
 import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from pionir.adapters._proc import run_process, unavailable
 from pionir.contracts import (
     AgentManifest,
     Capability,
@@ -53,26 +53,20 @@ class SubprocessDocumentTransport:
         if len(request) > MAX_DOCUMENT_CHARS:
             raise AdapterProtocolError("specialist task exceeds the protocol size limit")
         try:
-            process = subprocess.run(
+            process = run_process(
                 self._command,
-                input=request,
-                capture_output=True,
-                check=False,
-                encoding="utf-8",
-                errors="replace",
-                shell=False,
-                timeout=timeout_seconds,
+                label="specialist",
+                timeout_seconds=timeout_seconds,
+                input_text=request,
+                max_output_chars=MAX_DOCUMENT_CHARS,
             )
-        except FileNotFoundError as error:
-            raise AdapterUnavailable("specialist executable was not found") from error
-        except subprocess.TimeoutExpired as error:
-            raise AdapterUnavailable("specialist task timed out") from error
+        except AdapterProtocolError as error:
+            raise AdapterProtocolError(
+                "specialist response exceeds the protocol size limit"
+            ) from error
         if process.returncode != 0:
-            raise AdapterUnavailable(
-                f"specialist exited with status {process.returncode}"
-            )
-        if len(process.stdout) > MAX_DOCUMENT_CHARS:
-            raise AdapterProtocolError("specialist response exceeds the protocol size limit")
+            # The child's last stderr line is the reason; "status 1" alone is not.
+            raise unavailable("specialist", process)
         try:
             response = json.loads(process.stdout)
         except json.JSONDecodeError as error:

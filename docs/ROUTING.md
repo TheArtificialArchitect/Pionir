@@ -1,5 +1,34 @@
 # Intent routing
 
+## Jobs: work that outlives the request
+
+Every `POST /api/intent`, `POST /api/task` and approved action runs as a **job**
+(`server.py`, class `Jobs`). The job is written to
+`<state_root>/tasks/<task_id>.json` *before* the request is answered and again
+from the worker thread when the work ends - so a result is never lost to a
+client that gave up first (the voice at 180 s, the phone proxy at 6 s, Atani's
+240 s kill of a 600 s Daedalus run that went on to modify code). The directory
+keeps the newest 500 files.
+
+| route | request | response |
+|---|---|---|
+| `POST /api/intent` | `{"request": str, "wait"?: float}` | finished within `wait`: **200**, the usual `{decision, status, ...}` plus `task_id`. Not yet: **202** `{"status":"running","task_id","decision"}` |
+| `POST /api/task` | `{"capability", "payload"?, "permissions"?, "deferrable"?, "wait"?}` | finished: **200** `{ok, agent_id, result, evidence, task_id}` or `{ok:false, error, task_id}`; parked: **200** `{ok:false, status:"pending_approval", approval_id, task_id}`; not yet: **202** `{"status":"running","task_id"}` |
+| `POST /api/approvals/approve` | `{"id": approval_id}` | **202** `{"ok":true,"status":"running","approval_id","task_id"}` at once. Claim is atomic (pending -> running): a second tap gets `{"ok":false,"error":{"type":"AlreadyResolved"}}`. When the job ends the approval record becomes `approved` or `approved_failed`, with `result` |
+| `GET /api/task/<task_id>` | optional `?wait=<s>` long-poll | **200** the job file: `{task_id, kind, status, created_at, finished_at, request, result, error}`; **404** if unknown |
+| `GET /api/tasks?n=20` | | `{"tasks":[...]}` newest first, without `result` bodies |
+
+`wait` is seconds (default 150, max 600, 0 = answer immediately). `kind` is
+`intent` / `task` / `approval`; `status` is `running` / `done` / `error` /
+`pending_approval` / `unclear` / `self`. `result` is exactly the response dict
+the POST returned or would have returned. For the voice: POST with a `wait`
+under her own timeout, and on a 202 poll `GET /api/task/<task_id>?wait=60` until
+`status` leaves `running`.
+
+Every POST must carry `Content-Type: application/json` and a local `Host`; a
+browser `Origin`, if sent, must be `http://<Host>`. Anything else is **403**
+`{"error":"forbidden"}` - a cross-site page cannot drive the admin surface.
+
 `pionir route "<request>"` turns plain language into one declared capability and
 runs it. `src/pionir/router.py`.
 

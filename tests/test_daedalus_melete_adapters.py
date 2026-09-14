@@ -8,8 +8,8 @@ real refused/failed outcome comes back as a result to record - not as a bare
 
 import unittest
 
-from pionir.adapters._http import LoopbackHttpSettings, health_model
-from pionir.adapters.daedalus import DaedalusAdapter, DaedalusSettings
+from pionir.adapters._http import HttpStatusError, LoopbackHttpSettings, health_model
+from pionir.adapters.daedalus import AdapterTimeout, DaedalusAdapter, DaedalusSettings
 from pionir.adapters.melete import MeleteAdapter, MeleteSettings
 from pionir.contracts import RiskLevel, Task
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
@@ -23,13 +23,35 @@ class FakeClient:
         self._response = response if response is not None else {"ok": True}
         self.calls: list[tuple[str, object]] = []
 
-    def get(self, path: str):
+    def get(self, path: str, *, timeout_seconds=None):
         self.calls.append((path, None))
         return self._health
 
-    def post(self, path: str, payload):
+    def post(self, path: str, payload, *, timeout_seconds=None):
         self.calls.append((path, dict(payload)))
+        if path == "/jobs":
+            raise HttpStatusError("not found", status=404)
         return self._response
+
+
+class AsyncFakeClient:
+    def __init__(self, response: dict | None = None, *, running: bool = False) -> None:
+        self.response = response or {"ok": True}
+        self.running = running
+        self.calls: list[tuple[str, object, object]] = []
+
+    def post(self, path: str, payload, *, timeout_seconds=None):
+        self.calls.append((path, dict(payload), timeout_seconds))
+        if path == "/jobs":
+            return {"job": {"id": "job-1"}}
+        if path.endswith("/cancel"):
+            return {"ok": True}
+        raise AssertionError(path)
+
+    def get(self, path: str, *, timeout_seconds=None):
+        self.calls.append((path, None, timeout_seconds))
+        state = "running" if self.running else "done"
+        return {"job": {"id": "job-1", "state": state, "result": self.response}}
 
 
 def _daedalus_task(content="add a null check", **payload):
@@ -101,6 +123,35 @@ class DaedalusTests(unittest.TestCase):
     def test_status_requires_ok_health(self) -> None:
         with self.assertRaises(AdapterProtocolError):
             DaedalusAdapter(client=FakeClient(health={"model": "x"})).status()
+
+    def test_uses_async_jobs_when_the_server_supports_them(self) -> None:
+        client = AsyncFakeClient({"ok": True, "commit": "abc123"})
+        result = DaedalusAdapter(client=client, sleep=lambda _s: None).execute(
+            _daedalus_task("fix it")
+        )
+        self.assertEqual([call[0] for call in client.calls], ["/jobs", "/jobs/job-1"])
+        self.assertEqual(result.output["job_id"], "job-1")
+        self.assertEqual(result.output["state"], "done")
+        self.assertIn("daedalus:job:job-1", result.evidence)
+        self.assertIn("daedalus:commit:abc123", result.evidence)
+
+    def test_timeout_requests_cancellation_and_preserves_job_id(self) -> None:
+        client = AsyncFakeClient(running=True)
+        ticks = iter((0.0, 6.0))
+        adapter = DaedalusAdapter(
+            DaedalusSettings(
+                timeout_seconds=5,
+                request_timeout_seconds=5,
+                poll_interval_seconds=0.01,
+            ),
+            client=client,
+            sleep=lambda _s: None,
+            monotonic=lambda: next(ticks),
+        )
+        with self.assertRaises(AdapterTimeout) as caught:
+            adapter.execute(_daedalus_task())
+        self.assertEqual(caught.exception.job_id, "job-1")
+        self.assertEqual(client.calls[-1][0], "/jobs/job-1/cancel")
 
 
 class MeleteTests(unittest.TestCase):

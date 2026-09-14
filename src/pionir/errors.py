@@ -35,6 +35,13 @@ class ResourceUnavailable(PionirError):
     pass
 
 
+class BodyDeferred(ResourceUnavailable):
+    """Bryo, the spine's autonomic organ, advised deferring heavy work, and the caller
+    marked the task deferrable. The specialist was never called. A subclass of
+    ResourceUnavailable so the executive's existing handling applies unchanged: the
+    circuit's probe slot is returned and a deferral never counts against a doer."""
+
+
 class NamespaceAccessDenied(PionirError):
     pass
 

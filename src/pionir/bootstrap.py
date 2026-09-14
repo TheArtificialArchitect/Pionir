@@ -24,6 +24,7 @@ from .adapters import (
 from .adapters.galatea import resolve_served_model
 from .audit import JsonlAuditSink
 from .benchmark import read_loaded_models, unload
+from .bryo_pressure import BryoPressureReader
 from .config import PionirSettings
 from .cortex import Cortex, OllamaEmbedder
 from .reliability import CircuitBreaker
@@ -68,6 +69,14 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         OllamaEmbedder(configured.embed_model) if configured.embed_model else None
     )
     cortex = Cortex(configured.cortex_path, embedder=embedder)
+    # The body: Bryo's felt pressure, consulted before heavy GPU work. Built only
+    # when Bryo is wired in at all, so a runtime without him (every test) never
+    # starts a subprocess. peek() never blocks and fails open.
+    pressure_reader = (
+        BryoPressureReader(configured.bryo_status_command, cwd=configured.bryo_status_cwd)
+        if configured.bryo_status_command is not None and configured.bryo_pressure
+        else None
+    )
     executive = Executive(
         scheduler=ModelLeaseScheduler(
             configured.resource_budget,
@@ -79,6 +88,8 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
             evict_to_fit=configured.evict_to_fit,
             evictor=unload,
             loaded_probe=lambda: [item.name for item in read_loaded_models()],
+            # Never evict the voice's model: she does not take the shared lock.
+            protected_models=configured.protected_models,
         ),
         audit_sink=JsonlAuditSink(configured.audit_path),
         circuit_factory=lambda: CircuitBreaker(
@@ -88,6 +99,7 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         # A circuit opening is the shell's own repeated-failure lesson; record it
         # into the shared lessons namespace so it is recalled before acting later.
         on_lesson=cortex.record_lesson,
+        pressure_probe=pressure_reader.peek if pressure_reader is not None else None,
     )
     runtime = PionirRuntime(configured, executive, {}, cortex)
     runtime.register(

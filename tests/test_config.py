@@ -20,6 +20,8 @@ class ConfigTests(unittest.TestCase):
             "PIONIR_STATE_ROOT": str(Path(os.getcwd()).resolve() / "state"),
             "PIONIR_ATANI_COMMAND_JSON": '["C:\\\\src\\\\Atani\\\\atani.exe"]',
             "PIONIR_BRYO_STATUS_COMMAND_JSON": '["python","-m","bryo.status"]',
+            "PIONIR_DAEDALUS_TOKEN": "do-not-print-this-token",
+            "PIONIR_MELETE_TOKEN": "nor-this-one",
             "PIONIR_SPECIALISTS_FILE": str(
                 Path(os.getcwd()).resolve() / "specialists.toml"
             ),
@@ -38,7 +40,8 @@ class ConfigTests(unittest.TestCase):
             settings.specialists_file,
             Path(os.getcwd()).resolve() / "specialists.toml",
         )
-        self.assertNotIn("secret", repr(settings))
+        self.assertNotIn("do-not-print-this-token", repr(settings))
+        self.assertNotIn("nor-this-one", repr(settings))
         self.assertEqual(
             settings.gpu_lock_path,
             Path(os.getcwd()).resolve() / "gpu.lock",

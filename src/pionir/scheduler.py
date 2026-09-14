@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from threading import Lock
@@ -155,11 +155,16 @@ class ModelLeaseScheduler:
         evictor: Callable[[str], None] | None = None,
         loaded_probe: Callable[[], list[str]] | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        protected_models: Iterable[str] = (),
     ) -> None:
         self.budget = budget or ResourceBudget()
         self.shared_gpu_lock = shared_gpu_lock
         self.vram_probe = vram_probe
         self.residency_probe = residency_probe
+        # Models that are never evicted to make room. The voice (Galatea) never
+        # takes the shared lock, so the lock cannot protect her model from being
+        # pulled out mid-sentence; naming it here does.
+        self.protected_models = frozenset(canonical_model(m) for m in protected_models if m.strip())
         # When a needed model does not fit, evict idle resident models to make
         # room (a 12B voice and a 7B doer cannot share a 12 GB card). Only done
         # while holding the shared GPU lock, so a model in active use by a
@@ -211,10 +216,14 @@ class ModelLeaseScheduler:
             return self.vram_probe()
         target = canonical_model(target_model)
         free = self.vram_probe()
+        spared: list[str] = []
         for name in resident:
             if free is not None and free >= needed_mb:
                 break
             if canonical_model(name) == target:
+                continue
+            if canonical_model(name) in self.protected_models:
+                spared.append(name)
                 continue
             try:
                 evict(name)
@@ -225,6 +234,13 @@ class ModelLeaseScheduler:
                 free = self.vram_probe()
                 if free is not None and free >= needed_mb:
                     break
+        if spared and free is not None and free < needed_mb:
+            raise ResourceUnavailable(
+                f"{target_model} needs {needed_mb} MB VRAM; only {free} MB free, and "
+                f"making room would mean evicting a protected model "
+                f"({', '.join(spared)}) - refused. Wait for it to idle out, or "
+                f"change PIONIR_PROTECTED_MODELS."
+            )
         return free
 
     def acquire(self, requirement: ModelRequirement) -> ModelLease:
@@ -245,7 +261,8 @@ class ModelLeaseScheduler:
             )
             if shared_lease is None:
                 raise ResourceUnavailable(
-                    "GPU is leased by another Pionir-compatible process"
+                    "GPU is leased by another Pionir-compatible process "
+                    f"({self.shared_gpu_lock.describe_holder()})"
                 )
         try:
             if requirement.requires_gpu and self.vram_probe is not None:

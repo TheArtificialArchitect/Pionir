@@ -14,10 +14,14 @@ machine, the same trust boundary as the specialists it front-ends.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import tempfile
 import threading
+import uuid
 import webbrowser
+from collections.abc import Callable
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,10 +34,196 @@ from .cli import _capabilities, _doctor, _jsonable
 from .contracts import RiskLevel, Task
 from .errors import PionirError, RoutingAmbiguous
 from .router import Candidate, IntentRouter, RoutingDecision
+from .runtime import AuditEvent
 from .scheduler import observed_free_vram_mb
+
+_log = logging.getLogger(__name__)
 
 MAX_REQUEST_BYTES = 1_000_000
 _UI_PATH = Path(__file__).parent / "web" / "dashboard.html"
+
+# Jobs: how long a POST waits for its work before answering 202 and letting the
+# job run on. The voice gives up at 180s, so the default is under that; the max
+# covers the longest inner specialist call (Daedalus, up to 600s).
+DEFAULT_WAIT_SECONDS = 150.0
+MAX_WAIT_SECONDS = 600.0
+JOBS_KEEP = 500
+_TASK_ID = re.compile(r"[0-9a-f]{32}")
+JOB_STATUSES = ("running", "done", "error", "pending_approval", "unclear", "self")
+
+# Loopback admin surface: a browser tab on any origin can still POST here
+# (a `text/plain` "simple request" needs no CORS preflight), so a POST must look
+# like it came from our own page or a local client, or it is refused.
+_LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+class Jobs:
+    """Durable record of every intent/task/approval run, one JSON file each.
+
+    Written BEFORE the request is answered and again from the worker thread
+    when the work finishes, so a result is never lost to a client that gave up
+    (the voice at 180s, the phone proxy at 6s): the file holds it, and
+    ``GET /api/task/<id>`` hands it over later. Atomic writes (temp + replace);
+    the directory is bounded to the newest ``JOBS_KEEP`` files.
+    """
+
+    def __init__(self, root: Path, *, keep: int = JOBS_KEEP) -> None:
+        self.root = root
+        self.keep = keep
+        self._lock = threading.Lock()
+        self._done: dict[str, threading.Event] = {}
+        self.root.mkdir(parents=True, exist_ok=True)
+        self._recover_interrupted()
+
+    def _path(self, task_id: str) -> Path:
+        return self.root / f"{task_id}.json"
+
+    def _write(self, record: dict[str, Any]) -> None:
+        fd, tmp = tempfile.mkstemp(dir=str(self.root), prefix=".job-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(record, handle, ensure_ascii=False, default=str)
+            os.replace(tmp, self._path(record["task_id"]))
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError as error:
+                    _log.warning("job temp file %s not removed: %s", tmp, error)
+
+    def _files(self) -> list[Path]:
+        """Job files, newest first. A file that vanishes mid-listing sorts last."""
+        def mtime(path: Path) -> int:
+            try:
+                return path.stat().st_mtime_ns
+            except OSError:
+                return 0
+        return sorted(
+            (p for p in self.root.glob("*.json") if _TASK_ID.fullmatch(p.stem)),
+            key=mtime, reverse=True,
+        )
+
+    def _prune(self) -> None:
+        files = self._files()
+        for stale in files[self.keep:]:
+            try:
+                stale.unlink()
+            except OSError as error:
+                _log.warning("job file %s not pruned: %s", stale, error)
+
+    def _recover_interrupted(self) -> None:
+        """Mark jobs orphaned by a previous process as interrupted."""
+
+        for path in self._files():
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, dict) or record.get("status") != "running":
+                continue
+            record["status"] = "error"
+            record["finished_at"] = datetime.now(UTC).isoformat()
+            detail = {
+                "type": "Interrupted",
+                "message": "Pionir restarted before this job finished",
+            }
+            record["result"] = {
+                "status": "error",
+                "error": detail,
+                "task_id": record.get("task_id"),
+            }
+            record["error"] = detail
+            try:
+                self._write(record)
+            except OSError as error:
+                _log.warning("interrupted job %s could not be recovered: %s", path, error)
+
+    def create(self, kind: str, request: dict[str, Any], *, task_id: str | None = None) -> dict[str, Any]:
+        task_id = task_id or uuid.uuid4().hex
+        if not _TASK_ID.fullmatch(task_id):
+            raise ValueError("task_id must be a 32-character lowercase hex id")
+        record = {
+            "task_id": task_id,
+            "kind": kind,
+            "status": "running",
+            "created_at": datetime.now(UTC).isoformat(),
+            "finished_at": None,
+            "request": request,
+            "result": None,
+            "error": None,
+        }
+        with self._lock:
+            if self._path(task_id).exists():
+                raise ValueError(f"job {task_id} already exists")
+            self._done[task_id] = threading.Event()
+            self._write(record)
+            self._prune()
+        return record
+
+    def finish(self, task_id: str, status: str, *, result: dict[str, Any] | None = None,
+               error: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        if status not in JOB_STATUSES:
+            raise ValueError(f"unknown job status {status!r}")
+        with self._lock:
+            record = self.get(task_id)
+            if record is None:
+                return None
+            record["status"] = status
+            record["finished_at"] = datetime.now(UTC).isoformat()
+            record["result"] = result
+            record["error"] = error
+            self._write(record)
+            event = self._done.get(task_id)
+            if event is not None:
+                event.set()
+                self._done.pop(task_id, None)
+        return record
+
+    def get(self, task_id: str) -> dict[str, Any] | None:
+        if not _TASK_ID.fullmatch(task_id or ""):
+            return None
+        try:
+            document = json.loads(self._path(task_id).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return document if isinstance(document, dict) else None
+
+    def wait(self, task_id: str, timeout: float) -> bool:
+        """True once the job has finished (or was never running here)."""
+        event = self._done.get(task_id)
+        if event is None:
+            record = self.get(task_id)
+            return record is not None and record["status"] != "running"
+        return event.wait(max(0.0, timeout))
+
+    def recent(self, n: int = 20) -> list[dict[str, Any]]:
+        """The newest ``n`` jobs without their ``result`` bodies (fetch one by id)."""
+        out: list[dict[str, Any]] = []
+        for path in self._files()[: max(0, n)]:
+            record = self.get(path.stem)
+            if record is not None:
+                out.append({k: v for k, v in record.items() if k != "result"})
+        return out
+
+
+def _job_status(result: dict[str, Any]) -> str:
+    """Map a handler's response dict onto the job's terminal status."""
+    status = result.get("status")
+    if status in ("pending_approval", "unclear", "self", "error"):
+        return str(status)
+    if status in ("done", "planned"):
+        return "done"
+    if "ok" in result:
+        return "done" if result["ok"] else "error"
+    return "done"
+
+
+def _clamp_wait(wait: Any) -> float:
+    try:
+        value = float(DEFAULT_WAIT_SECONDS if wait is None else wait)
+    except (TypeError, ValueError):
+        value = DEFAULT_WAIT_SECONDS
+    return min(max(value, 0.0), MAX_WAIT_SECONDS)
 
 # The only thing the voice runs on her own through /api/intent: asking Atani to
 # think (no doer, no side effect). Everything else is a doer's job, which only
@@ -76,6 +266,80 @@ class PionirApp:
         self.runtime = runtime
         self.router = IntentRouter(runtime.executive)
         self.approvals = ApprovalQueue(runtime.settings.state_root / "approvals" / "queue.json")
+        self.jobs = Jobs(runtime.settings.state_root / "tasks")
+
+    # ---- jobs: work that outlives the request ---------------------------
+    def _submit(
+        self,
+        kind: str,
+        request: dict[str, Any],
+        work: Callable[[], dict[str, Any]],
+        wait: float,
+        *,
+        known: dict[str, Any] | None = None,
+        task_id: str | None = None,
+        on_finish: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Run ``work`` on a worker thread, wait up to ``wait`` seconds.
+
+        The job file is written before this returns and rewritten by the worker
+        when the work ends, whichever the client did in between. Finished in
+        time: the work's own response plus ``task_id``. Not yet: ``status:
+        running`` plus ``task_id`` and whatever is already ``known`` (the routing
+        decision), for the client to poll ``GET /api/task/<task_id>``.
+        """
+
+        record = self.jobs.create(kind, request, task_id=task_id)
+        tid = record["task_id"]
+        box: dict[str, Any] = {}
+
+        def worker() -> None:
+            result: dict[str, Any] | None = None
+            detail: dict[str, Any] | None = None
+            try:
+                result = work()
+                status = _job_status(result)
+                response = {**result, "task_id": tid}
+            except Exception as error:  # noqa: BLE001 - the worker must record, never vanish
+                _log.exception("job %s (%s) failed", tid, kind)
+                detail = {"type": type(error).__name__, "message": str(error)}
+                status = "error"
+                response = {"status": "error", "error": detail, "task_id": tid}
+            box["response"] = response
+            # on_finish (the approval record) runs BEFORE the job is marked done,
+            # so anyone who waited on the job sees the approval already settled.
+            if on_finish is not None:
+                try:
+                    on_finish(response)
+                except Exception:  # noqa: BLE001
+                    _log.exception("job %s (%s) on_finish failed", tid, kind)
+            # Polling should return the same response as a client that stayed
+            # connected, including the durable task id.
+            self.jobs.finish(tid, status, result=response, error=detail)
+
+        threading.Thread(target=worker, name=f"pionir-job-{tid[:8]}", daemon=True).start()
+        if self.jobs.wait(tid, wait) and "response" in box:
+            return box["response"]
+        return {**(known or {}), "status": "running", "task_id": tid}
+
+    def job(self, task_id: str) -> dict[str, Any] | None:
+        return self.jobs.get(task_id)
+
+    def jobs_view(self, n: int = 20) -> dict[str, Any]:
+        return {"tasks": self.jobs.recent(n)}
+
+    def _record_routed(self, decision: RoutingDecision, *, note: str) -> None:
+        """A classification that never reached the executive is still a routing
+        decision, and the ledger's ask-rate is meaningless without it."""
+        self.runtime.executive.audit_sink.record(
+            AuditEvent(
+                event_type="task.routed",
+                task_id=uuid.uuid4(),
+                agent_id="unrouted",
+                occurred_at=datetime.now(UTC),
+                detail=f"{decision.audit_detail()} {note}",
+            )
+        )
 
     # ---- read-only views -------------------------------------------------
     def roster(self) -> list[dict[str, Any]]:
@@ -129,7 +393,22 @@ class PionirApp:
             # Voice view rather than opening her in a separate tab. None when no
             # voice is configured, and the dashboard hides the view.
             "voice_url": self.runtime.settings.galatea_url,
+            # The spine's vital sign: Bryo's felt pressure. Read from the reader's
+            # cache - never a subprocess per poll. None when Bryo isn't wired in.
+            "bryo": self.body(),
             "generated_at": datetime.now(UTC).isoformat(),
+        }
+
+    def body(self) -> dict[str, Any] | None:
+        reading = self.runtime.executive.body_reading()
+        if reading is None:
+            return None
+        return {
+            "alive": bool(getattr(reading, "alive", False)),
+            "pressure": float(getattr(reading, "pressure", 0.0)),
+            "defer_heavy_work": bool(getattr(reading, "defer_heavy_work", False)),
+            "note": str(getattr(reading, "note", "")),
+            "source": str(getattr(reading, "source", "")),
         }
 
     def doctor(self) -> dict[str, Any]:
@@ -174,6 +453,7 @@ class PionirApp:
 
         decision = self.router.classify(request)
         if not execute:
+            self._record_routed(decision, note="executed=false")
             return {"executed": False, "decision": _decision_json(decision)}
         if not decision.resolved:
             return {
@@ -205,9 +485,10 @@ class PionirApp:
             "evidence": list(result.evidence),
         }
 
-    def intent(self, request: str) -> dict[str, Any]:
+    def intent(self, request: str, *, wait: float = DEFAULT_WAIT_SECONDS) -> dict[str, Any]:
         """The voice's one seam for getting something done - and it reaches only
-        Atani, never a doer.
+        Atani, never a doer. Runs as a job (see ``_submit``): answered in full if
+        it finishes within ``wait`` seconds, else ``status: running`` + task_id.
 
         The design (Ian, 2026-09-11): the voice does not control the organs
         directly. She views and reads, and she may ask Atani for a specific bot,
@@ -222,36 +503,47 @@ class PionirApp:
 
         decision = self.router.classify(request)
         base = {"decision": _decision_json(decision)}
+        body = {"request": request}
+
+        def settle(response: dict[str, Any]) -> dict[str, Any]:
+            # No work to run: the answer is the decision itself. Still a job, so
+            # the record of what the voice asked and what she was told persists.
+            record = self.jobs.create("intent", body)
+            self.jobs.finish(record["task_id"], _job_status(response), result=response)
+            return {**response, "task_id": record["task_id"]}
+
+        def run(capability: str, permissions: frozenset[str]) -> dict[str, Any]:
+            return self._submit(
+                "intent", body,
+                lambda: self._run_intent(capability, {"content": request}, permissions, decision),
+                wait, known=base,
+            )
+
         if not decision.resolved:
             if _NAMES_A_DOER.search(request):
                 # she named a bot; the classifier just wasn't sure. Hand it to
                 # Atani, who decides which organ and tasks it, rather than asking.
-                return self._run_intent(
-                    "manager.atani_manage", {"content": request},
-                    frozenset({"atani.manage"}), decision,
-                )
-            return {**base, "status": "unclear", "question": decision.question()}
+                return run("manager.atani_manage", frozenset({"atani.manage"}))
+            self._record_routed(decision, note="handled=voice_unclear")
+            return settle({**base, "status": "unclear", "question": decision.question()})
         cap = decision.capability
         if cap == "conversation.galatea_reply":
-            return {**base, "status": "self", "note": "that routes back to the voice - answer it yourself"}
+            self._record_routed(decision, note="handled=voice_self")
+            return settle({**base, "status": "self",
+                           "note": "that routes back to the voice - answer it yourself"})
         if cap in _VOICE_REASONING:
             # Asking Atani to think: Atani answers her directly, no doer involved.
-            return self._run_intent(cap, {"content": request}, frozenset({"atani.chat"}), decision)
+            return run(cap, frozenset({"atani.chat"}))
         if self._capability_risk(cap) is RiskLevel.READ_ONLY:
             # She may view, read and look for herself (Bryo's vitals, a status
             # snapshot); that is not tasking a doer, so it runs directly.
-            return self._run_intent(cap, {"content": request}, frozenset(), decision)
+            return run(cap, frozenset())
         # Everything else names a doer's job. The voice does not task doers - she
         # asks Atani, and Atani tasks the right bot through Pionir. Hand the whole
         # request to Atani the manager; it decides, tasks, waits, and returns what
         # actually happened. manager.atani_manage holds no GPU lease of its own,
         # so the doer's task can take the single lease.
-        return self._run_intent(
-            "manager.atani_manage",
-            {"content": request},
-            frozenset({"atani.manage"}),
-            decision,
-        )
+        return run("manager.atani_manage", frozenset({"atani.manage"}))
 
     def _capability_risk(self, name: str) -> RiskLevel | None:
         for manifest in self.runtime.executive.registry.manifests():
@@ -262,7 +554,12 @@ class PionirApp:
 
     def _run_intent(self, capability, payload, permissions, decision, *, planned=False):
         try:
-            result = self.runtime.executive.execute(Task(capability, payload, permissions))
+            # routing_detail: the ledger's task.routed event carries the router's
+            # confidence and runner-up, as it does for `pionir route`.
+            result = self.runtime.executive.execute(
+                Task(capability, payload, permissions),
+                routing_detail=decision.audit_detail(),
+            )
         except Exception as error:  # noqa: BLE001 - returned to the voice as data
             return {
                 "decision": _decision_json(decision),
@@ -320,28 +617,51 @@ class PionirApp:
         payload: dict[str, Any],
         *,
         permissions: list[str] | None = None,
+        deferrable: bool = False,
+        wait: float = DEFAULT_WAIT_SECONDS,
     ) -> dict[str, Any]:
         """Invoke one named capability directly. A privileged action without its
         permission is parked in the approval queue and does NOT run - it waits for
-        Ian's yes; everything else runs as before."""
+        Ian's yes; everything else runs as a job (``_submit``): answered in full
+        within ``wait`` seconds, else ``status: running`` + task_id to poll.
+
+        ``deferrable`` lets a background caller say its work can wait: if Bryo is
+        alive and stressed, GPU work is held back and returned as a BodyDeferred
+        error rather than run. Default False - nothing interactive is ever held."""
 
         granted = list(permissions or ())
+        body = {"capability": capability, "payload": payload, "permissions": granted,
+                "deferrable": deferrable}
         if self._needs_approval(capability, granted):
             _agent, cap = self._cap_and_agent(capability)
             summary = self._summarize(capability, payload)
             approval_id = self.approvals.enqueue(
                 capability, payload, sorted(cap.required_permissions), summary=summary
             )
-            return {
+            response = {
                 "ok": False,
                 "status": "pending_approval",
                 "approval_id": approval_id,
                 "summary": summary,
                 "note": "held for Ian's approval - it has not run",
             }
+            record = self.jobs.create("task", body)
+            self.jobs.finish(record["task_id"], "pending_approval", result=response)
+            return {**response, "task_id": record["task_id"]}
+        return self._submit(
+            "task", body,
+            lambda: self._execute_task(capability, payload, granted, deferrable=deferrable),
+            wait,
+        )
+
+    def _execute_task(
+        self, capability: str, payload: dict[str, Any], granted: list[str],
+        *, deferrable: bool = False,
+    ) -> dict[str, Any]:
+        """The synchronous core: run it now, on this thread, and report as data."""
         try:
             result = self.runtime.executive.execute(
-                Task(capability, payload, frozenset(granted))
+                Task(capability, payload, frozenset(granted)), deferrable=deferrable
             )
         except Exception as error:  # noqa: BLE001 - returned as data
             return {"ok": False, "error": {"type": type(error).__name__, "message": str(error)}}
@@ -356,18 +676,42 @@ class PionirApp:
     def approvals_view(self) -> dict[str, Any]:
         return {"pending": self.approvals.pending(), "recent": self.approvals.recent(20)}
 
-    def approve(self, approval_id: str) -> dict[str, Any]:
-        record = self.approvals.get(approval_id)
+    def approve(self, approval_id: str, *, wait: float = 0.0) -> dict[str, Any]:
+        """Claim first, then run as a job. The claim is an atomic pending->running
+        move in the queue, so two taps (or a proxy retry after its own timeout)
+        can never run the action twice: the second gets AlreadyResolved. The
+        response comes back at once with the job's task_id; when the job ends the
+        approval record is marked approved (or approved_failed) with the result."""
+
+        task_id = uuid.uuid4().hex
+        record = self.approvals.claim(approval_id, task_id=task_id)
         if record is None:
-            return {"ok": False, "error": {"type": "NotFound", "message": "no such approval"}}
-        if record["status"] != "pending":
+            current = self.approvals.get(approval_id)
+            if current is None:
+                return {"ok": False, "error": {"type": "NotFound", "message": "no such approval"}}
             return {"ok": False, "error": {"type": "AlreadyResolved",
-                                           "message": f"already {record['status']}"}}
+                                           "message": f"already {current['status']}"}}
+
+        def finish(response: dict[str, Any]) -> None:
+            status = "approved" if response.get("ok") is True else "approved_failed"
+            if not self.approvals.resolve(approval_id, status, response, from_status="running"):
+                _log.warning("approval %s was not running when its job finished", approval_id)
+
         # run it with exactly the permission it needed - never wider
-        outcome = self.run_task(record["capability"], record["payload"],
-                                permissions=record["permissions"])
-        self.approvals.resolve(approval_id, "approved", outcome)
-        return {"ok": True, "status": "approved", "approval_id": approval_id, "result": outcome}
+        response = self._submit(
+            "approval",
+            {"approval_id": approval_id, "capability": record["capability"],
+             "payload": record["payload"], "permissions": record["permissions"]},
+            lambda: self._execute_task(record["capability"], record["payload"],
+                                       list(record["permissions"])),
+            wait, task_id=task_id, on_finish=finish,
+        )
+        if response.get("status") == "running":
+            return {"ok": True, "status": "running", "approval_id": approval_id,
+                    "task_id": task_id}
+        # finished inside the wait (tests, or a caller that asked to wait)
+        return {"ok": True, "status": self.approvals.get(approval_id)["status"],
+                "approval_id": approval_id, "task_id": task_id, "result": response}
 
     def deny(self, approval_id: str) -> dict[str, Any]:
         if self.approvals.resolve(approval_id, "denied"):
@@ -382,9 +726,43 @@ def _ui_bytes() -> bytes:
         return b"<h1>Pionir</h1><p>dashboard.html is missing.</p>"
 
 
-def _make_handler(app: PionirApp):
+def _hostname(header: str | None) -> str | None:
+    """The host part of a Host/Origin-style header, without port or brackets."""
+    if not header:
+        return None
+    try:
+        return urlparse("//" + header.strip()).hostname
+    except ValueError:
+        return None
+
+
+def _post_allowed(headers: Any, bind_host: str) -> str | None:
+    """None if the POST may proceed, else why it may not.
+
+    Three checks, all cheap: the body must be declared JSON (a cross-site form
+    or `text/plain` fetch cannot say that without a preflight, which loopback
+    never grants); the Host must be us; and if the browser sent an Origin it
+    must be our own page. A local client with no Origin (curl, the voice,
+    Atani) passes.
+    """
+
+    content_type = (headers.get("Content-Type") or "").split(";")[0].strip().lower()
+    if content_type != "application/json":
+        return "content-type must be application/json"
+    host_header = headers.get("Host")
+    host = _hostname(host_header)
+    if host is None or host not in (_LOCAL_HOSTS | {bind_host}):
+        return "host is not local"
+    origin = headers.get("Origin")
+    if origin is not None and origin.strip().lower() != f"http://{host_header.strip()}".lower():
+        return "origin does not match host"
+    return None
+
+
+def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
     class Handler(BaseHTTPRequestHandler):
         server_version = "Pionir/0.1"
+        timeout = 30  # a stalled client releases its thread; a job outlives it anyway
 
         def log_message(self, *_args: Any) -> None:  # keep the console quiet
             return
@@ -398,10 +776,19 @@ def _make_handler(app: PionirApp):
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_job(self, payload: dict[str, Any]) -> None:
+            """A job response: 202 while it is still running, 200 once answered."""
+            self._send(payload, 202 if payload.get("status") == "running" else 200)
+
         def _body(self) -> dict[str, Any] | None:
-            length = int(self.headers.get("Content-Length") or 0)
-            if length <= 0 or length > MAX_REQUEST_BYTES:
-                return {} if length <= 0 else None
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return None
+            if length <= 0:
+                return {}
+            if length > MAX_REQUEST_BYTES:
+                return None
             try:
                 document = json.loads(self.rfile.read(length).decode("utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError):
@@ -431,6 +818,20 @@ def _make_handler(app: PionirApp):
                     self._send(app.audit(min(max(n, 1), 500)))
                 elif route.path == "/api/approvals":
                     self._send(app.approvals_view())
+                elif route.path == "/api/tasks":
+                    n = int(parse_qs(route.query).get("n", ["20"])[0] or 20)
+                    self._send(app.jobs_view(min(max(n, 1), JOBS_KEEP)))
+                elif route.path.startswith("/api/task/"):
+                    task_id = route.path[len("/api/task/"):].strip("/")
+                    query = parse_qs(route.query)
+                    if "wait" in query:
+                        # optional long-poll: hold up to `wait` seconds for it to end
+                        app.jobs.wait(task_id, _clamp_wait(query["wait"][0]))
+                    record = app.job(task_id)
+                    if record is None:
+                        self._send({"error": "not found", "task_id": task_id}, 404)
+                    else:
+                        self._send(record)
                 else:
                     self._send({"error": "not found"}, 404)
             except Exception as error:  # noqa: BLE001
@@ -438,6 +839,10 @@ def _make_handler(app: PionirApp):
 
         def do_POST(self) -> None:
             route = urlparse(self.path)
+            refused = _post_allowed(self.headers, bind_host)
+            if refused is not None:
+                self._send({"error": "forbidden", "reason": refused}, 403)
+                return
             body = self._body()
             if body is None:
                 self._send({"error": "bad json"}, 400)
@@ -460,26 +865,34 @@ def _make_handler(app: PionirApp):
                     if not request:
                         self._send({"error": "intent is required"}, 400)
                         return
-                    self._send(app.intent(request))
+                    self._send_job(app.intent(request, wait=_clamp_wait(body.get("wait"))))
                 elif route.path == "/api/task":
                     capability = str(body.get("capability", "")).strip()
                     if not capability:
                         self._send({"error": "capability is required"}, 400)
                         return
                     payload = body.get("payload")
-                    self._send(
+                    self._send_job(
                         app.run_task(
                             capability,
                             payload if isinstance(payload, dict) else {},
                             permissions=[str(p) for p in body.get("permissions", [])],
+                            deferrable=body.get("deferrable") is True,
+                            wait=_clamp_wait(body.get("wait")),
                         )
                     )
                 elif route.path == "/api/approvals/approve":
                     aid = str(body.get("id", "")).strip()
-                    self._send(app.approve(aid) if aid else {"error": "id required"})
+                    if not aid:
+                        self._send({"error": "id required"}, 400)
+                        return
+                    self._send_job(app.approve(aid))
                 elif route.path == "/api/approvals/deny":
                     aid = str(body.get("id", "")).strip()
-                    self._send(app.deny(aid) if aid else {"error": "id required"})
+                    if not aid:
+                        self._send({"error": "id required"}, 400)
+                        return
+                    self._send(app.deny(aid))
                 else:
                     self._send({"error": "not found"}, 404)
             except Exception as error:  # noqa: BLE001
@@ -538,7 +951,7 @@ def serve(
     """
 
     app = PionirApp(runtime)
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), _make_handler(app))
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), _make_handler(app, bind_host="127.0.0.1"))
     url = f"http://127.0.0.1:{port}/"
     pulse_thread, pulse_stop = _start_pulse(app)
     print("  PIONIR")

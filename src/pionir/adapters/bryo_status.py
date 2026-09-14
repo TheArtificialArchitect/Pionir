@@ -1,18 +1,32 @@
-"""Read-only observability adapter for Terrarium's Bryo organism."""
+"""Read-only observability adapter for Terrarium's Bryo organism.
+
+`python -m bryo.status` has two faces: the default prose snapshot (a box of
+vitals, lineage and the last journal lines) and `--json`, a machine-readable
+`bryo.vitals/1` document that never raises and reads neutral when he is absent.
+The JSON is preferred - a consumer can act on `pressure` and `advisory` without
+scraping a box-drawing table - and the prose is the fallback when the JSON
+face is missing or unparsable (an older terrarium tree, say).
+"""
 
 from __future__ import annotations
 
-import subprocess
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
+from pionir.adapters._proc import run_process, unavailable
 from pionir.contracts import AgentManifest, Capability, Task, TaskResult
-from pionir.errors import AdapterProtocolError, AdapterUnavailable
+from pionir.errors import AdapterError, AdapterProtocolError
+
+JSON_FLAG = "--json"
 
 
 class TextCommandRunner(Protocol):
-    def run(self, *, timeout_seconds: int) -> str: ...
+    # `arguments` are appended to the configured command for one call (the
+    # adapter uses it for `--json`). Keyword-only with a default so a runner
+    # built for the bare command - bryo_pressure's - keeps its call shape.
+    def run(self, *, timeout_seconds: int, arguments: Sequence[str] = ()) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,26 +50,15 @@ class SubprocessTextRunner:
         self._command = tuple(command)
         self._cwd = cwd
 
-    def run(self, *, timeout_seconds: int) -> str:
-        try:
-            process = subprocess.run(
-                self._command,
-                capture_output=True,
-                check=False,
-                encoding="utf-8",
-                errors="replace",
-                shell=False,
-                timeout=timeout_seconds,
-                cwd=self._cwd,
-            )
-        except FileNotFoundError as error:
-            raise AdapterUnavailable(
-                "Bryo's configured Python executable was not found"
-            ) from error
-        except subprocess.TimeoutExpired as error:
-            raise AdapterUnavailable("Bryo status timed out") from error
+    def run(self, *, timeout_seconds: int, arguments: Sequence[str] = ()) -> str:
+        process = run_process(
+            [*self._command, *arguments],
+            label="Bryo status",
+            timeout_seconds=timeout_seconds,
+            cwd=self._cwd,
+        )
         if process.returncode != 0:
-            raise AdapterUnavailable(f"Bryo status exited with code {process.returncode}")
+            raise unavailable("Bryo status", process)
         return process.stdout
 
 
@@ -89,11 +92,34 @@ class BryoStatusAdapter:
     def manifest(self) -> AgentManifest:
         return self._manifest
 
-    def status(self) -> dict[str, str]:
+    def _vitals(self) -> dict[str, Any] | None:
+        """His `--json` vitals, or None when that face is absent or unreadable.
+
+        Fail-open on purpose: a terrarium tree without `--json` prints the prose
+        snapshot and exits 0, an older one may reject the flag, and either is a
+        reason to fall back to the prose, not to report him unreachable.
+        """
+
+        try:
+            raw = self._runner.run(
+                timeout_seconds=self.settings.timeout_seconds, arguments=(JSON_FLAG,)
+            )
+        except AdapterError:
+            return None
+        try:
+            document = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return document if isinstance(document, dict) else None
+
+    def status(self) -> dict[str, Any]:
+        vitals = self._vitals()
+        if vitals is not None:
+            return {"format": "json", "vitals": vitals}
         snapshot = self._runner.run(timeout_seconds=self.settings.timeout_seconds).strip()
         if not snapshot:
             raise AdapterProtocolError("Bryo returned an empty status snapshot")
-        return {"snapshot": snapshot}
+        return {"format": "text", "snapshot": snapshot}
 
     def execute(self, task: Task) -> TaskResult:
         if task.capability != "organism.bryo_status":

@@ -187,7 +187,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     consolidate.add_argument("namespace", help="the conversation namespace to fold")
     consolidate.add_argument("--model", default=None,
-                            help="chat model to distil with (default: the configured embed/voice model)")
+                            help="chat model to distil with (default: PIONIR_DISTIL_MODEL)")
     consolidate.add_argument("--min-turns", type=int, default=None,
                             help="minimum un-consolidated turns before folding")
 
@@ -550,9 +550,16 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
     if args.command == "consolidate":
         from .consolidate import DEFAULT_MIN_TURNS, Consolidator, OllamaDistiller
 
-        model = args.model or runtime.settings.embed_model
+        # A chat model, never the embed model: nomic-embed-text cannot chat, so
+        # distilling with it always declined and consolidation never happened.
+        model = args.model or runtime.settings.distil_model
         if not model:
-            raise ValueError("no distil model; pass --model or set PIONIR_EMBED_MODEL")
+            raise ValueError("no distil model; pass --model or set PIONIR_DISTIL_MODEL")
+        if runtime.settings.embed_model and model == runtime.settings.embed_model:
+            raise ValueError(
+                f"distil model {model!r} is the embedding model, which cannot chat; "
+                "pass --model <chat model> or set PIONIR_DISTIL_MODEL"
+            )
         consolidator = Consolidator(runtime.cortex, OllamaDistiller(model))
         outcome = consolidator.consolidate(
             args.namespace, min_turns=args.min_turns or DEFAULT_MIN_TURNS

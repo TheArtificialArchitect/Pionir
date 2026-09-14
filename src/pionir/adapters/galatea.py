@@ -18,15 +18,19 @@ design:
   her own store, ascending by id. A turn's reply is the run of ``role == "her"``
   rows with ``initiated`` false that land after the id we sent. ``initiated``
   true is her speaking first - a rumination, not an answer to us - and must not
-  be mistaken for the reply. She emits one or more bubbles per turn, so the
-  adapter collects them until a quiet window passes with no new bubble rather
-  than returning on the first.
+  be mistaken for the reply. She emits one or more bubbles per turn, paced
+  like typing (observed up to ~7s+ apart), so the adapter collects them while
+  ``GET /api/state`` reports ``typing`` true and returns only once she has
+  stopped typing and a grace window has passed with no new bubble. A fixed
+  quiet window alone (the first version, 3s) cut multi-bubble replies short.
 
 Continuity needs no conversation id. Galatea is one persistent being with one
 ongoing relationship in one SQLite store; unlike Theo there are no threads to
-open or carry. And loopback needs no token: her server authorises 127.0.0.1
-outright, so - unlike Theo's bridge - this adapter carries no credential and
-refuses any non-loopback base url outright.
+open or carry. She is not loopback-only: she runs with ``--phone`` bound on
+0.0.0.0 so her phone page can reach her. Pionir, though, only ever dials
+127.0.0.1, which her server authorises without a token, so - unlike Theo's
+bridge - this adapter carries no credential, and it refuses any non-loopback
+base url so it can never be pointed at her over the LAN.
 
 Action authorisation stays with Pionir. This capability is conversation only:
 Galatea speaks, and any doing she wants done is a separate intent handed to the
@@ -69,14 +73,20 @@ class GalateaSettings:
     # A whole turn: send, then wait for her to appraise, recall, draft and pick.
     # Generous against a cold model load and a busy card rather than tuned to a
     # measured mean, because the tail is what strands a turn, not the median.
+    # This is the deadline checked between polls, never a socket timeout.
     timeout_seconds: int = 240
+    # One HTTP request: a send, a poll, a state read. Her server answers these
+    # in milliseconds; a hung socket should fail fast, not eat the whole turn.
+    request_timeout_seconds: int = 10
     # How often to poll for new bubbles. Her page polls several times a second;
     # once a second is ample for a single turn and keeps the loop cheap.
     poll_interval_seconds: float = 1.0
-    # After her first bubble, keep polling until this long passes with no new
-    # bubble. She answers in more than one bubble, and returning on the first
-    # would hand back a sentence fragment and call it her reply.
-    reply_grace_seconds: float = 3.0
+    # After her last bubble, once she is no longer typing, keep polling until
+    # this long passes with no new bubble. She answers in more than one bubble,
+    # up to ~7s+ apart, and returning on the first would hand back a sentence
+    # fragment and call it her reply. The typing flag carries the gaps; the
+    # grace covers the moment between her last bubble and the flag clearing.
+    reply_grace_seconds: float = 6.0
     # A last resort, used only when Galatea is unreachable - and if she is
     # unreachable no turn can happen anyway. The real one comes from
     # /api/settings, which reports the model her client actually resolved. Her
@@ -99,6 +109,8 @@ class GalateaSettings:
             raise ValueError("Galatea's URL cannot contain credentials or query data")
         if self.timeout_seconds < 30:
             raise ValueError("Galatea's timeout must be at least 30 seconds")
+        if self.request_timeout_seconds < 1:
+            raise ValueError("Galatea's per-request timeout must be at least 1 second")
         if self.poll_interval_seconds <= 0:
             raise ValueError("Galatea's poll interval must be positive")
         if self.reply_grace_seconds < 0:
@@ -110,7 +122,8 @@ class LoopbackTransport:
 
     def __init__(self, settings: GalateaSettings) -> None:
         self._base_url = settings.base_url.rstrip("/")
-        self._timeout = settings.timeout_seconds
+        # Per request, not per turn: the turn's deadline lives in the poll loop.
+        self._timeout = settings.request_timeout_seconds
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     @staticmethod
@@ -286,15 +299,31 @@ class GalateaAdapter:
             evidence=("galatea:loopback", "galatea:voice-async-poll"),
         )
 
+    def _typing(self) -> bool:
+        """Whether she is mid-reply right now, per ``/api/state``.
+
+        Read fail-open: a malformed or missing flag counts as not typing, so a
+        state read that breaks can only shorten the wait to the grace window,
+        never hold a turn open until the deadline.
+        """
+
+        try:
+            return self._transport.get("/api/state").get("typing") is True
+        except (AdapterUnavailable, AdapterProtocolError):
+            return False
+
     def _await_reply(self, sent_id: int) -> str:
         """Collect her reply bubbles by polling, or return "" if she never answers.
 
         A turn's reply is every ``her`` bubble with ``initiated`` false that lands
-        after ``sent_id``. She answers in more than one, so once the first has
-        landed the loop keeps going until a full grace window passes with no new
-        bubble - the difference between her whole reply and its first fragment.
-        An ``initiated`` bubble is her speaking first, not an answer, and is
-        skipped so a rumination racing into the window is never read as the reply.
+        after ``sent_id``. She answers in more than one, paced like typing, so
+        once the first has landed the loop keeps going while ``/api/state``
+        says she is still typing, and returns only when she is not and a full
+        grace window has passed since her last bubble - the difference between
+        her whole reply and its first fragment. An ``initiated`` bubble is her
+        speaking first, not an answer, and is skipped so a rumination racing
+        into the window is never read as the reply. The deadline is checked
+        between polls; whatever has landed by then is returned.
         """
 
         deadline = self._monotonic() + self.settings.timeout_seconds
@@ -326,6 +355,7 @@ class GalateaAdapter:
             if (
                 last_bubble_at is not None
                 and self._monotonic() - last_bubble_at >= self.settings.reply_grace_seconds
+                and not self._typing()
             ):
                 break
         return "\n\n".join(bubbles)

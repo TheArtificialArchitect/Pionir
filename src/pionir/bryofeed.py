@@ -100,7 +100,9 @@ def snapshot(url: str, *, prev_events_total: int | None, timeout: float = 4.0) -
     state = _get_json(url.rstrip("/") + "/api/state", timeout)
     if state is None:
         return {"ts": time.time(), "reachable": False}, prev_events_total
-    audit = _get_json(url.rstrip("/") + "/api/audit?limit=1", timeout)
+    # The server reads `n`, not `limit` (server.do_GET); `limit` was ignored and
+    # every poll pulled the default 60 events just to read events_total.
+    audit = _get_json(url.rstrip("/") + "/api/audit?n=1", timeout)
     events_total = audit.get("events_total") if isinstance(audit, dict) else None
     return shape(state, events_total, prev_events_total)
 

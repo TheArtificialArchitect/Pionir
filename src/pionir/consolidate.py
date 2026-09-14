@@ -57,7 +57,10 @@ class Consolidator:
     def consolidate(
         self, namespace: str, *, min_turns: int = DEFAULT_MIN_TURNS
     ) -> Consolidation | None:
-        turns = self.cortex.memories(namespace, kind="message")
+        # limit=None: every un-consolidated turn, not the first thousand - a long
+        # conversation folded in batches would otherwise summarise the oldest
+        # thousand and retire only those, leaving the rest to a later pass at best.
+        turns = self.cortex.memories(namespace, kind="message", limit=None)
         if len(turns) < min_turns:
             return None
         texts = [m.text for m in turns]
@@ -70,21 +73,18 @@ class Consolidator:
         if distilled is None or not distilled.summary.strip():
             return None
 
-        episode_id = self.cortex.remember(
-            "episode",
+        # One transaction: the episode and facts are written and the raw turns
+        # retired (soft-deleted, still recoverable) together, or not at all. An
+        # episode inserted and then N separate forget() commits could be cut off
+        # halfway, leaving the summary AND its turns both live in recall.
+        episode_id, fact_ids = self.cortex.fold(
+            namespace,
+            [m.id for m in turns],
             distilled.summary.strip(),
-            namespace=namespace,
+            [fact for fact in distilled.facts if fact.strip()],
             meta={"folded_turns": len(turns)},
         )
-        fact_ids = tuple(
-            self.cortex.remember("fact", fact.strip(), namespace=namespace)
-            for fact in distilled.facts
-            if fact.strip()
-        )
-        # Retire the raw turns: out of recall, still recoverable (soft delete).
-        for m in turns:
-            self.cortex.forget(m.id)
-        return Consolidation(episode_id, fact_ids, len(turns))
+        return Consolidation(episode_id, tuple(fact_ids), len(turns))
 
 
 class OllamaDistiller:
