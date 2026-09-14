@@ -10,7 +10,13 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import UUID
 
-from .contracts import AgentManifest, Task, TaskResult, outcome_failure_reason
+from .contracts import (
+    AgentManifest,
+    Task,
+    TaskResult,
+    outcome_failure_reason,
+    outcome_kind,
+)
 from .errors import BodyDeferred, CircuitOpen, ResourceUnavailable
 from .registry import CapabilityRegistry
 from .reliability import CircuitBreaker, CircuitState
@@ -166,12 +172,35 @@ class Executive:
             self._record("task.failed", task, route.agent_id, type(error).__name__)
             raise
 
-        # The adapter returned normally, but its own output may still report
-        # failure (ok: false, non-zero return code). That is a real failure of
-        # the doer: it counts toward the circuit and the ledger says task.failed
-        # with the reason - the same rule the server's outer ok uses.
-        reason = outcome_failure_reason(result.output)
-        if reason is not None:
+        # The adapter returned normally, but its own output may still carry a
+        # failing verdict (ok: false, non-zero return code). outcome_kind splits
+        # that verdict into a fault vs a refusal, in the one shared place, so the
+        # ledger and the breaker treat it the same way.
+        kind = outcome_kind(result.output)
+        if kind == "refused":
+            # A doer correctly refusing (Voodoo/Nyx policy denial) is not broken.
+            # The ledger still records task.failed - honestly, prefixed
+            # `refused:` - and the server's outer ok stays false, but the breaker
+            # must not count it, and must not reset the consecutive count either
+            # (a refusal between two real failures leaves the count as it was).
+            reason = outcome_failure_reason(result.output)
+            # One exception: a half-open recovery probe holds a slot. Leaving it
+            # in flight would wedge the circuit half-open forever, so hand the
+            # slot back - record_unattempted returns it WITHOUT counting a
+            # failure and WITHOUT resetting the count.
+            if circuit.snapshot().state is CircuitState.HALF_OPEN:
+                circuit.record_unattempted()
+            self._record("task.failed", task, route.agent_id, f"refused: {reason}")
+            # A refusal may teach a lesson ("this doer refuses X"), but never the
+            # circuit-trip lesson - that would falsely blame a working doer.
+            self._record_lesson(
+                f"{route.agent_id} refused a task (policy/germline, not a fault): {reason}"
+            )
+            return result
+        if kind == "failed":
+            # A real failure of the doer: it counts toward the circuit and the
+            # ledger says task.failed with the reason.
+            reason = outcome_failure_reason(result.output)
             self._count_failure(circuit, route.agent_id, f"specialist reported {reason}")
             self._record("task.failed", task, route.agent_id, reason)
             return result

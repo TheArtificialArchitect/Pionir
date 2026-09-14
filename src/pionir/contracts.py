@@ -175,3 +175,57 @@ def outcome_ok(output: Any) -> bool:
     """Whether a specialist's own output reports success (see outcome_failure_reason)."""
 
     return outcome_failure_reason(output) is None
+
+
+# Explicit signals that a FAILING outcome is a doer refusing, not a doer that is
+# broken. The runtime circuit breaker exists to stop hammering a BROKEN doer; a
+# Voodoo/Nyx/Daedalus policy refusal is the doer doing its job, so it must not
+# count toward the breaker or write a "doer is failing" lesson. The signals are
+# deliberately narrow and read only from the output an adapter actually returns.
+_REFUSAL_KEYS = ("refused", "unavailable")
+
+
+def _is_refusal(output: Mapping[str, Any]) -> bool:
+    """True only on an explicit refusal signal; ambiguity is left to the caller
+    (which then treats it as a fault - fail closed toward counting)."""
+
+    # Nyx prints {"refused": ...} / {"unavailable": ...} (cli.py ~1620-1627,
+    # 1900-2592). A CLI-backed adapter (nyx_status/voodoo_status run_action)
+    # wraps the child's JSON under "output", so check both levels.
+    for candidate in (output, output.get("output")):
+        if isinstance(candidate, Mapping) and any(k in candidate for k in _REFUSAL_KEYS):
+            return True
+    # Voodoo's CLI prints "Refused: <why>" to stdout and exits 2 on a policy
+    # denial (PolicyDenied/ValueError, cli.py ~260-262); run_action keeps that
+    # text under "output" and the exit code under "returncode".
+    payload = output.get("output")
+    if (
+        output.get("returncode") == 2
+        and isinstance(payload, str)
+        and payload.lstrip().startswith("Refused:")
+    ):
+        return True
+    # Daedalus is deliberately NOT matched: its declines (find_repo/git
+    # PolicyError, an empty intent, a failed gate) all surface as ok=false with
+    # an `error`/`gate.reason` string, structurally identical to a real fault
+    # (dispatcher.py TaskResult has no refusal marker). With no explicit signal,
+    # fail closed and let it count.
+    return False
+
+
+def outcome_kind(output: Any) -> str:
+    """Classify a specialist's own outcome: ``"ok"``, ``"refused"`` or ``"failed"``.
+
+    ``outcome_failure_reason`` says WHETHER an outcome failed; this says how it
+    should be TREATED. It lives next to that rule, and is the one place both the
+    ledger and the circuit breaker consult, so they cannot disagree about a
+    refusal. Only an explicit refusal signal is ``"refused"``; every other
+    failing shape - including an unrecognised one - is ``"failed"``, so the
+    breaker still trips on a genuinely broken doer.
+    """
+
+    if outcome_failure_reason(output) is None:
+        return "ok"
+    if isinstance(output, Mapping) and _is_refusal(output):
+        return "refused"
+    return "failed"
