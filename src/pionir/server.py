@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from .approvals import ApprovalQueue
 from .bootstrap import PionirRuntime
 from .cli import _capabilities, _doctor, _jsonable
-from .contracts import RiskLevel, Task
+from .contracts import RiskLevel, Task, outcome_ok
 from .errors import PionirError, RoutingAmbiguous
 from .router import Candidate, IntentRouter, RoutingDecision
 from .runtime import AuditEvent
@@ -219,25 +219,13 @@ def _job_status(result: dict[str, Any]) -> str:
     return "done"
 
 
-def _outcome_ok(output: Any) -> bool:
-    """Whether a specialist's own output reports success.
-
-    An adapter can return normally and still carry a failing verdict: Daedalus a
-    refused solve (``ok: false``), a security run a non-zero ``returncode``. The
-    executive routed and ran it, so it never raised - but reporting that as
-    ``ok: true`` recorded a failed action as a success (both approved rows in
-    queue.json were actually failures). So the outer ok is false whenever the
-    inner result says ``ok: false`` or a non-zero return code.
-    """
-
-    if isinstance(output, Mapping):
-        if output.get("ok") is False:
-            return False
-        for key in ("returncode", "rc", "exit_code"):
-            code = output.get(key)
-            if isinstance(code, int) and not isinstance(code, bool) and code != 0:
-                return False
-    return True
+# Whether a specialist's own output reports success. An adapter can return
+# normally and still carry a failing verdict; reporting that as ``ok: true``
+# recorded a failed action as a success (both approved rows in queue.json were
+# actually failures). This is the same function the executive uses to choose
+# task.failed over task.completed in the audit ledger - one rule, so the
+# response and the ledger can never disagree.
+_outcome_ok = outcome_ok
 
 
 def _clamp_wait(wait: Any) -> float:

@@ -94,6 +94,28 @@ def _redact(raw: str) -> dict[str, Any]:
     }
 
 
+# Voodoo's scanners exit 1 when they FIND something (voodoo/cli.py: drift,
+# secrets, hunt return `1 if findings else 0`); 2 is a refusal. A scan that
+# found leaked secrets succeeded - reporting it as a failed run would hide the
+# finding and trip the circuit breaker on the doer doing its job.
+_FINDINGS_EXIT_ACTIONS = frozenset({"defend drift", "defend secrets", "defend hunt"})
+
+
+def _findings_are_answers(action: str, result: dict[str, Any]) -> dict[str, Any]:
+    if action not in _FINDINGS_EXIT_ACTIONS or result.get("returncode") != 1:
+        return result
+    output = result.get("output")
+    if not isinstance(output, list):  # exit 1 without the findings list is a real failure
+        return result
+    return {
+        **result,
+        "ok": True,
+        "returncode": 0,
+        "process_returncode": 1,
+        "findings": len(output),
+    }
+
+
 class VoodooStatusAdapter:
     """Expose only Voodoo's read-only status surface, redacted."""
 
@@ -173,7 +195,7 @@ class VoodooStatusAdapter:
         # ran - not just the verb.
         result["action"] = " ".join([*action.split(), *args])
         result["argv"] = command
-        return result
+        return _findings_are_answers(action, result)
 
     def execute(self, task: Task) -> TaskResult:
         if task.capability == "security.voodoo_run":

@@ -129,3 +129,49 @@ class TaskResult:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "output", MappingProxyType(dict(self.output)))
+
+
+# The longest specialist error text carried into an audit reason. The ledger is
+# metadata-only by design, so the reason is a bounded one-line summary, never the
+# specialist's full output.
+_REASON_LIMIT = 160
+_RETURN_CODE_KEYS = ("returncode", "rc", "exit_code")
+
+
+def outcome_failure_reason(output: Any) -> str | None:
+    """Why a specialist's own output reports failure, or None when it reports success.
+
+    An adapter can return normally and still carry a failing verdict: Daedalus a
+    refused solve (``ok: false``), an action a non-zero ``returncode``. This is the
+    ONE rule for that - the server's outer ``ok`` and the executive's audit event
+    (``task.failed`` vs ``task.completed``) both read it, so they cannot disagree.
+    Failure is ``ok: false`` or any non-zero integer return code (bools are not rcs).
+    """
+
+    if not isinstance(output, Mapping):
+        return None
+    parts: list[str] = []
+    if output.get("ok") is False:
+        parts.append("ok=false")
+    for key in _RETURN_CODE_KEYS:
+        code = output.get(key)
+        if isinstance(code, int) and not isinstance(code, bool) and code != 0:
+            parts.append(f"{key}={code}")
+    if not parts:
+        return None
+    reason = " ".join(parts)
+    error = output.get("error")
+    if isinstance(error, Mapping):
+        error = error.get("message") or error.get("type")
+    if error:
+        text = " ".join(str(error).split())
+        if len(text) > _REASON_LIMIT:
+            text = text[: _REASON_LIMIT - 3] + "..."
+        reason = f"{reason}: {text}"
+    return reason
+
+
+def outcome_ok(output: Any) -> bool:
+    """Whether a specialist's own output reports success (see outcome_failure_reason)."""
+
+    return outcome_failure_reason(output) is None

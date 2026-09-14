@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import UUID
 
-from .contracts import AgentManifest, Task, TaskResult
+from .contracts import AgentManifest, Task, TaskResult, outcome_failure_reason
 from .errors import BodyDeferred, CircuitOpen, ResourceUnavailable
 from .registry import CapabilityRegistry
 from .reliability import CircuitBreaker, CircuitState
@@ -160,21 +160,35 @@ class Executive:
                 circuit.record_unattempted()
             elif not isinstance(error, CircuitOpen):
                 # A rejected call holds no probe slot, so there is nothing to return.
-                was_open = circuit.snapshot().state is CircuitState.OPEN
-                circuit.record_failure()
-                if not was_open and circuit.snapshot().state is CircuitState.OPEN:
-                    # It just tripped: a repeated failure, not a blip. That is a
-                    # real lesson - recorded once per trip, so it never floods.
-                    self._record_lesson(
-                        f"{route.agent_id} circuit opened after repeated failures; "
-                        f"last error {type(error).__name__}: {error}"
-                    )
+                self._count_failure(
+                    circuit, route.agent_id, f"{type(error).__name__}: {error}"
+                )
             self._record("task.failed", task, route.agent_id, type(error).__name__)
             raise
+
+        # The adapter returned normally, but its own output may still report
+        # failure (ok: false, non-zero return code). That is a real failure of
+        # the doer: it counts toward the circuit and the ledger says task.failed
+        # with the reason - the same rule the server's outer ok uses.
+        reason = outcome_failure_reason(result.output)
+        if reason is not None:
+            self._count_failure(circuit, route.agent_id, f"specialist reported {reason}")
+            self._record("task.failed", task, route.agent_id, reason)
+            return result
 
         circuit.record_success()
         self._record("task.completed", task, route.agent_id)
         return result
+
+    def _count_failure(self, circuit: CircuitBreaker, agent_id: str, last: str) -> None:
+        was_open = circuit.snapshot().state is CircuitState.OPEN
+        circuit.record_failure()
+        if not was_open and circuit.snapshot().state is CircuitState.OPEN:
+            # It just tripped: a repeated failure, not a blip. That is a
+            # real lesson - recorded once per trip, so it never floods.
+            self._record_lesson(
+                f"{agent_id} circuit opened after repeated failures; last error {last}"
+            )
 
     def circuit(self, agent_id: str) -> CircuitBreaker:
         return self._circuits[agent_id]
