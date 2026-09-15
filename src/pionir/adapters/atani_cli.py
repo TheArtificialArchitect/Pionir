@@ -19,7 +19,6 @@ from pionir.contracts import (
     TaskResult,
 )
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
-from pionir.scheduler import kv_cache_vram_mb
 
 # `atani manage` calls back into Pionir's /api/task, which runs the doer under
 # the doer's own adapter timeout (Daedalus 600s, Melete 300s). The manage
@@ -168,15 +167,24 @@ class AtaniCliAdapter:
                     required_permissions=permission,
                     model=ModelRequirement(
                         "qwen3:4b-instruct-2507-q4_K_M",
-                        # A lean 4B instruct for the manager/router: strong
-                        # instruction-following and tool selection at a fraction
-                        # of the footprint, leaving the card to the voice. The
-                        # figure is an estimate for a 4B q4 (~2.5-3 GB weights)
-                        # pending a `python -m pionir benchmark` re-measure once
-                        # it is pulled; conservative-but-not-inflated so admission
-                        # is neither falsely refused nor falsely granted.
-                        3_000,
-                        kv_cache_vram_mb(16_384),
+                        # A lean 4B instruct for the manager/router, declared as a
+                        # CPU/elastic tenant (requires_gpu=False, 0 MB) so it NEVER
+                        # competes with the voice for the card. This was a real bug:
+                        # as a GPU tenant needing ~3.7 GB it deadlocked outright
+                        # whenever Moss's protected gemma3:12b was resident - the
+                        # card can't hold both, and her model is (correctly) not
+                        # evicted for a doer, so Atani's reasoning was refused every
+                        # time she was hot (observed 2026-09-14). Atani is meant to
+                        # be the one that yields the card, not the one that demands
+                        # it: Ollama runs the 4B on the free slice plus CPU, it
+                        # takes no lease, and admission reads real free VRAM at
+                        # lease time so whatever it uses is priced in. Slower per
+                        # token than on-card, but a router/short-answer reasoner
+                        # rarely generates much, and manage-with-a-bot-pick loads
+                        # no model at all.
+                        0,
+                        0,
+                        requires_gpu=False,
                     ),
                     # "chat" is deliberately absent. Plain conversation is the
                     # voice's (Galatea's), and Atani keeps the reasoning
