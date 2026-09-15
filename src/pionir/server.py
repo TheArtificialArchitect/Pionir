@@ -510,11 +510,12 @@ class PionirApp:
         directly. She views and reads, and she may ask Atani for a specific bot,
         but only Atani tasks the doers. So this hands her intent to Atani and
         nothing else. Atani reasoning answers her outright. A request that needs
-        a doer (Daedalus, Melete) is Atani's to dispatch - and Atani tasking the
-        doers is the next piece, being built on Atani's side; until it lands,
-        such a request comes back as via_manager, unrun, naming who it is for.
-        Anti-confabulation still holds: what she reports is what actually came
-        back, and 'not wired yet' is reported as exactly that.
+        a doer (Daedalus, Melete, Nyx, Voodoo) is Atani's to dispatch, and it now
+        does: `atani manage` picks the bot, POSTs the task to Pionir's /api/task,
+        polls for the outcome, and parks on pending_approval - so the voice gets
+        back what actually happened (completed / needs_approval / failed), not a
+        promise. Anti-confabulation still holds: what she reports is what actually
+        came back.
         """
 
         decision = self.router.classify(request)

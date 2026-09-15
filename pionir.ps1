@@ -138,7 +138,11 @@ if ($NoBrowser) { $browserFlag = " --no-browser" }
 # Atani and Moss keeps the GPU.
 # ATANI_PIONIR_URL: Atani's callback into Pionir (it tasks the doers through
 # /api/task). Without it a -Port other than 8780 leaves Atani calling a dead port.
-$pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://127.0.0.1:8799'; `$env:ATANI_PIONIR_URL='http://127.0.0.1:$Port'; `$env:ATANI_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_DELIBERATE_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_TEACHER_MODEL='qwen3:4b-instruct-2507-q4_K_M'; "
+# ATANI_VOICE_RENDERER='0': skip Atani's conversational tone pass - the "donate
+# the voice to Moss" seam. Moss is the personality Ian talks to; Atani is the
+# background reasoner/router, so it answers plainly. Reversible, no state change,
+# and the answer/cycle_id contract is untouched (affect audit, 2026-09-14).
+$pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://127.0.0.1:8799'; `$env:ATANI_PIONIR_URL='http://127.0.0.1:$Port'; `$env:ATANI_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_DELIBERATE_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_TEACHER_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_VOICE_RENDERER='0'; "
 
 $panes = @()   # ordered: dashboard, voice, then the doers
 $ports = @()   # the ports this launch is responsible for verifying
