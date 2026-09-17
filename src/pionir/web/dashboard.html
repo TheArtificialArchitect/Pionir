@@ -414,9 +414,15 @@ async function pollState(){
     // the body: Bryo's pressure. Silent or dead reads as no opinion ("—"), never alarm.
     const B=s.bryo, sb=$id("s-body");
     if(B && B.alive){
-      sb.textContent = B.pressure.toFixed(2) + (B.defer_heavy_work ? " · defer" : "");
-      sb.className = "v " + (B.defer_heavy_work ? "bad" : "good");
-      sb.parentElement.title = "Bryo: " + (B.note||"") ;
+      // An organism running with nothing watching him is the loudest thing here:
+      // that failure hid for 2.3 days in a log file. It outranks the pressure number.
+      const unsup = B.supervised === false;
+      sb.textContent = B.pressure.toFixed(2)
+        + (unsup ? " · UNSUPERVISED" : (B.defer_heavy_work ? " · defer" : ""));
+      sb.className = "v " + (unsup || B.defer_heavy_work ? "bad" : "good");
+      sb.parentElement.title = unsup
+        ? "Bryo is alive but NOTHING is supervising him - relaunch watchdog.ps1"
+        : "Bryo: " + (B.note||"");
     } else {
       sb.textContent = "—"; sb.className = "v";
       sb.parentElement.title = "Bryo silent" + (B && B.note ? " (" + B.note + ")" : "") + " - no opinion, nothing held";

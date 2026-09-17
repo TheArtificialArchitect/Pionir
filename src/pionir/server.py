@@ -425,6 +425,10 @@ class PionirApp:
             "defer_heavy_work": bool(getattr(reading, "defer_heavy_work", False)),
             "note": str(getattr(reading, "note", "")),
             "source": str(getattr(reading, "source", "")),
+            # None = unknown. False means he is running with nothing watching him:
+            # the failure that went unnoticed for 2.3 days because it only ever
+            # reached a log file.
+            "supervised": getattr(reading, "supervised", None),
         }
 
     def doctor(self) -> dict[str, Any]:

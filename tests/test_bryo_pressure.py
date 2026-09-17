@@ -270,3 +270,35 @@ class ExecutiveBodyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SupervisionVisibilityTests(unittest.TestCase):
+    """A dead supervisor must reach a human surface.
+
+    Bryo's own beacon logged supervisor_missing 55 times across 2.3 days in September
+    2026 and nothing surfaced it: the log was the only witness, and nobody reads a log.
+    The reading therefore carries `supervised` so the dashboard can shout (HEAD 3.19 -
+    test the alarm path; it is the thing least likely to have run).
+    """
+
+    def test_supervised_is_carried_through_for_a_living_organism(self) -> None:
+        self.assertIs(parse_vitals(vitals(supervised=True)).supervised, True)
+        self.assertIs(parse_vitals(vitals(supervised=False)).supervised, False)
+
+    def test_unsupervised_is_reported_even_though_he_is_alive(self) -> None:
+        r = parse_vitals(vitals(supervised=False))
+        self.assertTrue(r.alive, "he is running; that is exactly why it matters")
+        self.assertIs(r.supervised, False)
+
+    def test_supervision_is_unknown_when_absent_or_unreadable(self) -> None:
+        self.assertIsNone(parse_vitals(vitals()).supervised, "absent means unknown")
+        self.assertIsNone(neutral("no reading yet").supervised)
+        self.assertIsNone(parse_vitals("not json").supervised)
+
+    def test_supervision_does_not_change_pacing(self) -> None:
+        """It is an alarm for a human, not an input to scheduling: an unsupervised
+        but comfortable organism must not start holding the spine's work back."""
+        ex, sink, adapter = executive(lambda: PressureReading(True, 0.2, False, "ok", supervised=False))
+        ex.execute(Task("research.deep", {}), deferrable=True)
+        self.assertEqual(adapter.calls, 1)
+        self.assertNotIn("task.deferred", kinds(sink))

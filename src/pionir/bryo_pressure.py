@@ -52,6 +52,12 @@ class PressureReading:
     defer_heavy_work: bool
     note: str
     source: str = "bryo"
+    # Is anything still supervising him? None when unknown (no reading, or an
+    # organism that isn't answering). Carried because a dead supervisor is
+    # invisible otherwise: his own beacon complained 55 times over 2.3 days in
+    # September 2026 and nothing surfaced it - the log was the only witness and
+    # nobody reads a log. An alarm nobody sees is not an alarm (HEAD 3.19).
+    supervised: bool | None = None
 
     @property
     def detail(self) -> str:
@@ -87,9 +93,12 @@ def parse_vitals(text: str) -> PressureReading:
     advisory = advisory if isinstance(advisory, dict) else {}
     note = str(advisory.get("note") or "")[:80]
     alive = doc.get("alive") is True
+    supervised = doc.get("supervised") is True if "supervised" in doc else None
     if not alive:
-        return PressureReading(False, pressure, False, note or "not alive")
-    return PressureReading(True, pressure, advisory.get("defer_heavy_work") is True, note)
+        return PressureReading(False, pressure, False, note or "not alive",
+                               supervised=supervised)
+    return PressureReading(True, pressure, advisory.get("defer_heavy_work") is True,
+                           note, supervised=supervised)
 
 
 def _spawn_daemon(target: Callable[[], None]) -> None:
