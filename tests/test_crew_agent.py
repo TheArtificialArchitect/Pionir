@@ -9,6 +9,7 @@ an idle crew that stays quiet about it.
 
 import json
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from crew_support import temp_dir
@@ -182,6 +183,24 @@ class TemperamentTests(unittest.TestCase):
         # Scrooge's initiative weighs unmet purpose more heavily and a lower impulsivity
         # makes the choice sharper; Skopos is likelier to sit and watch
         self.assertGreater(scrooge - skopos, 0.05)
+
+    def test_impulsivity_alone_loosens_the_choice(self) -> None:
+        # The comparison above cannot catch a broken choice temperature: Scrooge
+        # and Skopos also differ in initiative, which separates them on its own,
+        # and a mutation fixing the temperature to a constant survived it. So
+        # here nothing moves but impulsivity - the SAME agent, the same deficit,
+        # the same offer. If impulsivity stopped setting the temperature, the two
+        # shares would be equal and this would fail.
+        agent = self.crew["scrooge"]
+        base = agent.t
+        try:
+            agent.t = replace(base, impulsivity=0.0)
+            steady = self.work_share(agent)
+            agent.t = replace(base, impulsivity=1.0)
+            rash = self.work_share(agent)
+        finally:
+            agent.t = base
+        self.assertGreater(steady - rash, 0.1)
 
     def test_the_same_offer_draws_them_to_different_work(self) -> None:
         sim = self.crew.sim
