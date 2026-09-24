@@ -50,6 +50,17 @@ class CrewSettings:
     checkpoint_seconds: float = 300.0
     # How often the brain looks at the lock again while it is standing down.
     gpu_poll_seconds: float = 2.0
+    # A model request still queued after this long is expired, counted and reported to its
+    # owner (brain.EXPIRED) rather than spoken late.
+    request_ttl_seconds: float = 600.0
+    # Wall-clock time without real progress before an agent gives a project up.
+    project_stale_seconds: float = 6 * 3600.0
+    # The crew is its own process and reaches Pionir over loopback HTTP, as Moss does.
+    pionir_url: str = "http://127.0.0.1:8780"
+    # How long the hands keep following a job Pionir reports as still running, and how long
+    # each follow-up call may wait on Pionir.
+    job_follow_seconds: float = 600.0
+    job_poll_seconds: float = 20.0
     budget: CrewBudget = field(default_factory=CrewBudget)
 
     def __post_init__(self) -> None:
@@ -59,6 +70,10 @@ class CrewSettings:
             raise ValueError("checkpoint_seconds must be positive")
         if self.gpu_poll_seconds <= 0:
             raise ValueError("gpu_poll_seconds must be positive")
+        for name in ("request_ttl_seconds", "project_stale_seconds", "job_follow_seconds",
+                     "job_poll_seconds"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
         if self.num_ctx <= 0:
             raise ValueError("num_ctx must be positive")
         if not self.model:
@@ -87,6 +102,10 @@ class CrewSettings:
             ("PIONIR_CREW_TICK_SECONDS", "tick_seconds", float),
             ("PIONIR_CREW_CHECKPOINT_SECONDS", "checkpoint_seconds", float),
             ("PIONIR_CREW_GPU_POLL_SECONDS", "gpu_poll_seconds", float),
+            ("PIONIR_CREW_REQUEST_TTL_SECONDS", "request_ttl_seconds", float),
+            ("PIONIR_CREW_PROJECT_STALE_SECONDS", "project_stale_seconds", float),
+            ("PIONIR_CREW_PIONIR_URL", "pionir_url", str),
+            ("PIONIR_CREW_JOB_FOLLOW_SECONDS", "job_follow_seconds", float),
         ):
             raw = os.environ.get(env, "").strip()
             if raw:

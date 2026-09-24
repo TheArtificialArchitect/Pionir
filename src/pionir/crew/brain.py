@@ -9,6 +9,15 @@ made this hour against the ceiling. Everything it does is counted and shown.
 One worker, one call at a time: the model is shared with Moss, and a second
 concurrent crew call would only queue inside Ollama where nobody can see it.
 
+Pause holds the brain: while the crew is paused the worker makes no model call at
+all; queued work keeps its place and goes when the crew resumes.
+
+A queued request does not wait for ever. One older than ``request_ttl_seconds``
+(default 600) is EXPIRED: counted (``expired``), logged, and its callback is
+invoked with ``err == EXPIRED`` and ``meta["expired"] is True`` - so the agent
+knows the thought did not happen. It is never silently dropped, and a stale
+thought is never spoken as if it were fresh.
+
 Before every call the worker looks at Pionir's GPU lock and, if anybody holds
 it, stands down until it frees (gpu.py) - it never takes the lock itself. A
 yield is not a failure and costs nothing against the ceiling; the request
@@ -35,6 +44,10 @@ Post = Callable[[str, dict, float], dict]
 
 REPLY = 0        # a reply owed in a live conversation
 BACKGROUND = 1   # everything else
+
+EXPIRED = "expired"          # the err a callback gets when its request went stale
+DEFAULT_TTL_S = 600.0
+PAUSE_POLL_S = 0.25
 
 
 class OllamaError(RuntimeError):
@@ -68,7 +81,7 @@ class Request:
     )
 
     def __init__(self, rid, agent_id, purpose, messages, options, callback, priority, t,
-                 fmt=None):
+                 fmt=None, enqueued_real=None):
         self.id = rid
         self.agent_id = agent_id
         self.purpose = purpose
@@ -76,20 +89,22 @@ class Request:
         self.options = options
         self.callback = callback
         self.priority = priority          # REPLY goes ahead of BACKGROUND
-        self.enqueued_real = time.time()
+        self.enqueued_real = time.time() if enqueued_real is None else enqueued_real
         self.t = t
         self.fmt = fmt
 
 
 class Brain:
     def __init__(self, cfg, sim, *, card: CardWatch | None = None,
-                 post: Post = http_post_json) -> None:
+                 post: Post = http_post_json, now: Callable[[], float] = time.time) -> None:
         self.cfg = cfg
         self.sim = sim
         self.url = cfg.ollama_url.rstrip("/")
         self.model = cfg.model
         self.card = card or CardWatch(cfg.gpu_lock_path, poll_seconds=cfg.gpu_poll_seconds)
         self._post = post
+        self._now = now
+        self.ttl = float(getattr(cfg, "request_ttl_seconds", DEFAULT_TTL_S))
         self._q: collections.deque = collections.deque()
         self._cv = threading.Condition()
         self._stop = threading.Event()
@@ -107,6 +122,8 @@ class Brain:
         self.reloads = 0                  # calls that had to wait for the model to load back onto the card
         self.reload_seconds = 0.0         # total time spent waiting for it to come back
         self.last_summary_call = 0        # so the log shows the denominator, not just the bad news
+        self.expired = 0                  # requests that went stale in the queue
+        self.held_for_pause = 0           # worker turns spent holding while the crew was paused
 
     def start(self) -> None:
         self._thread.start()
@@ -138,7 +155,7 @@ class Brain:
             rid = self._next_id
             self._next_id += 1
             req = Request(rid, agent_id, purpose, messages, options, callback, priority,
-                          self.sim.clock.t, fmt)
+                          self.sim.clock.t, fmt, enqueued_real=self._now())
             self._q.append(req)
             self._cv.notify()
         return rid
@@ -153,8 +170,9 @@ class Brain:
 
     def waiting(self) -> list:
         with self._cv:
+            now = self._now()
             return [{"id": r.id, "agent": r.agent_id, "purpose": r.purpose,
-                     "waited_s": round(time.time() - r.enqueued_real, 1)} for r in self._q]
+                     "waited_s": round(now - r.enqueued_real, 1)} for r in self._q]
 
     # ---- the worker -------------------------------------------------------
     def _await_work(self) -> bool:
@@ -173,16 +191,53 @@ class Brain:
             self._q.remove(best)
             return best
 
+    def _paused(self) -> bool:
+        return getattr(self.sim, "paused_reason", None) is not None
+
+    def expire_stale(self) -> int:
+        """Take every request older than the TTL out of the queue and tell its owner, with
+        the explicit EXPIRED signal. Returns how many went."""
+        now = self._now()
+        with self._cv:
+            stale = [r for r in self._q if now - r.enqueued_real > self.ttl]
+            for r in stale:
+                self._q.remove(r)
+        for r in stale:
+            self.expired += 1
+            waited = now - r.enqueued_real
+            log.warning("brain: %s for %s expired after %.0f s in the queue (ttl %.0f s); "
+                        "it did not happen", r.purpose, r.agent_id, waited, self.ttl)
+            try:
+                self.sim.store.add_call(self.sim.clock.t, r.agent_id, r.purpose, None, None,
+                                        0.0, False, f"{EXPIRED} after {waited:.0f} s")
+            except Exception as exc:  # noqa: BLE001 - the ledger failing must not eat the signal
+                lesion("brain.ledger", exc)
+            try:
+                with self.sim.lock:
+                    r.callback(None, {"expired": True, "waited_s": round(waited, 1)}, EXPIRED)
+            except Exception as exc:  # noqa: BLE001
+                lesion(f"brain.callback.{r.purpose}", exc)
+        return len(stale)
+
     def step(self) -> bool:
-        """One turn of the worker: wait for work, wait for the card, make one call.
-        Returns False when stopping. The thread is only this in a loop, so tests
-        drive it directly with no thread at all."""
+        """One turn of the worker: wait for work, expire what went stale, hold while the
+        crew is paused, wait for the card, make one call. Returns False when stopping.
+        The thread is only this in a loop, so tests drive it directly with no thread."""
         if not self._await_work():
             return False
+        self.expire_stale()
+        if self._paused():
+            # pause holds the brain: no model call; queued work keeps its place
+            self.held_for_pause += 1
+            self._stop.wait(PAUSE_POLL_S)
+            return True
         # Look at the lock with work in hand but BEFORE choosing it: a reply that
         # arrives while we stand down must still go ahead of an older thought.
         if not self.card.wait_until_free(self._stop, waiter="brain"):
             return False
+        if self._paused():
+            return True               # paused while we stood down for the card
+        self.expire_stale()
         req = self._pop()
         if req is not None:
             self._serve(req)
@@ -286,7 +341,8 @@ class Brain:
                      "for_s": round(time.time() - self.busy_since, 1)} if self.busy_with else None,
             "queue": self.waiting(),
             "calls": self.calls, "failures": self.failures, "throttled": self.throttled,
-            "reloads": self.reloads,
+            "reloads": self.reloads, "expired": self.expired, "ttl_s": self.ttl,
+            "held": self._paused(),
             "calls_last_hour": self.sim.store.calls_last_hour(),
             "ceiling": self.cfg.budget.calls_per_hour,
             "last_latency_s": round(self.last_latency, 2), "avg_latency_s": round(avg, 2),

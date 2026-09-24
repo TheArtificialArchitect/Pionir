@@ -439,7 +439,9 @@ class Memory:
         count, rel, last_t = r
         if count < 3:
             return 0.0
-        stale = max(0.0, (t - last_t) / DAY - 3)   # unused for more than 3 days: fades
+        # unused for more than 3 days: fades. Ported numerically from Hearth's game days; now
+        # real days, flagged for retuning once the crew has been observed.
+        stale = max(0.0, (t - last_t) / DAY - 3)
         return max(0.0, min(0.5, 0.1 * math.log1p(count)) * rel * math.exp(-stale / 4))
 
     def habits(self) -> list:

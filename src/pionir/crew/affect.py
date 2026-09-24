@@ -76,6 +76,9 @@ REGISTER_SPECS = {
     "empathy":   (16.0, 1.00, 0.25),
 }
 
+# Half-lives below are ported numerically. They are now REAL hours (Hearth ran two game
+# hours to the real hour), and are flagged for retuning once the crew has been observed.
+
 # Echo - genesis-agent/src/brain/core/emotion.py. FOUR SCALARS, not channels:
 # valence (-1..1, rest 0.0, emotion.py:14), arousal (0..1, rest 0.0, :15),
 # curiosity (0..1, rest 0.5, :16), trust (0..1, rest 0.5, :17). ONE global half-life of
@@ -179,7 +182,9 @@ def _spec(name: str, palette: dict | None = None) -> tuple:
 class Affect:
     def __init__(self, t) -> None:
         self.t = t
-        self.channels = tuple(getattr(t, "channels", None) or BASE_CHANNELS)
+        # the emotional vocabulary is the temperament's PALETTE; "channel" in the crew means a
+        # workstream, so the word is not used for feelings on the temperament
+        self.channels = tuple(getattr(t, "palette", None) or BASE_CHANNELS)
         self.palette = PALETTES.get(self.channels)
         if self.palette is None:                     # a bespoke channel set: build its table
             self.palette = {k: _spec(k) for k in self.channels}

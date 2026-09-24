@@ -36,11 +36,13 @@ CHECKS = (
      lambda a: a.mem.counter("utterances"),
      6,
      "has been spoken to %(opp)d times and has never once said anything aloud"),
+    # Hearth counted "changes_noticed" (a moved chair, an empty fridge) here too; the crew has
+    # no house to notice, so the other half of the opportunity is news actually taken in.
     ("thought",
-     lambda a: a.mem.counter("actions_done") + a.mem.counter("changes_noticed"),
+     lambda a: a.mem.counter("actions_done") + a.mem.counter("news_taken_in"),
      lambda a: a.mem.counter("thoughts"),
      40,
-     "has done and noticed %(opp)d things and has never formed a single thought"),
+     "has done and taken in %(opp)d things and has never formed a single thought"),
     ("intention",
      lambda a: a.mem.counter("thoughts"),
      lambda a: a.mem.counter("intentions_formed"),
@@ -59,6 +61,21 @@ CHECKS = (
      lambda a: practice_in(a.mem),
      60,
      "has done %(opp)d things and has never got any better at one of them"),
+    # A crew with no real work must be LOUD, not quietly idle. An agent that keeps looking
+    # for something to take on and finds nothing achievable is reported; the streak resets
+    # (and the warning clears) the moment it takes a project on.
+    ("project",
+     lambda a: int(a.mem.get("no_project_streak", 0) or 0),
+     lambda a: 0,
+     6,
+     "has looked for real work %(opp)d times in a row and found nothing achievable"),
+    # ...and one that keeps choosing and never once moves real work forward (every step
+    # changed nothing, every job failed, or it only ever idled) is reported too.
+    ("work",
+     lambda a: a.mem.counter("choices"),
+     lambda a: a.mem.counter("project_steps"),
+     200,
+     "has chosen what to do %(opp)d times and has never once moved real work forward"),
 )
 
 # An action nobody has managed in this long is either unreachable for this crew or gated on

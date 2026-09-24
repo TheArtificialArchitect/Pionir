@@ -51,6 +51,9 @@ class Sim:
         self._by_id: dict = {}
         self.brain = None
         self.monitor = None
+        self.talk = None                      # conversation.Talk, wired by crew.build
+        self.hands = None                     # hands.Hands: the way to Pionir
+        self.kinds: list = []                 # projects.Kind instances this crew may take on
         self.vitals = Vitals(self, repertoire=repertoire)   # is anybody producing anything?
         self.ticks = 0                        # this process
         self.skipped_ticks = 0                # steps fallen behind by and deliberately not replayed
@@ -113,8 +116,10 @@ class Sim:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=15)
-        # the brain's callbacks take our lock and write our store: stop it before closing either
-        for part, name in ((self.brain, "brain"), (self.monitor, "monitor")):
+        # the brain's and the hands' callbacks take our lock and write our stores: stop them
+        # before closing either
+        for part, name in ((self.brain, "brain"), (self.hands, "hands"),
+                           (self.monitor, "monitor")):
             if part is not None:
                 safe(f"sim.stop.{name}", part.stop)
         with self.lock:
@@ -205,6 +210,8 @@ class Sim:
             order = self.agents[start:] + self.agents[:start]
             for a in order:
                 safe(f"agent.{a.id}.act", lambda a=a: a.act(self))
+            if self.talk is not None:
+                safe("talk.tick", self.talk.tick)
             # perception happens after everyone has acted, over this tick's events
             for a in order:
                 if hasattr(a, "perceive"):
@@ -218,6 +225,8 @@ class Sim:
         for a in self.agents:
             if hasattr(a, "checkpoint"):
                 safe(f"agent.{a.id}.checkpoint", a.checkpoint)
+        if self.talk is not None:
+            safe("talk.checkpoint", self.talk.checkpoint)
         self.store.checkpoint(self.clock.t, extra, saved_real=self.clock.now)
         self.checkpoints += 1
         self._next_checkpoint_t = self.clock.t + int(self.cfg.checkpoint_seconds)
@@ -244,5 +253,8 @@ class Sim:
                 "lesions": lesion_snapshot(),
                 "vitals": self.vitals.to_dict(),
                 "brain": self.brain.snapshot() if self.brain else None,
+                "talk": self.talk.snapshot() if self.talk else None,
+                "hands": self.hands.snapshot() if self.hands else None,
+                "kinds": [k.key for k in self.kinds],
                 "budget": self.monitor.latest if self.monitor else None,
             }

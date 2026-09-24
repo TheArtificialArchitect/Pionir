@@ -41,7 +41,9 @@ LEARN = 0.075
 # affinity movement per completion, toward +1 when it helped and -1 when it did not
 LIKE = 0.045
 DISLIKE = 0.060
-# half-lives in DAYS (wall clock) for the slide back toward neutral when unpractised
+# half-lives in DAYS (wall clock) for the slide back toward neutral when unpractised. Ported
+# numerically from Hearth, where a day was a game day (half a real day); they are now real
+# time and are flagged for retuning once the crew has been observed.
 ABILITY_HALF_LIFE_DAYS = 45.0
 AFFINITY_HALF_LIFE_DAYS = 12.0
 
