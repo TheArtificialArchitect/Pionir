@@ -15,3 +15,7 @@ build/
 state/
 models/
 checkpoints/
+
+# Isolated git worktrees for delegated builds. Each holds a .git file pointing
+# back here, so `git add -A` would sweep a whole nested repo copy into a commit.
+.claude/worktrees/
