@@ -5,11 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from . import benchmark, bryofeed, recallcheck, routecheck
 from .bootstrap import PionirRuntime, build_runtime
@@ -468,8 +468,10 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
         if callable(read_now):
             try:
                 read_now()
-            except Exception:  # noqa: BLE001 - the body is advisory, never load-bearing
-                pass
+            except Exception as exc:  # noqa: BLE001 - the body is advisory, never load-bearing
+                # advisory, but said out loud: a silent miss runs the task as if Bryo were calm
+                print(f"pionir: could not read Bryo's pressure ({type(exc).__name__}: {exc}); "
+                      "running without it", file=sys.stderr)
         try:
             decision, result = router.route(
                 request, granted_permissions=frozenset(args.permissions or ())

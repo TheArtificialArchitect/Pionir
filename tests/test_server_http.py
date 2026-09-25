@@ -103,8 +103,34 @@ class CsrfTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(out["error"], "bad json")
 
+    def test_a_refused_request_body_is_read_before_the_403(self) -> None:
+        # The server used to answer a refused POST without reading its body; on Windows,
+        # closing a socket with unread bytes sends a reset, and the client could get
+        # "connection aborted" (WinError 10053) instead of the 403 - the intermittent failure
+        # of the text/plain test above. Over a real socket that is a race, so this drives the
+        # handler over in-memory streams and checks the body was consumed, deterministically.
+        import email.message
+        import io
+        body = json.dumps({"request": "x" * 5000}).encode()
+        handler_cls = _make_handler(self.app)
+        handler = handler_cls.__new__(handler_cls)
+        headers = email.message.Message()
+        headers["Content-Type"] = "text/plain"
+        headers["Content-Length"] = str(len(body))
+        handler.headers = headers
+        handler.rfile = io.BytesIO(body + b"AFTER")
+        handler.wfile = io.BytesIO()
+        handler.path, handler.command = "/api/route", "POST"
+        handler.request_version, handler.requestline = "HTTP/1.1", "POST /api/route HTTP/1.1"
+        handler.client_address = ("127.0.0.1", 0)
+        handler.close_connection = True
+        handler.do_POST()
+        status_line = handler.wfile.getvalue().split(b"\r\n")[0]
+        self.assertRegex(status_line, rb"^HTTP/1\.[01] 403 ")
+        self.assertEqual(handler.rfile.read(), b"AFTER")     # exactly the body, no more
+
     def test_oversized_body_is_400(self) -> None:
-        status, out = self._raw("POST", "/api/route", None,
+        status, _out = self._raw("POST", "/api/route", None,
                                 self._json_headers(**{"Content-Length": "2000000"}))
         self.assertEqual(status, 400)
 

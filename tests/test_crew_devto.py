@@ -223,6 +223,29 @@ class OnceTests(_Case):
         self.run_at(T0 + 4 * 3600)
         self.assertEqual(len(self.hands.jobs), 1)
 
+    def test_a_submission_that_never_reached_pionir_is_retried_a_bounded_number_of_times(
+            self) -> None:
+        from pionir.crew.devto import RETRY_UNREACHABLE
+        self.publish_blog_post(T0)
+        down = JobOutcome("unreachable", CAPABILITY, error="connection refused")
+        self.hands.job = lambda job: (self.hands.jobs.append(job), down)[1]
+        for i in range(RETRY_UNREACHABLE):
+            self.run_at(T0 + (i + 1) * 3600)
+        self.assertEqual(len(self.hands.jobs), RETRY_UNREACHABLE)   # retried, not dropped
+        self.run_at(T0 + (RETRY_UNREACHABLE + 1) * 3600)
+        self.assertEqual(len(self.hands.jobs), RETRY_UNREACHABLE)   # and then it stops
+
+    def test_pionir_back_up_gets_the_cross_post(self) -> None:
+        self.publish_blog_post(T0)
+        real = self.hands.job
+        self.hands.job = lambda job: (self.hands.jobs.append(job),
+                                      JobOutcome("unreachable", CAPABILITY, error="down"))[1]
+        self.run_at(T0 + 3600)
+        self.hands.job = real
+        self.run_at(T0 + 7200)
+        self.assertEqual(len(self.hands.jobs), 2)
+        self.assertEqual(self.record()["posts"][-1]["status"], "pending_approval")
+
     def test_one_per_run_oldest_published_first(self) -> None:
         a = self.publish_blog_post(T0, good(slug="verify-email-before-sending"))
         b = self.publish_blog_post(T0 + DAY, good(slug="email-checks-at-sign-up",

@@ -50,6 +50,7 @@ BLOG_WORKER = "posting.blog"
 SITE = "https://api.dokaz.net"
 DEVTO_HOSTS = frozenset({"dev.to"})
 MAX_TAGS = 4
+RETRY_UNREACHABLE = 5        # runs a never-delivered submission is retried
 FALLBACK_TAG = "webdev"
 _DEVTO_TAG = re.compile(r"[a-z0-9]{1,30}")
 FOOTER = "*Originally published at [api.dokaz.net]({url})*"
@@ -203,7 +204,17 @@ class DevtoWorker(DailyPoster):
         """Submit the oldest published blog post not yet in this record; record any post
         passed over (blocked, or no text) on the way. Returns how many published posts are
         still waiting for a cross-post after this run, or the Err that stopped it."""
-        seen = {p.get("draft_id") for p in rec["posts"]}
+        # A submission that never reached Pionir ("unreachable") is retried on later runs, up
+        # to RETRY_UNREACHABLE times: Pionir being down for a moment must not cost a post its
+        # cross-post for ever. Safe, because Pionir's own ledger refuses a second cross-post of
+        # a draft, so a retry can never publish twice. Everything else is settled for good.
+        tries: dict = {}
+        for p in rec["posts"]:
+            if p.get("status") == "unreachable":
+                tries[p.get("draft_id")] = tries.get(p.get("draft_id"), 0) + 1
+        seen = {p.get("draft_id") for p in rec["posts"]
+                if p.get("status") != "unreachable"
+                or tries.get(p.get("draft_id"), 0) >= RETRY_UNREACHABLE}
         todo = [p for p in published_posts(blog)
                 if isinstance(p.get("draft_id"), str) and p["draft_id"] not in seen]
         submitted = False

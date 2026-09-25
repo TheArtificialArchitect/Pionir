@@ -905,6 +905,25 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
             """A job response: 202 while it is still running, 200 once answered."""
             self._send(payload, 202 if payload.get("status") == "running" else 200)
 
+        def _drain(self) -> None:
+            """Read and discard the request body before refusing it. Replying without reading
+            it leaves unread bytes on the socket, and on Windows closing such a socket sends a
+            reset: the client sees "connection aborted" (WinError 10053) instead of the 403
+            it was sent. Only a body within MAX_REQUEST_BYTES is read; a larger (or lying)
+            Content-Length is not waited for - the connection is simply closed."""
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length > MAX_REQUEST_BYTES:
+                self.close_connection = True
+                return
+            while length > 0:
+                chunk = self.rfile.read(min(length, 65536))
+                if not chunk:
+                    break
+                length -= len(chunk)
+
         def _body(self) -> dict[str, Any] | None:
             try:
                 length = int(self.headers.get("Content-Length") or 0)
@@ -913,6 +932,7 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
             if length <= 0:
                 return {}
             if length > MAX_REQUEST_BYTES:
+                self._drain()
                 return None
             try:
                 document = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -966,6 +986,7 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
             route = urlparse(self.path)
             refused = _post_allowed(self.headers, bind_host)
             if refused is not None:
+                self._drain()
                 self._send({"error": "forbidden", "reason": refused}, 403)
                 return
             body = self._body()
