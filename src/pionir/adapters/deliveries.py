@@ -205,6 +205,9 @@ class Inspection:
     files: tuple[tuple[str, int], ...]      # (entry name, uncompressed size), files only
     secret_values: int
     data: bytes = field(repr=False, compare=False)
+    # Executable entries let through because the caller allowed them (a product may ship
+    # a built program; a client delivery never does). Empty unless allowed and present.
+    executables: tuple[str, ...] = ()
 
 
 def _entry_name_problem(name: str) -> str | None:
@@ -245,14 +248,20 @@ def _secret_file_problem(name: str) -> str | None:
     return None
 
 
-def _binary_problem(name: str, head: bytes) -> str | None:
+def _archive_problem(name: str) -> str | None:
+    suffix = Path(name.lower()).suffix
+    if suffix in ARCHIVE_SUFFIXES:
+        return (f"entry {name[:120]!r} is an archive inside the archive ({suffix}) - its "
+                "contents cannot be scanned; put the files in the zip itself")
+    return None
+
+
+def _executable_problem(name: str, head: bytes) -> str | None:
+    """Why this entry is an executable (by extension, or a Windows/ELF header), or None."""
     suffix = Path(name.lower()).suffix
     shown = repr(name[:120])
     if suffix in EXECUTABLE_SUFFIXES:
         return f"entry {shown} is an executable ({suffix}) - deliver source, not binaries"
-    if suffix in ARCHIVE_SUFFIXES:
-        return (f"entry {shown} is an archive inside the archive ({suffix}) - its contents "
-                "cannot be scanned; put the files in the zip itself")
     if head.startswith(b"\x7fELF"):
         return f"entry {shown} is an executable binary (ELF)"
     if head.startswith(b"MZ") and len(head) >= 0x40:
@@ -276,17 +285,27 @@ def scan_bytes(name: str, data: bytes, secrets: SecretValues) -> str | None:
 
 
 def inspect_zip(path: Path, secrets: SecretValues, *, pinned_sha256: str | None = None,
-                root: Path | None = None) -> Inspection:
+                root: Path | None = None, max_bytes: int | None = None,
+                max_uncompressed: int | None = None, allow_executables: bool = False,
+                folder: str = "the deliveries folder") -> Inspection:
     """Run every check on the zip at ``path`` (optionally confined to ``root``), or raise
     DeliveryProblem with the first reason. The bytes returned are the bytes checked -
-    the caller uploads exactly those."""
+    the caller uploads exactly those.
+
+    The defaults (None) are a client delivery's limits. A product for sale passes a larger
+    ``max_bytes`` / ``max_uncompressed``, and may pass ``allow_executables``: then an
+    executable entry is let through (and listed in ``Inspection.executables``) but is
+    still scanned for secrets like every other entry. An archive inside the archive is
+    refused either way (its contents could not be scanned)."""
+    max_bytes = MAX_ZIP_BYTES if max_bytes is None else max_bytes
+    max_uncompressed = MAX_UNCOMPRESSED if max_uncompressed is None else max_uncompressed
     if root is not None:
         try:
             inside = path.resolve().is_relative_to(root.resolve())
         except OSError:
             inside = False
         if not inside:
-            raise DeliveryProblem(f"{path} is outside the deliveries folder")
+            raise DeliveryProblem(f"{path} is outside {folder}")
     try:
         info = path.lstat()
     except FileNotFoundError:
@@ -295,16 +314,16 @@ def inspect_zip(path: Path, secrets: SecretValues, *, pinned_sha256: str | None 
         raise DeliveryProblem(f"cannot read {path} ({type(error).__name__})") from error
     if not stat.S_ISREG(info.st_mode):
         raise DeliveryProblem(f"{path} is not a regular file (a link or a folder)")
-    if info.st_size > MAX_ZIP_BYTES:
+    if info.st_size > max_bytes:
         raise DeliveryProblem(f"the zip is {info.st_size:,} bytes - at most "
-                              f"{MAX_ZIP_BYTES:,} (too big)")
+                              f"{max_bytes:,} (too big)")
     try:
         with path.open("rb") as handle:
-            data = handle.read(MAX_ZIP_BYTES + 1)
+            data = handle.read(max_bytes + 1)
     except OSError as error:
         raise DeliveryProblem(f"cannot read {path} ({type(error).__name__})") from error
-    if len(data) > MAX_ZIP_BYTES:
-        raise DeliveryProblem(f"the zip is over {MAX_ZIP_BYTES:,} bytes (too big)")
+    if len(data) > max_bytes:
+        raise DeliveryProblem(f"the zip is over {max_bytes:,} bytes (too big)")
     sha = hashlib.sha256(data).hexdigest()
     if pinned_sha256 is not None and sha != pinned_sha256:
         raise DeliveryProblem(f"the zip's sha256 is {sha[:16]}..., not the pinned "
@@ -322,9 +341,9 @@ def inspect_zip(path: Path, secrets: SecretValues, *, pinned_sha256: str | None 
             raise DeliveryProblem(f"the zip has {len(entries):,} entries - at most "
                                   f"{MAX_ENTRIES:,}")
         total = sum(e.file_size for e in entries)
-        if total > MAX_UNCOMPRESSED:
+        if total > max_uncompressed:
             raise DeliveryProblem(f"the zip unpacks to {total:,} bytes - at most "
-                                  f"{MAX_UNCOMPRESSED:,} (a zip bomb?)")
+                                  f"{max_uncompressed:,} (a zip bomb?)")
         names: set[str] = set()
         for entry in entries:
             name = entry.filename
@@ -355,6 +374,7 @@ def inspect_zip(path: Path, secrets: SecretValues, *, pinned_sha256: str | None 
                                   "zip (or of its one top-level folder) - the client needs to "
                                   "know what they have")
         files: list[tuple[str, int]] = []
+        executables: list[str] = []
         for entry in entries:
             if entry.is_dir():
                 continue
@@ -367,12 +387,16 @@ def inspect_zip(path: Path, secrets: SecretValues, *, pinned_sha256: str | None 
             if len(content) > entry.file_size:
                 raise DeliveryProblem(f"entry {entry.filename[:120]!r} unpacks larger than "
                                       "it declares")
-            problem = (_binary_problem(entry.filename, content[:4096])
+            executable = _executable_problem(entry.filename, content[:4096])
+            problem = (_archive_problem(entry.filename)
+                       or (None if allow_executables else executable)
                        or scan_bytes(entry.filename, content, secrets)
                        or scan_bytes(entry.filename, entry.filename.encode("utf-8"),
                                      secrets))
             if problem:
                 raise DeliveryProblem(problem)
+            if executable:
+                executables.append(entry.filename)
             files.append((entry.filename, entry.file_size))
     return Inspection(path=path, size=len(data), sha256=sha, files=tuple(files),
-                      secret_values=len(secrets), data=data)
+                      secret_values=len(secrets), data=data, executables=tuple(executables))

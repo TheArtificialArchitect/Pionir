@@ -206,6 +206,16 @@ class PionirSettings:
     # leaves it unregistered; PIONIR_DEVTO_KEY_FILE points at another key file.
     devto_url: str | None = "https://dev.to/api"
     devto_key_file: Path | None = None
+    # The Gumroad API for the product.* capabilities. product.gumroad_publish puts a staged
+    # product on sale and parks for the owner's yes on every call. The token lives in
+    # gumroad_token_file (None means ~/.pionir/secrets/gumroad-token.txt, written by
+    # tools/setup-gumroad.ps1) and is read at call time: no network at boot. Products are
+    # staged at <products_dir>/<slug>/ (None means ~/.pionir/products). PIONIR_GUMROAD_URL
+    # set to "off" leaves it unregistered; PIONIR_GUMROAD_TOKEN_FILE and
+    # PIONIR_PRODUCTS_DIR point elsewhere.
+    gumroad_url: str | None = "https://api.gumroad.com/v2"
+    gumroad_token_file: Path | None = None
+    products_dir: Path | None = None
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
     # The local embedding model for hybrid recall. Default on: it is ~0.32 GB and
@@ -322,6 +332,26 @@ class PionirSettings:
         except RuntimeError:
             return self.state_root / "secrets" / "devto-api-key.txt"
         return home / ".pionir" / "secrets" / "devto-api-key.txt"
+
+    @property
+    def gumroad_token_path(self) -> Path:
+        if self.gumroad_token_file is not None:
+            return self.gumroad_token_file
+        try:
+            home = Path.home()
+        except RuntimeError:
+            return self.state_root / "secrets" / "gumroad-token.txt"
+        return home / ".pionir" / "secrets" / "gumroad-token.txt"
+
+    @property
+    def products_path(self) -> Path:
+        if self.products_dir is not None:
+            return self.products_dir
+        try:
+            home = Path.home()
+        except RuntimeError:
+            return self.state_root / "products"
+        return home / ".pionir" / "products"
 
     @property
     def devto_ledger_path(self) -> Path:
@@ -453,6 +483,17 @@ class PionirSettings:
             devto_key_file=(
                 Path(os.environ["PIONIR_DEVTO_KEY_FILE"]).expanduser()
                 if (os.environ.get("PIONIR_DEVTO_KEY_FILE") or "").strip()
+                else None
+            ),
+            gumroad_url=_optional_url("PIONIR_GUMROAD_URL", _declared("gumroad_url")),
+            gumroad_token_file=(
+                Path(os.environ["PIONIR_GUMROAD_TOKEN_FILE"]).expanduser()
+                if (os.environ.get("PIONIR_GUMROAD_TOKEN_FILE") or "").strip()
+                else None
+            ),
+            products_dir=(
+                Path(os.environ["PIONIR_PRODUCTS_DIR"]).expanduser()
+                if (os.environ.get("PIONIR_PRODUCTS_DIR") or "").strip()
                 else None
             ),
             embed_model=_embed_model_from_env(),

@@ -323,6 +323,9 @@ def client_settings(configured: Any) -> ClientSettings:
     and every token file Pionir is configured with (each is scanned for in a delivery)."""
     token_files = [configured.content_token_path, configured.instagram_token_path,
                    configured.devto_key_path]
+    gumroad = getattr(configured, "gumroad_token_path", None)
+    if gumroad is not None:
+        token_files.append(gumroad)
     discord = (os.environ.get("PIONIR_DISCORD_TOKEN_FILE") or "").strip()
     if discord:
         token_files.append(Path(discord))

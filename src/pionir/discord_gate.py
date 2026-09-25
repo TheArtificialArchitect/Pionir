@@ -11,7 +11,10 @@ caption and carries the rendered image itself as an attachment; a
 ``content.crosspost_devto`` card opens with CROSS-POSTS TO DEV.TO and shows the whole
 article; a ``client.email`` card opens with EMAILS A CLIENT, names the recipient and shows
 the whole message; a ``client.deliver`` card opens with DELIVERS TO A CLIENT and shows the
-zip's full file list as checked on disk, the secrets scan and the whole email),
+zip's full file list as checked on disk, the secrets scan and the whole email; a
+``product.gumroad_publish`` card opens with PUTS A PRODUCT ON SALE and the price, shows the
+whole listing - the FULL description, the zip's file list, the secrets scan and any
+executables it ships - and carries the cover image as an attachment),
 adds ✅ and ❌ itself, and polls the reactions. Only the configured owner's
 reaction counts; with no owner configured nothing can ever be approved here.
 
@@ -62,6 +65,8 @@ from .adapters.clients import LINK_PLACEHOLDER
 from .adapters.content import PUBLISH, public_url
 from .adapters.devto import CROSSPOST as DEVTO_CROSSPOST
 from .adapters.instagram import POST as INSTAGRAM_POST
+from .adapters.products import PUBLISH as PRODUCT_PUBLISH
+from .adapters.products import price_text
 from .social.card import render_card
 from .social.post import full_caption
 
@@ -569,6 +574,100 @@ def _client_deliver_lines(payload: Mapping[str, Any],
     return lines
 
 
+def product_line(payload: Mapping[str, Any]) -> str:
+    """The first line of a product.gumroad_publish card: it goes on sale, at what price."""
+    price = price_text(payload.get("price_cents"), payload.get("pay_what_you_want"))
+    return ("\U0001f6d2 **PUTS A PRODUCT ON SALE** - the listing below goes live on Gumroad "
+            f"at {price} if you approve.")
+
+
+def _executables_line(payload: Mapping[str, Any],
+                      preview: Mapping[str, Any] | None) -> str | None:
+    """Called out at the top of the card: the product ships programs buyers will run."""
+    if payload.get("allow_executables") is not True:
+        return None
+    found = ((preview or {}).get("zip") or {}).get("executables") \
+        if preview and preview.get("ok") is True else None
+    if isinstance(found, list) and found:
+        names = ", ".join(f"`{_fence_safe(str(n))}`" for n in found)
+        return (f"\u26a0\ufe0f **SHIPS EXECUTABLES ({len(found)})** - buyers will download and "
+                f"can run these programs: {names}")
+    if isinstance(found, list):
+        return "\u2139\ufe0f allow_executables is on, but the zip holds no executables."
+    return ("\u26a0\ufe0f **MAY SHIP EXECUTABLES** - allow_executables is on and the zip could "
+            "not be checked from here.")
+
+
+def _product_lines(payload: Mapping[str, Any],
+                   preview: Mapping[str, Any] | None) -> list[str]:
+    """The listing as the owner must see it before it goes on sale: the name, version,
+    price, summary and tags, the zip (its FULL file list as checked on disk NOW, the
+    secrets scan, any executables), the cover (attached to the message), and the WHOLE
+    description as its Markdown source (split across messages, never cut)."""
+
+    slug = payload.get("slug")
+    tags = payload.get("tags")
+    lines = [
+        f"**Name:** {_escape(str(payload.get('name')))}",
+        f"**Version:** `{_fence_safe(str(payload.get('version')))}`",
+        "**Price:** " + _escape(price_text(payload.get("price_cents"),
+                                           payload.get("pay_what_you_want"))),
+        "**Permalink:** " + (f"`{_fence_safe(slug)}` (the listing's address ends in "
+                             f"`/l/{_fence_safe(slug)}`)" if isinstance(slug, str)
+                             else "(no valid slug)"),
+        f"**Summary:** {_escape(str(payload.get('summary')))}",
+        "**Tags:** " + (", ".join(f"`{_fence_safe(str(t))}`" for t in tags)
+                        if isinstance(tags, list) and tags else "(none)"),
+    ]
+    name = _fence_safe(str(payload.get("zip_name")))
+    if preview is None:
+        lines.append("\u26a0\ufe0f **The product's files could not be inspected from here**, so "
+                     "they are not listed and the cover is not shown. Do not approve a product "
+                     "you cannot see - deny it.")
+    elif preview.get("ok") is not True:
+        lines.append("\u26a0\ufe0f **DO NOT APPROVE - the product's files no longer pass the "
+                     f"checks:** {_escape(str(preview.get('problem'))[:600])}. Approving will "
+                     "be refused; nothing would be published.")
+    else:
+        zipped = preview.get("zip") or {}
+        cover = preview.get("cover") or {}
+        files = zipped.get("files") or []
+        executables = set(zipped.get("executables") or [])
+        lines.append(f"**Zip:** `{name}` - {_size(zipped.get('size'))}, sha256 "
+                     f"`{str(zipped.get('sha256'))[:16]}`")
+        lines += [f"**The files in it ({len(files):,}), in full:**", _FENCE + "text"]
+        lines += [f"{_fence_safe(str(f[0]))}  ({_size(f[1])})"
+                  + ("  <- EXECUTABLE" if f[0] in executables else "") for f in files]
+        lines += [_FENCE,
+                  (f"\U0001f50d secrets scan: clean ({len(files):,} files and the cover, "
+                   f"{int(zipped.get('secret_values') or 0):,} secret values checked)")]
+        if executables:
+            lines.append(f"\u26a0\ufe0f **{len(executables)} executable(s) in the zip** "
+                         "(marked above) - allowed by allow_executables.")
+        lines.append(f"**Cover:** `{_fence_safe(str(cover.get('name')))}`, attached to this "
+                     f"message - {cover.get('width')}x{cover.get('height')} "
+                     f"{str(cover.get('content_type')).split('/')[-1].upper()}, "
+                     f"{_size(cover.get('size'))}, sha256 "
+                     f"`{str(cover.get('sha256'))[:16]}`")
+    body = payload.get("description_md")
+    text = body if isinstance(body, str) else str(body)
+    lines += [(f"**The description, in full ({len(text):,} characters) - the Markdown the "
+               "listing is rendered from:**"), _FENCE + "markdown", _fence_safe(text), _FENCE]
+    return lines
+
+
+def product_cover(preview: Mapping[str, Any] | None) -> Attachment | None:
+    """The cover to attach to a product card, as (file name, content type, bytes)."""
+    if not preview or preview.get("ok") is not True:
+        return None
+    data = preview.get("cover_bytes")
+    cover = preview.get("cover") or {}
+    kind = str(cover.get("content_type"))
+    if not isinstance(data, bytes) or kind not in ("image/png", "image/jpeg"):
+        return None
+    return ("cover.png" if kind == "image/png" else "cover.jpg", kind, data)
+
+
 INSTAGRAM_LINE = ("\U0001f4f8 **POSTS PUBLICLY TO INSTAGRAM** - the image and caption below go "
                   "live on the Dokaz Instagram if you approve.")
 CARD_FILENAME = "card.jpg"
@@ -631,11 +730,13 @@ def _instagram_lines(payload: Mapping[str, Any]) -> list[str]:
 
 
 def render_request(row: Mapping[str, Any], owner: str | None, *,
-                   delivery: Mapping[str, Any] | None = None) -> str:
+                   delivery: Mapping[str, Any] | None = None,
+                   product: Mapping[str, Any] | None = None) -> str:
     """The whole text of an approval message, before it is split to fit Discord.
     Nothing that says what the action does is ever cut; long text is split
     across messages instead. ``delivery`` is a client.deliver's zip as inspected on
-    disk (ClientAdapter.delivery_preview), or None if it could not be."""
+    disk (ClientAdapter.delivery_preview), or None if it could not be; ``product`` is a
+    product.gumroad_publish's files as inspected (ProductAdapter.product_preview)."""
 
     payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
     publishes = row.get("capability") == PUBLISH
@@ -643,7 +744,13 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
     crossposts = row.get("capability") == DEVTO_CROSSPOST
     emails = row.get("capability") == CLIENT_EMAIL
     delivers = row.get("capability") == CLIENT_DELIVER
+    sells = row.get("capability") == PRODUCT_PUBLISH
     lines: list[str] = []
+    if sells:
+        lines.append(product_line(payload))
+        executables = _executables_line(payload, product)
+        if executables:
+            lines.append(executables)
     if delivers:
         lines.append(client_deliver_line(payload.get("to")))
     if emails:
@@ -700,6 +807,12 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
         if isinstance(payload.get("body_text"), str):
             shown = {**payload, "body_text": f"(the full email above, "
                                              f"{len(payload['body_text']):,} characters)"}
+    if sells:
+        lines += _product_lines(payload, product)
+        if isinstance(payload.get("description_md"), str):
+            shown = {**payload, "description_md": f"(the full description above, "
+                                                  f"{len(payload['description_md']):,} "
+                                                  "characters)"}
     if posts:
         lines += _instagram_lines(payload)
         if isinstance(payload.get("caption"), str):
@@ -817,6 +930,7 @@ class DiscordGate:
         opener: Opener | None = None,
         sleep: Sleeper | None = None,
         inspect_delivery: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+        inspect_product: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     ) -> None:
         self.settings = settings
         self._approvals = approvals      # ApprovalQueue: pending() / get()
@@ -825,6 +939,9 @@ class DiscordGate:
         # ClientAdapter.delivery_preview: a client.deliver card lists the zip's files as
         # they are on disk when it is posted. None: the card says it could not look.
         self._inspect_delivery = inspect_delivery
+        # ProductAdapter.product_preview: a product card lists the zip's files and carries
+        # the cover as they are on disk when it is posted.
+        self._inspect_product = inspect_product
         self._previews: dict[str, tuple[float, Mapping[str, Any] | None]] = {}
         self._opener = opener
         self._stop = threading.Event()
@@ -853,14 +970,21 @@ class DiscordGate:
         preview = getattr(client, "delivery_preview", None)
         if callable(preview):
             kwargs.setdefault("inspect_delivery", preview)
+        products = adapters.get("product") if isinstance(adapters, Mapping) else None
+        product_preview = getattr(products, "product_preview", None)
+        if callable(product_preview):
+            kwargs.setdefault("inspect_product", product_preview)
         return cls(settings, approvals=app.approvals, approve=app.approve, deny=app.deny,
                    **kwargs)
 
     def _delivery_preview(self, row: Mapping[str, Any]) -> Mapping[str, Any] | None:
-        """The zip of a parked client.deliver as it is on disk (re-read at most every
-        PREVIEW_SECONDS, so a zip changed after posting turns the card into a DO NOT
-        APPROVE on a later poll without re-scanning 25 MB every tick)."""
-        if row.get("capability") != CLIENT_DELIVER or self._inspect_delivery is None:
+        """The zip of a parked client.deliver (or the files of a parked product) as it is
+        on disk (re-read at most every PREVIEW_SECONDS, so a zip changed after posting
+        turns the card into a DO NOT APPROVE on a later poll without re-scanning it every
+        tick)."""
+        inspect = {CLIENT_DELIVER: self._inspect_delivery,
+                   PRODUCT_PUBLISH: self._inspect_product}.get(str(row.get("capability")))
+        if inspect is None:
             return None
         key = str(row.get("id"))
         cached = self._previews.get(key)
@@ -868,15 +992,20 @@ class DiscordGate:
         if cached is not None and now - cached[0] < PREVIEW_SECONDS:
             return cached[1]
         try:
-            preview: Mapping[str, Any] | None = self._inspect_delivery(row.get("payload") or {})
+            preview: Mapping[str, Any] | None = inspect(row.get("payload") or {})
         except Exception as error:  # noqa: BLE001 - shown to the owner as "could not look"
-            _log.warning("discord gate: approval %s: the zip could not be inspected: %s",
+            _log.warning("discord gate: approval %s: the files could not be inspected: %s",
                          row.get("id"), type(error).__name__)
             preview = None
         if len(self._previews) > 200:     # answered approvals are never asked about again
             self._previews.clear()
         self._previews[key] = (now, preview)
         return preview
+
+    def _render(self, row: Mapping[str, Any], preview: Mapping[str, Any] | None) -> str:
+        if row.get("capability") == PRODUCT_PUBLISH:
+            return render_request(row, self.settings.owner, product=preview)
+        return render_request(row, self.settings.owner, delivery=preview)
 
     def __repr__(self) -> str:
         return (f"DiscordGate(channel={self.settings.channel_id!r}, "
@@ -1053,21 +1182,25 @@ class DiscordGate:
         """Post an approval (all its chunks), remember it at once, then react."""
 
         channel = self.settings.channel_id
-        chunks = split_message(render_request(row, self.settings.owner,
-                                              delivery=self._delivery_preview(row)))
+        preview = self._delivery_preview(row)
+        chunks = split_message(self._render(row, preview))
         owner = self.settings.owner
         mentions: dict[str, Any] = {"parse": [], "users": [owner] if owner and not status else []}
         head = chunks[0]
         message = {"content": _compose(status, head), "allowed_mentions": mentions}
-        image = card_image(row.get("payload") or {})[0] \
-            if row.get("capability") == INSTAGRAM_POST else None
+        attachment: Attachment | None = None
+        if row.get("capability") == INSTAGRAM_POST:
+            image = card_image(row.get("payload") or {})[0]
+            attachment = (CARD_FILENAME, "image/jpeg", image) if image is not None else None
+        elif row.get("capability") == PRODUCT_PUBLISH:
+            attachment = product_cover(preview)
         attach_failed: str | None = None
-        if image is None:
+        if attachment is None:
             sent = self._call("POST", f"/channels/{channel}/messages", message)
         else:
             try:
                 sent = self._call("POST", f"/channels/{channel}/messages", message,
-                                  files=[(CARD_FILENAME, "image/jpeg", image)])
+                                  files=[attachment])
             except DiscordError as error:
                 if isinstance(error, DiscordAuthError) or error.transport:
                     raise
@@ -1094,8 +1227,10 @@ class DiscordGate:
         if attach_failed is not None:
             _log.warning("discord gate: approval %s: the card image could not be attached: %s",
                          row["id"], attach_failed)
-            warning = ("\u26a0\ufe0f **The card image could not be attached** "
-                       f"({_escape(attach_failed[:200])}). Do not approve a post you cannot "
+            what = "cover image" if row.get("capability") == PRODUCT_PUBLISH else "card image"
+            thing = "a product" if row.get("capability") == PRODUCT_PUBLISH else "a post"
+            warning = (f"\u26a0\ufe0f **The {what} could not be attached** "
+                       f"({_escape(attach_failed[:200])}). Do not approve {thing} you cannot "
                        "see: give the bot the Attach Files permission in this channel, or "
                        "deny it.")
             extra = self._call("POST", f"/channels/{channel}/messages",
@@ -1157,8 +1292,7 @@ class DiscordGate:
             # the owner can add the reaction himself, so a failure here must not
             # stop his answer from being read
             self._guard(approval_id, lambda: self._add_reactions(entry))
-        head = split_message(render_request(row, self.settings.owner,
-                                            delivery=self._delivery_preview(row)))[0]
+        head = split_message(self._render(row, self._delivery_preview(row)))[0]
         if head != entry.get("head"):
             entry["head"] = head      # e.g. an owner id configured since it was posted
             self._edit(entry, head)

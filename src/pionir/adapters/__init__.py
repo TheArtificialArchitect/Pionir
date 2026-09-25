@@ -11,6 +11,7 @@ from .galatea import GalateaAdapter, GalateaSettings
 from .instagram import InstagramAdapter, InstagramSettings
 from .melete import MeleteAdapter, MeleteSettings
 from .nyx_status import NyxStatusAdapter, NyxStatusSettings
+from .products import ProductAdapter, ProductSettings
 from .stdio_json import StdioJsonAdapter, StdioJsonSettings, load_stdio_adapters
 from .voodoo_status import VoodooStatusAdapter, VoodooStatusSettings
 
@@ -37,6 +38,8 @@ __all__ = [
     "MeleteSettings",
     "NyxStatusAdapter",
     "NyxStatusSettings",
+    "ProductAdapter",
+    "ProductSettings",
     "StdioJsonAdapter",
     "StdioJsonSettings",
     "VoodooStatusAdapter",

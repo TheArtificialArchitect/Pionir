@@ -88,6 +88,11 @@ def _parser() -> argparse.ArgumentParser:
         help="check the dev.to API key: who it belongs to "
              "(reads only; never posts, never prints the key)",
     )
+    commands.add_parser(
+        "gumroad-check",
+        help="check the Gumroad token: whose account it is, the products and their sales "
+             "(reads only; never changes a product, never prints the token)",
+    )
     orders = commands.add_parser(
         "orders",
         help="list the paid client orders on Scrooge "
@@ -671,6 +676,23 @@ def devto_check(settings: PionirSettings | None = None, *, opener: Any = None) -
     return code
 
 
+def gumroad_check(settings: PionirSettings | None = None, *, opener: Any = None) -> int:
+    """``pionir gumroad-check``: 0 ok, 1 not configured (or could not check), 2 rejected.
+    No runtime is built: it reads the token file and asks Gumroad who it is and what it
+    sells (GET /v2/user, GET /v2/products). Never changes a product, never prints the
+    token."""
+    from .adapters.products import ProductAdapter, product_settings
+
+    configured = settings or PionirSettings.from_environment()
+    if configured.gumroad_url is None:
+        _print({"status": "not_configured", "message": "PIONIR_GUMROAD_URL is off"})
+        return 1
+    adapter = ProductAdapter(product_settings(configured), opener=opener)
+    code, report = adapter.check_account()
+    _print(report)
+    return code
+
+
 def orders(settings: PionirSettings | None = None, *, status: str | None = None,
            opener: Any = None) -> int:
     """``pionir orders``: 0 ok, 1 not configured (or could not list), 2 token rejected.
@@ -711,7 +733,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print({"status": "error", "error_type": type(error).__name__,
                     "message": str(error)})
             return 1
-    for name, check in (("instagram-check", instagram_check), ("devto-check", devto_check)):
+    for name, check in (("instagram-check", instagram_check), ("devto-check", devto_check),
+                        ("gumroad-check", gumroad_check)):
         if args.command == name:
             try:
                 return check()

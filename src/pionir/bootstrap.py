@@ -26,12 +26,14 @@ from .adapters import (
     MeleteSettings,
     NyxStatusAdapter,
     NyxStatusSettings,
+    ProductAdapter,
     VoodooStatusAdapter,
     VoodooStatusSettings,
     load_stdio_adapters,
 )
 from .adapters.clients import client_settings
 from .adapters.galatea import resolve_served_model
+from .adapters.products import product_settings
 from .audit import JsonlAuditSink
 from .benchmark import read_loaded_models, unload, warm
 from .bryo_pressure import BryoPressureReader
@@ -226,6 +228,11 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
             ledger_file=configured.devto_ledger_path,
             blog_url=configured.content_url,
         )))
+    if configured.gumroad_url is not None:
+        # No boot-time call: the token file is read when a product.* task runs.
+        # product.gumroad_publish always parks for approval; a product's zip is scanned for
+        # every secret Pionir is configured with, like a client delivery.
+        runtime.register(ProductAdapter(product_settings(configured)))
     if configured.specialists_file is not None:
         for adapter in load_stdio_adapters(configured.specialists_file):
             runtime.register(adapter)
