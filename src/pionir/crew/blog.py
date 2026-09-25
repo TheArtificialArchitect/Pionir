@@ -22,6 +22,8 @@ One run:
    allowed per run, with the reasons in the prompt. **Passed**: submitted as
    ``Job("content.publish", {draft_id, slug, title, description, body_md, tags})``; Pionir
    parks it for the owner, and it is recorded as PENDING APPROVAL - never as published.
+   The record keeps that exact payload with the post (``payload``): once published it is
+   the post's text, which the dev.to cross-poster (devto.py) copies.
 
 Every count this worker reports is a count of real events it recorded: drafts written,
 drafts blocked, posts submitted for approval, posts published.
@@ -222,6 +224,54 @@ class _Unreadable(ValueError):
     pass
 
 
+def record_path(state_dir: Path, worker_id: str) -> Path:
+    """Where a posting worker keeps its record: ``<state_dir>/<worker_id>.json``."""
+    return Path(state_dir) / f"{worker_id}.json"
+
+
+def read_record(state_dir: Path, worker_id: str) -> dict | None:
+    """Another worker's record, read-only: None when there is none yet (it has not run),
+    ``_Unreadable`` when it cannot be read. Never written from here: only its own worker
+    writes it."""
+    path = record_path(state_dir, worker_id)
+    if not path.exists():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise _Unreadable(f"{path}: {exc}") from exc
+    if not isinstance(doc, dict):
+        raise _Unreadable(f"{path} is not an object")
+    return doc
+
+
+def save_record(path: Path, rec: dict) -> None:
+    """Atomic: a half-written record is never read back. On Windows the swap fails while
+    another thread has the old file open for a moment (a sibling worker reading it), so it
+    is retried briefly rather than losing a record of something already submitted."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(rec, indent=1, sort_keys=True), encoding="utf-8")
+    for attempt in range(20):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if attempt == 19:
+                raise
+            time.sleep(0.05)
+
+
+def published_posts(rec: dict | None) -> list:
+    """The posts a posting record says are published, oldest first (by when that was
+    settled). Only ``status == "published"`` counts: pending, denied or failed is not."""
+    posts = [p for p in ((rec or {}).get("posts") or [])
+             if isinstance(p, dict) and p.get("status") == "published"]
+    return sorted(posts, key=lambda p: (float(p.get("settled_at") or 0),
+                                        float(p.get("submitted_at") or 0),
+                                        str(p.get("draft_id") or "")))
+
+
 class DailyPoster(_Base):
     """What every posting worker shares: one draft a day at most, words from the shared
     brain only, a fail-closed check on the exact payload, submission to Pionir (which parks
@@ -250,31 +300,19 @@ class DailyPoster(_Base):
 
     # ---- the record: what it drafted, what it used, what became of each post ----------
     def record_path(self, state_dir: Path) -> Path:
-        return Path(state_dir) / f"{self.worker_id}.json"
+        return record_path(state_dir, self.worker_id)
 
     def _blank(self) -> dict:
         return {"last_drafted_at": None, "used_topics": [], "posts": [], "blocked": [],
                 "counts": {}}
 
     def load(self, state_dir: Path) -> dict:
-        path = self.record_path(state_dir)
+        doc = read_record(state_dir, self.worker_id)
         blank = self._blank()
-        if not path.exists():
-            return blank
-        try:
-            doc = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise _Unreadable(f"{path}: {exc}") from exc
-        if not isinstance(doc, dict):
-            raise _Unreadable(f"{path} is not an object")
-        return {**blank, **doc}
+        return blank if doc is None else {**blank, **doc}
 
     def save(self, state_dir: Path, rec: dict) -> None:
-        path = self.record_path(state_dir)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(rec, indent=1, sort_keys=True), encoding="utf-8")
-        tmp.replace(path)       # atomic: a half-written record is never read back
+        save_record(self.record_path(state_dir), rec)
 
     @staticmethod
     def _count(rec: dict, what: str, n: int = 1) -> None:
@@ -332,8 +370,8 @@ class DailyPoster(_Base):
                                   outcome_of(self.capability, got.get("result")), events)
             elif state == "approved_failed":
                 out = outcome_of(self.capability, got.get("result"))
-                self._settle(ctx, rec, post, "failed", out.error or "the publish failed",
-                             events)
+                self._settle_failed(ctx, rec, post, out.error or "the publish failed",
+                                    got.get("result"), events)
             else:
                 log.warning("%s: approval %s has a status nobody knows (%r); still waiting",
                             self.worker_id, post["approval_id"], state)
@@ -355,6 +393,12 @@ class DailyPoster(_Base):
         events.append(self._event(ctx, "post.published", {
             "draft_id": post["draft_id"], self.link_field: link,
             self.title_field: _clip(post.get(self.title_field), 90)}))
+
+    def _settle_failed(self, ctx: WorkContext, rec: dict, post: dict, why: str, raw,
+                       events: list) -> None:
+        """Pionir said it did not work (``raw`` is its answer, when there is one). A
+        subclass may know a refusal that is really an answer (``DevtoWorker``)."""
+        self._settle(ctx, rec, post, "failed", why, events)
 
     def _settle(self, ctx: WorkContext, rec: dict, post: dict, status: str, why: str,
                 events: list) -> None:
@@ -475,6 +519,12 @@ class DailyPoster(_Base):
     def _submit(self, ctx: WorkContext, rec: dict, topic: Topic, draft: dict,
                 events: list) -> None:
         post = {"draft_id": draft["draft_id"], **self._describe(draft), "topic": topic.key}
+        self._submit_post(ctx, rec, post, draft, events)
+
+    def _submit_post(self, ctx: WorkContext, rec: dict, post: dict, draft: dict,
+                     events: list) -> None:
+        """Send one checked draft to Pionir and record what it said. ``post`` is the
+        record's entry for it, already describing the draft."""
         self._before_submit(ctx, rec, draft, post)
         out = ctx.job(self._job(draft))
         self._after_submit(ctx, rec, draft)
@@ -497,8 +547,11 @@ class DailyPoster(_Base):
                       draft["draft_id"])
             post["approved_by_owner"] = False
             self._settle_done(ctx, rec, post, out, events)
+        elif out.status == "failed":
+            self._settle_failed(ctx, rec, post, out.error or "Pionir said failed", None,
+                                events)
         else:
-            # failed, unreachable or still running: not published, and never assumed to be
+            # unreachable or still running: not published, and never assumed to be
             self._settle(ctx, rec, post, out.status if out.status != "running" else "unknown",
                          out.error or f"Pionir said {out.status}", events)
 
@@ -617,6 +670,12 @@ class BlogWorker(DailyPoster):
         payload = {k: draft[k] for k in contentcheck.FIELDS}      # exactly what was checked
         return Job(CAPABILITY, payload,
                    what=f"publish the blog post {draft['title']!r} on api.dokaz.net")
+
+    def _before_submit(self, ctx: WorkContext, rec: dict, draft: dict, post: dict) -> None:
+        """Keep the exact payload submitted beside the post: once it is published, that is
+        the post's text, and the dev.to cross-poster (devto.py) copies it from here rather
+        than from anywhere a word could have changed."""
+        post["payload"] = json.loads(json.dumps(self._job(draft).payload))
 
     def _after_submit(self, ctx: WorkContext, rec: dict, draft: dict) -> None:
         rec["used_slugs"].append(draft["slug"])

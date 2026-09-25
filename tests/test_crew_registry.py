@@ -17,12 +17,13 @@ class DefaultCatalogueTests(unittest.TestCase):
         reg = default_registry()
         self.assertEqual(reg.division_ids(),
                          ("treasury", "watch", "posting", "products", "builds"))
-        self.assertEqual(reg.ids(), ("builds.daedalus", "posting.blog", "posting.instagram",
+        self.assertEqual(reg.ids(), ("builds.daedalus", "posting.blog", "posting.devto",
+                                     "posting.instagram", "posting.results",
                                      "products.api_builder", "products.gumroad",
                                      "treasury.ledger", "watch.health"))
         live = sorted(w.worker_id for w in reg.all() if w.live)
-        self.assertEqual(live, ["posting.blog", "posting.instagram", "treasury.ledger",
-                                "watch.health"])
+        self.assertEqual(live, ["posting.blog", "posting.devto", "posting.instagram",
+                                "posting.results", "treasury.ledger", "watch.health"])
 
     def test_adding_a_worker_is_adding_an_entry(self) -> None:
         cat = load_catalogue()

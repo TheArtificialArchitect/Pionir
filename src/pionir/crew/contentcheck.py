@@ -20,8 +20,10 @@ The rules, one function each:
 - ``_markup``     Markdown only: no raw HTML, no HTML comments or entities, no
                   ``javascript:`` / ``vbscript:`` / ``data:`` URLs
 - ``_links``      https only, only to the Dokaz hosts, and every page link carries the
-                  blog's UTM tags (C:\\src\\Scrooge\\docs\\TRAFFIC.md); ``api.dokaz.net/v1/*``
-                  is an API endpoint, never counted as traffic, so it needs none
+                  post's UTM tags (C:\\src\\Scrooge\\docs\\TRAFFIC.md); ``api.dokaz.net/v1/*``
+                  is an API endpoint, never counted as traffic, so it needs none. The source
+                  is ``blog`` unless the caller names another from ``UTM_SOURCES`` (the
+                  dev.to cross-post's is ``devto``); nothing else about the rule changes
 - ``_personal``   no email addresses or @-handles, phone numbers, IP addresses, street
                   addresses
 - ``_names``      the proper-noun allowlist
@@ -67,6 +69,11 @@ LINK_HOSTS = frozenset({"api.dokaz.net", "dokazindustries.com", "www.dokazindust
 UTM_SOURCE = "blog"
 UTM_MEDIUM = "referral"
 UTM_CAMPAIGN_MAX = 40
+# Every source a post's links may carry, each tied to where that copy of the post is
+# published: the blog's own posts say ``blog``, the same post cross-posted to dev.to says
+# ``devto`` (TRAFFIC.md lists it). A caller names one; any other blocks the post.
+UTM_SOURCE_DEVTO = "devto"
+UTM_SOURCES = frozenset({UTM_SOURCE, UTM_SOURCE_DEVTO})
 
 # The owner's internal systems. Never in public text, in any case, in any field.
 INTERNAL_NAMES = ("Pionir", "Moss", "Galatea", "Atani", "Scrooge", "Skopos", "Hearth", "Bryo",
@@ -87,8 +94,8 @@ def utm_campaign(draft_id: str) -> str:
     return str(draft_id or "")[:UTM_CAMPAIGN_MAX].strip("-")
 
 
-def utm_query(draft_id: str) -> str:
-    return (f"utm_source={UTM_SOURCE}&utm_medium={UTM_MEDIUM}"
+def utm_query(draft_id: str, source: str = UTM_SOURCE) -> str:
+    return (f"utm_source={source}&utm_medium={UTM_MEDIUM}"
             f"&utm_campaign={utm_campaign(draft_id)}")
 
 
@@ -284,7 +291,7 @@ def links_in(text: str) -> list:
     return out
 
 
-def _link_reason(url: str, campaign: str | None) -> str | None:
+def _link_reason(url: str, campaign: str | None, source: str = UTM_SOURCE) -> str | None:
     try:
         parts = urlsplit(url)
         host = (parts.hostname or "").lower()
@@ -299,25 +306,25 @@ def _link_reason(url: str, campaign: str | None) -> str | None:
     if host == "api.dokaz.net" and parts.path.startswith("/v1/"):
         return None          # an API endpoint, not a page: TRAFFIC.md never counts /v1/*
     q = parse_qs(parts.query, keep_blank_values=True)
-    want = {"utm_source": UTM_SOURCE, "utm_medium": UTM_MEDIUM}
+    want = {"utm_source": source, "utm_medium": UTM_MEDIUM}
     if campaign:
         want["utm_campaign"] = campaign
     for key, value in want.items():
         if q.get(key) != [value]:
-            return (f"link {_snip(url)!r} does not carry {key}={value} (the blog's UTM tags, "
+            return (f"link {_snip(url)!r} does not carry {key}={value} (this post's UTM tags, "
                     "TRAFFIC.md)")
     if not campaign:
         return f"link {_snip(url)!r} has no campaign: the draft_id is not usable"
     return None
 
 
-def _links(draft: dict, texts: list) -> list:
+def _links(draft: dict, texts: list, source: str = UTM_SOURCE) -> list:
     did = draft.get("draft_id")
     campaign = utm_campaign(did) if isinstance(did, str) and _DRAFT_ID.fullmatch(did) else None
     reasons = []
     for field, text in texts:
         for url in links_in(text):
-            why = _link_reason(url, campaign)
+            why = _link_reason(url, campaign, source)
             if why:
                 reasons.append(f"{field}: {why}")
         for m in _WWW.finditer(text):
@@ -672,11 +679,19 @@ def _internal(texts: list) -> list:
 
 # ---- the check -----------------------------------------------------------------------------------
 
-def check(draft) -> list:
+def check(draft, *, utm_source: str = UTM_SOURCE) -> list:
     """Every reason this draft may not be published, in words. Empty means it passed.
 
-    Fail closed: a draft that is not even an object, or a rule that cannot run, blocks."""
+    ``utm_source`` is where this copy of the post is published (one of ``UTM_SOURCES``):
+    every Dokaz page link must carry exactly it. The blog's is the default; the dev.to
+    cross-post names ``devto``. Every other rule is the same for both.
+
+    Fail closed: a draft that is not even an object, a source nobody listed, or a rule that
+    cannot run, blocks."""
     reasons = _fields(draft)
+    if utm_source not in UTM_SOURCES:
+        reasons.append(f"utm_source {_snip(utm_source)!r} is not one of "
+                       f"{', '.join(sorted(UTM_SOURCES))}; the links cannot be checked")
     if not isinstance(draft, dict):
         return reasons
     texts = _texts(draft)
@@ -687,7 +702,7 @@ def check(draft) -> list:
     try:
         reasons += _markup(texts)
         reasons += _renderable(draft)
-        reasons += _links(draft, texts)
+        reasons += _links(draft, texts, utm_source)
         reasons += _personal(texts)
         reasons += _names(draft)
         reasons += _business(texts)

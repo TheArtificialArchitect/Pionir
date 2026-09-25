@@ -16,6 +16,10 @@ whole list, and a name not in it fails loudly at load time.
   that gets words; it gets them only through ``ctx.words``.
 - ``instagram_writer`` - REAL (instagram.py). The same for an Instagram card post: checked
   with ``contentcheck.check_social``, submitted as ``social.instagram_post``.
+- ``traffic_reader`` - REAL (results.py). The same dash read as the ledger (``DashReader``),
+  its ``traffic`` object: what the posts did, per post and per channel, last 30 days.
+- ``devto_crossposter`` - REAL (devto.py). Cross-posts each published blog post to dev.to
+  once, unchanged but for its links' ``utm_source``, for the owner's approval. No words.
 """
 from __future__ import annotations
 
@@ -88,9 +92,16 @@ class _Malformed(ValueError):
     pass
 
 
-class LedgerWorker(_Base):
-    """Scrooge's ledger, read-only. The read token can reach only GET endpoints on an
-    allowlist (Scrooge's ``READ_PATHS``); it cannot approve or send anything."""
+class DashReader(_Base):
+    """A read of Scrooge's ``GET /dash/api.json`` with the read-only token. The token can
+    reach only GET endpoints on an allowlist (Scrooge's ``READ_PATHS``); it cannot approve
+    or send anything. Shared by every worker that reads the dash (the ledger, the traffic
+    results), so the token is found, checked and sent in exactly one place.
+
+    ``unknown`` names what a subclass reads, for the error when it cannot: no token is
+    ``NOT_CONFIGURED`` and that thing is UNKNOWN - never a zero."""
+
+    unknown = "the dash"
 
     def __init__(self, spec, *, url: str, token_file: str) -> None:
         super().__init__(spec)
@@ -107,19 +118,19 @@ class LedgerWorker(_Base):
                     f"tools/setup-read-token.ps1 writes it)")
         return None
 
-    @never_raises()
-    def run(self, ctx: WorkContext) -> Result:
+    def _read_dash(self, ctx: WorkContext) -> Result:
+        """``Ok((doc, resp))`` with the parsed JSON object, or the Err to return."""
         path = self._token_path(ctx.secrets_dir)
         if not path.is_file():
             return self._err(ErrorKind.NOT_CONFIGURED,
-                             f"no read token at {path}; revenue is UNKNOWN, not zero. Run "
-                             f"Scrooge's tools/setup-read-token.ps1 to create it",
+                             f"no read token at {path}; {self.unknown} is UNKNOWN, not zero. "
+                             f"Run Scrooge's tools/setup-read-token.ps1 to create it",
                              retryable=False)
         token = path.read_text(encoding="utf-8").strip()
         if not token:
             return self._err(ErrorKind.NOT_CONFIGURED,
-                             f"the read token at {path} is empty; revenue is UNKNOWN, not zero",
-                             retryable=False)
+                             f"the read token at {path} is empty; {self.unknown} is UNKNOWN, "
+                             "not zero", retryable=False)
         try:
             resp = ctx.http.get(self.url, headers={"x-dash-token": token}, timeout=20.0)
         except HttpUnreachable as exc:
@@ -128,7 +139,31 @@ class LedgerWorker(_Base):
             return _status_error(self, resp.status, resp.body)
         try:
             doc = json.loads(resp.body.decode("utf-8"))
-            summary = doc["summary"] if isinstance(doc, dict) else None
+        except (ValueError, UnicodeDecodeError) as exc:
+            return self._err(ErrorKind.MALFORMED, f"{type(exc).__name__}: {exc}")
+        if not isinstance(doc, dict):
+            return self._err(ErrorKind.MALFORMED, "the dash answered with something that is "
+                             "not an object")
+        return Ok((doc, resp))
+
+    def _provenance(self, resp) -> dict:
+        return {"source": "real", "provider": self.provider, "url": self.url,
+                "status": resp.status, "latency_ms": round(resp.elapsed_ms)}
+
+
+class LedgerWorker(DashReader):
+    """Scrooge's ledger, read-only (``summary`` of ``/dash/api.json``)."""
+
+    unknown = "revenue"
+
+    @never_raises()
+    def run(self, ctx: WorkContext) -> Result:
+        got = self._read_dash(ctx)
+        if isinstance(got, Err):
+            return got
+        doc, resp = got.value
+        try:
+            summary = doc.get("summary")
             if not isinstance(summary, dict):
                 raise _Malformed("no summary object in the answer")
             figures = self._figures(summary)
@@ -139,8 +174,7 @@ class LedgerWorker(_Base):
             self, valid_at=ctx.now, observed_at=ctx.now,
             payload={"streams": streams},
             figures=figures, entities=(*self.entities, *streams),
-            provenance={"source": "real", "provider": self.provider, "url": self.url,
-                        "status": resp.status, "latency_ms": round(resp.elapsed_ms)},
+            provenance=self._provenance(resp),
         ),))
 
     @staticmethod
@@ -256,6 +290,21 @@ def instagram_writer(spec, **params):
     return InstagramWorker(spec, **params)
 
 
+def traffic_reader(spec, **params):
+    """REAL. ``posting.results`` (results.py): what the posts did - the site's traffic from
+    ``/dash/api.json``, matched to the blog worker's published posts by campaign. Imported
+    lazily: results.py builds on ``DashReader`` above."""
+    from .results import TrafficWorker
+    return TrafficWorker(spec, **params)
+
+
+def devto_crossposter(spec, **params):
+    """REAL. ``posting.devto`` (devto.py): each published blog post cross-posted to dev.to,
+    once, checked, as ``content.crosspost_devto`` for the owner's approval."""
+    from .devto import DevtoWorker
+    return DevtoWorker(spec, **params)
+
+
 # The whole list of worker implementations. A catalogue ``impl`` not named here is an
 # error at load time, never a worker that silently does not exist.
 IMPLS = {
@@ -264,4 +313,6 @@ IMPLS = {
     "http_health": HealthWorker,
     "blog_writer": blog_writer,
     "instagram_writer": instagram_writer,
+    "traffic_reader": traffic_reader,
+    "devto_crossposter": devto_crossposter,
 }
