@@ -2,6 +2,7 @@
 
 from .atani_cli import AtaniCliAdapter, AtaniCliSettings
 from .bryo_status import BryoStatusAdapter, BryoStatusSettings
+from .content import ContentAdapter, ContentSettings
 from .crew import CrewAdapter, CrewAdapterSettings
 from .daedalus import DaedalusAdapter, DaedalusSettings
 from .galatea import GalateaAdapter, GalateaSettings
@@ -15,6 +16,8 @@ __all__ = [
     "AtaniCliSettings",
     "BryoStatusAdapter",
     "BryoStatusSettings",
+    "ContentAdapter",
+    "ContentSettings",
     "CrewAdapter",
     "CrewAdapterSettings",
     "DaedalusAdapter",

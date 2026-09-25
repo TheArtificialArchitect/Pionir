@@ -4,7 +4,8 @@ owner's ✅ or ❌ reaction is the yes or no.
 The phone page stays the primary way in; this is a second window onto the SAME
 queue, not a second queue. For every pending approval the bot posts one message
 to a configured channel saying exactly what will happen (capability, the whole
-command and payload, who asked, and any money it spends in bold at the top),
+command and payload, who asked, and any money it spends in bold at the top; a
+``content.publish`` card opens with PUBLISHES PUBLICLY and shows the whole post),
 adds ✅ and ❌ itself, and polls the reactions. Only the configured owner's
 reaction counts; with no owner configured nothing can ever be approved here.
 
@@ -45,6 +46,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from .adapters.content import PUBLISH, public_url
 
 _log = logging.getLogger(__name__)
 
@@ -372,13 +375,44 @@ def _stamp(iso: str | None) -> str | None:
     return f"<t:{unix}:f> (<t:{unix}:R>)"
 
 
+PUBLISH_LINE = ("\U0001f4dd **PUBLISHES PUBLICLY** - everything below goes live on the "
+                "public blog if you approve. Read all of it.")
+
+
+def _publish_lines(payload: Mapping[str, Any]) -> list[str]:
+    """The post itself, as the owner must see it before it goes live: the address it
+    will have, the title, the description, the tags and the WHOLE body, verbatim in a
+    code block (split across messages by split_message, never cut)."""
+
+    slug = payload.get("slug")
+    title = payload.get("title")
+    description = payload.get("description")
+    body = payload.get("body_md")
+    lines = [
+        "**Will go live at:** " + (f"<{public_url(slug)}>" if isinstance(slug, str)
+                                   else "(no valid slug)"),
+        f"**Title:** {_escape(str(title))}",
+        f"**Description:** {_escape(str(description))}",
+    ]
+    tags = payload.get("tags")
+    if isinstance(tags, list) and tags:
+        lines.append("**Tags:** " + ", ".join(f"`{_fence_safe(str(t))}`" for t in tags))
+    text = body if isinstance(body, str) else str(body)
+    lines += [(f"**The post, in full ({len(text):,} characters), exactly as it will be "
+               "published:**"), _FENCE + "markdown", _fence_safe(text), _FENCE]
+    return lines
+
+
 def render_request(row: Mapping[str, Any], owner: str | None) -> str:
     """The whole text of an approval message, before it is split to fit Discord.
     Nothing that says what the action does is ever cut; long text is split
     across messages instead."""
 
     payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
+    publishes = row.get("capability") == PUBLISH
     lines: list[str] = []
+    if publishes:
+        lines.append(PUBLISH_LINE)
     money = money_line(row)
     if money:
         lines.append(money)
@@ -402,8 +436,16 @@ def render_request(row: Mapping[str, Any], owner: str | None) -> str:
     command = _command(payload)
     if command:
         lines += ["**Command:**", _FENCE, _fence_safe(command), _FENCE]
+    shown: Mapping[str, Any] = payload
+    if publishes:
+        lines += _publish_lines(payload)
+        if isinstance(payload.get("body_md"), str):
+            # the body is shown above, in full and readable; as one JSON-escaped line
+            # it would only double the messages
+            shown = {**payload, "body_md": f"(the full post above, "
+                                           f"{len(payload['body_md']):,} characters)"}
     lines += ["**Full payload:**", _FENCE + "json",
-              _fence_safe(json.dumps(payload, indent=2, ensure_ascii=False, default=str)),
+              _fence_safe(json.dumps(shown, indent=2, ensure_ascii=False, default=str)),
               _FENCE]
     return "\n".join(lines)
 

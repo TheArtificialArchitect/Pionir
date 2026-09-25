@@ -171,6 +171,13 @@ class PionirSettings:
     # by default like Daedalus/Melete; a crew that is not running answers "the crew
     # is not running" at once. PIONIR_CREW_URL set to "off" leaves it unregistered.
     crew_url: str | None = "http://127.0.0.1:8782"
+    # Scrooge's publish endpoint for the content.* capabilities. content.publish parks
+    # for the owner's yes on every call; the token is read from content_token_file
+    # (None means ~/.pionir/secrets/scrooge-publish-token.txt) at call time, so no
+    # network is touched at boot. PIONIR_CONTENT_URL set to "off" leaves it unregistered;
+    # PIONIR_CONTENT_TOKEN_FILE points at another token file.
+    content_url: str | None = "https://api.dokaz.net"
+    content_token_file: Path | None = None
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
     # The local embedding model for hybrid recall. Default on: it is ~0.32 GB and
@@ -227,6 +234,16 @@ class PionirSettings:
     @property
     def gpu_lock_path(self) -> Path:
         return self.shared_gpu_lock_file or self.state_root / "resource" / "gpu.lock"
+
+    @property
+    def content_token_path(self) -> Path:
+        if self.content_token_file is not None:
+            return self.content_token_file
+        try:
+            home = Path.home()
+        except RuntimeError:
+            return self.state_root / "secrets" / "scrooge-publish-token.txt"
+        return home / ".pionir" / "secrets" / "scrooge-publish-token.txt"
 
     @property
     def cortex_path(self) -> Path:
@@ -326,6 +343,12 @@ class PionirSettings:
             melete_url=_optional_url("PIONIR_MELETE_URL", _declared("melete_url")),
             melete_token=(os.environ.get("PIONIR_MELETE_TOKEN") or "").strip() or None,
             crew_url=_optional_url("PIONIR_CREW_URL", _declared("crew_url")),
+            content_url=_optional_url("PIONIR_CONTENT_URL", _declared("content_url")),
+            content_token_file=(
+                Path(os.environ["PIONIR_CONTENT_TOKEN_FILE"]).expanduser()
+                if (os.environ.get("PIONIR_CONTENT_TOKEN_FILE") or "").strip()
+                else None
+            ),
             embed_model=_embed_model_from_env(),
             distil_model=(os.environ.get("PIONIR_DISTIL_MODEL") or "").strip()
             or _declared("distil_model"),

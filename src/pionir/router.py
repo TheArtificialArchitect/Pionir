@@ -229,7 +229,9 @@ class IntentRouter:
             (manifest.agent_id, capability, capability_vocabulary(manifest.agent_id, capability))
             for manifest in self.executive.registry.manifests()
             for capability in manifest.capabilities
-            if capability.routable
+            # not merely routable: an action that needs the owner's yes on every call
+            # is never a routing target (see Capability.classifiable)
+            if capability.classifiable
         ]
 
     def classify(self, request: str) -> RoutingDecision:

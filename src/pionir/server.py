@@ -244,7 +244,7 @@ _VOICE_REASONING = frozenset({"reasoning.atani_answer"})
 # the classifier can come back unsure. That is exactly Atani's job to sort out, so
 # such a request goes to the manager rather than dead-ending as "unclear".
 _NAMES_A_DOER = re.compile(
-    r"\b(nyx|voodoo|daedalus|melete|atani|recon|reconnaissance|pentest)\b", re.I
+    r"\b(nyx|voodoo|daedalus|melete|atani|recon|reconnaissance|pentest)\b", re.IGNORECASE
 )
 
 
@@ -629,12 +629,15 @@ class PionirApp:
 
     def _needs_approval(self, capability: str, granted: list[str]) -> bool:
         """A privileged action arriving without the permission it needs is held
-        for Ian, not refused. Anything read-only or already-permitted just runs."""
+        for Ian, not refused. Anything read-only or already-permitted just runs -
+        except a capability that requires approval (spending money, publishing
+        publicly), which is held on EVERY call."""
         _agent, cap = self._cap_and_agent(capability)
         if cap is None:
             return False   # unknown capability: let execute() report it as it always has
-        if cap.spends_money:
-            # money never moves without a human yes - holding the permission is not enough
+        if cap.requires_approval or cap.spends_money:
+            # money never moves, and nothing goes public, without a human yes -
+            # holding the permission is not enough
             return True
         return (cap.risk is RiskLevel.PRIVILEGED
                 and not set(cap.required_permissions).issubset(set(granted)))
@@ -649,7 +652,8 @@ class PionirApp:
             gist = " ".join([action, *[str(a) for a in args]]) if isinstance(args, list) else action
         else:
             gist = ""
-            for key in ("content", "task", "goal", "command", "target", "request", "intent"):
+            for key in ("content", "task", "goal", "command", "target", "request", "intent",
+                        "title"):
                 value = payload.get(key)
                 if isinstance(value, str) and value.strip():
                     gist = value.strip()

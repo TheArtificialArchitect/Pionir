@@ -90,7 +90,7 @@ def registry_fingerprint(router: IntentRouter) -> str:
         capability.name
         for manifest in router.executive.registry.manifests()
         for capability in manifest.capabilities
-        if capability.routable
+        if capability.classifiable
     )
     return hashlib.sha256("\n".join(names).encode("utf-8")).hexdigest()[:16]
 
@@ -290,7 +290,7 @@ def run(router: IntentRouter, probes: tuple[Probe, ...] | None = None) -> Routin
         capability.name
         for manifest in router.executive.registry.manifests()
         for capability in manifest.capabilities
-        if capability.routable
+        if capability.classifiable
     }
     results: list[ProbeResult] = []
     skipped: list[str] = []

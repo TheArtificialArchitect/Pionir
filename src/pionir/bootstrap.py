@@ -9,6 +9,8 @@ from .adapters import (
     AtaniCliSettings,
     BryoStatusAdapter,
     BryoStatusSettings,
+    ContentAdapter,
+    ContentSettings,
     CrewAdapter,
     CrewAdapterSettings,
     DaedalusAdapter,
@@ -190,6 +192,12 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         # No boot-time call: the crew is reached only when a crew.* task runs (or
         # doctor asks), so a runtime without a running crew builds exactly the same.
         runtime.register(CrewAdapter(CrewAdapterSettings(base_url=configured.crew_url)))
+    if configured.content_url is not None:
+        # No boot-time call either: Scrooge is reached only when a content.* task runs,
+        # and the token file is read then. content.publish always parks for approval.
+        runtime.register(ContentAdapter(ContentSettings(
+            base_url=configured.content_url, token_file=configured.content_token_path,
+        )))
     if configured.specialists_file is not None:
         for adapter in load_stdio_adapters(configured.specialists_file):
             runtime.register(adapter)

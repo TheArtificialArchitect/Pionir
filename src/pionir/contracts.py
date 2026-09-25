@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 from uuid import UUID, uuid4
 
 
@@ -31,7 +32,7 @@ class MemoryNamespace:
         if any(set(part) - allowed for part in parts):
             raise ValueError("memory namespaces use lowercase letters, digits, '_' and '-'")
 
-    def contains(self, other: "MemoryNamespace") -> bool:
+    def contains(self, other: MemoryNamespace) -> bool:
         return other.value == self.value or other.value.startswith(f"{self.value}/")
 
 
@@ -93,6 +94,16 @@ class Capability:
     definition), and PionirApp parks it for approval on EVERY call - even when the
     caller already holds its permission, which is otherwise how an action skips
     the gate. So no path exists by which money moves without a human yes."""
+    requires_approval: bool = False
+    """This action parks for the owner's yes on EVERY call, whatever the caller holds.
+
+    The general form of ``spends_money`` (which implies it): Ian's rule that
+    publishing anything publicly goes live only after he approves it is the same
+    shape as the money rule, so it is the same mechanism. Holding the capability's
+    permission - otherwise how a privileged action skips the gate - is not a way
+    around it. Such a capability must be PRIVILEGED (enforced below), PionirApp
+    parks it on every call, and the intent router never classifies to it, so no
+    routed request can run it either."""
 
     def __post_init__(self) -> None:
         if not self.name or any(char.isspace() for char in self.name):
@@ -102,8 +113,25 @@ class Capability:
                 f"{self.name} spends money, so it must be RiskLevel.PRIVILEGED - "
                 "money never moves without an approval"
             )
+        if self.spends_money and not self.requires_approval:
+            # frozen: set through object.__setattr__, as Task does for its payload
+            object.__setattr__(self, "requires_approval", True)
+        if self.requires_approval and self.risk is not RiskLevel.PRIVILEGED:
+            raise ValueError(
+                f"{self.name} requires the owner's approval on every call, so it must be "
+                "RiskLevel.PRIVILEGED"
+            )
         if any(not hint or any(char.isspace() for char in hint) for hint in self.routing_hints):
             raise ValueError("routing hints must be non-empty single words")
+
+    @property
+    def classifiable(self) -> bool:
+        """Whether the intent router may classify a request to this capability.
+
+        ``routable`` minus anything that needs the owner's yes on every call: the
+        routed path runs with the caller's own permissions and would skip the
+        approval gate, so such an action is reached only by name (/api/task)."""
+        return self.routable and not self.requires_approval
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,19 +240,18 @@ def _is_refusal(output: Mapping[str, Any]) -> bool:
     # Voodoo's CLI prints "Refused: <why>" to stdout and exits 2 on a policy
     # denial (PolicyDenied/ValueError, cli.py ~260-262); run_action keeps that
     # text under "output" and the exit code under "returncode".
-    payload = output.get("output")
-    if (
-        output.get("returncode") == 2
-        and isinstance(payload, str)
-        and payload.lstrip().startswith("Refused:")
-    ):
-        return True
+    #
     # Daedalus is deliberately NOT matched: its declines (find_repo/git
     # PolicyError, an empty intent, a failed gate) all surface as ok=false with
     # an `error`/`gate.reason` string, structurally identical to a real fault
     # (dispatcher.py TaskResult has no refusal marker). With no explicit signal,
     # fail closed and let it count.
-    return False
+    payload = output.get("output")
+    return (
+        output.get("returncode") == 2
+        and isinstance(payload, str)
+        and payload.lstrip().startswith("Refused:")
+    )
 
 
 def outcome_kind(output: Any) -> str:
