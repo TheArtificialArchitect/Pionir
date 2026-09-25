@@ -351,7 +351,7 @@ class ClientAdapter:
         scrooge_said_no = status in (502, 503) and doc.get("ok") is False
         if emailing and not scrooge_said_no and (status == 0 or status >= 500):
             why = f"{why} - {CHECK_BEFORE_RETRY}"
-        elif emailing and scrooge_said_no:
+        elif emailing and scrooge_said_no and "nothing was sent" not in why:
             why = f"{why} - nothing was sent"
         return _unavailable(why, status=status)
 
