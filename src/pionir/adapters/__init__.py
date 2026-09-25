@@ -6,6 +6,7 @@ from .content import ContentAdapter, ContentSettings
 from .crew import CrewAdapter, CrewAdapterSettings
 from .daedalus import DaedalusAdapter, DaedalusSettings
 from .galatea import GalateaAdapter, GalateaSettings
+from .instagram import InstagramAdapter, InstagramSettings
 from .melete import MeleteAdapter, MeleteSettings
 from .nyx_status import NyxStatusAdapter, NyxStatusSettings
 from .stdio_json import StdioJsonAdapter, StdioJsonSettings, load_stdio_adapters
@@ -24,6 +25,8 @@ __all__ = [
     "DaedalusSettings",
     "GalateaAdapter",
     "GalateaSettings",
+    "InstagramAdapter",
+    "InstagramSettings",
     "MeleteAdapter",
     "MeleteSettings",
     "NyxStatusAdapter",

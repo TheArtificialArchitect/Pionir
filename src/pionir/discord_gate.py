@@ -5,7 +5,9 @@ The phone page stays the primary way in; this is a second window onto the SAME
 queue, not a second queue. For every pending approval the bot posts one message
 to a configured channel saying exactly what will happen (capability, the whole
 command and payload, who asked, and any money it spends in bold at the top; a
-``content.publish`` card opens with PUBLISHES PUBLICLY and shows the whole post),
+``content.publish`` card opens with PUBLISHES PUBLICLY and shows the whole post; a
+``social.instagram_post`` card opens with POSTS PUBLICLY TO INSTAGRAM, shows the full
+caption and carries the rendered image itself as an attachment),
 adds ✅ and ❌ itself, and polls the reactions. Only the configured owner's
 reaction counts; with no owner configured nothing can ever be approved here.
 
@@ -31,6 +33,7 @@ Wiring (done elsewhere)::
 """
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import logging
@@ -44,10 +47,15 @@ import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .adapters.content import PUBLISH, public_url
+from .adapters.instagram import POST as INSTAGRAM_POST
+from .social.card import render_card
+from .social.post import full_caption
 
 _log = logging.getLogger(__name__)
 
@@ -245,21 +253,29 @@ class DiscordRest:
     def scrub(self, text: str) -> str:
         return text.replace(self.__token, "<redacted>") if self.__token else text
 
-    def call(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
-        """One call; a 429 waits out ``retry_after`` (bounded) and retries."""
+    def call(self, method: str, path: str, body: dict[str, Any] | None = None, *,
+             files: list[Attachment] | None = None) -> Any:
+        """One call; a 429 waits out ``retry_after`` (bounded) and retries. With
+        ``files``, the body goes as Discord's multipart form: ``payload_json`` plus one
+        ``files[n]`` part per attachment."""
 
         for _attempt in range(4):
             try:
-                return self._once(method, path, body)
+                return self._once(method, path, body, files)
             except _RateLimited as limited:
                 self._sleep(limited.retry_after)
         raise DiscordError(f"{method} {path}: still rate limited after retries", status=429)
 
-    def _once(self, method: str, path: str, body: dict[str, Any] | None) -> Any:
-        data = json.dumps(body).encode("utf-8") if body is not None else None
+    def _once(self, method: str, path: str, body: dict[str, Any] | None,
+              files: list[Attachment] | None = None) -> Any:
         headers = {"Authorization": f"Bot {self.__token}", "User-Agent": USER_AGENT}
-        if data is not None:
-            headers["Content-Type"] = "application/json"
+        data: bytes | None
+        if files:
+            data, headers["Content-Type"] = multipart_body(body or {}, files)
+        else:
+            data = json.dumps(body).encode("utf-8") if body is not None else None
+            if data is not None:
+                headers["Content-Type"] = "application/json"
         request = urllib.request.Request(self.api_base + path, data=data, method=method,
                                          headers=headers)
         where = f"{method} {path}"
@@ -301,6 +317,36 @@ class DiscordRest:
         except ValueError:
             raise DiscordError(f"{where}: Discord answered with something that is not JSON") \
                 from None
+
+
+# (filename, content type, bytes)
+Attachment = tuple[str, str, bytes]
+
+
+def multipart_body(payload: Mapping[str, Any], files: list[Attachment]) -> tuple[bytes, str]:
+    """Discord's message-with-files form, by hand (stdlib only): a ``payload_json`` part
+    holding the JSON message (with an ``attachments`` entry per file), then ``files[n]``
+    parts with the raw bytes. Returns (body, Content-Type header)."""
+
+    message = dict(payload)
+    message["attachments"] = [{"id": i, "filename": name} for i, (name, _t, _d) in
+                              enumerate(files)]
+    encoded = json.dumps(message, ensure_ascii=False).encode("utf-8")
+    while True:
+        boundary = f"pionir-{uuid4().hex}"
+        mark = boundary.encode("ascii")
+        if mark not in encoded and not any(mark in data for _n, _t, data in files):
+            break
+    head = f"--{boundary}\r\n"
+    parts = [(head + 'Content-Disposition: form-data; name="payload_json"\r\n'
+              "Content-Type: application/json\r\n\r\n").encode("ascii") + encoded + b"\r\n"]
+    for i, (name, content_type, data) in enumerate(files):
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+        parts.append((head + f'Content-Disposition: form-data; name="files[{i}]"; '
+                      f'filename="{safe}"\r\nContent-Type: {content_type}\r\n\r\n'
+                      ).encode("ascii") + data + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("ascii"))
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
 class _RateLimited(Exception):
@@ -403,6 +449,67 @@ def _publish_lines(payload: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+INSTAGRAM_LINE = ("\U0001f4f8 **POSTS PUBLICLY TO INSTAGRAM** - the image and caption below go "
+                  "live on the Dokaz Instagram if you approve.")
+CARD_FILENAME = "card.jpg"
+
+
+@lru_cache(maxsize=16)
+def _render_cached(headline: str, points: tuple[str, ...]) -> bytes | str:
+    try:
+        return render_card(headline, points)
+    except Exception as error:  # noqa: BLE001 - any failure is shown to the owner, plainly
+        return f"{type(error).__name__}: {error}"[:300]
+
+
+def card_image(payload: Mapping[str, Any]) -> tuple[bytes | None, str | None]:
+    """The Instagram card the post will carry, rendered exactly as the adapter will render
+    it: (JPEG bytes, None), or (None, why it could not be rendered)."""
+
+    headline = payload.get("headline")
+    points = payload.get("points")
+    if not isinstance(headline, str) or not isinstance(points, list) \
+            or not all(isinstance(p, str) for p in points):
+        return None, "the post has no usable headline and points"
+    # the adapter renders check_post's normalised text: stripped
+    out = _render_cached(headline.strip(), tuple(p.strip() for p in points))
+    return (out, None) if isinstance(out, bytes) else (None, out)
+
+
+def _instagram_lines(payload: Mapping[str, Any]) -> list[str]:
+    """The post as the owner must see it before it goes live: the image (attached to the
+    message), the headline and points drawn on it, and the FULL caption exactly as
+    Instagram will receive it - hashtags included."""
+
+    image, why = card_image(payload)
+    lines: list[str] = []
+    if image is None:
+        lines.append(f"\u26a0\ufe0f **The card image could not be rendered** ({_escape(str(why))}), "
+                     "so it is not attached. Do not approve a post you cannot see - deny it "
+                     "and have it redrafted.")
+    else:
+        sha = hashlib.sha256(image).hexdigest()
+        lines.append(f"**The image:** `{CARD_FILENAME}`, attached to this message - exactly "
+                     f"the picture that will be posted (sha256 `{sha[:16]}`).")
+        pinned = payload.get("card_sha")
+        if isinstance(pinned, str) and pinned != sha:
+            lines.append("\u26a0\ufe0f **This image differs from the one the post pinned "
+                         "(card_sha)** - approving will be refused; deny it.")
+    lines.append(f"**Headline:** {_escape(str(payload.get('headline')))}")
+    points = payload.get("points")
+    for point in points if isinstance(points, list) else []:
+        lines.append(f"\u2022 {_escape(str(point))}")
+    caption = payload.get("caption")
+    tags = payload.get("hashtags") or []
+    if isinstance(caption, str) and isinstance(tags, list):
+        text = full_caption(caption.strip(), [str(t) for t in tags])
+    else:
+        text = str(caption)
+    lines += [(f"**The caption, in full ({len(text):,} characters), exactly as Instagram "
+               "will receive it:**"), _FENCE, _fence_safe(text), _FENCE]
+    return lines
+
+
 def render_request(row: Mapping[str, Any], owner: str | None) -> str:
     """The whole text of an approval message, before it is split to fit Discord.
     Nothing that says what the action does is ever cut; long text is split
@@ -410,9 +517,12 @@ def render_request(row: Mapping[str, Any], owner: str | None) -> str:
 
     payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
     publishes = row.get("capability") == PUBLISH
+    posts = row.get("capability") == INSTAGRAM_POST
     lines: list[str] = []
     if publishes:
         lines.append(PUBLISH_LINE)
+    if posts:
+        lines.append(INSTAGRAM_LINE)
     money = money_line(row)
     if money:
         lines.append(money)
@@ -444,6 +554,10 @@ def render_request(row: Mapping[str, Any], owner: str | None) -> str:
             # it would only double the messages
             shown = {**payload, "body_md": f"(the full post above, "
                                            f"{len(payload['body_md']):,} characters)"}
+    if posts:
+        lines += _instagram_lines(payload)
+        if isinstance(payload.get("caption"), str):
+            shown = {**payload, "caption": "(the full caption above)"}
     lines += ["**Full payload:**", _FENCE + "json",
               _fence_safe(json.dumps(shown, indent=2, ensure_ascii=False, default=str)),
               _FENCE]
@@ -717,9 +831,10 @@ class DiscordGate:
     def _scrub(self, text: str) -> str:
         return self._client.scrub(text) if self._client else text
 
-    def _call(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+    def _call(self, method: str, path: str, body: dict[str, Any] | None = None, *,
+              files: list[Attachment] | None = None) -> Any:
         assert self._client is not None
-        return self._client.call(method, path, body)
+        return self._client.call(method, path, body, files=files)
 
     def _hello(self) -> None:
         me = self._call("GET", "/users/@me")
@@ -763,8 +878,23 @@ class DiscordGate:
         owner = self.settings.owner
         mentions: dict[str, Any] = {"parse": [], "users": [owner] if owner and not status else []}
         head = chunks[0]
-        sent = self._call("POST", f"/channels/{channel}/messages",
-                          {"content": _compose(status, head), "allowed_mentions": mentions})
+        message = {"content": _compose(status, head), "allowed_mentions": mentions}
+        image = card_image(row.get("payload") or {})[0] \
+            if row.get("capability") == INSTAGRAM_POST else None
+        attach_failed: str | None = None
+        if image is None:
+            sent = self._call("POST", f"/channels/{channel}/messages", message)
+        else:
+            try:
+                sent = self._call("POST", f"/channels/{channel}/messages", message,
+                                  files=[(CARD_FILENAME, "image/jpeg", image)])
+            except DiscordError as error:
+                if isinstance(error, DiscordAuthError) or error.transport:
+                    raise
+                # e.g. 403: the bot lacks Attach Files. The approval is still shown -
+                # with a plain warning right under it - and stays parked.
+                attach_failed = str(error)
+                sent = self._call("POST", f"/channels/{channel}/messages", message)
         previous = self._entries.get(row["id"], {})
         entry = {
             "message_id": str(sent["id"]),
@@ -781,6 +911,16 @@ class DiscordGate:
         # post this approval a second time.
         self._entries[row["id"]] = entry
         self._save()
+        if attach_failed is not None:
+            _log.warning("discord gate: approval %s: the card image could not be attached: %s",
+                         row["id"], attach_failed)
+            warning = ("\u26a0\ufe0f **The card image could not be attached** "
+                       f"({_escape(attach_failed[:200])}). Do not approve a post you cannot "
+                       "see: give the bot the Attach Files permission in this channel, or "
+                       "deny it.")
+            extra = self._call("POST", f"/channels/{channel}/messages",
+                               {"content": warning, "allowed_mentions": {"parse": []}})
+            entry["extra_ids"].append(str(extra["id"]))
         for chunk in chunks[1:]:
             extra = self._call("POST", f"/channels/{channel}/messages",
                                {"content": chunk, "allowed_mentions": {"parse": []}})
