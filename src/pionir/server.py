@@ -269,6 +269,21 @@ def _candidate_json(candidate: Candidate) -> dict[str, Any]:
     }
 
 
+def _product_gist(payload: Mapping[str, Any]) -> str:
+    """"Post Guard 1.0.0 ($19.00) - post-guard" for a product listing's payload."""
+    words = [" ".join(str(payload["name"]).split())]
+    version = payload.get("version")
+    if isinstance(version, str) and version.strip():
+        words.append(version.strip())
+    cents = payload.get("price_cents")
+    if isinstance(cents, int) and not isinstance(cents, bool):
+        price = f"${cents / 100:,.2f}"
+        if payload.get("pay_what_you_want") is True:
+            price = f"pay what you want, from {price}"
+        words.append(f"({price})")
+    return f"{' '.join(words)} - {payload['slug'].strip()}"
+
+
 class PionirApp:
     """Every dashboard endpoint, as plain data - no HTTP, so it is unit-testable."""
 
@@ -658,6 +673,10 @@ class PionirApp:
                 if isinstance(value, str) and value.strip():
                     gist += f": {value.strip()}" if key == "subject" else f" -> {value.strip()}"
                     break
+        elif isinstance(payload.get("slug"), str) and isinstance(payload.get("name"), str) \
+                and payload["name"].strip():
+            # a product listing: what it is, which version, at what price, and its permalink
+            gist = _product_gist(payload)
         else:
             gist = ""
             for key in ("content", "task", "goal", "command", "target", "request", "intent",

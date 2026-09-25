@@ -48,14 +48,19 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import io
 import json
 import logging
 import math
 import re
+import secrets
 import stat
+import struct
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
+import zlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1124,3 +1129,229 @@ class ProductAdapter:
                   "on_sale": sum(1 for p in products if p["published"]),
                   "sales_count": sum(counts), "sales_usd": f"{sum(cents) / 100:,.2f}"}
         return 0, json.loads(self._scrub(json.dumps(report), token))
+
+    # ---- the upload probe (python -m pionir gumroad-check --probe-upload) --------------
+    def probe_upload(self, say: Callable[[str], Any] = print) -> int:
+        """Prove the upload paths once, before the owner's first real approval: make a
+        throwaway DRAFT (never enabled), upload a tiny zip and a cover to it the way a real
+        publish does, look at what Gumroad shows, then delete it. Every step is said in
+        plain words, never the token. 0 only if every step passed and the draft is gone;
+        1 otherwise (or not configured); 2 if the token was rejected."""
+        token = read_token(self.settings.token_file)
+        if token is None:
+            say(f"NOT OK  {self._not_configured()}")
+            return 1
+        slug = f"{PROBE_PERMALINK_PREFIX}{secrets.token_hex(4)}"
+        state: dict[str, Any] = {"ok": True, "rejected": False, "product_id": None,
+                                 "live": False}
+
+        def ok(text: str) -> None:
+            say(f"OK      {self._scrub(text, token)}")
+
+        def fail(text: str) -> None:
+            state["ok"] = False
+            say(f"NOT OK  {self._scrub(text, token)}")
+
+        def failed(step: str, failure: _Failure) -> None:
+            if failure.output.get("token_rejected"):
+                state["rejected"] = True
+            fail(f"{step}: {failure.output.get('error')}")
+
+        say(f"Gumroad upload probe at {self._api} - a throwaway draft, never published, "
+            "deleted at the end")
+
+        def run_steps() -> None:
+            step = "create the draft"
+            try:
+                made = self._call("POST", "/products", step, token, body={
+                    "native_type": "digital", "name": PROBE_NAME, "price": 100,
+                    "price_currency_type": "usd", "custom_permalink": slug, "draft": True})
+            except _Failure as failure:
+                failed(step, failure)
+                return
+            product = made.get("product") if isinstance(made.get("product"), Mapping) else {}
+            product_id = product.get("id")
+            if not isinstance(product_id, str) or not product_id:
+                fail(f"{step}: Gumroad answered without a product id - look for a draft "
+                     f"with the permalink {slug} in the dashboard and delete it")
+                return
+            state["product_id"] = product_id
+            if product.get("published") is not False:
+                # Never continue with something that might be on sale.
+                state["live"] = True
+                fail(f"{step}: Gumroad reports product {product_id} as published "
+                     f"(published: {product.get('published')!r}) although it was sent as a "
+                     "draft - stopping; it is taken off sale and deleted below")
+                return
+            ok(f"{step}: product {product_id}, permalink {slug}, published: false")
+
+            zipped = _probe_zip()
+            png = _probe_png(*PROBE_COVER)
+            cover = Cover(path=Path("pionir-probe-cover.png"), size=len(png),
+                          sha256=hashlib.sha256(png).hexdigest(), content_type="image/png",
+                          width=PROBE_COVER[0], height=PROBE_COVER[1], data=png)
+            held: dict[str, Any] = {}
+
+            def upload_zip() -> str:
+                held["file_url"] = self._upload_zip("pionir-probe.zip", zipped, token)
+                return (f"a {len(zipped)}-byte zip went up through presign, one part PUT "
+                        "and complete")
+
+            def attach_zip() -> str:
+                answer = self._call("PUT", self._path(product_id), "attach the zip", token,
+                                    body={"files": [{"url": held["file_url"],
+                                                     "display_name": "pionir-probe.zip"}]})
+                shown = answer.get("product")
+                files = shown.get("files") if isinstance(shown, Mapping) else None
+                return "Gumroad accepted it" + (
+                    f" (the product now lists {len(files)} file(s))"
+                    if isinstance(files, list) else "")
+
+            def upload_cover() -> str:
+                held["signed_id"] = self._upload_cover(cover, token)
+                return (f"a {PROBE_COVER[0]}x{PROBE_COVER[1]} PNG ({cover.size} bytes) went "
+                        "up through direct_uploads and its storage PUT")
+
+            def attach_cover() -> str:
+                answer = self._call("POST", self._path(product_id, "/covers"),
+                                    "attach the cover", token,
+                                    body={"signed_blob_id": held["signed_id"]})
+                covers = answer.get("covers")
+                return "Gumroad accepted it" + (
+                    f" ({len(covers)} cover(s), main cover {answer.get('main_cover_id')})"
+                    if isinstance(covers, list) else "")
+
+            stages = [("upload the zip", upload_zip), ("attach the zip", attach_zip),
+                      ("upload the cover", upload_cover), ("attach the cover", attach_cover)]
+            for name, run in stages:
+                try:
+                    ok(f"{name}: {run()}")
+                except _Failure as failure:
+                    failed(name, failure)
+                    return
+            self._probe_verify(product_id, token, state, ok, fail, failed)
+
+        try:
+            run_steps()
+        finally:
+            # whatever happened above, a probe draft never outlives the probe
+            if state["product_id"] is not None:
+                self._probe_cleanup(state, token, slug, ok, fail, failed)
+                say("PASSED - the upload paths work; the probe draft was deleted"
+                    if state["ok"] else "FAILED - see the NOT OK lines above")
+            elif not state["ok"]:
+                say("FAILED - nothing was created on Gumroad")
+        return self._probe_code(state)
+
+    def _probe_verify(self, product_id: str, token: str, state: dict[str, Any],
+                      ok: Callable[[str], None], fail: Callable[[str], None],
+                      failed: Callable[[str, _Failure], None]) -> None:
+        """Re-read the draft and report what Gumroad shows of the file and the cover."""
+        step = "check the draft"
+        try:
+            answer = self._call("GET", self._path(product_id), step, token)
+        except _Failure as failure:
+            failed(step, failure)
+            return
+        product = answer.get("product") if isinstance(answer.get("product"), Mapping) else {}
+        if product.get("published") is not False:
+            state["live"] = True
+            fail(f"{step}: Gumroad reports the draft as published "
+                 f"(published: {product.get('published')!r}) - it is taken off sale and "
+                 "deleted below")
+            return
+        files = product.get("files")
+        covers = product.get("covers")
+        preview = product.get("preview_url") or product.get("thumbnail_url")
+        seen: list[str] = []
+        if isinstance(files, list):
+            if not files:
+                fail(f"{step}: Gumroad shows the draft with no files - the zip did not "
+                     "stick")
+                return
+            names = ", ".join(str(f.get("name") or f.get("display_name") or f.get("id"))
+                              for f in files if isinstance(f, Mapping))
+            seen.append(f"{len(files)} file(s) ({names})")
+        else:
+            seen.append("no file list in its product view (the attach call succeeded)")
+        if isinstance(covers, list):
+            if not covers:
+                fail(f"{step}: Gumroad shows the draft with no covers - the cover did not "
+                     "stick")
+                return
+            seen.append(f"{len(covers)} cover(s)")
+        elif preview:
+            seen.append("a cover image (preview_url)")
+        else:
+            seen.append("no cover list in its product view (the attach call succeeded)")
+        ok(f"{step}: still a draft (published: false); Gumroad shows " + "; ".join(seen))
+
+    def _probe_cleanup(self, state: dict[str, Any], token: str, slug: str,
+                       ok: Callable[[str], None], fail: Callable[[str], None],
+                       failed: Callable[[str, _Failure], None]) -> None:
+        """Always: off sale if it might be on sale, then delete, then make sure it is gone."""
+        product_id = state["product_id"]
+        if state["live"]:
+            try:
+                self._call("PUT", self._path(product_id, "/disable"), "take it off sale",
+                           token)
+                ok(f"take it off sale: product {product_id} disabled")
+            except _Failure as failure:
+                failed("take it off sale", failure)
+        step = "delete the draft"
+        try:
+            self._call("DELETE", self._path(product_id), step, token)
+        except _Failure as failure:
+            failed(step, failure)
+        gone = self._probe_gone(product_id, token)
+        if gone:
+            ok(f"{step}: product {product_id} is gone")
+        else:
+            fail(f"the probe draft was NOT removed: product {product_id} (permalink {slug}) "
+                 "- delete it in the Gumroad dashboard")
+
+    def _probe_gone(self, product_id: str, token: str) -> bool:
+        status, document, _headers = self._http("GET", f"{self._api}{self._path(product_id)}",
+                                                auth=token)
+        if status == 404:
+            return True
+        if not 200 <= status < 300 or not isinstance(document, Mapping):
+            return False                     # no answer, a 5xx, a 401: not confirmed
+        if document.get("success") is False:
+            return True                      # Gumroad's "not found" at HTTP 200
+        product = document.get("product")
+        return isinstance(product, Mapping) and product.get("deleted") is True
+
+    @staticmethod
+    def _probe_code(state: Mapping[str, Any]) -> int:
+        if state["ok"]:
+            return 0
+        return 2 if state["rejected"] else 1
+
+
+PROBE_NAME = "pionir upload probe - safe to delete"
+PROBE_PERMALINK_PREFIX = "pionir-upload-probe-"
+PROBE_COVER = (1280, 720)
+
+
+def _probe_zip() -> bytes:
+    """A tiny zip that would pass a product's own checks: a README and nothing else."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("README.md", "# Pionir upload probe\n\nSafe to delete. Pionir made "
+                                      "this to check that uploads to Gumroad work.\n")
+    return buffer.getvalue()
+
+
+def _probe_png(width: int, height: int) -> bytes:
+    """A plain PNG of the given size, made with the standard library."""
+    row = b"\x00" + bytes((24, 70, 110)) * width
+    raw = zlib.compress(row * height, 9)
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", raw) + chunk(b"IEND", b""))

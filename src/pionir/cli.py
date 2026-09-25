@@ -88,10 +88,16 @@ def _parser() -> argparse.ArgumentParser:
         help="check the dev.to API key: who it belongs to "
              "(reads only; never posts, never prints the key)",
     )
-    commands.add_parser(
+    gumroad = commands.add_parser(
         "gumroad-check",
         help="check the Gumroad token: whose account it is, the products and their sales "
              "(reads only; never changes a product, never prints the token)",
+    )
+    gumroad.add_argument(
+        "--probe-upload", action="store_true",
+        help="run once after setup: make a throwaway DRAFT (never published), upload a tiny "
+             "zip and a cover to it the way a real publish does, report what Gumroad shows, "
+             "then delete it; exit 0 only if every step passed",
     )
     orders = commands.add_parser(
         "orders",
@@ -676,11 +682,13 @@ def devto_check(settings: PionirSettings | None = None, *, opener: Any = None) -
     return code
 
 
-def gumroad_check(settings: PionirSettings | None = None, *, opener: Any = None) -> int:
+def gumroad_check(settings: PionirSettings | None = None, *, opener: Any = None,
+                  probe_upload: bool = False) -> int:
     """``pionir gumroad-check``: 0 ok, 1 not configured (or could not check), 2 rejected.
     No runtime is built: it reads the token file and asks Gumroad who it is and what it
     sells (GET /v2/user, GET /v2/products). Never changes a product, never prints the
-    token."""
+    token. With ``--probe-upload`` it instead proves the upload paths on a throwaway
+    draft that is never published and is deleted at the end (ProductAdapter.probe_upload)."""
     from .adapters.products import ProductAdapter, product_settings
 
     configured = settings or PionirSettings.from_environment()
@@ -688,6 +696,8 @@ def gumroad_check(settings: PionirSettings | None = None, *, opener: Any = None)
         _print({"status": "not_configured", "message": "PIONIR_GUMROAD_URL is off"})
         return 1
     adapter = ProductAdapter(product_settings(configured), opener=opener)
+    if probe_upload:
+        return adapter.probe_upload(say=lambda line: print(line, flush=True))
     code, report = adapter.check_account()
     _print(report)
     return code
@@ -737,6 +747,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                         ("gumroad-check", gumroad_check)):
         if args.command == name:
             try:
+                if getattr(args, "probe_upload", False):
+                    return gumroad_check(probe_upload=True)
                 return check()
             except (ValueError, OSError) as error:
                 _print({"status": "error", "error_type": type(error).__name__,

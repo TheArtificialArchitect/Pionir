@@ -182,4 +182,6 @@ Write-Host "  token saved to $TokenFile (not shown)"
 Write-Host ""
 Write-Host "OK - Gumroad products are set up. Every product still waits for your yes before it goes on sale." -ForegroundColor Green
 Write-Host "Check it any time with: python -m pionir gumroad-check"
+Write-Host "Once, before the first real product, prove the uploads work (a throwaway draft, never published, deleted at the end):"
+Write-Host "  python -m pionir gumroad-check --probe-upload"
 exit 0

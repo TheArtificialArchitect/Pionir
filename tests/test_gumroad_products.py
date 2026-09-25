@@ -203,7 +203,7 @@ class FakeGumroad:
         if parts == ["products"]:
             return ("list" if method == "GET" else "create"), parts
         if parts[0] == "products" and len(parts) == 2:
-            return "update", parts
+            return {"GET": "get", "DELETE": "delete"}.get(method, "update"), parts
         if parts[0] == "products" and len(parts) == 3:
             return {"enable": "enable", "disable": "disable", "covers": "covers"}[parts[2]], parts
         return {"files/presign": "presign", "files/complete": "complete",
@@ -248,11 +248,18 @@ class FakeGumroad:
             product = self.add(**fields, published=(self.publish_on_create
                                                    or not body.get("draft")))
             return _Response(200, {"success": True, "product": dict(product)})
-        if step in ("update", "enable", "disable", "covers"):
-            matches = [p for p in self.products if p["id"] == parts[1]]
+        if step in ("update", "enable", "disable", "covers", "get", "delete"):
+            matches = [p for p in self.products
+                       if p["id"] == parts[1] and not p.get("deleted")]
             if not matches:
                 self._error(url, 404, {"success": False, "message": "not found"})
             product = matches[0]
+            if step == "get":
+                return _Response(200, {"success": True, "product": dict(product)})
+            if step == "delete":
+                product["deleted"] = True
+                return _Response(200, {"success": True,
+                                       "message": "The product has been deleted successfully."})
             if step == "update":
                 product.update(body)
             elif step in ("enable", "disable"):
@@ -1071,6 +1078,15 @@ class _Loopback(BaseHTTPRequestHandler):
         elif path == "/v2/products/p1/enable":
             status, out = 200, {"success": True, "product": {
                 "id": "p1", "published": True, "short_url": "https://dokaz.gumroad.com/l/x"}}
+        elif path == "/v2/products/p1" and self.command == "DELETE":
+            state["deleted"] = True
+            status, out = 200, {"success": True, "message": "deleted"}
+        elif path == "/v2/products/p1" and self.command == "GET":
+            status, out = (404, {"success": False, "message": "not found"}) \
+                if state.get("deleted") else (200, {"success": True, "product": {
+                    "id": "p1", "published": False,
+                    "files": [{"id": "f1", "name": "pionir-probe.zip"}],
+                    "covers": [{"id": "c1"}]}})
         elif path == "/v2/products/p1":
             status, out = 200, {"success": True, "product": {"id": "p1"}}
         else:
@@ -1084,7 +1100,7 @@ class _Loopback(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    do_GET = do_POST = do_PUT = _reply
+    do_GET = do_POST = do_PUT = do_DELETE = _reply
 
     def log_message(self, *_a: Any) -> None:
         pass
@@ -1133,6 +1149,171 @@ class RealOpenerTests(unittest.TestCase):
         for record in seen:
             if record["path"].startswith("/storage/"):
                 self.assertNotIn("authorization", record["headers"])
+
+
+    def test_the_upload_probe_through_the_real_opener(self) -> None:
+        seen: list[dict[str, Any]] = []
+        state: dict[str, Any] = {}
+        handler = type("Handler", (_Loopback,), {"seen": seen, "state": state})
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        lines: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            token = Path(tmp) / "gumroad-token.txt"
+            token.write_text(GUMROAD_TOKEN, encoding="utf-8")
+            adapter = ProductAdapter(ProductSettings(
+                api_url=f"http://127.0.0.1:{httpd.server_address[1]}/v2", token_file=token,
+                products_dir=Path(tmp) / "products", secrets_dir=None, ssh_dir=None))
+            code = adapter.probe_upload(say=lines.append)
+        self.assertEqual(code, 0, lines)
+        self.assertEqual([(r["method"], r["path"]) for r in seen], [
+            ("POST", "/v2/products"), ("POST", "/v2/files/presign"),
+            ("PUT", "/storage/part1"), ("POST", "/v2/files/complete"),
+            ("PUT", "/v2/products/p1"), ("POST", "/v2/direct_uploads"),
+            ("PUT", "/storage/cover"), ("POST", "/v2/products/p1/covers"),
+            ("GET", "/v2/products/p1"), ("DELETE", "/v2/products/p1"),
+            ("GET", "/v2/products/p1")])
+        self.assertIs(json.loads(seen[0]["body"])["draft"], True)
+        self.assertTrue(state["deleted"])
+        self.assertIn("Gumroad shows 1 file(s) (pionir-probe.zip); 1 cover(s)", "\n".join(lines))
+        self.assertEqual(lines[-1], "PASSED - the upload paths work; the probe draft was deleted")
+        with Image.open(io.BytesIO(state["/storage/cover"])) as cover:
+            self.assertEqual(cover.size, (1280, 720))
+        for record in seen:
+            if record["path"].startswith("/storage/"):
+                self.assertNotIn("authorization", record["headers"])
+
+
+# ---- python -m pionir gumroad-check --probe-upload -------------------------------------
+PROBE_SEQUENCE = ["create", "presign", "part", "complete", "update", "direct_upload", "blob",
+                  "covers", "get", "delete", "get"]
+
+
+class ProbeTests(_Case):
+    def probe(self) -> tuple[int, str]:
+        lines: list[str] = []
+        code = self.adapter.probe_upload(say=lines.append)
+        text = "\n".join(lines)
+        self.assertNotIn(GUMROAD_TOKEN, text)
+        self.assertNotIn("enable", self.world.steps())          # never published
+        return code, text
+
+    def test_the_happy_path_proves_every_step_and_deletes_the_draft(self) -> None:
+        code, text = self.probe()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.world.steps(), PROBE_SEQUENCE)
+        create = self.world.calls[0]["body"]
+        self.assertEqual(create["name"], "pionir upload probe - safe to delete")
+        self.assertRegex(create["custom_permalink"], r"^pionir-upload-probe-[0-9a-f]{8}$")
+        self.assertEqual(create["price"], 100)
+        self.assertIs(create["draft"], True)
+        (product,) = self.world.products
+        self.assertTrue(product["deleted"])
+        self.assertIs(product["published"], False)
+        (uploaded,) = self.world.files.values()
+        with zipfile.ZipFile(io.BytesIO(uploaded)) as archive:
+            self.assertEqual(archive.namelist(), ["README.md"])
+        (cover,) = self.world.cover_data.values()
+        self.assertEqual(products._png_size(cover), (1280, 720))
+        with Image.open(io.BytesIO(cover)) as opened:
+            self.assertEqual((opened.format, opened.size), ("PNG", (1280, 720)))
+        self.assertIn("OK      create the draft: product prod-1", text)
+        self.assertIn("published: false", text)
+        self.assertIn("Gumroad shows 1 file(s) (pionir-probe.zip); 1 cover(s)", text)
+        self.assertIn("OK      delete the draft: product prod-1 is gone", text)
+        self.assertNotIn("NOT OK", text)
+        self.assertTrue(text.endswith("PASSED - the upload paths work; the probe draft was "
+                                      "deleted"))
+
+    def test_a_failing_step_still_deletes_the_draft(self) -> None:
+        for forced, words in (
+                ("covers", (200, {"success": False, "message": "Could not process"})),
+                ("complete", (500, {"success": False})),
+                ("blob", (403, b"<Error>expired</Error>"))):
+            with self.subTest(forced):
+                self.world = FakeGumroad()
+                self.adapter._open = self.world
+                self.world.forced = {forced: words}
+                code, text = self.probe()
+                self.assertEqual(code, 1)
+                self.assertIn("NOT OK", text)
+                self.assertEqual(self.world.steps()[-2:], ["delete", "get"])
+                self.assertTrue(self.world.products[0]["deleted"])
+                self.assertIn("delete the draft: product prod-1 is gone", text)
+                self.assertTrue(text.endswith("FAILED - see the NOT OK lines above"))
+
+    def test_a_draft_that_cannot_be_deleted_is_named(self) -> None:
+        self.world.forced = {"delete": (500, {"success": False})}
+        code, text = self.probe()
+        self.assertEqual(code, 1)
+        self.assertIn("the probe draft was NOT removed: product prod-1 (permalink "
+                      "pionir-upload-probe-", text)
+        self.assertIn("delete it in the Gumroad dashboard", text)
+        self.assertFalse(self.world.products[0]["deleted"])
+
+    def test_a_create_that_comes_back_published_is_disabled_and_deleted(self) -> None:
+        self.world.publish_on_create = True
+        code, text = self.probe()
+        self.assertEqual(code, 1)
+        self.assertEqual(self.world.steps(), ["create", "disable", "delete", "get"])
+        self.assertIn("reports product prod-1 as published", text)
+        self.assertIn("OK      take it off sale: product prod-1 disabled", text)
+        product = self.world.products[0]
+        self.assertIs(product["published"], False)
+        self.assertTrue(product["deleted"])
+
+    def test_a_rejected_token_and_no_token(self) -> None:
+        self.token_file.write_text("gum" + "road-revoked-token-0000", encoding="utf-8")
+        code, text = self.probe()
+        self.assertEqual(code, 2)
+        self.assertIn(TOKEN_REJECTED, text)
+        self.assertEqual(self.world.products, [])
+        self.assertTrue(text.endswith("FAILED - nothing was created on Gumroad"))
+        self.token_file.unlink()
+        code, text = self.probe()
+        self.assertEqual(code, 1)
+        self.assertIn("setup-gumroad.ps1", text)
+
+    def test_the_command(self) -> None:
+        settings = _settings(self.root / "state", gumroad_token_file=self.token_file)
+        with mock.patch("pionir.adapters.products.product_settings",
+                        lambda _c: self.adapter.settings), \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            code = cli.gumroad_check(settings, opener=self.world, probe_upload=True)
+        self.assertEqual(code, 0, printed.getvalue())
+        self.assertIn("PASSED", printed.getvalue())
+        self.assertNotIn(GUMROAD_TOKEN, printed.getvalue())
+        self.assertEqual(self.world.steps(), PROBE_SEQUENCE)
+        with mock.patch.object(cli, "gumroad_check", return_value=0) as check:
+            self.assertEqual(cli.main(["gumroad-check", "--probe-upload"]), 0)
+        check.assert_called_once_with(probe_upload=True)
+        with mock.patch.object(cli, "gumroad_check", return_value=0) as check:
+            self.assertEqual(cli.main(["gumroad-check"]), 0)
+        check.assert_called_once_with()
+
+
+# ---- the approval summary names the product ---------------------------------------------
+class SummaryTests(_Case):
+    def test_a_parked_publish_names_the_product(self) -> None:
+        out = self.park()
+        self.assertEqual(out["summary"], "product · product.gumroad_publish — Invoice Kit 1.2.0 "
+                                         "($19.00) - invoice-kit")
+        self.assertEqual(self.app.approvals.pending()[0]["summary"], out["summary"])
+        pwyw = self.park(self.payload(pay_what_you_want=True))
+        self.assertIn("Invoice Kit 1.2.0 (pay what you want, from $19.00) - invoice-kit",
+                      pwyw["summary"])
+
+    def test_the_shape(self) -> None:
+        from pionir.server import _product_gist
+        self.assertEqual(_product_gist({"slug": "post-guard", "name": "Post Guard",
+                                        "version": "1.0.0", "price_cents": 1900}),
+                         "Post Guard 1.0.0 ($19.00) - post-guard")
+        self.assertEqual(_product_gist({"slug": "x-y", "name": "Only  A\nName"}),
+                         "Only A Name - x-y")
+        out = self.app.run_task(UNPUBLISH, {"slug": SLUG})           # no name: as before
+        self.assertEqual(out["summary"], "product · product.gumroad_unpublish")
 
 
 if __name__ == "__main__":
