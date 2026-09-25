@@ -23,6 +23,9 @@ def settings(root: str | Path, **overrides) -> CrewSettings:
     overrides.setdefault("state_dir", root / "crew")
     overrides.setdefault("gpu_lock_path", root / "resource" / "gpu.lock")
     overrides.setdefault("gpu_poll_seconds", 0.01)
+    # Never the real port: 8782 is where a running crew listens, so a test crew binding it
+    # collides with the owner's live one. 0 = any free port.
+    overrides.setdefault("api_port", 0)
     calls = overrides.pop("calls_per_hour", None)
     if calls is not None:
         overrides["budget"] = CrewBudget(calls_per_hour=calls)
