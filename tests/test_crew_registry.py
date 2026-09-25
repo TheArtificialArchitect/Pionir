@@ -21,7 +21,8 @@ class DefaultCatalogueTests(unittest.TestCase):
                                      "products.api_builder", "products.gumroad",
                                      "treasury.ledger", "watch.health"))
         live = sorted(w.worker_id for w in reg.all() if w.live)
-        self.assertEqual(live, ["posting.blog", "treasury.ledger", "watch.health"])
+        self.assertEqual(live, ["posting.blog", "posting.instagram", "treasury.ledger",
+                                "watch.health"])
 
     def test_adding_a_worker_is_adding_an_entry(self) -> None:
         cat = load_catalogue()

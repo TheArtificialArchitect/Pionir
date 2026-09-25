@@ -29,6 +29,11 @@ The rules, one function each:
                   revenue" / "we made", no counts of customers or users, no money amounts
 - ``_internal``   none of the owner's internal systems is named in public text
 
+``check_social(post)`` runs the same crew's rules on an Instagram post (no Markdown, no links
+at all, a Title-Case headline on a card): Pionir's ``social.post.check_post`` first, then
+``_no_links``, ``_personal``, the names rule, ``_business`` and ``_internal`` on the headline,
+each point and the caption, and ``_hashtag_words`` on the hashtags.
+
 Deterministic and model-free: nothing here imports a model or touches a network. It does run
 Pionir's own publish validator (`adapters.content.check_draft`) first, so this check can never
 pass a draft that Pionir would then refuse: three separately-written validators drifting apart is
@@ -45,6 +50,8 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from pionir.adapters.content import check_draft, reserved_email
+from pionir.social.card import CardTooLong, layout
+from pionir.social.post import check_post
 
 ALLOWLIST_PATH = Path(__file__).with_name("content_allowlist.json")
 
@@ -489,7 +496,8 @@ def _initial(line: str, start: int) -> bool:
 
 
 def unknown_names(texts: list, allow: frozenset | None = None,
-                  openers: frozenset | None = None) -> list:
+                  openers: frozenset | None = None, *,
+                  headings: frozenset = frozenset({"title"})) -> list:
     """Capitalised words and phrases the allowlist does not vouch for, in order.
 
     Mid-sentence, only the allowlist vouches. A word that opens a sentence (or a heading,
@@ -501,7 +509,8 @@ def unknown_names(texts: list, allow: frozenset | None = None,
     writes them in Title Case ("A Practical Guide"), where capitals carry no signal. There
     EVERY word may be vouched for by the post using it in lower case elsewhere - which an
     invented name ("Acme Corp") never is. Known gap, unchanged: a name that is also an
-    ordinary word the post uses ("Mark")."""
+    ordinary word the post uses ("Mark"). ``headings`` names the fields written in Title
+    Case (the blog's title; a social card's headline)."""
     allow = load_allowlist() if allow is None else allow
     openers = load_openers() if openers is None else openers
     lower_words = {t.lower() for _f, text in texts for t in _TOKEN.findall(text)
@@ -509,7 +518,7 @@ def unknown_names(texts: list, allow: frozenset | None = None,
     found: list = []
     for field, text in texts:
         for line, code in _segments(text):
-            heading = not code and (field == "title" or _HEADING.match(line) is not None)
+            heading = not code and (field in headings or _HEADING.match(line) is not None)
             toks = [(m.group(0), m.start()) for m in _TOKEN.finditer(line)]
             i = 0
             while i < len(toks):
@@ -573,14 +582,19 @@ _COMPANY = re.compile(r"\b((?:[A-Z][\w&'\u2019-]*\s+){0,3}[A-Z][\w&'\u2019-]*)\s
 
 
 def _names(draft: dict) -> list:
+    return _names_in(_prose(draft))
+
+
+def _names_in(prose: list, headings: frozenset = frozenset({"title"})) -> list:
+    """The names rule on (field, text) pairs whose URLs are already blanked."""
     reasons, seen = [], set()
-    for _field, text in _prose(draft):
+    for _field, text in prose:
         for m in _COMPANY.finditer(text):
             if m.group(0).lower() not in seen:
                 seen.add(m.group(0).lower())
                 reasons.append(f"names the company {m.group(0)!r} (a person, place or company "
                                "blocks the post)")
-    for name in unknown_names(_prose(draft)):
+    for name in unknown_names(prose, headings=headings):
         if name.lower() in seen:
             continue
         seen.add(name.lower())
@@ -616,7 +630,7 @@ _MONEY = re.compile(r"(?i)[$\u20ac\u00a3\u00a5]\s?\d|\b\d[\d,.]*\s?(?:k\s)?(?:us
                     r"dollars?|euros?|pounds?|bucks)\b")
 
 
-def _business(texts: list) -> list:
+def _business(texts: list, who: str = "the blog") -> list:
     reasons = []
     for field, text in texts:
         if field in ("slug", "draft_id"):
@@ -633,9 +647,9 @@ def _business(texts: list) -> list:
             elif _COUNT_OF.search(s):
                 why = "a count of customers or users"
             elif _MONEY.search(s):
-                why = "a money amount (the blog has no source for any price or sum)"
+                why = f"a money amount ({who} has no source for any price or sum)"
             if why:
-                reasons.append(f"{field} states {why}: {_snip(s)!r}; the blog must not state "
+                reasons.append(f"{field} states {why}: {_snip(s)!r}; {who} must not state "
                                "business numbers")
     return reasons
 
@@ -686,3 +700,135 @@ def check(draft) -> list:
             seen.add(r)
             out.append(r)
     return out
+
+
+# ---- social posts ------------------------------------------------------------------------------
+#
+# An Instagram post is not a blog post: no Markdown, no links at all (a caption cannot link;
+# the bio does), a Title-Case headline on a card, short points, a caption and lower-case
+# hashtags. Pionir's own post check (pionir.social.post.check_post) runs first - the same
+# function the adapter runs before parking and before publishing, so the crew can never pass
+# a post Pionir would refuse - and then the crew's rules above run on each piece of text.
+
+SOCIAL_WHO = "a social post"
+# Hashtag words the dictionary lacks. Lower case only, and only ever read inside a hashtag:
+# none of them may be written with a capital anywhere ("Dev" is also a first name).
+HASHTAG_WORDS = frozenset({"dev", "devs", "saas", "nocode", "lowcode", "fintech", "martech",
+                           "indie", "js"})
+
+
+def _social_texts(post: dict) -> list:
+    """(field, text) for every piece of text that would appear on the card or the caption."""
+    out = []
+    if isinstance(post.get("headline"), str):
+        out.append(("headline", post["headline"]))
+    points = post.get("points")
+    if isinstance(points, list):
+        out += [(f"points[{i}]", p) for i, p in enumerate(points) if isinstance(p, str)]
+    if isinstance(post.get("caption"), str):
+        out.append(("caption", post["caption"]))
+    return out
+
+
+def _no_links(texts: list) -> list:
+    """A social post links to nothing, not even a Dokaz page: the bio link does that."""
+    reasons = []
+    for field, text in texts:
+        found = links_in(text) + [m.group(0) for m in _WWW.finditer(text)]
+        found += [m.group(1) for m in _BARE_DOMAIN.finditer(_URL.sub(" ", text))]
+        for target in dict.fromkeys(found):
+            reasons.append(f"{field} has a link, URL or domain ({_snip(target, 40)!r}); a "
+                           "social post links to nothing, the bio link does that")
+    return reasons
+
+
+def _hashtag_words(tags: list) -> list:
+    """A hashtag is lower case, so the names rule cannot see it: "#janedoe" or "#seattle"
+    would pass it. Instead every hashtag must break into ordinary dictionary words or names
+    on the allowlist ("emaildeliverability" = email + deliverability); one that does not is
+    named and blocks. Fail closed: a word the dictionary does not know blocks the tag."""
+    common, _proper = _dictionary()
+    allowed = {re.sub(r"[^a-z0-9]", "", n) for n in load_allowlist()} | HASHTAG_WORDS
+    internal = {n.lower() for n in INTERNAL_NAMES}
+
+    def word(piece: str) -> bool:
+        if piece in internal:
+            return False
+        return piece in allowed or (len(piece) > 1 and piece.isalpha() and piece in common)
+
+    def splits(s: str) -> bool:
+        ok = [True] + [False] * len(s)
+        for end in range(1, len(s) + 1):
+            ok[end] = any(ok[start] and word(s[start:end])
+                          for start in range(max(0, end - 30), end))
+        return ok[-1]
+
+    reasons = []
+    for tag in tags:
+        pieces = [p for p in tag.split("_") if p]
+        if not pieces or not all(splits(p) for p in pieces):
+            reasons.append(f"hashtag {_snip(tag, 40)!r} is not made of ordinary words or "
+                           "allowlisted names (a person, place or company blocks the post)")
+    return reasons
+
+
+def _card_fits(post: dict) -> list:
+    """The crew's own statement of the fit rule, so a card that cannot hold the text is
+    named as such even when Pionir's check stopped at an earlier field."""
+    headline, points = post.get("headline"), post.get("points")
+    if not isinstance(headline, str) or not isinstance(points, list) \
+            or not all(isinstance(p, str) for p in points):
+        return []
+    try:
+        layout(headline.strip(), [p.strip() for p in points])
+    except CardTooLong as exc:
+        return [f"card: {exc}"]
+    return []
+
+
+def check_social(post) -> list:
+    """Every reason this social post may not go out, in words. Empty means it passed.
+
+    ``post`` is the exact payload that would be submitted: draft_id, headline, points,
+    caption, hashtags and card_sha. Pionir's post check runs first; then the crew's rules -
+    the card fits, no links, personal data, names (with the dictionary; the headline is
+    Title Case), business figures, internal system names - on the headline, each point and
+    the caption, and the names and internal-name rules on the hashtags. The crew also
+    requires ``card_sha``: the approval must pin the exact image the owner is shown.
+
+    Fail closed: a post that is not an object, or a rule that cannot run, blocks."""
+    if not isinstance(post, dict):
+        return [f"the post is {type(post).__name__}, not an object"]
+    reasons: list = []
+    try:
+        check_post(post)
+    except ValueError as exc:
+        reasons.append(f"Pionir's post check refuses it: {exc}")
+    except Exception as exc:  # noqa: BLE001 - its check failing is a block, never a pass
+        reasons.append(f"Pionir's post check could not run: {type(exc).__name__}: {exc}")
+    if "card_sha" not in post:
+        reasons.append("card_sha is missing: the post must pin the exact card the owner "
+                       "approves")
+    texts = _social_texts(post)
+    tags = post.get("hashtags")
+    tags = [t for t in tags if isinstance(t, str)] if isinstance(tags, list) else []
+    tag_text = [("hashtags", " ".join(tags))] if tags else []
+    did = post.get("draft_id")
+    id_text = [("draft_id", did)] if isinstance(did, str) else []
+    rules = (
+        lambda: _card_fits(post),
+        lambda: _markup(texts),
+        lambda: _no_links(texts),
+        lambda: _personal(texts),
+        lambda: _names_in([(k, _URL.sub(" ", t)) for k, t in texts],
+                          headings=frozenset({"headline"})),
+        lambda: _hashtag_words(tags),
+        lambda: _business(texts, who=SOCIAL_WHO),
+        lambda: _internal(texts + tag_text + id_text),
+    )
+    for rule in rules:
+        try:
+            reasons += rule()
+        except Exception as exc:  # noqa: BLE001 - a rule that cannot run is a block
+            reasons.append(f"the content check could not run: {type(exc).__name__}: {exc}")
+    return list(dict.fromkeys(reasons))
