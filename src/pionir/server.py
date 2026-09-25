@@ -633,6 +633,9 @@ class PionirApp:
         _agent, cap = self._cap_and_agent(capability)
         if cap is None:
             return False   # unknown capability: let execute() report it as it always has
+        if cap.spends_money:
+            # money never moves without a human yes - holding the permission is not enough
+            return True
         return (cap.risk is RiskLevel.PRIVILEGED
                 and not set(cap.required_permissions).issubset(set(granted)))
 
@@ -1104,10 +1107,20 @@ def serve(
     httpd = ThreadingHTTPServer(("127.0.0.1", port), _make_handler(app, bind_host="127.0.0.1"))
     url = f"http://127.0.0.1:{port}/"
     pulse_thread, pulse_stop = _start_pulse(app)
+    # Every parked action is also posted to Discord for Ian's yes/no. It runs inside this
+    # process and stops with it; unconfigured, it stays off and says why (the phone still works).
+    from .discord_gate import DiscordGate, DiscordGateSettings
+    gate = DiscordGate.for_app(app, DiscordGateSettings.from_environment(runtime.settings.state_root))
+    gate_on = gate.start()
     print("  PIONIR")
     print(f"  the brain is visible at {url}")
     if pulse_thread is not None:
         print("  Bryo's pulse is beating (Pionir's state written where he can feel it).")
+    if gate_on:
+        print("  approvals are posted to Discord - only your reaction counts.")
+    else:
+        print(f"  Discord approvals are off ({gate.state().get('reason') or 'not configured'}); "
+              "the phone still approves.")
     print("  awake while this window is open; Ctrl+C stops it.")
     if open_browser:
         threading.Thread(target=lambda: webbrowser.open(url), daemon=True).start()
@@ -1116,6 +1129,7 @@ def serve(
     except KeyboardInterrupt:
         print("\nstopping.")
     finally:
+        gate.stop()
         pulse_stop.set()
         httpd.shutdown()
         httpd.server_close()

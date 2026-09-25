@@ -84,10 +84,24 @@ class Capability:
     or tie a classification it should never take part in (it tied at 0.50 in a
     fresh route-check). Non-routable capabilities are excluded from classification
     and from route-check's probe set; they still resolve and execute by name."""
+    spends_money: bool = False
+    """This capability spends real money (a purchase, a paid API credit, an ad).
+
+    Ian's rule, 2026-09-25: "Moss is not allowed to spend any actual money without
+    asking." That has to be structural, not a convention a future capability can
+    forget. A capability that spends money must be PRIVILEGED (enforced below, at
+    definition), and PionirApp parks it for approval on EVERY call - even when the
+    caller already holds its permission, which is otherwise how an action skips
+    the gate. So no path exists by which money moves without a human yes."""
 
     def __post_init__(self) -> None:
         if not self.name or any(char.isspace() for char in self.name):
             raise ValueError("capability names must be non-empty and contain no whitespace")
+        if self.spends_money and self.risk is not RiskLevel.PRIVILEGED:
+            raise ValueError(
+                f"{self.name} spends money, so it must be RiskLevel.PRIVILEGED - "
+                "money never moves without an approval"
+            )
         if any(not hint or any(char.isspace() for char in hint) for hint in self.routing_hints):
             raise ValueError("routing hints must be non-empty single words")
 
