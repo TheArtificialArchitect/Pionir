@@ -47,9 +47,10 @@
       "id": "posting",
       "title": "Posting",
       "leader_cadence_seconds": 21600,
-      "leader_notes": "Two workers post: posting.blog (blog posts on the website) and posting.instagram (Instagram card posts). Each row names its worker; report the two separately. Each worker's post.tally holds its counts: drafts written, drafts blocked, posts submitted for approval, posts pending approval, posts published, posts denied. A post PENDING APPROVAL has NOT been published: say it is waiting for the owner's approval, never that it is out. Only a post.published row is a published post; give its URL for the blog, its permalink for Instagram. A post.blocked row is a draft the content check stopped before anyone saw it: say so and give its reasons by kind (a name not on the allowlist, a link or domain, personal data, a business number, an internal system name, text that does not fit the Instagram card) without repeating any name the reasons quote. A post.not_published row says why a submitted post did not go out (denied by the owner, failed, or done without a URL or permalink).",
-      "brief_quota": {"post.tally": 4, "post.blocked": 6, "post.pending_approval": 6,
-                      "post.published": 6, "post.not_published": 6},
+      "leader_notes": "Three workers post: posting.blog (blog posts on the website), posting.instagram (Instagram card posts) and posting.devto (each published blog post cross-posted to dev.to, unchanged). Each row names its worker; report them separately. Each worker's post.tally holds its counts: drafts written, drafts blocked, posts submitted for approval, posts pending approval, posts published, posts denied (for posting.devto: cross-posts, and published blog posts waiting to be cross-posted). A post PENDING APPROVAL has NOT been published: say it is waiting for the owner's approval, never that it is out. Only a post.published row is a published post; give its URL for the blog and dev.to, its permalink for Instagram. A post.blocked row is a draft the content check stopped before anyone saw it: say so and give its reasons by kind (a name not on the allowlist, a link or domain, personal data, a business number, an internal system name, text that does not fit the Instagram card) without repeating any name the reasons quote. A post.not_published row says why a submitted post did not go out (denied by the owner, failed, or done without a URL or permalink). posting.results reads the site's own visit counter for the last 30 days: traffic.working is the plain summary (read it first), traffic.site the site and each channel (blog links, instagram bio, dev.to, search), traffic.posts each published post by its slug (page views, clicks to product pages, dev.to visits, sales), traffic.sales sales and net revenue per campaign. Use these figures to suggest which topics to do more of, naming each post by its slug with its figures as recorded. Say what the numbers show, never why: one post doing well is not proof that its topic caused it, so never claim cause from one data point. A post with fewer than 20 page views is too early to tell: say so, and draw nothing from it. A figure marked 'at least' is a lower bound, and a post listed as unknown has no number: never write it as zero. When traffic.working says there is no traffic data yet, say exactly that and suggest nothing about topics.",
+      "brief_quota": {"post.tally": 6, "post.blocked": 5, "post.pending_approval": 5,
+                      "post.published": 6, "post.not_published": 5, "traffic.working": 1,
+                      "traffic.site": 1, "traffic.posts": 1, "traffic.sales": 1},
       "workers": [
         {"name": "blog", "impl": "blog_writer", "kind": "post", "cadence_seconds": 21600,
          "provider": "none", "entities": ["Blog"],
@@ -58,7 +59,16 @@
         {"name": "instagram", "impl": "instagram_writer", "kind": "post", "cadence_seconds": 21600,
          "provider": "none", "entities": ["Instagram"],
          "note": "one checked Instagram card post a day, each submitted for the owner's approval",
-         "params": {"draft_every_seconds": 86400}}
+         "params": {"draft_every_seconds": 86400}},
+        {"name": "devto", "impl": "devto_crossposter", "kind": "post", "cadence_seconds": 21600,
+         "provider": "none", "entities": ["Blog"],
+         "note": "each published blog post cross-posted to dev.to once, checked, for the owner's approval",
+         "params": {"blog_worker": "posting.blog"}},
+        {"name": "results", "impl": "traffic_reader", "kind": "traffic", "cadence_seconds": 21600,
+         "provider": "dokaz", "entities": ["Blog", "Instagram"],
+         "note": "what the posts did: the site's page views, clicks and sales by post and channel, last 30 days",
+         "params": {"url": "https://api.dokaz.net/dash/api.json",
+                    "token_file": "scrooge-read-token.txt", "blog_worker": "posting.blog"}}
       ]
     },
     {
