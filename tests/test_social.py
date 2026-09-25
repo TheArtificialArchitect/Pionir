@@ -93,6 +93,17 @@ class PostCheckTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             check_post(post(caption=GOOD["caption"] + " Try it with user@example.com first."))
 
+    def test_card_sha_pins_the_image(self) -> None:
+        sha = card_sha(GOOD["headline"], GOOD["points"])
+        self.assertEqual(check_post(post(card_sha=sha))["card_sha"], sha)
+        with self.assertRaises(ValueError):
+            check_post(post(card_sha="0" * 64))
+        with self.assertRaises(ValueError):
+            check_post(post(card_sha=sha, headline=GOOD["headline"] + " now"))
+        with self.assertRaises(ValueError):
+            check_post(post(card_sha="not-a-sha"))
+        self.assertNotIn("card_sha", check_post(post()))
+
     def test_full_caption_appends_hashtags(self) -> None:
         self.assertEqual(full_caption("Hello there.", ["a1", "b_2"]), "Hello there.\n\n#a1 #b_2")
         self.assertEqual(full_caption("Hello there.", []), "Hello there.")

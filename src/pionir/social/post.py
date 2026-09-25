@@ -14,9 +14,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from pionir.adapters.content import _contact_problem, _scrooge_problem
-from pionir.social.card import CardTooLong, layout
+from pionir.social.card import CardTooLong, card_sha, layout
 
-POST_FIELDS = frozenset({"draft_id", "headline", "points", "caption", "hashtags"})
+POST_FIELDS = frozenset({"draft_id", "headline", "points", "caption", "hashtags", "card_sha"})
+_SHA = re.compile(r"[0-9a-f]{64}")
 _DRAFT_ID = re.compile(r"[a-z0-9-]{1,64}")
 _HASHTAG = re.compile(r"[a-z0-9_]{2,30}")
 HEADLINE = (10, 90)
@@ -108,5 +109,16 @@ def check_post(payload: Mapping[str, Any]) -> dict[str, Any]:
         layout(headline, points)
     except CardTooLong as exc:
         raise ValueError(f"card: {exc}") from exc
-    return {"draft_id": draft_id, "headline": headline, "points": points,
-            "caption": caption, "hashtags": list(hashtags)}
+    out = {"draft_id": draft_id, "headline": headline, "points": points,
+           "caption": caption, "hashtags": list(hashtags)}
+    # card_sha pins the image: the approval payload names the exact JPEG the owner was shown,
+    # and a renderer that has changed since (a different CARD_VERSION, a font update) makes
+    # the post refuse rather than publish a picture he never saw.
+    pinned = payload.get("card_sha")
+    if pinned is not None:
+        if not isinstance(pinned, str) or not _SHA.fullmatch(pinned):
+            raise ValueError("card_sha: 64 lower-case hex characters")
+        if card_sha(headline, points) != pinned:
+            raise ValueError("card_sha: the card would render differently from the one checked")
+        out["card_sha"] = pinned
+    return out
