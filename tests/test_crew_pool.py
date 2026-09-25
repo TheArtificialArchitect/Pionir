@@ -53,22 +53,27 @@ class ConcurrencyTests(_Case):
         self.assertTrue(all(d < 0.1 for d in fast), fast)   # another host is not held up
 
     def test_the_gate_reserves_before_it_sleeps(self) -> None:
-        gate = ProviderGate({"h": 0.1})
-        starts: list = []
+        # Checks the slots the gate hands out, not wall-clock wake-ups: timestamping after the
+        # sleep measured the OS scheduler too, and a thread woken late made a correct gate
+        # look wrong (a 78 ms gap on a loaded Windows box). The clock stands still, so every
+        # thread asks at the same instant; each must still get its own slot, 0.1 apart - which
+        # holds only if the slot is reserved before the sleep.
+        gate = ProviderGate({"h": 0.1}, clock=lambda: 100.0,
+                            sleep=lambda _s: time.sleep(0.01))   # let the threads interleave
+        waits: list = []
         lock = threading.Lock()
 
         def go():
-            gate.wait_turn("h")
+            waited = gate.wait_turn("h")
             with lock:
-                starts.append(time.monotonic())
+                waits.append(round(waited, 6))
 
         threads = [threading.Thread(target=go) for _ in range(5)]
         for t in threads:
             t.start()
         for t in threads:
             t.join(5)
-        starts.sort()
-        self.assertTrue(all(b - a >= 0.09 for a, b in pairwise(starts)), starts)
+        self.assertEqual(sorted(waits), [0.0, 0.1, 0.2, 0.3, 0.4])
 
     def test_a_worker_is_never_run_twice_at_once(self) -> None:
         crew = self.crew({"alpha": [{"name": "slow", "params": {"sleep": 0.3}}]})
