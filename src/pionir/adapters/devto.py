@@ -76,6 +76,9 @@ _log = logging.getLogger(__name__)
 CROSSPOST = "content.crosspost_devto"
 DEFAULT_DEVTO_URL = "https://dev.to/api"
 FOREM_ACCEPT = "application/vnd.forem.api-v1+json"
+# Contains "bot", so Scrooge's traffic counter (CRAWLER = /bot|crawl|spider|slurp|preview/i)
+# never counts the liveness check as a visitor.
+LIVENESS_AGENT = "PionirBot/0.1 (liveness check before a dev.to cross-post; not a visitor)"
 MAX_RESPONSE_BYTES = 1_000_000
 SETUP_HINT = r"run tools\setup-devto.ps1"
 KEY_REJECTED = f"the dev.to API key was rejected - {SETUP_HINT}"
@@ -366,8 +369,10 @@ class DevtoAdapter:
                            url=done.get("url"), id=done.get("id"))
 
         slug = urllib.parse.quote(article["slug"], safe="")
+        # "bot" in the agent: Scrooge's traffic counter skips it, so this liveness check is
+        # never counted as a visitor (it was, in the end-to-end run: 8 views for 7 visits)
         status, _ = self._http("GET", f"{self._blog}/blog/{slug}", None,
-                               {"Accept": "text/html"})
+                               {"Accept": "text/html", "User-Agent": LIVENESS_AGENT})
         if status != 200:
             said = f"HTTP {status}" if status else "no answer"
             raise _refused(f"{NOT_LIVE} ({self._blog}/blog/{article['slug']}: {said})",

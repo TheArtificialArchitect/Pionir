@@ -158,6 +158,7 @@ class FakeWorld:
             "step": step, "method": method, "url": url, "body": body, "timeout": timeout,
             "key": request.get_header("Api-key"), "accept": request.get_header("Accept"),
             "content_type": request.get_header("Content-type"),
+            "agent": request.get_header("User-agent"),
         })
         if parts.netloc in self.down:
             raise urllib.error.URLError(f"connection refused: {url} key={KEY}")
@@ -440,6 +441,14 @@ class CanonicalTests(_Case):
 
 
 class LiveCheckTests(_Case):
+    def test_the_liveness_check_is_not_counted_as_a_visitor(self) -> None:
+        # Scrooge's traffic counter skips any agent matching its CRAWLER pattern; the
+        # end-to-end run showed the check counted as a view without it (8 for 7 visits)
+        import re
+        self.execute()
+        (live,) = [c for c in self.world.calls if c["step"] == "live"]
+        self.assertRegex(live["agent"], re.compile(r"bot|crawl|spider|slurp|preview", re.IGNORECASE))
+
     def test_an_original_that_is_not_live_is_refused_and_dev_to_never_called(self) -> None:
         self.world.live = set()
         out = self.execute()
