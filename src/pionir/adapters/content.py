@@ -99,6 +99,17 @@ _PHONES_STRICT = (
     re.compile(r"(?<![\d.])1?[2-9]\d{9}(?![\d.])"),
 )
 
+# RFC 2606 / 6761 reserve example.com, example.org, example.net and the .example TLD for
+# documentation: an address there can never reach a person, so it is not personal data. A
+# post about checking email addresses needs to show one; every other address still blocks.
+# Mirrored in Pionir (adapters/content.py) and Scrooge (worker/src/blog.ts).
+_RESERVED_MAIL = re.compile(r"(?i)@(?:[a-z0-9-]+\.)*(?:example\.(?:com|org|net)|[a-z0-9-]+\.example)$")
+
+
+def reserved_email(address: str) -> bool:
+    return _RESERVED_MAIL.search(address) is not None
+
+
 READ_TIMEOUT_SECONDS = 30
 
 
@@ -135,8 +146,8 @@ def _link_problem(url: str) -> str | None:
 def _contact_problem(text: str) -> str | None:
     """No email address, phone number or IP address anywhere in published text. The
     match itself is not echoed: it may be someone's contact details."""
-    if _EMAIL.search(text):
-        return "no email addresses are allowed"
+    if any(not reserved_email(m.group(0)) for m in _EMAIL.finditer(text)):
+        return "no email addresses are allowed (except at example.com, .org, .net)"
     if _IPV4.search(text) or any(_is_ipv6(m.group(0)) for m in _IPV6_CANDIDATE.finditer(text)):
         return "no IP addresses are allowed"
     if _PHONE.search(text):

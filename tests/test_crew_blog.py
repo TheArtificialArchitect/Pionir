@@ -287,6 +287,26 @@ class TopicAndSlugTests(_Case):
         topics = [p["topic"] for p in self.record()["posts"]]
         self.assertEqual(len(set(topics)), 3, topics)
 
+    def test_a_blocked_day_does_not_use_up_the_topic(self) -> None:
+        # the first real run blocked a topic and moved on: 14 seeds would be gone in a
+        # fortnight with nothing published
+        brain = FakeBrain(bad(), bad(), good())
+        self.run_at(T0, brain)
+        self.assertEqual(self.record()["used_topics"], [])
+        self.run_at(T0 + DAY, brain)
+        self.assertIn(SEEDS[0].subject, brain.calls[0]["user"])
+        self.assertIn(SEEDS[0].subject, brain.calls[2]["user"])      # retried, then passed
+        self.assertEqual(self.record()["used_topics"], [SEEDS[0].key])
+
+    def test_a_topic_blocked_on_three_days_is_retired(self) -> None:
+        from pionir.crew.blog import MAX_TOPIC_BLOCKS
+        brain = FakeBrain(*[bad()] * (2 * MAX_TOPIC_BLOCKS))
+        for day in range(MAX_TOPIC_BLOCKS):
+            if day:
+                self.assertEqual(self.record()["used_topics"], [], day)
+            self.run_at(T0 + day * DAY, brain)
+        self.assertEqual(self.record()["used_topics"], [SEEDS[0].key])
+
     def test_the_divisions_goal_steers_the_topic(self) -> None:
         brain = FakeBrain()
         self.run_at(T0, brain, goal="more search traffic to the QR code pages")

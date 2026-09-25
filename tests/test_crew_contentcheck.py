@@ -88,6 +88,73 @@ class RenderableTests(unittest.TestCase):
         self.assertEqual(cc.check(with_body("```\n# a shell comment\n| pipe\n```")), [])
 
 
+class TitleCaseTests(unittest.TestCase):
+    """The first real run: gemma3:12b wrote Title Case headings, and every draft was blocked
+    on 'Practical Guide', 'Problem', 'Traditionally' - a check that blocks everything is a
+    worker that never posts. Headings may now be vouched for by the post's own lower-case
+    words; invented names still block."""
+
+    def test_title_case_heading_of_words_the_post_uses_passes(self) -> None:
+        self.assertEqual(cc.check(with_body(
+            "## A Practical Guide To The Problem\n\nThis practical guide covers the problem "
+            "and a guide to it.")), [])
+
+    def test_an_invented_company_in_a_heading_still_blocks(self) -> None:
+        reasons = cc.check(with_body("## Invoices For Acme Corp\n\nMaking invoices for a "
+                                     "company is simple."))
+        self.assertTrue(any("Acme" in r for r in reasons), reasons)
+
+    def test_a_sentence_opening_adverb_passes_and_a_name_does_not(self) -> None:
+        self.assertEqual(cc.check(with_body("Traditionally, this was slow.")), [])
+        for name in ("Kimberly", "Emily", "Beverly"):
+            with self.subTest(name):
+                reasons = cc.check(with_body(f"{name} said this was slow."))
+                self.assertTrue(any(name in r for r in reasons), reasons)
+
+    def test_mid_sentence_capitals_are_not_vouched_by_lower_case_use(self) -> None:
+        # the heading exception must not leak into prose: an unknown name stays a name even
+        # when the post happens to use the same letters in lower case
+        reasons = cc.check(with_body("We asked Milica about it. Then milica again."))
+        self.assertTrue(any("Milica" in r for r in reasons), reasons)
+
+
+class DictionaryTests(unittest.TestCase):
+    """Hunspell en_US tells an ordinary word with a capital from a proper noun."""
+
+    def test_capitalised_ordinary_words_pass(self) -> None:
+        self.assertEqual(cc.check(with_body(
+            "- **Implement** rate limiting.\n- **Monitor** results.\n\n"
+            "**Reduced Complexity:** fewer moving parts. Verification Helps. "
+            "Real-time Checks matter.")), [])
+
+    def test_title_case_compounds_pass_but_a_leading_name_blocks(self) -> None:
+        self.assertEqual(cc.check(with_body("Use Opt-In Forms and Real-Time Checks.")), [])
+        reasons = cc.check(with_body("It was Kimberly-Jones who asked."))
+        self.assertTrue(any("Kimberly" in r for r in reasons), reasons)
+
+    def test_proper_nouns_and_unknown_words_block(self) -> None:
+        for name in ("Seattle", "Target", "Mark", "Kimberly", "Verizon", "Milica"):
+            with self.subTest(name):
+                reasons = cc.check(with_body(f"It was tried by {name} last week."))
+                self.assertTrue(any(name in r for r in reasons), reasons)
+
+    def test_an_unlisted_acronym_blocks(self) -> None:
+        reasons = cc.check(with_body("The DEA list helps."))
+        self.assertTrue(any("DEA" in r for r in reasons), reasons)
+
+    def test_a_company_of_ordinary_words_blocks(self) -> None:
+        for company in ("Acme Corp", "Blue Sky Ltd", "Bright Labs"):
+            with self.subTest(company):
+                reasons = cc.check(with_body(f"Invoices for {company} are simple."))
+                self.assertTrue(any("company" in r for r in reasons), reasons)
+
+    def test_the_dictionary_loads_and_splits(self) -> None:
+        common, proper = cc._dictionary()
+        self.assertGreater(len(common), 90_000)
+        self.assertIn("Seattle", proper)
+        self.assertIn("verification", common)
+
+
 class PionirAgreementTests(unittest.TestCase):
     """The crew check runs Pionir's publish validator first: never pass a draft Pionir refuses
     (and so never park one for the owner that Scrooge would then bounce)."""
@@ -213,7 +280,15 @@ class PersonalDataTests(unittest.TestCase):
         self.assertTrue(any(needle in r for r in reasons), (extra, reasons))
 
     def test_an_email_address_blocks(self) -> None:
-        self.assertBlocked("Write to someone at jane.doe@example.org for help.", "email address")
+        self.assertBlocked("Write to someone at jane.doe@mailbox.org for help.", "email address")
+
+    def test_a_reserved_documentation_address_passes_and_lookalikes_block(self) -> None:
+        # RFC 2606: example.com/.org/.net reach nobody; the model writes them in every
+        # email-topic post. The same rule is in Pionir and Scrooge.
+        self.assertEqual(cc.check(with_body("Send a test to user@example.com first.")), [])
+        for addr in ("x@example.co", "x@example.com.evil.io", "x@notexample.com"):
+            with self.subTest(addr):
+                self.assertBlocked(f"Send a test to {addr} first.", "email address")
 
     def test_an_at_handle_blocks(self) -> None:
         self.assertBlocked("Say hi to @janedoe about it.", "@-handle")

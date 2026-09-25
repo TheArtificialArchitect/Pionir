@@ -305,12 +305,12 @@ class LocalValidationTests(_Case):
         "reference link": {"body_md": BODY + "\n\n[ref]: https://evil.example.com"},
         "bare www": {"body_md": BODY + "\nor www.example.com today"},
         "mailto": {"body_md": BODY + "\n[mail](mailto:someone@example.com)"},
-        "email": {"body_md": BODY + "\nWrite to ian@example.com with questions."},
+        "email": {"body_md": BODY + "\nWrite to ian@fastmail.net with questions."},
         "phone": {"body_md": BODY + "\nCall (555) 123-4567 any time."},
         "intl phone": {"body_md": BODY + "\nCall +44 20 7946 0958 any time."},
         "ipv4": {"body_md": BODY + "\nThe box is at 192.168.1.20 on the LAN."},
         "ipv6": {"body_md": BODY + "\nThe box is at fe80::1ff:fe23:4567:890a here."},
-        "email in title": {"title": "Mail ian@example.com today"},
+        "email in title": {"title": "Mail ian@fastmail.net today"},
         "phone in description": {"description": "Call 555-123-4567 to hear about "
                                                 "the bounded digest design and more."},
         "html in title": {"title": "A <i>bounded</i> digest"},
@@ -373,7 +373,7 @@ class LocalValidationTests(_Case):
     def test_the_refusal_names_the_field(self) -> None:
         with self.assertRaisesRegex(AdapterProtocolError, r"body_md: no email addresses"):
             self.adapter.validate(Task("content.publish",
-                                       draft(body_md=BODY + "\nian@example.com")))
+                                       draft(body_md=BODY + "\nian@fastmail.net")))
 
     def test_ordinary_prose_is_not_mistaken_for_contact_details(self) -> None:
         body = BODY + ("\nOn 2026-09-25 at 12:30:45 we shipped v1.2.3; it took 2019-2021 "
@@ -406,6 +406,12 @@ class ScroogeMirrorTests(unittest.TestCase):
                 check_draft(draft(body_md=body))
         with self.assertRaises(ValueError):
             check_draft(draft(title="Two lines\nof a title here"))
+
+    def test_reserved_documentation_addresses_pass(self) -> None:
+        check_draft(draft(body_md=BODY + " Send a test to user@example.com first."))
+        for addr in ("x@example.co", "x@example.com.evil.io", "x@notexample.com"):
+            with self.subTest(addr), self.assertRaises(ValueError):
+                check_draft(draft(body_md=BODY + f" Send a test to {addr} first."))
 
     def test_ordinary_prose_still_passes(self) -> None:
         check_draft(draft(body_md=BODY + "\n\nOn 2026-09-25 at 14:30, over 10,000 ran."))

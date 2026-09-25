@@ -36,6 +36,7 @@ exactly how a shared vocabulary fails (HEAD 3.8).
 """
 from __future__ import annotations
 
+import gzip
 import ipaddress
 import json
 import re
@@ -43,7 +44,7 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from pionir.adapters.content import check_draft
+from pionir.adapters.content import check_draft, reserved_email
 
 ALLOWLIST_PATH = Path(__file__).with_name("content_allowlist.json")
 
@@ -362,7 +363,8 @@ def _personal(texts: list) -> list:
     reasons = []
     for field, text in texts:
         for m in _EMAIL.finditer(text):
-            reasons.append(f"{field} has an email address ({m.group(0)!r})")
+            if not reserved_email(m.group(0)):
+                reasons.append(f"{field} has an email address ({m.group(0)!r})")
         for m in _HANDLE.finditer(_EMAIL.sub(" ", text)):
             reasons.append(f"{field} has an @-handle ({m.group(0)!r})")
         if _OBFUSCATED_AT.search(text):
@@ -412,6 +414,46 @@ def _segments(body: str) -> list:
     return out
 
 
+WORDS_PATH = Path(__file__).with_name("words_en.txt.gz")
+
+
+@lru_cache(maxsize=1)
+def _dictionary() -> tuple:
+    """(common, proper): every surface form of Hunspell en_US, split by how the dictionary
+    enters it - common words in lower case, proper nouns (names, places, companies)
+    capitalised. Built by tools/build_wordlist.py; licence in words_en.LICENSE."""
+    text = gzip.decompress(WORDS_PATH.read_bytes()).decode("utf-8")
+    common, _, proper = text.partition("# proper\n")
+    return (frozenset(common.split("\n")[1:]) - {""}, frozenset(proper.split("\n")) - {""})
+
+
+def _ordinary_word(tok: str) -> bool:
+    """A capitalised token that is just an English word ("Verification", "Implementing",
+    "Real-time"), not a name. The first real drafting run blocked six of six drafts on
+    words like these: a names rule without a dictionary cannot tell "Verification" from
+    "Verizon", and a check that blocks everything is a worker that never posts.
+
+    Fail closed where it matters: a form the dictionary enters as a proper noun ("Mark",
+    "Target", "Seattle", "Kimberly") is never ordinary, a word it does not know ("Milica",
+    "Verizon") is never ordinary, and an all-capitals token (an acronym) needs the allowlist.
+    The input carries no private data - the drafting prompt holds a topic, nothing about
+    anyone - so what this rule guards against is an invented or real public name, and the
+    owner still reads every post before it goes live."""
+    common, proper = _dictionary()
+    for form in _forms(tok):
+        form = form.replace("\u2019", "'")
+        if len(form) > 1 and form.isupper():
+            return False
+        parts = form.split("-")
+        # A Title-Case compound ("Opt-In", "Real-Time") capitalises its later parts by
+        # habit, so only the first part's capital can mark a name: "In" is a proper noun
+        # (indium) in Hunspell, "in" is not.
+        if all(p and (i > 0 or p not in proper) and (p.lower() in common or p in common) and
+               not (len(p) > 1 and p.isupper()) for i, p in enumerate(parts)):
+            return True
+    return False
+
+
 def _capitalised(tok: str, code: bool) -> bool:
     if tok[0].isupper():
         return True
@@ -453,14 +495,21 @@ def unknown_names(texts: list, allow: frozenset | None = None,
     Mid-sentence, only the allowlist vouches. A word that opens a sentence (or a heading,
     a list item, a table cell) is vouched for by the allowlist, by the list of common
     sentence openers, or by the post also using the same word in lower case - never by
-    its position alone, or "Marko said..." would pass."""
+    its position alone, or "Marko said..." would pass.
+
+    Headings and the title are the exception measured in the first real run: the model
+    writes them in Title Case ("A Practical Guide"), where capitals carry no signal. There
+    EVERY word may be vouched for by the post using it in lower case elsewhere - which an
+    invented name ("Acme Corp") never is. Known gap, unchanged: a name that is also an
+    ordinary word the post uses ("Mark")."""
     allow = load_allowlist() if allow is None else allow
     openers = load_openers() if openers is None else openers
     lower_words = {t.lower() for _f, text in texts for t in _TOKEN.findall(text)
                    if t == t.lower() and any(c.isalpha() for c in t)}
     found: list = []
-    for _field, text in texts:
+    for field, text in texts:
         for line, code in _segments(text):
+            heading = not code and (field == "title" or _HEADING.match(line) is not None)
             toks = [(m.group(0), m.start()) for m in _TOKEN.finditer(line)]
             i = 0
             while i < len(toks):
@@ -473,15 +522,17 @@ def unknown_names(texts: list, allow: frozenset | None = None,
                     j += 1
                 found += _uncovered([t for t, _s in toks[i:j]],
                                     not code and _initial(line, toks[i][1]), allow,
-                                    openers | lower_words)
+                                    openers | lower_words, heading=heading)
                 i = j
     return found
 
 
-def _uncovered(phrase: list, initial: bool, allow: frozenset, common: frozenset) -> list:
+def _uncovered(phrase: list, initial: bool, allow: frozenset, common: frozenset, *,
+               heading: bool = False) -> list:
     """Cover a phrase with the longest allowed sub-phrases; what is left over is unknown.
     ``common`` (openers and the post's own lower-case words) vouches only for the first
-    word, and only when it opens a sentence."""
+    word, and only when it opens a sentence - or, in a heading, for any word. A sentence-
+    opening adverb ("Traditionally,") is vouched for by its suffix."""
     out, run, k = [], [], 0
     while k < len(phrase):
         step = 0
@@ -489,8 +540,12 @@ def _uncovered(phrase: list, initial: bool, allow: frozenset, common: frozenset)
             if _allowed(phrase[k:end], allow):
                 step = end - k
                 break
-        if not step and k == 0 and initial \
-                and any(f.lower() in common for f in _forms(phrase[0])):
+        if not step and ((k == 0 and initial) or heading) \
+                and any(f.lower() in common for f in _forms(phrase[k])):
+            step = 1
+        if not step and k == 0 and initial and _ADVERB.fullmatch(phrase[0]):
+            step = 1
+        if not step and _ordinary_word(phrase[k]):
             step = 1
         if step:
             if run:
@@ -505,8 +560,26 @@ def _uncovered(phrase: list, initial: bool, allow: frozenset, common: frozenset)
     return out
 
 
+_HEADING = re.compile(r"^\s{0,3}#{1,6}\s")
+# Sentence-opening adverbs, by suffix. Chosen so no common given name matches (Kimberly,
+# Emily, Holly, Beverly, Shelly all fail it); a name still needs the allowlist.
+_ADVERB = re.compile(r"[A-Z][a-z]{3,}(?:ally|ously|ively|ately|ently|antly|arly|ically)")
+
+
+# "Acme Corp", "Blue Sky Ltd": a company is a company even when every word of its name is an
+# ordinary word, so a capitalised phrase before a company suffix blocks on its own.
+_COMPANY = re.compile(r"\b((?:[A-Z][\w&'\u2019-]*\s+){0,3}[A-Z][\w&'\u2019-]*)\s+"
+                      r"(?:Inc|Corp|Corporation|LLC|Ltd|Limited|GmbH|Co|Company|Group|Labs)\b")
+
+
 def _names(draft: dict) -> list:
     reasons, seen = [], set()
+    for _field, text in _prose(draft):
+        for m in _COMPANY.finditer(text):
+            if m.group(0).lower() not in seen:
+                seen.add(m.group(0).lower())
+                reasons.append(f"names the company {m.group(0)!r} (a person, place or company "
+                               "blocks the post)")
     for name in unknown_names(_prose(draft)):
         if name.lower() in seen:
             continue

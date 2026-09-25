@@ -47,6 +47,7 @@ from .workers import _Base
 CAPABILITY = "content.publish"
 SITE = "https://api.dokaz.net"
 MAX_SLUG = 50              # "YYYY-MM-DD-" + slug stays inside draft_id's 64
+MAX_TOPIC_BLOCKS = 3       # days a topic may be blocked before it is retired
 DRAFT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -150,6 +151,10 @@ starts a sentence.
 prices, no money amounts. Never write "we made", "we earned", "we sold" or "our revenue".
 - No email addresses, phone numbers, IP addresses or street addresses, not even made-up \
 examples.
+- Never write the @ character. Say "an email address", never an example of one.
+- Invent NO example data at all: no sample people, companies, addresses, invoice or order \
+numbers, dates or IDs. Describe a field by what it holds ("the customer's name", "the \
+invoice number"), never by an example value.
 - Code is optional. If you show any, show only a JSON request body in a fenced block, \
 with lower-case keys and no keys, tokens, headers or URLs.
 - title: 10 to 120 characters. description: one or two sentences, 60 to 280 characters. \
@@ -359,6 +364,7 @@ class BlogWorker(_Base):
                         "new seed topic is given", self.worker_id)
             return None
         reasons: list = []
+        submitted = False
         for attempt in (1, 2):      # one fresh draft per run, at most, after a block
             got = ctx.words("blog_draft", SYSTEM.format(names=self._names()),
                             self._prompt(topic, ctx.goal, reasons), DRAFT_SCHEMA)
@@ -374,8 +380,19 @@ class BlogWorker(_Base):
                 self._blocked(ctx, rec, topic, draft, reasons, attempt, events)
                 continue
             self._submit(ctx, rec, topic, draft, events)
+            submitted = True
             break
-        if topic.key not in rec["used_topics"]:
+        # A topic is used up by a submitted post, not by a blocked day: with a strict check,
+        # burning a topic per block would exhaust the seeds having published nothing. A topic
+        # blocked on MAX_TOPIC_BLOCKS days is retired, loudly - it is not going to work.
+        blocks = rec.setdefault("topic_blocks", {})
+        if not submitted and reasons:
+            blocks[topic.key] = int(blocks.get(topic.key, 0)) + 1
+            if blocks[topic.key] >= MAX_TOPIC_BLOCKS:
+                log.warning("%s: topic %r blocked on %d days; retiring it", self.worker_id,
+                            topic.key, blocks[topic.key])
+        if (submitted or blocks.get(topic.key, 0) >= MAX_TOPIC_BLOCKS) \
+                and topic.key not in rec["used_topics"]:
             rec["used_topics"].append(topic.key)
         return None
 

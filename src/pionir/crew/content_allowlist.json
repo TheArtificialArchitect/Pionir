@@ -7,7 +7,10 @@
     "HTTP", "HTTPS", "REST", "SQL", "CSV", "URL", "SVG", "PNG", "DNS", "MX", "SMTP", "HTML",
     "CSS", "SEO", "UTF-8", "ASCII", "Unicode", "ID", "AI", "LLM", "SaaS", "Wi-Fi", "vCard",
     "CRM", "FAQ", "OK", "Markdown", "Cloudflare", "Stripe", "Gumroad", "Windows", "macOS",
-    "Linux", "Excel", "Google", "Chrome", "GitHub"
+    "Linux", "Excel", "Google", "Chrome", "GitHub",
+    "IP", "WHOIS", "SPF", "DKIM", "DMARC", "TLS", "SSL", "IMAP", "MIME", "XML", "YAML", "UI", "UX",
+    "CLI", "SDK", "OCR", "ISO", "B2B", "B2C", "ROI", "CAPTCHA", "MFA", "2FA", "OTP", "Deliverability",
+    "Exchanger"
   ],
   "code": ["True", "False", "None", "YOUR_API_KEY", "Content-Type", "GET", "POST"],
   "currencies": ["USD", "EUR", "GBP", "CAD", "AUD"],
