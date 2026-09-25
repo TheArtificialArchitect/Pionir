@@ -378,6 +378,46 @@ class NeverTwiceTests(_Case):
         self.assertEqual(len(self.pionir.emails()), RETRY_UNREACHABLE)   # and then it stops
         self.assertEqual(self.tally(result)["client emails failed"], 1)
 
+    def _approved_but_failed(self, approval_id: str, inner: dict) -> None:
+        self.pionir.approvals[approval_id] = {"id": approval_id, "status": "approved_failed",
+                                              "result": {"ok": False, "agent_id": "client",
+                                                         "result": inner}}
+
+    def test_an_approved_email_that_hit_an_outage_is_offered_again_then_stops(self) -> None:
+        # The phase 4a end-to-end run: the owner approved the acknowledgement while mail was
+        # down (Scrooge 503) and the desk recorded it as final - a paid client never
+        # acknowledged. It is now offered to the owner again, a bounded number of times.
+        from pionir.crew.orders import RETRY_UNDELIVERED
+        self.pionir.orders = [order()]
+        down = {"ok": False, "unavailable": "Scrooge answered HTTP 503 - nothing was sent"}
+        for i in range(RETRY_UNDELIVERED):
+            self.run_at(T0 + i * 1800)
+            self._approved_but_failed(f"em-{i + 1}", down)
+        self.run_at(T0 + RETRY_UNDELIVERED * 1800)
+        self.assertEqual(len(self.pionir.emails()), RETRY_UNDELIVERED)
+        self.run_at(T0 + (RETRY_UNDELIVERED + 1) * 1800)
+        self.assertEqual(len(self.pionir.emails()), RETRY_UNDELIVERED)   # and then it stops
+
+    def test_an_approved_email_that_was_refused_is_final(self) -> None:
+        self.pionir.orders = [order()]
+        self.run_at(T0)
+        self._approved_but_failed("em-1", {"ok": False,
+                                           "refused": "to: does not match the order"})
+        self.run_at(T0 + 900)
+        self.run_at(T0 + 1800)
+        self.assertEqual(len(self.pionir.emails()), 1)
+        self.assertEqual(self.record()["emails"][0]["status"], "failed")
+
+    def test_a_reported_failure_the_order_shows_sent_is_sent(self) -> None:
+        self.pionir.orders = [order()]
+        self.run_at(T0)
+        subject = self.pionir.emails()[0].payload["subject"]
+        self.pionir.orders[0]["messages"] = [{"at": "2026-09-25T10:00:00Z", "subject": subject}]
+        self._approved_but_failed("em-1", {"ok": False, "unavailable": "HTTP 0"})
+        self.run_at(T0 + 900)
+        self.assertEqual(self.record()["emails"][0]["status"], "sent")
+        self.assertEqual(len(self.pionir.emails()), 1)
+
     def test_pionir_back_up_gets_the_email_once(self) -> None:
         self.pionir.orders = [order()]
         self.pionir.email_outcome = JobOutcome("unreachable", EMAIL, error="down")

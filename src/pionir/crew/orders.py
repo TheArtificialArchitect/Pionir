@@ -66,6 +66,13 @@ SET_STATUS = "client.set_status"
 HIRE_URL = "https://api.dokaz.net/hire"     # the one link an email may carry
 MAX_EMAILS_PER_RUN = 2
 RETRY_UNREACHABLE = 5                       # runs a never-delivered email is retried
+# An email the owner approved whose SEND then failed for a passing reason (the mail provider
+# or Scrooge unavailable - not a refusal) is offered to him again, up to this many times.
+# Found by the phase 4a end-to-end run: otherwise a paid client whose acknowledgement hit a
+# mail outage would never be acknowledged. The order's own messages guard against a double
+# send (``_already_sent``).
+RETRY_UNDELIVERED = 3
+RETRYABLE = {"unreachable": RETRY_UNREACHABLE, "undelivered": RETRY_UNDELIVERED}
 RETRY_STATUS = 5                            # runs a status update is retried
 ABANDONED_AFTER = 3 * 86400                 # an unpaid checkout older than this is abandoned
 
@@ -555,7 +562,16 @@ class OrderDesk(_Base):
                                  f"{out.status}", events)
             elif state == "approved_failed":
                 out = outcome_of(EMAIL, got.get("result"))
-                self._settle(ctx, rec, e, "failed", out.error or "the send failed", events)
+                order = by_id.get(e.get("order_id"))
+                if order is not None and _already_sent(order, e.get("subject")):
+                    self._settle(ctx, rec, e, "sent", "the send reported a failure, but the "
+                                 "order's messages show it sent", events)
+                elif _refused(got.get("result")):
+                    self._settle(ctx, rec, e, "failed", out.error or "the send was refused",
+                                 events)
+                else:
+                    self._settle(ctx, rec, e, "undelivered", (out.error or "the send failed")
+                                 + "; it will be offered to the owner again", events)
             else:
                 log.warning("%s: approval %s has a status nobody knows (%r); still waiting",
                             self.worker_id, e["approval_id"], state)
@@ -626,16 +642,18 @@ class OrderDesk(_Base):
         """True when this order must never get this email (again): one was submitted, sent,
         blocked or given up on - or it got the opposite answer (acknowledged vs declined)."""
         tries = self._attempts(rec, oid, kind)
-        if any(e.get("status") != "unreachable" for e in tries) \
-                or len(tries) >= RETRY_UNREACHABLE:
+        if any(e.get("status") not in RETRYABLE for e in tries):
             return True
+        for status, cap in RETRYABLE.items():
+            if sum(1 for e in tries if e.get("status") == status) >= cap:
+                return True
         opposite = {ACK: (DECLINE,), QUOTE_ACK: (DECLINE,), DECLINE: (ACK, QUOTE_ACK)}[kind]
-        return any(e.get("status") != "unreachable"
+        return any(e.get("status") not in RETRYABLE
                    for k in opposite for e in self._attempts(rec, oid, k))
 
     @staticmethod
     def _touched(rec: dict, oid: str) -> bool:
-        return any(e.get("order_id") == oid and e.get("status") != "unreachable"
+        return any(e.get("order_id") == oid and e.get("status") not in RETRYABLE
                    for e in rec["emails"])
 
     def _blocked(self, ctx: WorkContext, rec: dict, entry: dict, reasons: list,
@@ -837,6 +855,9 @@ class OrderDesk(_Base):
             Figure(n("denied"), "count", "client emails denied", window="all_time"),
             Figure(n("failed", "unknown") + gave_up, "count", "client emails failed",
                    window="all_time"),
+            Figure(n("undelivered"), "count",
+                   "approved client emails that failed to send (offered to the owner again)",
+                   window="all_time"),
             Figure(n("blocked"), "count", "client emails blocked by the template check",
                    window="all_time"),
             Figure(sum(1 for e in emails if e.get("status_state") == "failed"), "count",
@@ -852,6 +873,16 @@ class OrderDesk(_Base):
                            figures=figures, entities=self.entities,
                            provenance={"source": "real", "provider": self.provider,
                                        "record": self.record_what})
+
+
+def _refused(result) -> bool:
+    """Whether a failed send was a refusal (Scrooge or Pionir said no - final) rather than a
+    passing outage (retryable). Looks for a ``refused`` reason anywhere in the result."""
+    if isinstance(result, dict):
+        if result.get("refused"):
+            return True
+        return any(_refused(v) for v in result.values() if isinstance(v, dict))
+    return False
 
 
 def _already_sent(order: dict, subject) -> bool:

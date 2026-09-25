@@ -340,9 +340,19 @@ class ClientAdapter:
             why = f"Scrooge is unreachable at {urllib.parse.urlparse(self._base).netloc}"
         else:
             why = f"Scrooge answered HTTP {status}" + (f": {said}" if said else "")
-        if emailing and (status == 0 or status >= 500):
-            # Unanswered or a server error: the email may or may not have gone out.
+        # Only an unanswered call or an unexpected server error leaves the send unknown. Scrooge
+        # answers 503 (mail not configured) BEFORE sending and 502 when the provider refused -
+        # it removes the message row then - so both mean nothing went out, and saying "may have
+        # been sent" there would send the owner looking for a message that doesn't exist.
+        # Only Scrooge's OWN 502/503 (its JSON refusal: 503 = mail not configured, checked
+        # before sending; 502 = the provider refused, and Scrooge removes the message row) means
+        # nothing went out. A bare 502 from the edge (Cloudflare's HTML page), a 500, a 504 or
+        # no answer at all leaves the send unknown.
+        scrooge_said_no = status in (502, 503) and doc.get("ok") is False
+        if emailing and not scrooge_said_no and (status == 0 or status >= 500):
             why = f"{why} - {CHECK_BEFORE_RETRY}"
+        elif emailing and scrooge_said_no:
+            why = f"{why} - nothing was sent"
         return _unavailable(why, status=status)
 
     # ---- transport -----------------------------------------------------------------

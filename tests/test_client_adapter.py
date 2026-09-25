@@ -434,6 +434,11 @@ class ErrorTests(_Case):
             (403, {"ok": False, "error": "no"}, "unavailable", TOKEN_REJECTED),
             (500, {"ok": False, "error": "boom"}, "unavailable", CHECK_BEFORE_RETRY),
             (502, b"<html>bad gateway</html>", "unavailable", CHECK_BEFORE_RETRY),
+            # Scrooge's own refusals, before (503) or instead of (502) a send: nothing went out
+            (503, {"ok": False, "error": "RESEND_API_KEY is not set; nothing was sent"},
+             "unavailable", "nothing was sent"),
+            (502, {"ok": False, "error": "the mail provider refused it"},
+             "unavailable", "nothing was sent"),
             (200, {"sent": True}, "unavailable", CHECK_BEFORE_RETRY),
         ]
         for status, body, kind, words in cases:
@@ -443,6 +448,8 @@ class ErrorTests(_Case):
                 self.assertIs(out["ok"], False)
                 self.assertIn(words, out[kind])
                 self.assertNotIn("refused", out)
+                if words == "nothing was sent":        # and no "may have been sent" warning
+                    self.assertNotIn(CHECK_BEFORE_RETRY, out[kind])
         self.assertIn(r"Scrooge's tools\setup-ops-token.ps1", TOKEN_REJECTED)
         self.assertEqual(RATE_LIMITED, "too many emails to this order today")
         self.world.forced = {}
