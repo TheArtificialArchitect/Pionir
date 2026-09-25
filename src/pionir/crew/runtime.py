@@ -113,7 +113,8 @@ class Crew:
                            words=partial(self._words, worker), job=partial(self._job, worker),
                            approval=self.hands.approval, goal=goal,
                            state_dir=self.cfg.state_dir / "workers",
-                           deliveries_dir=getattr(self.cfg, "deliveries_dir", None))
+                           deliveries_dir=getattr(self.cfg, "deliveries_dir", None),
+                           products_dir=getattr(self.cfg, "products_dir", None))
 
     def _words(self, worker, purpose: str, system: str, user: str, schema: dict) -> Result:
         """The ONLY way a worker reaches a model: the shared brain, JSON-schema output,

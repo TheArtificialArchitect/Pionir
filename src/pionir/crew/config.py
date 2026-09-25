@@ -81,6 +81,10 @@ class CrewSettings:
     # (``<deliveries_dir>/<order_id>/<name>.zip``); contracts.delivery ships it through
     # Pionir, which reads the same folder. None -> ~/.pionir/deliveries
     deliveries_dir: Path | None = None
+    # Where the owner stages each product for sale on Gumroad, one folder per product
+    # (``<products_dir>/<slug>/`` with listing.json, the zip and the cover); products.shelf
+    # submits it through Pionir, which reads the same folder. None -> ~/.pionir/products
+    products_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if self.tick_seconds <= 0:
@@ -108,6 +112,8 @@ class CrewSettings:
             object.__setattr__(self, "secrets_dir", Path.home() / ".pionir" / "secrets")
         if self.deliveries_dir is None:
             object.__setattr__(self, "deliveries_dir", Path.home() / ".pionir" / "deliveries")
+        if self.products_dir is None:
+            object.__setattr__(self, "products_dir", Path.home() / ".pionir" / "products")
 
     @classmethod
     def from_pionir(cls, settings: PionirSettings, **overrides) -> CrewSettings:
@@ -138,6 +144,7 @@ class CrewSettings:
             ("PIONIR_CREW_SECRETS_DIR", "secrets_dir", Path),
             ("PIONIR_CREW_CATALOGUE", "catalogue_path", Path),
             ("PIONIR_CREW_DELIVERIES_DIR", "deliveries_dir", Path),
+            ("PIONIR_CREW_PRODUCTS_DIR", "products_dir", Path),
             ("PIONIR_CREW_PIONIR_URL", "pionir_url", str),
             ("PIONIR_CREW_JOB_FOLLOW_SECONDS", "job_follow_seconds", float),
         ):
@@ -158,6 +165,7 @@ class CrewSettings:
         d["gpu_lock_path"] = str(self.gpu_lock_path)
         d["secrets_dir"] = str(self.secrets_dir)
         d["deliveries_dir"] = str(self.deliveries_dir)
+        d["products_dir"] = str(self.products_dir)
         d["catalogue_path"] = str(self.catalogue_path) if self.catalogue_path else None
         return d
 

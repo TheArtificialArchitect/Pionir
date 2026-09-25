@@ -25,6 +25,9 @@ whole list, and a name not in it fails loudly at load time.
   approval. No words: no model can put a promise, a price or a date in a client's email.
 - ``delivery_desk`` - REAL (delivery.py). Ships each order's finished zip, dropped by the
   owner in its order's folder, as ``client.deliver`` by fixed template for his approval.
+- ``product_shelf`` - REAL (products.py). Submits each product the owner stages in its own
+  folder as ``product.gumroad_publish`` for his approval, and reads what the live ones sold
+  (``product.gumroad_list``). No words: every word of a listing is the owner's.
 """
 from __future__ import annotations
 
@@ -324,6 +327,13 @@ def delivery_desk(spec, **params):
     return DeliveryDesk(spec, **params)
 
 
+def product_shelf(spec, **params):
+    """REAL. ``products.shelf`` (products.py): each staged product published on Gumroad, for
+    the owner's approval, and the live products' sales as Gumroad reports them."""
+    from .products import ProductShelf
+    return ProductShelf(spec, **params)
+
+
 # The whole list of worker implementations. A catalogue ``impl`` not named here is an
 # error at load time, never a worker that silently does not exist.
 IMPLS = {
@@ -336,4 +346,5 @@ IMPLS = {
     "devto_crossposter": devto_crossposter,
     "order_desk": order_desk,
     "delivery_desk": delivery_desk,
+    "product_shelf": product_shelf,
 }

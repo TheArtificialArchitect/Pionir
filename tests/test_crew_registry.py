@@ -21,13 +21,14 @@ class DefaultCatalogueTests(unittest.TestCase):
                                      "contracts.orders", "posting.blog",
                                      "posting.devto",
                                      "posting.instagram", "posting.results",
-                                     "products.api_builder", "products.gumroad",
+                                     "products.api_builder", "products.shelf",
                                      "treasury.ledger", "watch.health"))
         live = sorted(w.worker_id for w in reg.all() if w.live)
         self.assertEqual(live, ["contracts.delivery", "contracts.orders", "posting.blog",
                                 "posting.devto",
                                 "posting.instagram",
-                                "posting.results", "treasury.ledger", "watch.health"])
+                                "posting.results", "products.shelf", "treasury.ledger",
+                                "watch.health"])
 
     def test_adding_a_worker_is_adding_an_entry(self) -> None:
         cat = load_catalogue()
