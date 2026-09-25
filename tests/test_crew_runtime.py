@@ -18,6 +18,7 @@ from pionir.crew.brain import EXPIRED
 from pionir.crew.hands import Job
 from pionir.crew.log import check_source
 from pionir.crew.registry import default_registry
+from pionir.crew.workers import CONTROL_URL
 
 
 class _Case(unittest.TestCase):
@@ -130,7 +131,10 @@ class ForegroundRunTests(unittest.TestCase):
             self.assertFalse(crew.brain._thread.is_alive())
             self.assertFalse(crew.hands._thread.is_alive())
             urls = {u for u, _h, _t in http.calls}
-            self.assertEqual(urls, {"https://api.dokaz.net/health"})  # the ledger never called
+            # Strict on purpose - no surprise network calls. The ledger is never called (no
+            # token). Health got no answer here, so it asked the control site before daring to
+            # call the site down; that second call is the one it is supposed to make.
+            self.assertEqual(urls, {"https://api.dokaz.net/health", CONTROL_URL})
 
     def test_a_restart_records_the_gap_it_was_not_running(self) -> None:
         with temp_dir() as root:
