@@ -125,6 +125,12 @@ class WorkContext:
     words: Callable[..., Result] | None = None
     # (hands.Job) -> hands.JobOutcome; the only way to act in the world
     job: Callable[[Any], Any] | None = None
+    # (approval_id) -> Pionir's approval record for a job it parked (hands.Hands.approval)
+    approval: Callable[[str], dict] | None = None
+    # this worker's division's goal, as Moss set it (direction.py), or None
+    goal: str | None = None
+    # where a worker that must remember what it did keeps its own small record
+    state_dir: Path | None = None
 
 
 @runtime_checkable

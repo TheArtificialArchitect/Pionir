@@ -79,6 +79,7 @@ class JobOutcome:
     error: str = ""
     figures: list = field(default_factory=list)
     evidence: list = field(default_factory=list)
+    result: object = None           # a done job's raw result, for a worker that needs a field
 
     def __post_init__(self) -> None:
         if self.status not in STATUSES:
@@ -136,7 +137,7 @@ def outcome_of(capability: str, doc) -> JobOutcome:
         return JobOutcome("done", capability, task_id=task_id,
                           agent_id=str(doc.get("agent_id") or ""),
                           answer=_answer_of(result),
-                          figures=sorted(values_in_data(result)),
+                          figures=sorted(values_in_data(result)), result=result,
                           evidence=[str(e) for e in (doc.get("evidence") or [])][:10])
     return JobOutcome("failed", capability, task_id=task_id,
                       error=_error_of(doc) or "Pionir's answer carried no outcome; "
@@ -190,6 +191,10 @@ class PionirClient:
     def task(self, task_id: str, *, wait: float = 0.0) -> dict:
         return self._call("GET", f"/api/task/{quote(task_id)}?wait={wait:g}", None,
                           self.timeout + wait)
+
+    def approvals(self) -> dict:
+        """Pionir's approval queue: ``{"pending": [...], "recent": [...]}``."""
+        return self._call("GET", "/api/approvals", None, self.timeout)
 
 
 class _Req:
@@ -271,6 +276,22 @@ class Hands:
         with self._cv:
             return [{"id": r.id, "agent": r.agent_id, "capability": r.job.capability}
                     for r in self._q]
+
+    def approval(self, approval_id: str) -> dict:
+        """What became of a job Pionir parked for the owner: its approval record (``status``
+        pending / running / approved / approved_failed / denied, and ``result`` once it
+        ran). ``{"status": "unknown"}`` when Pionir no longer lists it, ``{"status":
+        "unreachable"}`` when it could not be asked. A read: it starts nothing."""
+        try:
+            view = self.client.approvals()
+        except Exception as exc:  # noqa: BLE001 - not knowing is an answer, never a crash
+            return {"status": "unreachable", "error": f"{type(exc).__name__}: {exc}"}
+        if not isinstance(view, dict):
+            return {"status": "unreachable", "error": "Pionir's approvals are not an object"}
+        for row in [*(view.get("pending") or []), *(view.get("recent") or [])]:
+            if isinstance(row, dict) and row.get("id") == approval_id:
+                return dict(row)
+        return {"status": "unknown"}
 
     # ---- the worker -----------------------------------------------------
     def step(self) -> bool:

@@ -47,9 +47,14 @@
       "id": "posting",
       "title": "Posting",
       "leader_cadence_seconds": 21600,
+      "leader_notes": "The blog worker's rows. post.tally holds the counts: drafts written, drafts blocked, posts submitted for approval, posts pending approval, posts published. A post PENDING APPROVAL has NOT been published: say it is waiting for the owner's approval, never that it is out. Only a post.published row is a published post; give its URL. A post.blocked row is a draft the content check stopped before anyone saw it: say so and give its reasons by kind (a name not on the allowlist, a link without its tags, a business number) without repeating any name the reasons quote. A post.not_published row says why a submitted post did not go out.",
+      "brief_quota": {"post.tally": 2, "post.blocked": 4, "post.pending_approval": 4,
+                      "post.published": 4, "post.not_published": 4},
       "workers": [
-        {"name": "blog", "impl": "placeholder", "kind": "post", "cadence_seconds": 21600,
-         "provider": "none", "entities": ["Blog"], "note": "drafting and publishing blog posts"},
+        {"name": "blog", "impl": "blog_writer", "kind": "post", "cadence_seconds": 21600,
+         "provider": "none", "entities": ["Blog"],
+         "note": "one checked blog draft a day for api.dokaz.net, each submitted for the owner's approval",
+         "params": {"draft_every_seconds": 86400}},
         {"name": "instagram", "impl": "placeholder", "kind": "post", "cadence_seconds": 21600,
          "provider": "none", "entities": ["Instagram"], "note": "posting to Instagram"}
       ]
