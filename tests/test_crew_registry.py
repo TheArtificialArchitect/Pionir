@@ -17,13 +17,15 @@ class DefaultCatalogueTests(unittest.TestCase):
         reg = default_registry()
         self.assertEqual(reg.division_ids(),
                          ("treasury", "watch", "posting", "contracts", "products", "builds"))
-        self.assertEqual(reg.ids(), ("builds.daedalus", "contracts.orders", "posting.blog",
+        self.assertEqual(reg.ids(), ("builds.daedalus", "contracts.delivery",
+                                     "contracts.orders", "posting.blog",
                                      "posting.devto",
                                      "posting.instagram", "posting.results",
                                      "products.api_builder", "products.gumroad",
                                      "treasury.ledger", "watch.health"))
         live = sorted(w.worker_id for w in reg.all() if w.live)
-        self.assertEqual(live, ["contracts.orders", "posting.blog", "posting.devto",
+        self.assertEqual(live, ["contracts.delivery", "contracts.orders", "posting.blog",
+                                "posting.devto",
                                 "posting.instagram",
                                 "posting.results", "treasury.ledger", "watch.health"])
 

@@ -77,6 +77,10 @@ class CrewSettings:
     secrets_dir: Path | None = None
     # The catalogue of divisions and workers. None -> the packaged catalogue.json
     catalogue_path: Path | None = None
+    # Where the owner drops each paid order's finished work, one folder per order
+    # (``<deliveries_dir>/<order_id>/<name>.zip``); contracts.delivery ships it through
+    # Pionir, which reads the same folder. None -> ~/.pionir/deliveries
+    deliveries_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if self.tick_seconds <= 0:
@@ -102,6 +106,8 @@ class CrewSettings:
             raise ValueError("api_port is a TCP port (0-65535), or None for no API")
         if self.secrets_dir is None:
             object.__setattr__(self, "secrets_dir", Path.home() / ".pionir" / "secrets")
+        if self.deliveries_dir is None:
+            object.__setattr__(self, "deliveries_dir", Path.home() / ".pionir" / "deliveries")
 
     @classmethod
     def from_pionir(cls, settings: PionirSettings, **overrides) -> CrewSettings:
@@ -131,6 +137,7 @@ class CrewSettings:
             ("PIONIR_CREW_CLAUDE_DAILY_CAP", "claude_daily_cap", int),
             ("PIONIR_CREW_SECRETS_DIR", "secrets_dir", Path),
             ("PIONIR_CREW_CATALOGUE", "catalogue_path", Path),
+            ("PIONIR_CREW_DELIVERIES_DIR", "deliveries_dir", Path),
             ("PIONIR_CREW_PIONIR_URL", "pionir_url", str),
             ("PIONIR_CREW_JOB_FOLLOW_SECONDS", "job_follow_seconds", float),
         ):
@@ -150,6 +157,7 @@ class CrewSettings:
         d["state_dir"] = str(self.state_dir)
         d["gpu_lock_path"] = str(self.gpu_lock_path)
         d["secrets_dir"] = str(self.secrets_dir)
+        d["deliveries_dir"] = str(self.deliveries_dir)
         d["catalogue_path"] = str(self.catalogue_path) if self.catalogue_path else None
         return d
 

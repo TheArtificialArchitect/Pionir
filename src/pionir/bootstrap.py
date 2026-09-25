@@ -10,7 +10,6 @@ from .adapters import (
     BryoStatusAdapter,
     BryoStatusSettings,
     ClientAdapter,
-    ClientSettings,
     ContentAdapter,
     ContentSettings,
     CrewAdapter,
@@ -31,6 +30,7 @@ from .adapters import (
     VoodooStatusSettings,
     load_stdio_adapters,
 )
+from .adapters.clients import client_settings
 from .adapters.galatea import resolve_served_model
 from .audit import JsonlAuditSink
 from .benchmark import read_loaded_models, unload, warm
@@ -205,10 +205,9 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
             base_url=configured.content_url, token_file=configured.content_token_path,
         )))
         # The paid client orders on the same Scrooge, with its own ops token (read when a
-        # client.* task runs). client.email always parks for approval.
-        runtime.register(ClientAdapter(ClientSettings(
-            base_url=configured.content_url, token_file=configured.ops_token_path,
-        )))
+        # client.* task runs). client.email and client.deliver always park for approval;
+        # a delivery's zip is scanned for every secret Pionir is configured with.
+        runtime.register(ClientAdapter(client_settings(configured)))
     if configured.content_url is not None and configured.instagram_graph_url is not None:
         # Needs Scrooge to host the card image. No boot-time call: both token files are
         # read when a post runs. social.instagram_post always parks for approval.

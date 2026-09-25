@@ -10,7 +10,8 @@ command and payload, who asked, and any money it spends in bold at the top; a
 caption and carries the rendered image itself as an attachment; a
 ``content.crosspost_devto`` card opens with CROSS-POSTS TO DEV.TO and shows the whole
 article; a ``client.email`` card opens with EMAILS A CLIENT, names the recipient and shows
-the whole message),
+the whole message; a ``client.deliver`` card opens with DELIVERS TO A CLIENT and shows the
+zip's full file list as checked on disk, the secrets scan and the whole email),
 adds ✅ and ❌ itself, and polls the reactions. Only the configured owner's
 reaction counts; with no owner configured nothing can ever be approved here.
 
@@ -55,7 +56,9 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .adapters.clients import DELIVER as CLIENT_DELIVER
 from .adapters.clients import EMAIL as CLIENT_EMAIL
+from .adapters.clients import LINK_PLACEHOLDER
 from .adapters.content import PUBLISH, public_url
 from .adapters.devto import CROSSPOST as DEVTO_CROSSPOST
 from .adapters.instagram import POST as INSTAGRAM_POST
@@ -75,6 +78,8 @@ MESSAGE_LIMIT = 2000
 STATUS_RESERVE = 500
 MAX_RETRY_AFTER = 30.0
 RETAIN_FINAL = timedelta(days=7)
+# How long a client.deliver card's look at its zip is reused before looking again.
+PREVIEW_SECONDS = 60.0
 _SNOWFLAKE = re.compile(r"\d{5,25}")
 _FENCE = "```"
 _CONFIG_NAME = "config.json"
@@ -504,6 +509,66 @@ def _client_email_lines(payload: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def client_deliver_line(to: Any) -> str:
+    """The first line of a client.deliver card: the zip goes out, to whom."""
+    shown = f"`{_fence_safe(str(to))}`" if isinstance(to, str) and to else "(no address)"
+    return ("\U0001f4e6 **DELIVERS TO A CLIENT** - the zip below is uploaded to a private "
+            f"link and emailed to {shown} if you approve.")
+
+
+DOWNLOAD_LINK_SHOWN = "<private download link>"
+
+
+def _size(n: Any) -> str:
+    if not isinstance(n, int) or isinstance(n, bool):
+        return "(unknown size)"
+    for unit, scale in (("MB", 1_000_000), ("KB", 1_000)):
+        if n >= scale:
+            return f"{n:,} bytes ({n / scale:.1f} {unit})"
+    return f"{n:,} bytes"
+
+
+def _client_deliver_lines(payload: Mapping[str, Any],
+                          preview: Mapping[str, Any] | None) -> list[str]:
+    """The delivery as the owner must see it before it goes: the order, the recipient,
+    the zip (its name, size and sha256 as checked on disk NOW), the FULL file list with
+    sizes, the secrets scan, and the WHOLE email with the link's place marked."""
+
+    name = _fence_safe(str(payload.get("zip_name")))
+    lines = [
+        f"**Order:** `{_fence_safe(str(payload.get('order_id')))}`",
+        (f"**To:** `{_fence_safe(str(payload.get('to')))}` (Scrooge sends only to the "
+         "address stored on this order)"),
+    ]
+    if preview is None:
+        lines.append("⚠️ **The zip could not be inspected from here**, so its "
+                     "files are not listed. Do not approve a delivery you cannot see - run "
+                     "`python -m pionir deliveries`, or deny it.")
+    elif preview.get("ok") is not True:
+        lines.append("⚠️ **DO NOT APPROVE - the zip no longer passes the checks:** "
+                     f"{_escape(str(preview.get('problem'))[:600])}. Approving will be "
+                     "refused; nothing would be uploaded or emailed.")
+    else:
+        files = preview.get("files") or []
+        lines.append(f"**Zip:** `{name}` - {_size(preview.get('size'))}, sha256 "
+                     f"`{str(preview.get('sha256'))[:16]}`")
+        lines += [f"**The files in it ({len(files):,}), in full:**", _FENCE + "text"]
+        lines += [f"{_fence_safe(str(f[0]))}  ({_size(f[1])})" for f in files]
+        lines += [_FENCE,
+                  (f"\U0001f50d secrets scan: clean ({len(files):,} files, "
+                   f"{int(preview.get('secret_values') or 0):,} secret values checked)")]
+    body = payload.get("body_text")
+    text = body if isinstance(body, str) else str(body)
+    text = text.replace(LINK_PLACEHOLDER, DOWNLOAD_LINK_SHOWN)
+    lines += [
+        f"**Subject:** {_escape(str(payload.get('subject')))}",
+        (f"**The email, in full, exactly as it will be sent - "
+         f"`{DOWNLOAD_LINK_SHOWN}` becomes the link to the zip:**"),
+        _FENCE + "text", _fence_safe(text), _FENCE,
+    ]
+    return lines
+
+
 INSTAGRAM_LINE = ("\U0001f4f8 **POSTS PUBLICLY TO INSTAGRAM** - the image and caption below go "
                   "live on the Dokaz Instagram if you approve.")
 CARD_FILENAME = "card.jpg"
@@ -565,17 +630,22 @@ def _instagram_lines(payload: Mapping[str, Any]) -> list[str]:
     return lines
 
 
-def render_request(row: Mapping[str, Any], owner: str | None) -> str:
+def render_request(row: Mapping[str, Any], owner: str | None, *,
+                   delivery: Mapping[str, Any] | None = None) -> str:
     """The whole text of an approval message, before it is split to fit Discord.
     Nothing that says what the action does is ever cut; long text is split
-    across messages instead."""
+    across messages instead. ``delivery`` is a client.deliver's zip as inspected on
+    disk (ClientAdapter.delivery_preview), or None if it could not be."""
 
     payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
     publishes = row.get("capability") == PUBLISH
     posts = row.get("capability") == INSTAGRAM_POST
     crossposts = row.get("capability") == DEVTO_CROSSPOST
     emails = row.get("capability") == CLIENT_EMAIL
+    delivers = row.get("capability") == CLIENT_DELIVER
     lines: list[str] = []
+    if delivers:
+        lines.append(client_deliver_line(payload.get("to")))
     if emails:
         lines.append(client_email_line(payload.get("to")))
     if publishes:
@@ -624,6 +694,11 @@ def render_request(row: Mapping[str, Any], owner: str | None) -> str:
         lines += _client_email_lines(payload)
         if isinstance(payload.get("body_text"), str):
             shown = {**payload, "body_text": f"(the full message above, "
+                                             f"{len(payload['body_text']):,} characters)"}
+    if delivers:
+        lines += _client_deliver_lines(payload, delivery)
+        if isinstance(payload.get("body_text"), str):
+            shown = {**payload, "body_text": f"(the full email above, "
                                              f"{len(payload['body_text']):,} characters)"}
     if posts:
         lines += _instagram_lines(payload)
@@ -741,11 +816,16 @@ class DiscordGate:
         deny: Callable[[str], Mapping[str, Any]],
         opener: Opener | None = None,
         sleep: Sleeper | None = None,
+        inspect_delivery: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
     ) -> None:
         self.settings = settings
         self._approvals = approvals      # ApprovalQueue: pending() / get()
         self._approve = approve          # PionirApp.approve: claim, run as a job, settle
         self._deny = deny                # PionirApp.deny
+        # ClientAdapter.delivery_preview: a client.deliver card lists the zip's files as
+        # they are on disk when it is posted. None: the card says it could not look.
+        self._inspect_delivery = inspect_delivery
+        self._previews: dict[str, tuple[float, Mapping[str, Any] | None]] = {}
         self._opener = opener
         self._stop = threading.Event()
         self._sleep = sleep or self._stop.wait
@@ -766,9 +846,37 @@ class DiscordGate:
 
     @classmethod
     def for_app(cls, app: Any, settings: DiscordGateSettings, **kwargs: Any) -> DiscordGate:
-        """Wire to a PionirApp: its queue, and its own approve/deny."""
+        """Wire to a PionirApp: its queue, and its own approve/deny (and the client
+        adapter's delivery preview, when it is registered)."""
+        adapters = getattr(getattr(app, "runtime", None), "adapters", None) or {}
+        client = adapters.get("client") if isinstance(adapters, Mapping) else None
+        preview = getattr(client, "delivery_preview", None)
+        if callable(preview):
+            kwargs.setdefault("inspect_delivery", preview)
         return cls(settings, approvals=app.approvals, approve=app.approve, deny=app.deny,
                    **kwargs)
+
+    def _delivery_preview(self, row: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        """The zip of a parked client.deliver as it is on disk (re-read at most every
+        PREVIEW_SECONDS, so a zip changed after posting turns the card into a DO NOT
+        APPROVE on a later poll without re-scanning 25 MB every tick)."""
+        if row.get("capability") != CLIENT_DELIVER or self._inspect_delivery is None:
+            return None
+        key = str(row.get("id"))
+        cached = self._previews.get(key)
+        now = time.monotonic()
+        if cached is not None and now - cached[0] < PREVIEW_SECONDS:
+            return cached[1]
+        try:
+            preview: Mapping[str, Any] | None = self._inspect_delivery(row.get("payload") or {})
+        except Exception as error:  # noqa: BLE001 - shown to the owner as "could not look"
+            _log.warning("discord gate: approval %s: the zip could not be inspected: %s",
+                         row.get("id"), type(error).__name__)
+            preview = None
+        if len(self._previews) > 200:     # answered approvals are never asked about again
+            self._previews.clear()
+        self._previews[key] = (now, preview)
+        return preview
 
     def __repr__(self) -> str:
         return (f"DiscordGate(channel={self.settings.channel_id!r}, "
@@ -945,7 +1053,8 @@ class DiscordGate:
         """Post an approval (all its chunks), remember it at once, then react."""
 
         channel = self.settings.channel_id
-        chunks = split_message(render_request(row, self.settings.owner))
+        chunks = split_message(render_request(row, self.settings.owner,
+                                              delivery=self._delivery_preview(row)))
         owner = self.settings.owner
         mentions: dict[str, Any] = {"parse": [], "users": [owner] if owner and not status else []}
         head = chunks[0]
@@ -1048,7 +1157,8 @@ class DiscordGate:
             # the owner can add the reaction himself, so a failure here must not
             # stop his answer from being read
             self._guard(approval_id, lambda: self._add_reactions(entry))
-        head = split_message(render_request(row, self.settings.owner))[0]
+        head = split_message(render_request(row, self.settings.owner,
+                                            delivery=self._delivery_preview(row)))[0]
         if head != entry.get("head"):
             entry["head"] = head      # e.g. an owner id configured since it was posted
             self._edit(entry, head)

@@ -170,6 +170,7 @@ def make_crew(root, *, cat: dict | None = None, http=None, post=None, claude=Non
               registry=None, now=time.time, **cfg):
     """A whole, unstarted Crew on fakes. Caller must ``crew.stop()``."""
     cfg.setdefault("secrets_dir", __import__("pathlib").Path(root) / "secrets")
+    cfg.setdefault("deliveries_dir", __import__("pathlib").Path(root) / "deliveries")
     s = settings(root, **cfg)
     reg = registry or build_registry(cat or catalogue(), TEST_IMPLS)
     return Crew(s, reg, http=http or FakeHttp(), post=post or FakeOllama(),

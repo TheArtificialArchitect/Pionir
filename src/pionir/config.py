@@ -184,6 +184,10 @@ class PionirSettings:
     # tools/setup-ops-token.ps1), read at call time: no network at boot. Registered only
     # when content_url is on; PIONIR_OPS_TOKEN_FILE points at another token file.
     ops_token_file: Path | None = None
+    # Where the owner drops each order's finished zip for client.deliver:
+    # <deliveries_dir>/<order_id>/<name>.zip. None means ~/.pionir/deliveries;
+    # PIONIR_DELIVERIES_DIR points elsewhere.
+    deliveries_dir: Path | None = None
     # The Instagram Graph API (Instagram API with Instagram Login) for
     # social.instagram_post, which parks for the owner's yes on every call. It also needs
     # Scrooge (content_url) to host the card image, so it is registered only when both are
@@ -278,6 +282,26 @@ class PionirSettings:
         except RuntimeError:
             return self.state_root / "secrets" / "scrooge-ops-token.txt"
         return home / ".pionir" / "secrets" / "scrooge-ops-token.txt"
+
+    @property
+    def deliveries_path(self) -> Path:
+        if self.deliveries_dir is not None:
+            return self.deliveries_dir
+        try:
+            home = Path.home()
+        except RuntimeError:
+            return self.state_root / "deliveries"
+        return home / ".pionir" / "deliveries"
+
+    @property
+    def secrets_path(self) -> Path:
+        """The folder of the owner's secrets (~/.pionir/secrets): every value in it is
+        looked for in a client delivery before it can leave."""
+        try:
+            home = Path.home()
+        except RuntimeError:
+            return self.state_root / "secrets"
+        return home / ".pionir" / "secrets"
 
     @property
     def instagram_token_path(self) -> Path:
@@ -410,6 +434,11 @@ class PionirSettings:
             ops_token_file=(
                 Path(os.environ["PIONIR_OPS_TOKEN_FILE"]).expanduser()
                 if (os.environ.get("PIONIR_OPS_TOKEN_FILE") or "").strip()
+                else None
+            ),
+            deliveries_dir=(
+                Path(os.environ["PIONIR_DELIVERIES_DIR"]).expanduser()
+                if (os.environ.get("PIONIR_DELIVERIES_DIR") or "").strip()
                 else None
             ),
             instagram_graph_url=_optional_url(

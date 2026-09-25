@@ -97,6 +97,12 @@ def _parser() -> argparse.ArgumentParser:
                         help="only orders in this status (one of: "
                              "awaiting_payment, paid, in_progress, delivered, declined, "
                              "refunded, quote_requested, quoted)")
+    commands.add_parser(
+        "deliveries",
+        help="list each order's zips waiting in the deliveries folder, with their sizes and "
+             "sha256 and whether they pass client.deliver's checks "
+             "(local only; never uploads or emails, never prints a secret)",
+    )
     commands.add_parser("bryo-status", help="read Bryo's non-mutating status snapshot")
     commands.add_parser("nyx-status", help="read Nyx's redacted offensive-security health")
     commands.add_parser("voodoo-status", help="read Voodoo's redacted defensive posture")
@@ -684,8 +690,27 @@ def orders(settings: PionirSettings | None = None, *, status: str | None = None,
     return code
 
 
+def deliveries(settings: PionirSettings | None = None) -> int:
+    """``pionir deliveries``: 0 listed, 1 no deliveries folder (or the secrets could not
+    be read). No runtime, no network: it runs client.deliver's checks on each zip under
+    the deliveries folder and prints the reasons, never a secret value."""
+    from .adapters.clients import ClientAdapter, client_settings
+
+    configured = settings or PionirSettings.from_environment()
+    code, report = ClientAdapter(client_settings(configured)).list_deliveries()
+    _print(report)
+    return code
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "deliveries":
+        try:
+            return deliveries()
+        except (ValueError, OSError) as error:
+            _print({"status": "error", "error_type": type(error).__name__,
+                    "message": str(error)})
+            return 1
     for name, check in (("instagram-check", instagram_check), ("devto-check", devto_check)):
         if args.command == name:
             try:

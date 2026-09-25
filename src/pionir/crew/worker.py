@@ -131,6 +131,8 @@ class WorkContext:
     goal: str | None = None
     # where a worker that must remember what it did keeps its own small record
     state_dir: Path | None = None
+    # where the owner drops each order's finished work (config.CrewSettings.deliveries_dir)
+    deliveries_dir: Path | None = None
 
 
 @runtime_checkable

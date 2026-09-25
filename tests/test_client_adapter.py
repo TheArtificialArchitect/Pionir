@@ -213,7 +213,8 @@ class _Case(unittest.TestCase):
 class GateTests(_Case):
     def test_the_declarations(self) -> None:
         caps = {c.name: c for c in self.adapter.manifest.capabilities}
-        self.assertEqual(set(caps), {ORDERS, EMAIL, SET_STATUS})
+        # client.deliver is pinned in test_client_deliver.py
+        self.assertEqual(set(caps), {ORDERS, EMAIL, SET_STATUS, "client.deliver"})
         self.assertTrue(caps[EMAIL].requires_approval)
         self.assertIs(caps[EMAIL].risk, RiskLevel.PRIVILEGED)
         self.assertIs(caps[ORDERS].risk, RiskLevel.READ_ONLY)

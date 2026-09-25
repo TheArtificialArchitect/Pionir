@@ -23,6 +23,8 @@ whole list, and a name not in it fails loudly at load time.
 - ``order_desk`` - REAL (orders.py). Reads the client orders through Pionir and answers each
   by fixed template (acknowledgement, quote acknowledgement or decline) for the owner's
   approval. No words: no model can put a promise, a price or a date in a client's email.
+- ``delivery_desk`` - REAL (delivery.py). Ships each order's finished zip, dropped by the
+  owner in its order's folder, as ``client.deliver`` by fixed template for his approval.
 """
 from __future__ import annotations
 
@@ -315,6 +317,13 @@ def order_desk(spec, **params):
     return OrderDesk(spec, **params)
 
 
+def delivery_desk(spec, **params):
+    """REAL. ``contracts.delivery`` (delivery.py): each order's finished zip delivered to its
+    client by fixed template, as ``client.deliver`` for the owner's approval."""
+    from .delivery import DeliveryDesk
+    return DeliveryDesk(spec, **params)
+
+
 # The whole list of worker implementations. A catalogue ``impl`` not named here is an
 # error at load time, never a worker that silently does not exist.
 IMPLS = {
@@ -326,4 +335,5 @@ IMPLS = {
     "traffic_reader": traffic_reader,
     "devto_crossposter": devto_crossposter,
     "order_desk": order_desk,
+    "delivery_desk": delivery_desk,
 }

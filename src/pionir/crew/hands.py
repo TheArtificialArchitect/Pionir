@@ -77,6 +77,9 @@ class JobOutcome:
     agent_id: str = ""
     answer: str = ""
     error: str = ""
+    # Pionir's typed error ("AdapterProtocolError" = it refused the request; "AdapterUnavailable",
+    # "CircuitOpen" ... = a passing problem). Workers decide on this, not on message wording.
+    error_type: str = ""
     figures: list = field(default_factory=list)
     evidence: list = field(default_factory=list)
     result: object = None           # a done job's raw result, for a worker that needs a field
@@ -107,6 +110,11 @@ def _answer_of(result) -> str:
         return ""
 
 
+def _error_type_of(doc: dict) -> str:
+    err = doc.get("error")
+    return str(err.get("type") or "") if isinstance(err, dict) else ""
+
+
 def _error_of(doc: dict) -> str:
     err = doc.get("error")
     if isinstance(err, dict):
@@ -131,7 +139,8 @@ def outcome_of(capability: str, doc) -> JobOutcome:
     if status == "error" or doc.get("ok") is False:
         return JobOutcome("failed", capability, task_id=task_id,
                           agent_id=str(doc.get("agent_id") or ""),
-                          error=_error_of(doc) or "Pionir reported it did not work")
+                          error=_error_of(doc) or "Pionir reported it did not work",
+                          error_type=_error_type_of(doc))
     if doc.get("ok") is True:
         result = doc.get("result")
         return JobOutcome("done", capability, task_id=task_id,
