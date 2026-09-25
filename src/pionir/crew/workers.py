@@ -20,6 +20,9 @@ whole list, and a name not in it fails loudly at load time.
   its ``traffic`` object: what the posts did, per post and per channel, last 30 days.
 - ``devto_crossposter`` - REAL (devto.py). Cross-posts each published blog post to dev.to
   once, unchanged but for its links' ``utm_source``, for the owner's approval. No words.
+- ``order_desk`` - REAL (orders.py). Reads the client orders through Pionir and answers each
+  by fixed template (acknowledgement, quote acknowledgement or decline) for the owner's
+  approval. No words: no model can put a promise, a price or a date in a client's email.
 """
 from __future__ import annotations
 
@@ -305,6 +308,13 @@ def devto_crossposter(spec, **params):
     return DevtoWorker(spec, **params)
 
 
+def order_desk(spec, **params):
+    """REAL. ``contracts.orders`` (orders.py): every client order answered by fixed
+    template, as ``client.email`` for the owner's approval."""
+    from .orders import OrderDesk
+    return OrderDesk(spec, **params)
+
+
 # The whole list of worker implementations. A catalogue ``impl`` not named here is an
 # error at load time, never a worker that silently does not exist.
 IMPLS = {
@@ -315,4 +325,5 @@ IMPLS = {
     "instagram_writer": instagram_writer,
     "traffic_reader": traffic_reader,
     "devto_crossposter": devto_crossposter,
+    "order_desk": order_desk,
 }
