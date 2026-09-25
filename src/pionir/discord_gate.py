@@ -7,7 +7,9 @@ to a configured channel saying exactly what will happen (capability, the whole
 command and payload, who asked, and any money it spends in bold at the top; a
 ``content.publish`` card opens with PUBLISHES PUBLICLY and shows the whole post; a
 ``social.instagram_post`` card opens with POSTS PUBLICLY TO INSTAGRAM, shows the full
-caption and carries the rendered image itself as an attachment),
+caption and carries the rendered image itself as an attachment; a
+``content.crosspost_devto`` card opens with CROSS-POSTS TO DEV.TO and shows the whole
+article),
 adds ✅ and ❌ itself, and polls the reactions. Only the configured owner's
 reaction counts; with no owner configured nothing can ever be approved here.
 
@@ -53,6 +55,7 @@ from typing import Any
 from uuid import uuid4
 
 from .adapters.content import PUBLISH, public_url
+from .adapters.devto import CROSSPOST as DEVTO_CROSSPOST
 from .adapters.instagram import POST as INSTAGRAM_POST
 from .social.card import render_card
 from .social.post import full_caption
@@ -449,6 +452,32 @@ def _publish_lines(payload: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+DEVTO_LINE = ("📰 **CROSS-POSTS TO DEV.TO** - the blog post below, already live on "
+              "api.dokaz.net, goes up on dev.to under your account if you approve.")
+
+
+def _devto_lines(payload: Mapping[str, Any]) -> list[str]:
+    """The article as the owner must see it before it goes up: the canonical URL it will
+    point back to (the adapter builds it from the slug the same way), the title, the
+    description, the tags and the WHOLE body, verbatim (split across messages, never cut)."""
+
+    slug = payload.get("slug")
+    tags = payload.get("tags")
+    body = payload.get("body_md")
+    lines = [
+        "**Canonical URL (the original on the blog):** "
+        + (f"<{public_url(slug)}>" if isinstance(slug, str) else "(no valid slug)"),
+        f"**Title:** {_escape(str(payload.get('title')))}",
+        f"**Description:** {_escape(str(payload.get('description')))}",
+        "**Tags:** " + (", ".join(f"`{_fence_safe(str(t))}`" for t in tags)
+                        if isinstance(tags, list) and tags else "(none)"),
+    ]
+    text = body if isinstance(body, str) else str(body)
+    lines += [(f"**The article, in full ({len(text):,} characters), exactly as dev.to will "
+               "receive it:**"), _FENCE + "markdown", _fence_safe(text), _FENCE]
+    return lines
+
+
 INSTAGRAM_LINE = ("\U0001f4f8 **POSTS PUBLICLY TO INSTAGRAM** - the image and caption below go "
                   "live on the Dokaz Instagram if you approve.")
 CARD_FILENAME = "card.jpg"
@@ -518,11 +547,14 @@ def render_request(row: Mapping[str, Any], owner: str | None) -> str:
     payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
     publishes = row.get("capability") == PUBLISH
     posts = row.get("capability") == INSTAGRAM_POST
+    crossposts = row.get("capability") == DEVTO_CROSSPOST
     lines: list[str] = []
     if publishes:
         lines.append(PUBLISH_LINE)
     if posts:
         lines.append(INSTAGRAM_LINE)
+    if crossposts:
+        lines.append(DEVTO_LINE)
     money = money_line(row)
     if money:
         lines.append(money)
@@ -553,6 +585,11 @@ def render_request(row: Mapping[str, Any], owner: str | None) -> str:
             # the body is shown above, in full and readable; as one JSON-escaped line
             # it would only double the messages
             shown = {**payload, "body_md": f"(the full post above, "
+                                           f"{len(payload['body_md']):,} characters)"}
+    if crossposts:
+        lines += _devto_lines(payload)
+        if isinstance(payload.get("body_md"), str):
+            shown = {**payload, "body_md": f"(the full article above, "
                                            f"{len(payload['body_md']):,} characters)"}
     if posts:
         lines += _instagram_lines(payload)

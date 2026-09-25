@@ -5,6 +5,7 @@ from .bryo_status import BryoStatusAdapter, BryoStatusSettings
 from .content import ContentAdapter, ContentSettings
 from .crew import CrewAdapter, CrewAdapterSettings
 from .daedalus import DaedalusAdapter, DaedalusSettings
+from .devto import DevtoAdapter, DevtoSettings
 from .galatea import GalateaAdapter, GalateaSettings
 from .instagram import InstagramAdapter, InstagramSettings
 from .melete import MeleteAdapter, MeleteSettings
@@ -23,6 +24,8 @@ __all__ = [
     "CrewAdapterSettings",
     "DaedalusAdapter",
     "DaedalusSettings",
+    "DevtoAdapter",
+    "DevtoSettings",
     "GalateaAdapter",
     "GalateaSettings",
     "InstagramAdapter",

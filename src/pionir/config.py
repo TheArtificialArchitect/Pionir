@@ -187,6 +187,15 @@ class PionirSettings:
     # unregistered; PIONIR_INSTAGRAM_TOKEN_FILE points at another token file.
     instagram_graph_url: str | None = "https://graph.instagram.com/v25.0"
     instagram_token_file: Path | None = None
+    # The dev.to (Forem) API for content.crosspost_devto, which republishes a blog post that
+    # is already live and parks for the owner's yes on every call. It checks the original
+    # on the blog (content_url) first, so it is registered only when both are on. The API
+    # key lives in devto_key_file (None means ~/.pionir/secrets/devto-api-key.txt, written by
+    # tools/setup-devto.ps1) and is read at call time: no network at boot. The ledger of
+    # cross-posted drafts is <state_root>/devto/posts.json. PIONIR_DEVTO_URL set to "off"
+    # leaves it unregistered; PIONIR_DEVTO_KEY_FILE points at another key file.
+    devto_url: str | None = "https://dev.to/api"
+    devto_key_file: Path | None = None
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
     # The local embedding model for hybrid recall. Default on: it is ~0.32 GB and
@@ -263,6 +272,20 @@ class PionirSettings:
         except RuntimeError:
             return self.state_root / "secrets" / "instagram.json"
         return home / ".pionir" / "secrets" / "instagram.json"
+
+    @property
+    def devto_key_path(self) -> Path:
+        if self.devto_key_file is not None:
+            return self.devto_key_file
+        try:
+            home = Path.home()
+        except RuntimeError:
+            return self.state_root / "secrets" / "devto-api-key.txt"
+        return home / ".pionir" / "secrets" / "devto-api-key.txt"
+
+    @property
+    def devto_ledger_path(self) -> Path:
+        return self.state_root / "devto" / "posts.json"
 
     @property
     def cortex_path(self) -> Path:
@@ -374,6 +397,12 @@ class PionirSettings:
             instagram_token_file=(
                 Path(os.environ["PIONIR_INSTAGRAM_TOKEN_FILE"]).expanduser()
                 if (os.environ.get("PIONIR_INSTAGRAM_TOKEN_FILE") or "").strip()
+                else None
+            ),
+            devto_url=_optional_url("PIONIR_DEVTO_URL", _declared("devto_url")),
+            devto_key_file=(
+                Path(os.environ["PIONIR_DEVTO_KEY_FILE"]).expanduser()
+                if (os.environ.get("PIONIR_DEVTO_KEY_FILE") or "").strip()
                 else None
             ),
             embed_model=_embed_model_from_env(),

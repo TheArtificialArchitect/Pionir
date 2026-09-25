@@ -83,6 +83,11 @@ def _parser() -> argparse.ArgumentParser:
         help="check the Instagram token: who it is for and today's posting quota "
              "(reads only; never posts, never prints the token)",
     )
+    commands.add_parser(
+        "devto-check",
+        help="check the dev.to API key: who it belongs to "
+             "(reads only; never posts, never prints the key)",
+    )
     commands.add_parser("bryo-status", help="read Bryo's non-mutating status snapshot")
     commands.add_parser("nyx-status", help="read Nyx's redacted offensive-security health")
     commands.add_parser("voodoo-status", help="read Voodoo's redacted defensive posture")
@@ -630,14 +635,35 @@ def instagram_check(settings: PionirSettings | None = None, *, opener: Any = Non
     return code
 
 
+def devto_check(settings: PionirSettings | None = None, *, opener: Any = None) -> int:
+    """``pionir devto-check``: 0 ok, 1 not configured (or could not check), 2 rejected.
+    No runtime is built: it reads the key file and asks dev.to one question (GET
+    /users/me). Never posts, never prints the key."""
+    from .adapters.devto import DevtoAdapter, DevtoSettings
+
+    configured = settings or PionirSettings.from_environment()
+    if configured.devto_url is None:
+        _print({"status": "not_configured", "message": "PIONIR_DEVTO_URL is off"})
+        return 1
+    adapter = DevtoAdapter(DevtoSettings(api_url=configured.devto_url,
+                                         key_file=configured.devto_key_path,
+                                         ledger_file=configured.devto_ledger_path),
+                           opener=opener)
+    code, report = adapter.check_account()
+    _print(report)
+    return code
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.command == "instagram-check":
-        try:
-            return instagram_check()
-        except (ValueError, OSError) as error:
-            _print({"status": "error", "error_type": type(error).__name__, "message": str(error)})
-            return 1
+    for name, check in (("instagram-check", instagram_check), ("devto-check", devto_check)):
+        if args.command == name:
+            try:
+                return check()
+            except (ValueError, OSError) as error:
+                _print({"status": "error", "error_type": type(error).__name__,
+                        "message": str(error)})
+                return 1
     if args.command == "bryo-feed":
         # A standalone poller: it reads the running server over HTTP and needs no
         # runtime of its own (no Cortex, no GPU lock), so it short-circuits here.

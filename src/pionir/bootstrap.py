@@ -15,6 +15,8 @@ from .adapters import (
     CrewAdapterSettings,
     DaedalusAdapter,
     DaedalusSettings,
+    DevtoAdapter,
+    DevtoSettings,
     GalateaAdapter,
     GalateaSettings,
     InstagramAdapter,
@@ -208,6 +210,15 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
             token_file=configured.instagram_token_path,
             content=ContentSettings(base_url=configured.content_url,
                                     token_file=configured.content_token_path),
+        )))
+    if configured.content_url is not None and configured.devto_url is not None:
+        # Checks the original on the blog before cross-posting it. No boot-time call: the
+        # key file is read when a cross-post runs. content.crosspost_devto always parks.
+        runtime.register(DevtoAdapter(DevtoSettings(
+            api_url=configured.devto_url,
+            key_file=configured.devto_key_path,
+            ledger_file=configured.devto_ledger_path,
+            blog_url=configured.content_url,
         )))
     if configured.specialists_file is not None:
         for adapter in load_stdio_adapters(configured.specialists_file):
