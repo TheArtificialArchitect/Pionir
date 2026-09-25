@@ -11,6 +11,9 @@ whole list, and a name not in it fails loudly at load time.
   is ``Err(not_configured)``, loudly - never a fake zero. Revenue is recorded as typed
   figures in ``usd_cents``, exactly as Scrooge keeps it.
 - ``http_health`` - REAL. ``GET``s a health URL and records up/down and latency.
+- ``blog_writer`` - REAL (blog.py). Drafts a blog post through the shared brain, checks
+  it with contentcheck.py, and submits it for the owner's approval. The one worker here
+  that gets words; it gets them only through ``ctx.words``.
 """
 from __future__ import annotations
 
@@ -235,10 +238,19 @@ class HealthWorker(_Base):
         ),))
 
 
+def blog_writer(spec, **params):
+    """REAL. ``posting.blog`` (blog.py): one checked draft a day for api.dokaz.net, words
+    from the shared brain only, submitted as ``content.publish`` for the owner's approval.
+    Imported here rather than at the top because blog.py builds on ``_Base`` above."""
+    from .blog import BlogWorker
+    return BlogWorker(spec, **params)
+
+
 # The whole list of worker implementations. A catalogue ``impl`` not named here is an
 # error at load time, never a worker that silently does not exist.
 IMPLS = {
     "placeholder": Placeholder,
     "scrooge_ledger": LedgerWorker,
     "http_health": HealthWorker,
+    "blog_writer": blog_writer,
 }

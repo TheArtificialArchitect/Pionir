@@ -23,7 +23,7 @@ CATALOGUE_PATH = Path(__file__).with_name("catalogue.json")
 
 _TOP = frozenset({"_how", "providers", "known_names", "divisions"})
 _DIVISION = frozenset({"id", "title", "leader_cadence_seconds", "workers", "brief_quota",
-                       "entities", "_note"})
+                       "entities", "leader_notes", "_note"})
 _WORKER = frozenset({"name", "impl", "kind", "cadence_seconds", "provider", "stage",
                      "entities", "note", "params", "_note"})
 
@@ -51,6 +51,7 @@ class DivisionSpec:
     worker_ids: tuple
     brief_quota: dict = field(default_factory=dict)
     entities: tuple = ()
+    leader_notes: str = ""      # division-specific rules added to its leader's instructions
 
 
 def _unknown(where: str, d: dict, allowed: frozenset) -> None:
@@ -192,7 +193,8 @@ def build_registry(catalogue: dict, impls: Mapping | None = None) -> Registry:
             leader_cadence_seconds=_positive_int(f"{did}.leader_cadence_seconds",
                                                  d.get("leader_cadence_seconds", 3600)),
             worker_ids=tuple(ids), brief_quota=dict(quota),
-            entities=tuple(d.get("entities") or ())))
+            entities=tuple(d.get("entities") or ()),
+            leader_notes=str(d.get("leader_notes") or "").strip()))
     return Registry(divisions, workers, providers, catalogue.get("known_names") or ())
 
 

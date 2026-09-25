@@ -235,6 +235,8 @@ class Leader:
             return Ok(abstain), 1
         user = render(brief)
         system = SYSTEM.format(title=brief.title)
+        if self.spec.leader_notes:
+            system += f"\n\nFor this division:\n{self.spec.leader_notes}"
         digest = hashlib.sha256(f"{self.model}\x1f{system}\x1f{user}".encode()).hexdigest()[:16]
         provenance = {"model": self.model, "prompt_digest": digest, "temperature": 0,
                       "inputs": len(brief.outputs), "new_inputs": len(brief.new_outputs)}

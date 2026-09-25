@@ -108,8 +108,11 @@ class Crew:
 
     # ---- what a worker is handed ------------------------------------------
     def context_for(self, worker) -> WorkContext:
+        goal = (self.store.directions().get(worker.division) or {}).get("goal")
         return WorkContext(now=self._now(), http=self.http, secrets_dir=self.cfg.secrets_dir,
-                           words=partial(self._words, worker), job=partial(self._job, worker))
+                           words=partial(self._words, worker), job=partial(self._job, worker),
+                           approval=self.hands.approval, goal=goal,
+                           state_dir=self.cfg.state_dir / "workers")
 
     def _words(self, worker, purpose: str, system: str, user: str, schema: dict) -> Result:
         """The ONLY way a worker reaches a model: the shared brain, JSON-schema output,
