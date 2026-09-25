@@ -96,9 +96,16 @@
       "id": "products",
       "title": "Products",
       "leader_cadence_seconds": 21600,
+      "entities": ["Gumroad", "Discord"],
+      "leader_notes": "products.shelf puts the products the owner stages on sale on Gumroad, each only after the owner approves it on Discord, and reads what the live ones sold. Report NEW SALES first and prominently: they are money. Each product.new_sales row is one product whose sales count rose since the last look, with its slug, the new sales and its totals as Gumroad reports them. A product.blocked row is URGENT for the owner: Pionir's checks refused the product before anyone saw it (for example a secret found in the zip, no README, an executable, a cover too small); give its slug, version and the reason, and say it stays off sale until he stages fixed files - the same content is never tried again. The tally's blocked list holds each blocked product's reason. A product.listing_malformed row, and the tally's malformed list, is a listing.json that failed the shelf's own check and was NOT submitted: give the folder and the reasons. Never call a product live, on sale or published until a product.published row says so (or product.sales lists it as live): a product PENDING APPROVAL is waiting for the owner and is NOT on sale. A product.not_published row says why a submitted product did not go out (denied by the owner, failed, or an approved one that failed to publish and will be offered to him again). product.tally holds the counts: products staged, staged but not yet approved, pending the owner's approval, blocked by the checks, denied by the owner, malformed listings, failed, and product versions published. product.sales holds each live product's sales and revenue as Gumroad reports them (stream = the product's slug), and the totals (stream all). When the newest row is product.sales_unavailable, the sales and revenue are UNKNOWN, never zero: say so. Suggest a price or listing change only from the sales recorded in product.sales, naming the product by its slug with its figures as recorded; never invent a sale, a price or a trend, and never claim why a product sold. With no sales recorded yet, say exactly that and suggest nothing about prices.",
+      "brief_quota": {"product.tally": 3, "product.sales": 2, "product.sales_unavailable": 2,
+                      "product.new_sales": 6, "product.blocked": 5, "product.pending": 5,
+                      "product.published": 5, "product.not_published": 5,
+                      "product.listing_malformed": 4, "product.not_set_up": 2},
       "workers": [
-        {"name": "gumroad", "impl": "placeholder", "kind": "product", "cadence_seconds": 21600,
-         "provider": "none", "entities": ["Gumroad"], "note": "Gumroad listings and sales"},
+        {"name": "shelf", "impl": "product_shelf", "kind": "product", "cadence_seconds": 1800,
+         "provider": "none", "entities": ["Gumroad"],
+         "note": "each product staged in its own folder published on Gumroad, for the owner's approval, and the live products' sales as Gumroad reports them; no model"},
         {"name": "api_builder", "impl": "placeholder", "kind": "product", "cadence_seconds": 21600,
          "provider": "none", "entities": [], "note": "building new paid API products"}
       ]
