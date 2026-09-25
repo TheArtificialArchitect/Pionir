@@ -165,6 +165,12 @@ class PionirSettings:
     daedalus_token: str | None = field(default=None, repr=False)
     melete_url: str | None = "http://127.0.0.1:8770"
     melete_token: str | None = field(default=None, repr=False)
+    # The crew (`python -m pionir.crew`, its own foreground process) serves its
+    # Direction API on loopback; Moss reads and directs it through the crew.*
+    # capabilities, so every direction change is gated and audited here. Wired in
+    # by default like Daedalus/Melete; a crew that is not running answers "the crew
+    # is not running" at once. PIONIR_CREW_URL set to "off" leaves it unregistered.
+    crew_url: str | None = "http://127.0.0.1:8782"
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
     # The local embedding model for hybrid recall. Default on: it is ~0.32 GB and
@@ -249,7 +255,7 @@ class PionirSettings:
             pass
 
     @classmethod
-    def from_environment(cls) -> "PionirSettings":
+    def from_environment(cls) -> PionirSettings:
         configured_state_root = os.environ.get("PIONIR_STATE_ROOT", "").strip()
         return cls(
             state_root=(
@@ -319,6 +325,7 @@ class PionirSettings:
             daedalus_token=(os.environ.get("PIONIR_DAEDALUS_TOKEN") or "").strip() or None,
             melete_url=_optional_url("PIONIR_MELETE_URL", _declared("melete_url")),
             melete_token=(os.environ.get("PIONIR_MELETE_TOKEN") or "").strip() or None,
+            crew_url=_optional_url("PIONIR_CREW_URL", _declared("crew_url")),
             embed_model=_embed_model_from_env(),
             distil_model=(os.environ.get("PIONIR_DISTIL_MODEL") or "").strip()
             or _declared("distil_model"),

@@ -69,6 +69,10 @@ class CrewSettings:
     # Claude escalations per local day across ALL leaders. 0 turns escalation off.
     claude_daily_cap: int = 10
     escalation_timeout_seconds: float = 300.0
+    # The loopback HTTP API Moss reaches the crew through (api.py), via Pionir's
+    # ``crew.*`` capabilities. Bound to 127.0.0.1 only. 0 takes a free port (tests);
+    # None runs the crew without it. PIONIR_CREW_API_PORT overrides ("off" = None).
+    api_port: int | None = 8782
     # Where workers find the secrets they read (the Scrooge read token). None -> ~/.pionir/secrets
     secrets_dir: Path | None = None
     # The catalogue of divisions and workers. None -> the packaged catalogue.json
@@ -93,6 +97,9 @@ class CrewSettings:
             raise ValueError("pool sizes must be positive")
         if self.claude_daily_cap < 0:
             raise ValueError("claude_daily_cap cannot be negative")
+        if self.api_port is not None and (isinstance(self.api_port, bool)
+                                          or not 0 <= self.api_port <= 65535):
+            raise ValueError("api_port is a TCP port (0-65535), or None for no API")
         if self.secrets_dir is None:
             object.__setattr__(self, "secrets_dir", Path.home() / ".pionir" / "secrets")
 
@@ -130,6 +137,9 @@ class CrewSettings:
             raw = os.environ.get(env, "").strip()
             if raw:
                 overrides[key] = cast(raw)
+        raw = os.environ.get("PIONIR_CREW_API_PORT", "").strip()
+        if raw:
+            overrides["api_port"] = None if raw.lower() in {"off", "none"} else int(raw)
         raw = os.environ.get("PIONIR_CREW_CALLS_PER_HOUR", "").strip()
         if raw:
             overrides["budget"] = CrewBudget(calls_per_hour=int(raw))

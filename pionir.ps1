@@ -6,12 +6,13 @@
 #   .\pionir.ps1 -NoVoice        don't wake Galatea
 #   .\pionir.ps1 -NoSpecialists  don't start Daedalus/Melete; reach whoever's already up
 #   .\pionir.ps1 -NoBryo         don't start Bryo, the observer organism
+#   .\pionir.ps1 -NoCrew         don't start the crew (workers, division leaders)
 #   .\pionir.ps1 -NoBrowser      don't open the dashboard in a browser
 #   .\pionir.ps1 -Port 8781      a different dashboard port
 #   .\pionir.ps1 -Stop           stop the whole stack from anywhere
 #
 # One window, every bridge a pane: with Windows Terminal (wt.exe) the dashboard
-# server, Galatea, Daedalus, Melete and Bryo each get a titled pane in a single
+# server, Galatea, Daedalus, Melete, the crew and Bryo each get a titled pane in a single
 # window. Closing that window brings the whole stack down - wt kills every pane's
 # process tree on close (verified: ports free afterwards, no orphans). If wt.exe
 # is not present the launcher falls back to one window per bridge. It is a
@@ -22,6 +23,7 @@ param(
     [switch]$NoVoice,
     [switch]$NoSpecialists,
     [switch]$NoBryo,
+    [switch]$NoCrew,
     [switch]$NoBrowser,
     [switch]$Stop,
     [int]$Port = 8780
@@ -112,6 +114,7 @@ if ($Stop) {
     Stop-Port 8799 "Galatea"
     Stop-Port 8771 "Daedalus"
     Stop-Port 8770 "Melete"
+    Stop-Port 8782 "crew"
     Stop-Bryo
     Write-Host "  stack stopped. (Closing the Pionir window does the same thing.)"
     exit 0
@@ -189,6 +192,21 @@ if (-not $NoSpecialists) {
     } else { Write-Host "  ! Melete not found at $meleteDir; skipping." -ForegroundColor Yellow }
 }
 
+# The crew: personality-free workers in divisions, leaders that distil, reports up
+# to Moss. Its own foreground process (python -m pionir.crew, from this repo) with a
+# loopback Direction API on 8782, which Moss reaches only through Pionir's crew.*
+# capabilities, so every goal and compute allocation she sets is gated and audited.
+# PIONIR_CREW_PIONIR_URL: the crew's hands task Pionir, so a -Port other than 8780
+# must reach them too (the same reason Atani gets ATANI_PIONIR_URL above).
+if (-not $NoCrew) {
+    if (Test-Port 8782) { Write-Host "  crew already up on 8782." -ForegroundColor DarkCyan }
+    else {
+        $crewPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_CREW_PIONIR_URL='http://127.0.0.1:$Port'; `$env:PIONIR_CREW_API_PORT='8782'; "
+        $panes += ,(Pane-Cmd "Crew :8782" $root "python -m pionir.crew" $crewPrelude)
+        $ports += 8782
+    }
+}
+
 # Bryo, the observer organism. Foreground pane now, not a logon task: he lives
 # while the window is open and stops when it closes (crash-safe - he checkpoints
 # every tick and replays on restart). He takes a singleton pidfile lock, so skip
@@ -246,7 +264,11 @@ if (Test-Path $wt) {
 # Verify the artifact, not the window (HEAD 3.16): a drawn pane is not a live
 # server. Wait for each port this launch started to actually answer.
 Write-Host "  verifying bridges are actually up..." -ForegroundColor DarkGray
-$deadline = (Get-Date).AddSeconds(30)
+# The crew opens 8782 only after its boot check has warmed and measured its model
+# (it can wait on the card), so it may take longer than the others to answer.
+$waitSeconds = 30
+if ($ports -contains 8782) { $waitSeconds = 90 }
+$deadline = (Get-Date).AddSeconds($waitSeconds)
 $pending = [System.Collections.ArrayList]@($ports)
 while ($pending.Count -gt 0 -and (Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 800

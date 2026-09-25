@@ -9,6 +9,8 @@ from .adapters import (
     AtaniCliSettings,
     BryoStatusAdapter,
     BryoStatusSettings,
+    CrewAdapter,
+    CrewAdapterSettings,
     DaedalusAdapter,
     DaedalusSettings,
     GalateaAdapter,
@@ -184,6 +186,10 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
                 )
             )
         )
+    if configured.crew_url is not None:
+        # No boot-time call: the crew is reached only when a crew.* task runs (or
+        # doctor asks), so a runtime without a running crew builds exactly the same.
+        runtime.register(CrewAdapter(CrewAdapterSettings(base_url=configured.crew_url)))
     if configured.specialists_file is not None:
         for adapter in load_stdio_adapters(configured.specialists_file):
             runtime.register(adapter)

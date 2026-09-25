@@ -15,6 +15,10 @@ One loop thread looks at the wall clock every ``tick_seconds`` and:
    start, so it does not abstain as blind before its workers have had one go;
 3. checks the vitals (inertness) and takes a checkpoint now and then.
 
+Beside the loop, ``Crew.start`` serves the Direction API on loopback HTTP (api.py, port
+``cfg.api_port``) so Moss can read and direct the crew through Pionir; ``Crew.stop``
+stops it first, before anything it reads is closed.
+
 Honest time, kept from Hearth: a restart records "process was not running" for the gap
 since the last checkpoint, and an operator ``pause`` is recorded when it ends. While
 paused nothing is dispatched, the brain makes no model call and the hands start no job;
@@ -28,6 +32,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
+from .api import CrewApi
 from .brain import Brain, Post, http_post_json
 from .clock import WallClock
 from .direction import Allocation, Direction
@@ -96,6 +101,9 @@ class Crew:
         self._next_checkpoint = 0.0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="pionir-crew-loop", daemon=True)
+        # Built here, served from start(): building a crew opens no socket.
+        self.api = (CrewApi(self.direction, health=self.api_health, port=cfg.api_port)
+                    if cfg.api_port is not None else None)
         self._restore()
 
     # ---- what a worker is handed ------------------------------------------
@@ -149,11 +157,16 @@ class Crew:
         self.brain.start()
         self.hands.start()
         self._thread.start()
+        if self.api is not None:
+            self.api.start()
 
     def stop(self) -> None:
         if self.stopping:
             return                    # once: a second stop would write into a closed store
         self.stopping = True
+        # the API first: no direction write may arrive once the store starts closing
+        if self.api is not None:
+            safe("crew.stop.api", self.api.stop)
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout=15)
@@ -257,6 +270,13 @@ class Crew:
         return {"workers": report, "leaders": results}
 
     # ---- for a viewer ----------------------------------------------------------
+    def api_health(self) -> dict:
+        """What ``GET /api/health`` says: up, paused or stopping, and which divisions."""
+        now = self._now()
+        return {"service": "pionir-crew", "paused": self.paused_reason,
+                "stopping": self.stopping, "uptime_s": round(now - self.started_at),
+                "divisions": list(self.registry.division_ids())}
+
     def snapshot(self) -> dict:
         now = self._now()
         return {
