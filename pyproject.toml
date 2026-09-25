@@ -10,7 +10,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
 authors = [{ name = "Ian Lee" }]
-dependencies = []
+dependencies = [
+  "pillow>=10.1",  # social/card.py draws the Instagram card (variable-font axes need 10.1+)
+]
 
 [project.optional-dependencies]
 dev = [

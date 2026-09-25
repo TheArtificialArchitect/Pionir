@@ -72,6 +72,7 @@ class PostCheckTests(unittest.TestCase):
             "email": post(points=["Write to someone at jane@mailbox.org for help."]),
             "phone": post(caption=GOOD["caption"] + " Call 2065550123 now."),
             "angle bracket": post(headline="Use <b> tags for bold text here"),
+            "backtick": post(caption=GOOD["caption"] + " Use `code` here."),
             "emoji": post(headline="Check an email address before \U0001F680"),
             "multi-line headline": post(headline="Check an email\naddress first"),
             "too many points": post(points=GOOD["points"] + ["One more point that is long enough."]),

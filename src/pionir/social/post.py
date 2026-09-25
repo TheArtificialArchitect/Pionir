@@ -40,6 +40,8 @@ def _text_problem(key: str, text: str) -> str | None:
         return f"has a character the card cannot use ({bad!r})"
     if "@" in text:
         return "has an @ (no mentions, no addresses)"
+    if "`" in text:
+        return "has a backtick (plain text only)"
     if "#" in text:
         return "has a # (hashtags go in the hashtags field)"
     if _URLISH.search(text):
