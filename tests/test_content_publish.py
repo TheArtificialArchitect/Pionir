@@ -87,7 +87,12 @@ class FakeScrooge:
         self.answer: tuple[int, Any] | None = None   # force one status/body
         self.down = False
 
-    def __call__(self, request: Any, timeout: float) -> _Response:
+    def __call__(self, request: Any, data: Any = None, timeout: float | None = None) -> _Response:
+        # The real opener is OpenerDirector.open(url, data=None, timeout=...): a timeout
+        # passed positionally lands in `data` and the POST dies with a TypeError at the
+        # owner's approval. This fake has the same signature, so it fails the same way.
+        if data is not None:
+            raise TypeError(f"opener got a positional data argument: {data!r}")
         body = json.loads(request.data)
         self.calls.append({"url": request.full_url, "method": request.get_method(),
                            "token": request.get_header("X-dash-token"), "body": body,
@@ -416,6 +421,48 @@ class ScroogeMirrorTests(unittest.TestCase):
     def test_ordinary_prose_still_passes(self) -> None:
         check_draft(draft(body_md=BODY + "\n\nOn 2026-09-25 at 14:30, over 10,000 ran."))
         check_draft(draft(body_md=BODY + "\n\n```json\n{\"a\": 1}\n```"))
+
+
+class RealOpenerTests(unittest.TestCase):
+    """The adapter's real urllib opener against a real loopback HTTP server: the path the
+    owner's approval takes. The first real end-to-end run crashed here with every fake green."""
+
+    def test_publish_through_the_real_opener(self) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        seen: list = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 - http.server's name
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                seen.append((self.path, self.headers.get("x-dash-token"), body))
+                out = json.dumps({"ok": True, "slug": body["slug"], "created": True,
+                                  "url": f"https://api.dokaz.net/blog/{body['slug']}",
+                                  "published_at": "2026-09-25T00:00:00Z"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+
+            def log_message(self, *_a: Any) -> None:
+                pass
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        with tempfile.TemporaryDirectory() as tmp:
+            token = Path(tmp) / "token.txt"
+            token.write_text(SECRET, encoding="utf-8")
+            adapter = ContentAdapter(ContentSettings(
+                base_url=f"http://127.0.0.1:{httpd.server_address[1]}", token_file=token))
+            status, body = adapter._post("/dash/content/publish", draft(), SECRET)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["ok"])
+        self.assertEqual(seen[0][0], "/dash/content/publish")
+        self.assertEqual(seen[0][1], SECRET)
+        self.assertEqual(seen[0][2]["slug"], draft()["slug"])
 
 
 class ResponseMappingTests(_Case):

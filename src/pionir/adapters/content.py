@@ -383,7 +383,7 @@ class ContentAdapter:
             method="POST",
         )
         try:
-            with self._open(request, self.settings.timeout_seconds) as response:
+            with self._open(request, timeout=self.settings.timeout_seconds) as response:
                 return int(getattr(response, "status", 200)), self._json(response)
         except urllib.error.HTTPError as error:
             try:
