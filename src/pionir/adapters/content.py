@@ -83,6 +83,22 @@ _PHONE = re.compile(
 _IPV4 = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
 _IPV6_CANDIDATE = re.compile(r"(?<![\w:])[0-9A-Fa-f:]*:[0-9A-Fa-f:]*:[0-9A-Fa-f:.]*(?![\w:])")
 
+# Mirrors of Scrooge's own refusals (worker/src/blog.ts) that the rules above let through, so
+# nothing Pionir parks for the owner's yes can then bounce at the endpoint: an approval that
+# cannot publish wastes his attention. Found by the end-to-end agreement run; rerun it if
+# Scrooge's rules change.
+_CONTROL_LINE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_CONTROL_BODY = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
+_INVISIBLE = re.compile("[\u200b\u200c\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]")
+_OTHER_SCHEME = re.compile(r"\b(?:mailto|tel|file)\s*:(?=\S)", re.IGNORECASE)
+_IMAGE = re.compile(r"!\[")
+_FENCE = re.compile(r"^\s{0,3}```", re.MULTILINE)
+_PHONES_STRICT = (
+    re.compile(r"\+\d[\d\s().-]{6,20}\d"),
+    re.compile(r"(?<!\d)(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]\d{4}(?!\d)"),
+    re.compile(r"(?<![\d.])1?[2-9]\d{9}(?![\d.])"),
+)
+
 READ_TIMEOUT_SECONDS = 30
 
 
@@ -148,6 +164,24 @@ def _text_problem(text: str) -> str | None:
     return _contact_problem(text)
 
 
+def _scrooge_problem(key: str, text: str) -> str | None:
+    """What Scrooge's endpoint would refuse that `_text_problem` lets through."""
+    if (_CONTROL_BODY if key == "body_md" else _CONTROL_LINE).search(text):
+        return "contains a control character" + ("" if key == "body_md" else " or line break")
+    if _INVISIBLE.search(text):
+        return "contains an invisible direction or zero-width character"
+    if _OTHER_SCHEME.search(text):
+        return "mailto:, tel: and file: are not allowed"
+    if _IMAGE.search(text):
+        return "images are not supported"
+    if key == "body_md" and len(_FENCE.findall(text)) % 2:
+        return "a ``` code fence is not closed"
+    for pattern in _PHONES_STRICT:
+        if any(sum(c.isdigit() for c in m.group(0)) >= 8 for m in pattern.finditer(text)):
+            return "no phone numbers are allowed"
+    return None
+
+
 def _require_str(payload: Mapping[str, Any], key: str) -> str:
     value = payload.get(key)
     if not isinstance(value, str):
@@ -180,7 +214,7 @@ def check_draft(payload: Mapping[str, Any]) -> dict[str, Any]:
         text = _require_str(payload, key)
         if not low <= len(text) <= high:
             raise ValueError(f"{key}: {low}-{high} characters (this is {len(text)})")
-        problem = _text_problem(text)
+        problem = _text_problem(text) or _scrooge_problem(key, text)
         if problem:
             raise ValueError(f"{key}: {problem}")
         body[key] = text

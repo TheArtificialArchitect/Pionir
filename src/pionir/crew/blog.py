@@ -139,6 +139,8 @@ description, body_md, tags. Nothing else.
 
 Hard rules. A draft that breaks any one of them is thrown away unread:
 - Markdown only: no HTML tags, no HTML comments, no angle brackets at all.
+- Only ## and ### headings, paragraphs, - or 1. lists, **bold**, *italic*, `code` and ```
+  fences. No # or #### headings, no tables, no > quotes, no --- rules, no images.
 - Write NO links, NO URLs and NO website or domain names. The links are added for you.
 - Name no person, place, city, country, company, customer or website. The only names you \
 may write with a capital letter are: {names}. Every other word is lower case unless it \

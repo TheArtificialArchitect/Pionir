@@ -387,6 +387,31 @@ class LocalValidationTests(_Case):
         self.assertEqual(self.scrooge.calls, [])
 
 
+class ScroogeMirrorTests(unittest.TestCase):
+    """What Scrooge's endpoint refuses, Pionir refuses before parking: the owner must never
+    approve a post that then bounces. Each case was found passing Pionir and 400ing at a real
+    local Scrooge in the blog end-to-end run."""
+
+    def test_scrooge_refusals_are_refused_here(self) -> None:
+        cases = {
+            "image": BODY + "\n\n![d](https://api.dokaz.net/x.png)",
+            "unclosed fence": BODY + "\n\n```json\n{\"a\": 1}",
+            "zero-width": BODY + "\n\nSome" + chr(0x200B) + "text.",
+            "control char": BODY + "\n\nBell" + chr(7) + ".",
+            "bare phone": BODY + "\n\nCall 2065550123 today.",
+            "mailto": BODY + "\n\nWrite mailto:hello.",
+        }
+        for name, body in cases.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                check_draft(draft(body_md=body))
+        with self.assertRaises(ValueError):
+            check_draft(draft(title="Two lines\nof a title here"))
+
+    def test_ordinary_prose_still_passes(self) -> None:
+        check_draft(draft(body_md=BODY + "\n\nOn 2026-09-25 at 14:30, over 10,000 ran."))
+        check_draft(draft(body_md=BODY + "\n\n```json\n{\"a\": 1}\n```"))
+
+
 class ResponseMappingTests(_Case):
     def test_409_is_a_refusal_with_scrooges_reason(self) -> None:
         self.scrooge.answer = (409, {"ok": False, "error": "slug taken"})

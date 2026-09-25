@@ -29,7 +29,10 @@ The rules, one function each:
                   revenue" / "we made", no counts of customers or users, no money amounts
 - ``_internal``   none of the owner's internal systems is named in public text
 
-Deterministic and model-free: nothing here imports a model, a network or Pionir.
+Deterministic and model-free: nothing here imports a model or touches a network. It does run
+Pionir's own publish validator (`adapters.content.check_draft`) first, so this check can never
+pass a draft that Pionir would then refuse: three separately-written validators drifting apart is
+exactly how a shared vocabulary fails (HEAD 3.8).
 """
 from __future__ import annotations
 
@@ -39,6 +42,8 @@ import re
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+
+from pionir.adapters.content import check_draft
 
 ALLOWLIST_PATH = Path(__file__).with_name("content_allowlist.json")
 
@@ -213,6 +218,37 @@ def _markup(texts: list) -> list:
             reasons.append(f"{field} has a {m.group(0).split(':')[0].strip().lower()}: URL")
         if _INVISIBLE.search(text):
             reasons.append(f"{field} has invisible or control characters")
+    return reasons
+
+
+# Markdown the site's renderer does not draw: it is published as literal text ("| a | b |",
+# "&gt; quote", "---", "# Big"), so a post using it looks broken to a reader. Measured against
+# the real renderer in the blog end-to-end run. Supported: ## and ### headings, paragraphs,
+# lists, **bold**, *italic*, `code`, ``` fences and links.
+_UNRENDERED = (
+    (re.compile(r"^\s{0,3}#(?!#)\s"), "a # heading (use ## or ###)"),
+    (re.compile(r"^\s{0,3}#{4,}\s"), "a #### heading (use ## or ###)"),
+    (re.compile(r"^\s{0,3}>"), "a > blockquote"),
+    (re.compile(r"^\s{0,3}\|"), "a | table"),
+    (re.compile(r"^\s{0,3}(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$"), "a --- rule"),
+    (re.compile(r"^\s{0,3}~~~"), "a ~~~ fence (use ```)"),
+)
+
+
+def _renderable(draft: dict) -> list:
+    body = draft.get("body_md")
+    if not isinstance(body, str):
+        return []
+    reasons, fenced = [], False
+    for line in body.splitlines():
+        if re.match(r"^\s{0,3}```", line):
+            fenced = not fenced
+            continue
+        if fenced:
+            continue
+        for pattern, what in _UNRENDERED:
+            if pattern.match(line):
+                reasons.append(f"body_md uses {what}, which the site shows as literal text")
     return reasons
 
 
@@ -558,7 +594,12 @@ def check(draft) -> list:
         return reasons
     texts = _texts(draft)
     try:
+        check_draft(draft)
+    except Exception as exc:  # noqa: BLE001 - Pionir's refusal, or its check failing, both block
+        reasons.append(f"Pionir's publish check refuses it: {exc}")
+    try:
         reasons += _markup(texts)
+        reasons += _renderable(draft)
         reasons += _links(draft, texts)
         reasons += _personal(texts)
         reasons += _names(draft)

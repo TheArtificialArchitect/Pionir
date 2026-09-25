@@ -73,6 +73,36 @@ class CleanDraftTests(unittest.TestCase):
             "```\ncurl https://api.dokaz.net/v1/email/verify\n```")), [])
 
 
+class RenderableTests(unittest.TestCase):
+    """Markdown the site's renderer does not draw is published as literal text."""
+
+    def test_unrendered_markdown_blocks(self) -> None:
+        for extra, needle in (("# Big", "# heading"), ("#### Deep", "#### heading"),
+                              ("> quoted", "blockquote"), ("| a | b |", "table"),
+                              ("---", "rule"), ("* * *", "rule"), ("~~~\nx\n~~~", "~~~")):
+            with self.subTest(extra=extra):
+                reasons = cc.check(with_body(extra))
+                self.assertTrue(any(needle in r for r in reasons), (extra, reasons))
+
+    def test_inside_a_code_fence_it_is_code(self) -> None:
+        self.assertEqual(cc.check(with_body("```\n# a shell comment\n| pipe\n```")), [])
+
+
+class PionirAgreementTests(unittest.TestCase):
+    """The crew check runs Pionir's publish validator first: never pass a draft Pionir refuses
+    (and so never park one for the owner that Scrooge would then bounce)."""
+
+    def test_what_pionir_refuses_the_crew_blocks(self) -> None:
+        from pionir.adapters.content import check_draft
+        for extra in ("see [x](https://api.dokaz.net/y)\x07", "call 2065550123 today",
+                      "```json\n{\"a\": 1}"):
+            with self.subTest(extra=extra):
+                d = with_body(extra)
+                with self.assertRaises(ValueError):
+                    check_draft(d)
+                self.assertTrue(any("Pionir's publish check" in r for r in cc.check(d)))
+
+
 class FieldRuleTests(unittest.TestCase):
     def assertBlocked(self, draft, needle: str) -> None:
         reasons = cc.check(draft)
