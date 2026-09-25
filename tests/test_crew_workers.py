@@ -19,7 +19,7 @@ from pionir.crew import workers as workers_module
 from pionir.crew.registry import WorkerSpec
 from pionir.crew.result import Err, Ok
 from pionir.crew.worker import ErrorKind, WorkContext
-from pionir.crew.workers import HealthWorker, LedgerWorker, Placeholder
+from pionir.crew.workers import CONTROL_URL, HealthWorker, LedgerWorker, Placeholder
 
 LEDGER_URL = "https://api.dokaz.net/dash/api.json"
 HEALTH_URL = "https://api.dokaz.net/health"
@@ -220,10 +220,21 @@ class HealthWorkerTests(unittest.TestCase):
         self.assertEqual(figs["status"].value, 503)
         self.assertEqual(out.payload["failing"], ["b"])
 
-    def test_no_answer_at_all_is_recorded_as_down_not_skipped(self) -> None:
-        (out,) = self.worker().run(ctx(FakeHttp())).value
+    def test_site_silent_while_the_network_works_is_down(self) -> None:
+        # the control site answers, so the silence really is the site's
+        (out,) = self.worker().run(ctx(FakeHttp({CONTROL_URL: (204, b"")}))).value
         self.assertFalse(out.payload["reachable"])
+        self.assertEqual(out.payload["control"], "answered")
         self.assertEqual({f.measures: f.value for f in out.figures}, {"up": 0})
+
+    def test_nothing_answering_at_all_is_could_not_check_not_site_down(self) -> None:
+        # The owner's own internet dropping must never read as his storefront failing.
+        # Neither the site nor the control answers: that is a check that could not be made
+        # (an Err the pool records as a failed run - still not skipped), NOT a "down" verdict.
+        result = self.worker().run(ctx(FakeHttp()))
+        self.assertIsInstance(result, Err)
+        self.assertEqual(result.error.kind, ErrorKind.UNAVAILABLE)
+        self.assertIn("NOT judged", result.error.message)
 
 
 class NoModelInWorkersTests(unittest.TestCase):

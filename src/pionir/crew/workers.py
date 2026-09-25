@@ -165,22 +165,44 @@ class LedgerWorker(_Base):
         return figs
 
 
+# A connectivity check on a DIFFERENT provider from the site's (the site sits behind
+# Cloudflare; this is Google's endpoint built for exactly this job). It is asked only when
+# the site gives no answer at all, to tell "the site is down" from "this machine is offline".
+CONTROL_URL = "https://www.google.com/generate_204"
+
+
 class HealthWorker(_Base):
     """Is the site up? One GET; up/down, latency, and which products it says failed.
-    No answer at all is recorded as DOWN (unreachable from here), with the reason."""
 
-    def __init__(self, spec, *, url: str) -> None:
+    No answer at all is NOT automatically "down". If the control site on another provider
+    does not answer either, this machine is offline, and that is reported as a check that
+    could not be made (an Err) - never as the site being down. The owner's own internet
+    dropping must not read as his storefront failing: a wrong red light costs trust as
+    fast as a wrong green one (HEAD 3.20)."""
+
+    def __init__(self, spec, *, url: str, control_url: str = CONTROL_URL) -> None:
         super().__init__(spec)
         self.url = url
+        self.control_url = control_url
 
     @never_raises()
     def run(self, ctx: WorkContext) -> Result:
         try:
             resp = ctx.http.get(self.url, timeout=20.0)
         except HttpUnreachable as exc:
+            try:
+                ctx.http.get(self.control_url, timeout=10.0)
+            except HttpUnreachable as control_exc:
+                return Err(WorkerError(
+                    self.worker_id, ErrorKind.UNAVAILABLE,
+                    "could not check: this machine looks offline - the control site did not "
+                    f"answer either ({str(control_exc)[:120]}). The site itself was NOT judged.",
+                    retryable=True,
+                ))
             return Ok((make_output(
                 self, valid_at=ctx.now, observed_at=ctx.now,
-                payload={"up": False, "reachable": False, "error": str(exc)[:300]},
+                payload={"up": False, "reachable": False, "control": "answered",
+                         "error": str(exc)[:300]},
                 figures=[Figure(0, "boolean", "up", window="now")],
                 entities=self.entities,
                 provenance={"source": "real", "provider": self.provider, "url": self.url},
