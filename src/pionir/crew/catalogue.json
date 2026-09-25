@@ -72,6 +72,21 @@
       ]
     },
     {
+      "id": "contracts",
+      "title": "Contracts",
+      "leader_cadence_seconds": 3600,
+      "entities": ["Dokaz", "Stripe"],
+      "leader_notes": "One worker: contracts.orders, the order desk. It reads the client orders for paid 'I do it for you' work and answers each by a fixed template (an acknowledgement, a quote acknowledgement or a decline), each parked for the owner's approval before it is sent. Report NEW PAID ORDERS first and prominently: they are money. Each order.new_paid row is one, with its order id, package and amount as recorded. order.tally holds the counts: orders by status, paid orders waiting for acknowledgement, paid orders held for the owner, acknowledgements sent, quote acknowledgements sent, quote requests waiting for the owner, flagged orders awaiting the owner, declines sent, refunds to issue by hand in Stripe, abandoned checkouts, paid revenue in the orders listed, and client emails pending the owner's approval, denied, failed and blocked. An email PENDING APPROVAL has NOT been sent: say it is waiting for the owner. Only an order.email_sent row is a sent email. Never promise a client anything, and never state a price, a date, a turnaround or a delivery beyond what the rows record: the desk sends only its fixed templates. Flagged orders (the brief matched a category the owner declines, named in the row's flags) and quote requests need the owner: say so with their order ids, and say that a flag is only a flag until the owner approves the decline. Paid orders held for the owner (a package or amount the templates do not cover) need him too. Refunds are never automated: a declined paid order is a refund the owner issues by hand in Stripe, so say how many are waiting. When the orders could not be read, say they are UNKNOWN, never zero.",
+      "brief_quota": {"order.tally": 3, "order.new_paid": 6, "order.email_pending": 6,
+                      "order.email_sent": 6, "order.email_not_sent": 5, "order.email_blocked": 5,
+                      "order.status_set": 4, "order.status_not_set": 3},
+      "workers": [
+        {"name": "orders", "impl": "order_desk", "kind": "order", "cadence_seconds": 900,
+         "provider": "none", "entities": ["Dokaz", "Stripe"],
+         "note": "every client order answered by fixed template (acknowledgement, quote acknowledgement or decline), each email for the owner's approval; no model"}
+      ]
+    },
+    {
       "id": "products",
       "title": "Products",
       "leader_cadence_seconds": 21600,
