@@ -81,6 +81,43 @@ Write-Host "  token file : $TokenFile"
 Write-Host "  settings   : $configFile"
 Write-Host ""
 
+# ---- is it even a bot token? (checked locally; the value is never shown) ------
+# The Developer Portal shows several long strings, and copying the wrong one is the
+# usual reason Discord answers 401. A bot token is three dot-separated parts, and its
+# first part encodes the bot's numeric user id. Name the mistake instead of just 401.
+function Get-TokenProblem([string]$t) {
+    # Specific mistakes first: an Application ID is 17-20 digits, so a plain length
+    # check would misread it as a failed paste and give the wrong advice.
+    if ($t -match '^\d{17,20}$') {
+        return "that is the Application ID (General Information page), not the bot token. Get it from the Bot page: Reset Token, then copy."
+    }
+    if ($t -match '^[0-9a-f]{64}$') {
+        return "that is the Public Key (General Information page), not the bot token. Get it from the Bot page: Reset Token, then copy."
+    }
+    if ($t.Length -lt 20) {
+        return "that is too short to be a token - the paste probably did not go in. In this window, paste with a RIGHT-CLICK; Ctrl+V does not always work in a hidden prompt."
+    }
+    $parts = $t.Split('.')
+    if ($parts.Count -ne 3) {
+        if ($t -match '^[A-Za-z0-9_-]{28,40}$') {
+            return "that looks like the Client Secret (OAuth2 page), not the bot token. Get it from the Bot page: Reset Token, then copy."
+        }
+        return "that does not have the shape of a bot token (three parts separated by dots). Copy it from the Bot page: Reset Token, then copy."
+    }
+    try {
+        $b64 = $parts[0].Replace('-', '+').Replace('_', '/')
+        while ($b64.Length % 4) { $b64 += '=' }
+        $id = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64))
+        if ($id -notmatch '^\d{17,20}$') {
+            return "that does not look like a bot token - its first part should encode the bot's user id. Copy it from the Bot page: Reset Token, then copy."
+        }
+    }
+    catch {
+        return "that does not look like a bot token (its first part is not valid). Copy it from the Bot page: Reset Token, then copy."
+    }
+    return $null
+}
+
 # ---- the token: read hidden, written without echo ---------------------------
 $token = ""
 $replace = $true
@@ -102,6 +139,11 @@ if ($replace) {
         Write-NotOk "no token entered; nothing saved"
         exit 1
     }
+    $problem = Get-TokenProblem $token
+    if ($problem) {
+        Write-NotOk "not saved: $problem"
+        exit 1
+    }
     $tokenDir = Split-Path -Parent $TokenFile
     New-Item -ItemType Directory -Force -Path $tokenDir | Out-Null
     [IO.File]::WriteAllText($TokenFile, $token, $utf8NoBom)
@@ -115,6 +157,11 @@ if ($replace) {
 }
 else {
     $token = ([IO.File]::ReadAllText($TokenFile)).Trim() -replace '^(?i)bot\s+', ''
+    $problem = Get-TokenProblem $token
+    if ($problem) {
+        Write-NotOk "the saved token is wrong: $problem Run this again and answer y to replace it."
+        exit 1
+    }
 }
 
 # ---- channel and owner -------------------------------------------------------
@@ -155,7 +202,7 @@ if ($r.ok) {
     Write-Ok "token works: the bot is $($r.body.username)"
 }
 elseif ($r.code -eq 401) {
-    Write-NotOk "Discord rejected the token (401). Reset it in the Developer Portal and run this again."
+    Write-NotOk "Discord rejected the token (401). It has the right shape, so the usual cause is that it was RESET after you copied it - a reset makes every earlier copy invalid. On the Bot page: Reset Token ONCE, copy that value, and run this again straight away."
     $allOk = $false
 }
 else {
