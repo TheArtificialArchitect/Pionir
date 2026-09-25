@@ -13,6 +13,7 @@ from typing import Any, Sequence
 
 from . import benchmark, bryofeed, recallcheck, routecheck
 from .bootstrap import PionirRuntime, build_runtime
+from .config import PionirSettings
 from .contracts import Task
 from .errors import PionirError, RoutingAmbiguous
 from .router import IntentRouter
@@ -77,6 +78,11 @@ def _parser() -> argparse.ArgumentParser:
                       help="seconds between polls")
     feed.add_argument("--once", action="store_true", help="write one snapshot and exit (for checks)")
 
+    commands.add_parser(
+        "instagram-check",
+        help="check the Instagram token: who it is for and today's posting quota "
+             "(reads only; never posts, never prints the token)",
+    )
     commands.add_parser("bryo-status", help="read Bryo's non-mutating status snapshot")
     commands.add_parser("nyx-status", help="read Nyx's redacted offensive-security health")
     commands.add_parser("voodoo-status", help="read Voodoo's redacted defensive posture")
@@ -607,8 +613,31 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
     return 2
 
 
+def instagram_check(settings: PionirSettings | None = None, *, opener: Any = None) -> int:
+    """``pionir instagram-check``: 0 ok, 1 not configured (or could not check), 2 rejected.
+    No runtime is built: it reads the token file and asks the Graph API two questions."""
+    from .adapters.instagram import InstagramAdapter, InstagramSettings
+
+    configured = settings or PionirSettings.from_environment()
+    if configured.instagram_graph_url is None:
+        _print({"status": "not_configured", "message": "PIONIR_INSTAGRAM_GRAPH_URL is off"})
+        return 1
+    adapter = InstagramAdapter(InstagramSettings(graph_url=configured.instagram_graph_url,
+                                                 token_file=configured.instagram_token_path),
+                               opener=opener)
+    code, report = adapter.check_account()
+    _print(report)
+    return code
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "instagram-check":
+        try:
+            return instagram_check()
+        except (ValueError, OSError) as error:
+            _print({"status": "error", "error_type": type(error).__name__, "message": str(error)})
+            return 1
     if args.command == "bryo-feed":
         # A standalone poller: it reads the running server over HTTP and needs no
         # runtime of its own (no Cortex, no GPU lock), so it short-circuits here.

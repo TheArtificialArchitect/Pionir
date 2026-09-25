@@ -17,6 +17,8 @@ from .adapters import (
     DaedalusSettings,
     GalateaAdapter,
     GalateaSettings,
+    InstagramAdapter,
+    InstagramSettings,
     MeleteAdapter,
     MeleteSettings,
     NyxStatusAdapter,
@@ -197,6 +199,15 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         # and the token file is read then. content.publish always parks for approval.
         runtime.register(ContentAdapter(ContentSettings(
             base_url=configured.content_url, token_file=configured.content_token_path,
+        )))
+    if configured.content_url is not None and configured.instagram_graph_url is not None:
+        # Needs Scrooge to host the card image. No boot-time call: both token files are
+        # read when a post runs. social.instagram_post always parks for approval.
+        runtime.register(InstagramAdapter(InstagramSettings(
+            graph_url=configured.instagram_graph_url,
+            token_file=configured.instagram_token_path,
+            content=ContentSettings(base_url=configured.content_url,
+                                    token_file=configured.content_token_path),
         )))
     if configured.specialists_file is not None:
         for adapter in load_stdio_adapters(configured.specialists_file):

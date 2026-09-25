@@ -15,7 +15,7 @@
   In Discord: Developer Mode on (Settings > Advanced), then right-click the
   channel > Copy Channel ID, and right-click yourself > Copy User ID.
   The bot needs, in that channel: View Channel, Send Messages, Add Reactions,
-  Read Message History.
+  Read Message History, and Attach Files (an Instagram approval carries the image).
 
 .PARAMETER TokenFile
   Where the token is kept. Default: ~\.pionir\secrets\discord-bot-token.txt
@@ -226,8 +226,8 @@ if ($botId) {
         else {
             Write-NotOk "channel check failed (HTTP $($r.code)): $($r.why)"
         }
-        $invite = "https://discord.com/oauth2/authorize?client_id=$botId&scope=bot&permissions=68672"
-        Write-Host "          Invite link (View Channel, Send Messages, Add Reactions, Read Message History):"
+        $invite = "https://discord.com/oauth2/authorize?client_id=$botId&scope=bot&permissions=101440"
+        Write-Host "          Invite link (View Channel, Send Messages, Add Reactions, Read Message History, Attach Files):"
         Write-Host "          $invite"
     }
 

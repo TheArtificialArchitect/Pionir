@@ -178,6 +178,15 @@ class PionirSettings:
     # PIONIR_CONTENT_TOKEN_FILE points at another token file.
     content_url: str | None = "https://api.dokaz.net"
     content_token_file: Path | None = None
+    # The Instagram Graph API (Instagram API with Instagram Login) for
+    # social.instagram_post, which parks for the owner's yes on every call. It also needs
+    # Scrooge (content_url) to host the card image, so it is registered only when both are
+    # on. The token lives in instagram_token_file (None means
+    # ~/.pionir/secrets/instagram.json, written by tools/setup-instagram.ps1) and is read at
+    # call time: no network at boot. PIONIR_INSTAGRAM_GRAPH_URL set to "off" leaves it
+    # unregistered; PIONIR_INSTAGRAM_TOKEN_FILE points at another token file.
+    instagram_graph_url: str | None = "https://graph.instagram.com/v25.0"
+    instagram_token_file: Path | None = None
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
     # The local embedding model for hybrid recall. Default on: it is ~0.32 GB and
@@ -244,6 +253,16 @@ class PionirSettings:
         except RuntimeError:
             return self.state_root / "secrets" / "scrooge-publish-token.txt"
         return home / ".pionir" / "secrets" / "scrooge-publish-token.txt"
+
+    @property
+    def instagram_token_path(self) -> Path:
+        if self.instagram_token_file is not None:
+            return self.instagram_token_file
+        try:
+            home = Path.home()
+        except RuntimeError:
+            return self.state_root / "secrets" / "instagram.json"
+        return home / ".pionir" / "secrets" / "instagram.json"
 
     @property
     def cortex_path(self) -> Path:
@@ -347,6 +366,14 @@ class PionirSettings:
             content_token_file=(
                 Path(os.environ["PIONIR_CONTENT_TOKEN_FILE"]).expanduser()
                 if (os.environ.get("PIONIR_CONTENT_TOKEN_FILE") or "").strip()
+                else None
+            ),
+            instagram_graph_url=_optional_url(
+                "PIONIR_INSTAGRAM_GRAPH_URL", _declared("instagram_graph_url")
+            ),
+            instagram_token_file=(
+                Path(os.environ["PIONIR_INSTAGRAM_TOKEN_FILE"]).expanduser()
+                if (os.environ.get("PIONIR_INSTAGRAM_TOKEN_FILE") or "").strip()
                 else None
             ),
             embed_model=_embed_model_from_env(),

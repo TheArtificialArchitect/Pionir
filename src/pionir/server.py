@@ -653,7 +653,7 @@ class PionirApp:
         else:
             gist = ""
             for key in ("content", "task", "goal", "command", "target", "request", "intent",
-                        "title"):
+                        "title", "headline"):
                 value = payload.get(key)
                 if isinstance(value, str) and value.strip():
                     gist = value.strip()
