@@ -25,6 +25,10 @@ One run:
 
 Every count this worker reports is a count of real events it recorded: drafts written,
 drafts blocked, posts submitted for approval, posts published.
+
+The machinery of steps 1-6 is ``DailyPoster``, shared with the Instagram worker
+(instagram.py); ``BlogWorker`` says only what a blog post is, how it is checked and where it
+is published.
 """
 from __future__ import annotations
 
@@ -34,6 +38,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import ClassVar
 from urllib.parse import urlsplit
 
 from . import contentcheck
@@ -176,10 +181,9 @@ def _clip(s, n: int) -> str:
     return s if len(s) <= n else s[:n - 3] + "..."
 
 
-def published_url(result, slug: str) -> str | None:
-    """The post's public URL from Pionir's result, or None. Only an https URL on a Dokaz
-    host that carries the post's slug counts: a done job with no such URL is not a
-    published post."""
+def result_links(result) -> list:
+    """Every ``url`` / ``published_url`` / ``permalink`` string in Pionir's result, shallow
+    first. A caller decides which of them, if any, is really the post's address."""
     found: list = []
 
     def walk(obj, depth: int) -> None:
@@ -196,7 +200,14 @@ def published_url(result, slug: str) -> str | None:
                 walk(v, depth + 1)
 
     walk(result, 0)
-    for url in found:
+    return found
+
+
+def published_url(result, slug: str) -> str | None:
+    """The post's public URL from Pionir's result, or None. Only an https URL on a Dokaz
+    host that carries the post's slug counts: a done job with no such URL is not a
+    published post."""
+    for url in result_links(result):
         try:
             parts = urlsplit(url)
         except ValueError:
@@ -211,8 +222,24 @@ class _Unreadable(ValueError):
     pass
 
 
-class BlogWorker(_Base):
-    """``posting.blog``: one checked draft a day, submitted for the owner's approval."""
+class DailyPoster(_Base):
+    """What every posting worker shares: one draft a day at most, words from the shared
+    brain only, a fail-closed check on the exact payload, submission to Pionir (which parks
+    it for the owner), and an honest record of what became of each post.
+
+    A subclass says what it drafts and how: ``capability``, ``purpose``, ``schema``, and the
+    hooks ``_system``, ``_prompt``, ``assemble``, ``check_draft``, ``published_link``,
+    ``_describe`` and ``_job`` (plus ``_before_submit`` / ``_after_submit`` if it keeps
+    anything of its own). Everything else - the cadence, the record, the follow-up, the
+    one redraft, the topic rule and the counts - is here, once."""
+
+    capability = ""                 # the Pionir capability a passed draft is submitted as
+    purpose = ""                    # what ctx.words is asked for (the brain's ledger)
+    schema: ClassVar[dict] = {}     # the JSON schema the words must fill
+    title_field = "title"           # the draft's one-line name, for the record and events
+    link_field = "url"              # where a published post's public address is recorded
+    link_missing = "gave no URL for the post"
+    record_what = "this worker's own event counts"
 
     def __init__(self, spec, *, draft_every_seconds: int = 86400) -> None:
         super().__init__(spec)
@@ -225,10 +252,13 @@ class BlogWorker(_Base):
     def record_path(self, state_dir: Path) -> Path:
         return Path(state_dir) / f"{self.worker_id}.json"
 
+    def _blank(self) -> dict:
+        return {"last_drafted_at": None, "used_topics": [], "posts": [], "blocked": [],
+                "counts": {}}
+
     def load(self, state_dir: Path) -> dict:
         path = self.record_path(state_dir)
-        blank = {"last_drafted_at": None, "used_topics": [], "used_slugs": [], "posts": [],
-                 "blocked": [], "counts": {}}
+        blank = self._blank()
         if not path.exists():
             return blank
         try:
@@ -298,10 +328,10 @@ class BlogWorker(_Base):
                              f"the owner did not approve it ({got.get('reason') or 'denied'})",
                              events)
             elif state == "approved":
-                self._settle_done(ctx, rec, post, outcome_of(CAPABILITY, got.get("result")),
-                                  events)
+                self._settle_done(ctx, rec, post,
+                                  outcome_of(self.capability, got.get("result")), events)
             elif state == "approved_failed":
-                out = outcome_of(CAPABILITY, got.get("result"))
+                out = outcome_of(self.capability, got.get("result"))
                 self._settle(ctx, rec, post, "failed", out.error or "the publish failed",
                              events)
             else:
@@ -314,16 +344,17 @@ class BlogWorker(_Base):
             self._settle(ctx, rec, post, "failed", out.error or f"Pionir said {out.status}",
                          events)
             return
-        url = published_url(out.result, post["slug"])
-        if url is None:
-            self._settle(ctx, rec, post, "unconfirmed", "Pionir said done but gave no URL for "
-                         "the post; NOT counted as published", events)
+        link = self.published_link(out.result, post)
+        if link is None:
+            self._settle(ctx, rec, post, "unconfirmed", f"Pionir said done but "
+                         f"{self.link_missing}; NOT counted as published", events)
             return
-        post.update(status="published", url=url, settled_at=ctx.now)
+        post.update({"status": "published", self.link_field: link, "settled_at": ctx.now})
         self._count(rec, "published")
-        log.info("%s: published %s", self.worker_id, url)
+        log.info("%s: published %s", self.worker_id, link)
         events.append(self._event(ctx, "post.published", {
-            "draft_id": post["draft_id"], "url": url, "title": _clip(post.get("title"), 90)}))
+            "draft_id": post["draft_id"], self.link_field: link,
+            self.title_field: _clip(post.get(self.title_field), 90)}))
 
     def _settle(self, ctx: WorkContext, rec: dict, post: dict, status: str, why: str,
                 events: list) -> None:
@@ -366,8 +397,8 @@ class BlogWorker(_Base):
         reasons: list = []
         submitted = False
         for attempt in (1, 2):      # one fresh draft per run, at most, after a block
-            got = ctx.words("blog_draft", SYSTEM.format(names=self._names()),
-                            self._prompt(topic, ctx.goal, reasons), DRAFT_SCHEMA)
+            got = ctx.words(self.purpose, self._system(),
+                            self._prompt(topic, ctx.goal, reasons), self.schema)
             if isinstance(got, Err):
                 if attempt == 1:
                     return got          # no words came: nothing was drafted, the day is not used
@@ -375,7 +406,7 @@ class BlogWorker(_Base):
             rec["last_drafted_at"] = ctx.now
             self._count(rec, "drafts_written")
             draft = self.assemble(got.value, topic, rec, ctx.now)
-            reasons = contentcheck.check(draft)
+            reasons = self.check_draft(draft)
             if reasons:
                 self._blocked(ctx, rec, topic, draft, reasons, attempt, events)
                 continue
@@ -395,6 +426,129 @@ class BlogWorker(_Base):
                 and topic.key not in rec["used_topics"]:
             rec["used_topics"].append(topic.key)
         return None
+
+    # ---- what a subclass says about its own kind of post ----------------------------------
+    def _system(self) -> str:
+        raise NotImplementedError
+
+    def _prompt(self, topic: Topic, goal: str | None, reasons: list) -> str:
+        raise NotImplementedError
+
+    def assemble(self, raw, topic: Topic, rec: dict, now: float) -> dict:
+        """The exact payload that would be submitted, built from the model's words."""
+        raise NotImplementedError
+
+    def check_draft(self, draft: dict) -> list:
+        """Every reason the draft may not go out; empty is the only pass."""
+        raise NotImplementedError
+
+    def published_link(self, result, post: dict) -> str | None:
+        """The post's public address from Pionir's result, or None: not published."""
+        raise NotImplementedError
+
+    def _describe(self, draft: dict) -> dict:
+        """The fields the record keeps about a draft, beside its id and topic."""
+        raise NotImplementedError
+
+    def _job(self, draft: dict) -> Job:
+        raise NotImplementedError
+
+    def _before_submit(self, ctx: WorkContext, rec: dict, draft: dict, post: dict) -> None:
+        """Anything kept locally about a passed draft before it goes to Pionir."""
+
+    def _after_submit(self, ctx: WorkContext, rec: dict, draft: dict) -> None:
+        """Anything the record must remember once a draft went to Pionir."""
+
+    # ---- blocked, or submitted -----------------------------------------------------------
+    def _blocked(self, ctx: WorkContext, rec: dict, topic: Topic, draft: dict, reasons: list,
+                 attempt: int, events: list) -> None:
+        self._count(rec, "drafts_blocked")
+        rec["blocked"] = (rec["blocked"] + [{
+            "draft_id": draft["draft_id"], **self._describe(draft), "topic": topic.key,
+            "reasons": reasons, "attempt": attempt, "at": ctx.now}])[-100:]
+        log.warning("%s: draft %s BLOCKED by the content check and NOT submitted (attempt %d): "
+                    "%s", self.worker_id, draft["draft_id"], attempt, "; ".join(reasons))
+        events.append(self._event(ctx, "post.blocked", {
+            "draft_id": draft["draft_id"], "attempt": attempt, "reasons_total": len(reasons),
+            "reasons": [_clip(r, 90) for r in reasons[:3]]}))
+
+    def _submit(self, ctx: WorkContext, rec: dict, topic: Topic, draft: dict,
+                events: list) -> None:
+        post = {"draft_id": draft["draft_id"], **self._describe(draft), "topic": topic.key}
+        self._before_submit(ctx, rec, draft, post)
+        out = ctx.job(self._job(draft))
+        self._after_submit(ctx, rec, draft)
+        post.update(submitted_at=ctx.now, status=out.status, task_id=out.task_id,
+                    approval_id=out.approval_id)
+        rec["posts"].append(post)
+        if out.status == "pending_approval":
+            self._count(rec, "submitted_for_approval")
+            log.info("%s: %s submitted; PENDING the owner's approval (approval %s)",
+                     self.worker_id, draft["draft_id"], out.approval_id)
+            events.append(self._event(ctx, "post.pending_approval", {
+                "draft_id": draft["draft_id"],
+                self.title_field: _clip(draft[self.title_field], 90),
+                "approval_id": out.approval_id}))
+        elif out.status == "done":
+            # Pionir ran it without parking it: the owner did NOT approve this post. That
+            # breaks his rule, and it is Pionir's gate that must hold it - say so loudly.
+            log.error("%s: %s ran WITHOUT the owner's approval for %s; the capability must "
+                      "be approval-gated in Pionir", self.worker_id, self.capability,
+                      draft["draft_id"])
+            post["approved_by_owner"] = False
+            self._settle_done(ctx, rec, post, out, events)
+        else:
+            # failed, unreachable or still running: not published, and never assumed to be
+            self._settle(ctx, rec, post, out.status if out.status != "running" else "unknown",
+                         out.error or f"Pionir said {out.status}", events)
+
+    # ---- what the leader reads --------------------------------------------------------------
+    def _event(self, ctx: WorkContext, kind: str, payload: dict):
+        # it carries model-written words (a title, a slug), so it backs no figure and vouches
+        # for no name (grounding.py)
+        return make_output(self, kind=kind, valid_at=ctx.now, observed_at=ctx.now,
+                           payload=payload, entities=self.entities,
+                           provenance={"source": "model", "derived": True,
+                                       "checked_by": "contentcheck"})
+
+    def _tally(self, ctx: WorkContext, rec: dict):
+        c = rec["counts"]
+        pending = [p["draft_id"] for p in rec["posts"] if p.get("status") == "pending_approval"]
+        figures = [
+            Figure(int(c.get("drafts_written", 0)), "count", "drafts written", window="all_time"),
+            Figure(int(c.get("drafts_blocked", 0)), "count", "drafts blocked", window="all_time"),
+            Figure(int(c.get("submitted_for_approval", 0)), "count",
+                   "posts submitted for approval", window="all_time"),
+            Figure(len(pending), "count", "posts pending approval", window="now"),
+            Figure(int(c.get("published", 0)), "count", "posts published", window="all_time"),
+            Figure(int(c.get("denied", 0)), "count", "posts denied", window="all_time"),
+        ]
+        last = rec.get("last_drafted_at")
+        wait = 0 if last is None else max(0, round(float(last) + self.draft_every_seconds
+                                                   - ctx.now))
+        return make_output(self, kind="post.tally", valid_at=ctx.now, observed_at=ctx.now,
+                           payload={"pending_approval": pending[-3:],
+                                    "next_draft_in_hours": round(wait / 3600, 1),
+                                    "topics_left": sum(1 for t in SEEDS
+                                                       if t.key not in rec["used_topics"])},
+                           figures=figures, entities=self.entities,
+                           provenance={"source": "real", "provider": self.provider,
+                                       "record": self.record_what})
+
+
+class BlogWorker(DailyPoster):
+    """``posting.blog``: one checked draft a day, submitted for the owner's approval."""
+
+    capability = CAPABILITY
+    purpose = "blog_draft"
+    schema = DRAFT_SCHEMA
+    record_what = "the blog worker's own event counts"
+
+    def _blank(self) -> dict:
+        return {**super()._blank(), "used_slugs": []}
+
+    def _system(self) -> str:
+        return SYSTEM.format(names=self._names())
 
     @staticmethod
     def _names() -> str:
@@ -450,81 +604,22 @@ class BlogWorker(_Base):
             lines.append(f"- [all Dokaz APIs]({SITE}/?{q})")
         return "\n".join(lines) + "\n"
 
-    def _blocked(self, ctx: WorkContext, rec: dict, topic: Topic, draft: dict, reasons: list,
-                 attempt: int, events: list) -> None:
-        self._count(rec, "drafts_blocked")
-        rec["blocked"] = (rec["blocked"] + [{
-            "draft_id": draft["draft_id"], "slug": draft["slug"], "topic": topic.key,
-            "title": draft.get("title"), "reasons": reasons, "attempt": attempt,
-            "at": ctx.now}])[-100:]
-        log.warning("%s: draft %s BLOCKED by the content check and NOT submitted (attempt %d): "
-                    "%s", self.worker_id, draft["draft_id"], attempt, "; ".join(reasons))
-        events.append(self._event(ctx, "post.blocked", {
-            "draft_id": draft["draft_id"], "attempt": attempt, "reasons_total": len(reasons),
-            "reasons": [_clip(r, 90) for r in reasons[:3]]}))
+    def check_draft(self, draft: dict) -> list:
+        return contentcheck.check(draft)
 
-    def _submit(self, ctx: WorkContext, rec: dict, topic: Topic, draft: dict,
-                events: list) -> None:
+    def published_link(self, result, post: dict) -> str | None:
+        return published_url(result, post["slug"])
+
+    def _describe(self, draft: dict) -> dict:
+        return {"slug": draft["slug"], "title": draft.get("title")}
+
+    def _job(self, draft: dict) -> Job:
         payload = {k: draft[k] for k in contentcheck.FIELDS}      # exactly what was checked
-        out = ctx.job(Job(CAPABILITY, payload,
-                          what=f"publish the blog post {draft['title']!r} on api.dokaz.net"))
+        return Job(CAPABILITY, payload,
+                   what=f"publish the blog post {draft['title']!r} on api.dokaz.net")
+
+    def _after_submit(self, ctx: WorkContext, rec: dict, draft: dict) -> None:
         rec["used_slugs"].append(draft["slug"])
-        post = {"draft_id": draft["draft_id"], "slug": draft["slug"], "topic": topic.key,
-                "title": draft["title"], "submitted_at": ctx.now, "status": out.status,
-                "task_id": out.task_id, "approval_id": out.approval_id}
-        rec["posts"].append(post)
-        if out.status == "pending_approval":
-            self._count(rec, "submitted_for_approval")
-            log.info("%s: %s submitted; PENDING the owner's approval (approval %s)",
-                     self.worker_id, draft["draft_id"], out.approval_id)
-            events.append(self._event(ctx, "post.pending_approval", {
-                "draft_id": draft["draft_id"], "title": _clip(draft["title"], 90),
-                "approval_id": out.approval_id}))
-        elif out.status == "done":
-            # Pionir ran it without parking it: the owner did NOT approve this post. That
-            # breaks his rule, and it is Pionir's gate that must hold it - say so loudly.
-            log.error("%s: content.publish ran WITHOUT the owner's approval for %s; the "
-                      "capability must be approval-gated in Pionir", self.worker_id,
-                      draft["draft_id"])
-            post["approved_by_owner"] = False
-            self._settle_done(ctx, rec, post, out, events)
-        else:
-            # failed, unreachable or still running: not published, and never assumed to be
-            self._settle(ctx, rec, post, out.status if out.status != "running" else "unknown",
-                         out.error or f"Pionir said {out.status}", events)
-
-    # ---- what the leader reads --------------------------------------------------------------
-    def _event(self, ctx: WorkContext, kind: str, payload: dict):
-        # it carries model-written words (a title, a slug), so it backs no figure and vouches
-        # for no name (grounding.py)
-        return make_output(self, kind=kind, valid_at=ctx.now, observed_at=ctx.now,
-                           payload=payload, entities=self.entities,
-                           provenance={"source": "model", "derived": True,
-                                       "checked_by": "contentcheck"})
-
-    def _tally(self, ctx: WorkContext, rec: dict):
-        c = rec["counts"]
-        pending = [p["draft_id"] for p in rec["posts"] if p.get("status") == "pending_approval"]
-        figures = [
-            Figure(int(c.get("drafts_written", 0)), "count", "drafts written", window="all_time"),
-            Figure(int(c.get("drafts_blocked", 0)), "count", "drafts blocked", window="all_time"),
-            Figure(int(c.get("submitted_for_approval", 0)), "count",
-                   "posts submitted for approval", window="all_time"),
-            Figure(len(pending), "count", "posts pending approval", window="now"),
-            Figure(int(c.get("published", 0)), "count", "posts published", window="all_time"),
-            Figure(int(c.get("denied", 0)), "count", "posts denied", window="all_time"),
-        ]
-        last = rec.get("last_drafted_at")
-        wait = 0 if last is None else max(0, round(float(last) + self.draft_every_seconds
-                                                   - ctx.now))
-        return make_output(self, kind="post.tally", valid_at=ctx.now, observed_at=ctx.now,
-                           payload={"pending_approval": pending[-3:],
-                                    "next_draft_in_hours": round(wait / 3600, 1),
-                                    "topics_left": sum(1 for t in SEEDS
-                                                       if t.key not in rec["used_topics"])},
-                           figures=figures, entities=self.entities,
-                           provenance={"source": "real", "provider": self.provider,
-                                       "record": "the blog worker's own event counts"})
 
 
 def _allowlist_display() -> list:

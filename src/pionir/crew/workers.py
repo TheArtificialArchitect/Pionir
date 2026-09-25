@@ -1,4 +1,4 @@
-"""The workers themselves: two real ones and honest placeholders.
+"""The workers themselves: the real ones and honest placeholders.
 
 None of these holds a model or imports the brain. Each is built from a catalogue entry
 (catalogue.json -> registry.py) by the factory named in its ``impl``; ``IMPLS`` is the
@@ -14,6 +14,8 @@ whole list, and a name not in it fails loudly at load time.
 - ``blog_writer`` - REAL (blog.py). Drafts a blog post through the shared brain, checks
   it with contentcheck.py, and submits it for the owner's approval. The one worker here
   that gets words; it gets them only through ``ctx.words``.
+- ``instagram_writer`` - REAL (instagram.py). The same for an Instagram card post: checked
+  with ``contentcheck.check_social``, submitted as ``social.instagram_post``.
 """
 from __future__ import annotations
 
@@ -246,6 +248,14 @@ def blog_writer(spec, **params):
     return BlogWorker(spec, **params)
 
 
+def instagram_writer(spec, **params):
+    """REAL. ``posting.instagram`` (instagram.py): one checked card post a day, words from
+    the shared brain only, submitted as ``social.instagram_post`` for the owner's approval.
+    Imported lazily for the same reason as the blog's."""
+    from .instagram import InstagramWorker
+    return InstagramWorker(spec, **params)
+
+
 # The whole list of worker implementations. A catalogue ``impl`` not named here is an
 # error at load time, never a worker that silently does not exist.
 IMPLS = {
@@ -253,4 +263,5 @@ IMPLS = {
     "scrooge_ledger": LedgerWorker,
     "http_health": HealthWorker,
     "blog_writer": blog_writer,
+    "instagram_writer": instagram_writer,
 }
