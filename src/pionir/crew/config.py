@@ -1,14 +1,18 @@
-"""The crew's settings: the one model, the budget, the tick, and where state lives.
+"""The crew's settings: the one model, the budgets, the pool, and where state lives.
 
-Hearth kept these in a ``state/config.json`` beside its own code and minted a
-viewer token there. The crew has no viewer of its own in this phase, and its
-state belongs under Pionir's state root (``state_root/crew/``) - never under
-the Hearth tree, which is being retired. Settings come from the environment
-the way ``PionirSettings`` does, and the GPU lock path is Pionir's own, so the
-crew and the scheduler can never disagree about which file is the lock.
+State belongs under Pionir's state root (``state_root/crew/``). Settings come from the
+environment the way ``PionirSettings`` does, and the GPU lock path is Pionir's own, so
+the crew and the scheduler can never disagree about which file is the lock.
 
-The budget numbers are the ones Hearth measured for gemma3:12b at num_ctx
-8192 on this card; they are enforced at boot and watched while running.
+Two budgets bound what the crew may spend, and both are compute: the shared brain's
+hourly model-call ceiling (``budget.calls_per_hour``) and the daily cap on Claude
+escalations (``claude_daily_cap``, default 10 - each ``claude -p`` loads the full Claude
+Code system prompt, and ~505 such calls once exhausted a 5-hour usage window). Moss
+divides both between divisions (direction.py). There is no money setting: nothing in
+this package can spend money.
+
+The VRAM numbers are the ones Hearth measured for gemma3:12b at num_ctx 8192 on this
+card; they are enforced at boot and watched while running.
 """
 from __future__ import annotations
 
@@ -26,8 +30,7 @@ class CrewBudget:
     model_gb: float = 8.6        # the one model, at num_ctx 8192 (measured in Hearth)
     card_gb: float = 11.0        # whole card while the crew runs
     calls_per_hour: int = 80     # crew-wide model calls per real hour
-    sim_rss_mb: int = 500        # the process the crew runs in
-    store_mb_per_agent: int = 50
+    process_rss_mb: int = 500    # the process the crew runs in
 
     def __post_init__(self) -> None:
         if self.calls_per_hour <= 0:
@@ -44,8 +47,8 @@ class CrewSettings:
     num_ctx: int = 8192
     ollama_url: str = DEFAULT_OLLAMA_URL
     keep_alive: str = "30m"
-    # One tick is one real-time step. There is no time compression: this crew
-    # does real work, and a compressed clock would lie about when it happened.
+    # How often the runtime looks for due workers and leaders. There is no time
+    # compression: the crew does real work on the wall clock.
     tick_seconds: float = 1.0
     checkpoint_seconds: float = 300.0
     # How often the brain looks at the lock again while it is standing down.
@@ -53,8 +56,6 @@ class CrewSettings:
     # A model request still queued after this long is expired, counted and reported to its
     # owner (brain.EXPIRED) rather than spoken late.
     request_ttl_seconds: float = 600.0
-    # Wall-clock time without real progress before an agent gives a project up.
-    project_stale_seconds: float = 6 * 3600.0
     # The crew is its own process and reaches Pionir over loopback HTTP, as Moss does.
     pionir_url: str = "http://127.0.0.1:8780"
     # How long the hands keep following a job Pionir reports as still running, and how long
@@ -62,6 +63,16 @@ class CrewSettings:
     job_follow_seconds: float = 600.0
     job_poll_seconds: float = 20.0
     budget: CrewBudget = field(default_factory=CrewBudget)
+    # How many workers run at once, and how many leaders (leaders mostly wait on the brain).
+    pool_size: int = 4
+    leader_pool_size: int = 2
+    # Claude escalations per local day across ALL leaders. 0 turns escalation off.
+    claude_daily_cap: int = 10
+    escalation_timeout_seconds: float = 300.0
+    # Where workers find the secrets they read (the Scrooge read token). None -> ~/.pionir/secrets
+    secrets_dir: Path | None = None
+    # The catalogue of divisions and workers. None -> the packaged catalogue.json
+    catalogue_path: Path | None = None
 
     def __post_init__(self) -> None:
         if self.tick_seconds <= 0:
@@ -70,14 +81,20 @@ class CrewSettings:
             raise ValueError("checkpoint_seconds must be positive")
         if self.gpu_poll_seconds <= 0:
             raise ValueError("gpu_poll_seconds must be positive")
-        for name in ("request_ttl_seconds", "project_stale_seconds", "job_follow_seconds",
-                     "job_poll_seconds"):
+        for name in ("request_ttl_seconds", "job_follow_seconds", "job_poll_seconds",
+                     "escalation_timeout_seconds"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
         if self.num_ctx <= 0:
             raise ValueError("num_ctx must be positive")
         if not self.model:
             raise ValueError("the crew needs a model")
+        if self.pool_size <= 0 or self.leader_pool_size <= 0:
+            raise ValueError("pool sizes must be positive")
+        if self.claude_daily_cap < 0:
+            raise ValueError("claude_daily_cap cannot be negative")
+        if self.secrets_dir is None:
+            object.__setattr__(self, "secrets_dir", Path.home() / ".pionir" / "secrets")
 
     @classmethod
     def from_pionir(cls, settings: PionirSettings, **overrides) -> CrewSettings:
@@ -103,7 +120,10 @@ class CrewSettings:
             ("PIONIR_CREW_CHECKPOINT_SECONDS", "checkpoint_seconds", float),
             ("PIONIR_CREW_GPU_POLL_SECONDS", "gpu_poll_seconds", float),
             ("PIONIR_CREW_REQUEST_TTL_SECONDS", "request_ttl_seconds", float),
-            ("PIONIR_CREW_PROJECT_STALE_SECONDS", "project_stale_seconds", float),
+            ("PIONIR_CREW_POOL_SIZE", "pool_size", int),
+            ("PIONIR_CREW_CLAUDE_DAILY_CAP", "claude_daily_cap", int),
+            ("PIONIR_CREW_SECRETS_DIR", "secrets_dir", Path),
+            ("PIONIR_CREW_CATALOGUE", "catalogue_path", Path),
             ("PIONIR_CREW_PIONIR_URL", "pionir_url", str),
             ("PIONIR_CREW_JOB_FOLLOW_SECONDS", "job_follow_seconds", float),
         ):
@@ -119,6 +139,8 @@ class CrewSettings:
         d = asdict(self)
         d["state_dir"] = str(self.state_dir)
         d["gpu_lock_path"] = str(self.gpu_lock_path)
+        d["secrets_dir"] = str(self.secrets_dir)
+        d["catalogue_path"] = str(self.catalogue_path) if self.catalogue_path else None
         return d
 
 

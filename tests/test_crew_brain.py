@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 
 from crew_support import FakeOllama, ScriptedProbe, settings, temp_dir
+from test_crew_fakes import make_crew
 
 from pionir.config import PionirSettings
 from pionir.crew import log as crewlog
@@ -21,17 +22,16 @@ from pionir.crew.brain import BACKGROUND, REPLY, Brain, OllamaError
 from pionir.crew.budget import CardBusy, warm_brain
 from pionir.crew.config import CrewSettings
 from pionir.crew.gpu import CardWatch, who
-from pionir.crew.sim import Sim
 from pionir.shared_gpu import SharedGpuLock
 
 
 class _Crew:
-    """A real, unstarted Sim in a temp dir, with a brain on a fake model."""
+    """A real, unstarted crew in a temp dir, with a brain on a fake model."""
 
     def __init__(self, root, *, probe=None, post=None, **cfg) -> None:
-        self.cfg = settings(root, **cfg)
-        self.sim = Sim(self.cfg)
         self.post = post or FakeOllama()
+        self.sim = make_crew(root, post=self.post, **cfg)
+        self.cfg = self.sim.cfg
         card = CardWatch(self.cfg.gpu_lock_path, probe=probe,
                          poll_seconds=self.cfg.gpu_poll_seconds)
         self.brain = Brain(self.cfg, self.sim, card=card, post=self.post)
@@ -231,7 +231,7 @@ class RealLockTests(unittest.TestCase):
         self.assertIsNone(card.holder())                     # released: free, no latch
 
     def test_the_brain_waits_out_a_real_lease_then_calls(self) -> None:
-        sim = Sim(self.cfg)
+        sim = make_crew(self._tmp.name)
         post = FakeOllama()
         brain = Brain(self.cfg, sim, post=post)              # the default, real probe
         got: list = []
@@ -260,7 +260,7 @@ class RealLockTests(unittest.TestCase):
             if lease is not None:
                 lease.release()
 
-        sim = Sim(self.cfg)
+        sim = make_crew(self._tmp.name)
         brain = Brain(self.cfg, sim, post=FakeOllama(on_call=during_call))
         brain.request("a", "thought", "s", "u", {}, lambda *_: None)
         brain.step()
@@ -303,6 +303,8 @@ class SettingsTests(unittest.TestCase):
             self.assertEqual(crew.gpu_lock_path, pionir.gpu_lock_path)
             self.assertEqual(crew.tick_seconds, 1.0)
             self.assertEqual(crew.model, "gemma3:12b")
+            self.assertEqual(crew.claude_daily_cap, 10)       # the owner's hard default
+            self.assertEqual(crew.secrets_dir, Path.home() / ".pionir" / "secrets")
 
     def test_a_non_positive_tick_is_refused(self) -> None:
         with temp_dir() as root, self.assertRaises(ValueError):

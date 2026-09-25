@@ -1,10 +1,16 @@
 """The one brain: a shared language organ behind a single queue.
 
-Stateless between calls. It receives a fully assembled situation built from
-ONE agent's own store and returns words. It keeps no memory and no
-personality; the queue knows who is waiting and for how long, whether the
-model is resident (warm) or evicted (cold), and how many calls the crew has
+Stateless between calls. It receives a fully assembled request - a division leader's
+brief to distil, or the rare worker that needs words drafted - and returns words. It
+keeps no memory and no personality; the queue knows who is waiting and for how long,
+whether the model is resident (warm) or evicted (cold), and how many calls the crew has
 made this hour against the ceiling. Everything it does is counted and shown.
+
+Two ceilings are enforced at the door, before anything is queued. The crew-wide one:
+``cfg.budget.calls_per_hour``. And, when a request names its DIVISION, that division's
+share of it as Moss allocated (direction.Allocation): the calls it made in the last
+hour plus the ones it already has waiting may not exceed its cap. A refused request is
+counted (``throttled``, ``throttled_by``) and never queued.
 
 One worker, one call at a time: the model is shared with Moss, and a second
 concurrent crew call would only queue inside Ollama where nobody can see it.
@@ -70,6 +76,7 @@ class Request:
     __slots__ = (
         "agent_id",
         "callback",
+        "division",
         "enqueued_real",
         "fmt",
         "id",
@@ -81,8 +88,9 @@ class Request:
     )
 
     def __init__(self, rid, agent_id, purpose, messages, options, callback, priority, t,
-                 fmt=None, enqueued_real=None):
+                 fmt=None, enqueued_real=None, division=None):
         self.id = rid
+        self.division = division
         self.agent_id = agent_id
         self.purpose = purpose
         self.messages = messages
@@ -95,10 +103,17 @@ class Request:
 
 
 class Brain:
-    def __init__(self, cfg, sim, *, card: CardWatch | None = None,
-                 post: Post = http_post_json, now: Callable[[], float] = time.time) -> None:
+    """``crew`` is whatever runs it (runtime.Crew): the brain reads its ``store``,
+    ``clock``, ``lock``, ``paused_reason`` and ``monitor``. ``allocation`` (a
+    direction.Allocation) turns on per-division shares; without one, only the crew-wide
+    ceiling applies."""
+
+    def __init__(self, cfg, crew, *, card: CardWatch | None = None,
+                 post: Post = http_post_json, now: Callable[[], float] = time.time,
+                 allocation=None) -> None:
         self.cfg = cfg
-        self.sim = sim
+        self.sim = crew
+        self.allocation = allocation
         self.url = cfg.ollama_url.rstrip("/")
         self.model = cfg.model
         self.card = card or CardWatch(cfg.gpu_lock_path, poll_seconds=cfg.gpu_poll_seconds)
@@ -124,6 +139,8 @@ class Brain:
         self.last_summary_call = 0        # so the log shows the denominator, not just the bad news
         self.expired = 0                  # requests that went stale in the queue
         self.held_for_pause = 0           # worker turns spent holding while the crew was paused
+        self.throttled_by: collections.Counter = collections.Counter()   # division -> refusals
+        self.last_refusal: str | None = None
 
     def start(self) -> None:
         self._thread.start()
@@ -139,26 +156,82 @@ class Brain:
     def ceiling_hit(self) -> bool:
         return self.sim.store.calls_last_hour() >= self.cfg.budget.calls_per_hour
 
+    def _queued_for(self, division: str) -> int:
+        with self._cv:
+            waiting = sum(1 for r in self._q if r.division == division)
+        busy = self.busy_with
+        return waiting + (1 if busy is not None and busy.division == division else 0)
+
+    def refusal(self, division: str | None = None) -> str | None:
+        """Why a request would be refused right now, or None if it would be queued."""
+        if self.ceiling_hit():
+            return f"the crew's ceiling of {self.cfg.budget.calls_per_hour} calls/hour is reached"
+        if division is not None and self.allocation is not None:
+            cap = self.allocation.cap("model_calls", division)
+            used = self.sim.store.calls_last_hour(division) + self._queued_for(division)
+            if used >= cap:
+                return (f"{division}'s share of the brain is {cap} calls/hour and {used} are "
+                        "used or waiting")
+        return None
+
     def request(self, agent_id: str, purpose: str, system, user, options: dict, callback,
-                priority: int = BACKGROUND, fmt=None, messages: list | None = None) -> int | None:
+                priority: int = BACKGROUND, fmt=None, messages: list | None = None,
+                division: str | None = None) -> int | None:
         """Queue a call. ``messages`` (a full role list) wins over system+user. Returns the
-        request id, or None if the hourly ceiling refuses it (the caller treats that as 'no
-        words came')."""
+        request id, or None if a ceiling refuses it (the caller treats that as 'no words
+        came'). ``division`` charges the call to that division's share."""
         if messages is None:
             messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        if self.ceiling_hit():
-            self.throttled += 1
-            log.warning("brain: ceiling of %d calls/hour reached; refusing %s for %s",
-                        self.cfg.budget.calls_per_hour, purpose, agent_id)
-            return None
+        # the check and the append under one lock: two callers of one division cannot both
+        # take its last slot (the condition's lock is reentrant, so _queued_for may take it)
         with self._cv:
-            rid = self._next_id
-            self._next_id += 1
-            req = Request(rid, agent_id, purpose, messages, options, callback, priority,
-                          self.sim.clock.t, fmt, enqueued_real=self._now())
-            self._q.append(req)
-            self._cv.notify()
-        return rid
+            why = self.refusal(division)
+            if why is None:
+                rid = self._next_id
+                self._next_id += 1
+                req = Request(rid, agent_id, purpose, messages, options, callback, priority,
+                              self.sim.clock.t, fmt, enqueued_real=self._now(),
+                              division=division)
+                self._q.append(req)
+                self._cv.notify()
+                return rid
+            self.throttled += 1
+            if division is not None:
+                self.throttled_by[division] += 1
+            self.last_refusal = why
+        log.warning("brain: refusing %s for %s: %s", purpose, agent_id, why)
+        return None
+
+    def ask(self, agent_id: str, purpose: str, messages: list, options: dict, *,
+            fmt=None, division: str | None = None, timeout: float | None = None) -> tuple:
+        """Queue a call and WAIT for it: -> (text, meta, err). For a caller on its own
+        thread (a leader, a worker in the pool) - never the brain's own worker. A refusal
+        comes back at once, as an ``err`` starting "refused:"."""
+        done = threading.Event()
+        box: dict = {}
+
+        def callback(text, meta, err):
+            box.update(text=text, meta=meta or {}, err=err)
+            done.set()
+
+        if self._stop.is_set():
+            return None, {}, "the brain is stopped"
+        rid = self.request(agent_id, purpose, None, None, options, callback, fmt=fmt,
+                           messages=messages, division=division)
+        if rid is None:
+            return None, {"refused": True}, f"refused: {self.last_refusal}"
+        wait = timeout if timeout is not None else self.ttl + TIMEOUT_S + 30
+        deadline = time.monotonic() + wait
+        while not done.wait(0.25):
+            # a stopping brain serves nothing more: say so rather than wait out the clock
+            if self._stop.is_set() or time.monotonic() >= deadline:
+                self.cancel(rid)
+                if done.is_set():
+                    break
+                if self._stop.is_set():
+                    return None, {}, "the brain stopped"
+                return None, {}, f"no answer within {wait:.0f} s"
+        return box.get("text"), box.get("meta", {}), box.get("err")
 
     def cancel(self, rid: int) -> bool:
         with self._cv:
@@ -209,7 +282,8 @@ class Brain:
                         "it did not happen", r.purpose, r.agent_id, waited, self.ttl)
             try:
                 self.sim.store.add_call(self.sim.clock.t, r.agent_id, r.purpose, None, None,
-                                        0.0, False, f"{EXPIRED} after {waited:.0f} s")
+                                        0.0, False, f"{EXPIRED} after {waited:.0f} s",
+                                        division=r.division)
             except Exception as exc:  # noqa: BLE001 - the ledger failing must not eat the signal
                 lesion("brain.ledger", exc)
             try:
@@ -300,7 +374,7 @@ class Brain:
         try:
             self.sim.store.add_call(self.sim.clock.t, req.agent_id, req.purpose,
                                     meta.get("prompt_eval_count"), meta.get("eval_count"),
-                                    round(dt, 2), err is None, err)
+                                    round(dt, 2), err is None, err, division=req.division)
         except Exception as exc:  # noqa: BLE001 - the ledger failing must not eat the reply
             lesion("brain.ledger", exc)
         try:
@@ -341,6 +415,7 @@ class Brain:
                      "for_s": round(time.time() - self.busy_since, 1)} if self.busy_with else None,
             "queue": self.waiting(),
             "calls": self.calls, "failures": self.failures, "throttled": self.throttled,
+            "throttled_by": dict(self.throttled_by), "last_refusal": self.last_refusal,
             "reloads": self.reloads, "expired": self.expired, "ttl_s": self.ttl,
             "held": self._paused(),
             "calls_last_hour": self.sim.store.calls_last_hour(),

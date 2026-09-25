@@ -1,113 +1,18 @@
-"""Jobs: the only way a crew member touches the world, and what gets recorded.
+"""Jobs: the only way a worker acts in the world, and what an outcome may be taken to mean.
 
 Pionir is a scripted fake in its real response shapes. Each test fails if the rule it
-names is reverted: a job recorded as done when Pionir did not report it ran, a job
-parked for Ian's approval recorded as done (or as nothing), a failed job relieving
-purpose, or an answer of unknown shape assumed to be success.
+names is reverted: a job parked for the owner's approval read as done, an answer of
+unknown shape assumed to be success, a job with no outcome read as done, or the client
+reaching anywhere but loopback.
 """
 
+import threading
 import unittest
 
-from test_crew_kit import FAILED, PENDING, Crew, SendKind, World, done, member
+from crew_support import temp_dir
+from test_crew_fakes import FAILED, PENDING, FakePionir, done, make_crew
 
-from pionir.crew.hands import JobOutcome, PionirClient, PionirUnreachable, outcome_of
-
-
-def kinds_of(agent) -> set:
-    return {e["kind"] for e in agent.mem.recent(200)}
-
-
-class JobTests(unittest.TestCase):
-    def make(self, answer):
-        self.world = World(target=10)
-        self.kind = SendKind(self.world)
-        crew = Crew([member("ada", ["outreach"])], kinds=[self.kind],
-                    answers={"outreach.send": answer})
-        self.addCleanup(crew.close)
-        ada = crew["ada"]
-        crew.give_project(ada, self.kind)
-        ada.drives.value["purpose"] = 0.2
-        return crew, ada
-
-    def sends(self, result):
-        """Pionir 'runs' it: the world really changes, then Pionir says so."""
-        def answer(payload):
-            self.world.sent += payload["n"]
-            return done(result)
-        return answer
-
-    def test_a_job_pionir_reports_as_run_becomes_a_did_episode_and_a_seen_result(self) -> None:
-        crew, ada = self.make(self.sends({"answer": "Sent 1 follow-up to Acme", "sent": 1}))
-        crew.work_one_step(ada)
-        self.assertEqual(len(crew.pionir.calls), 1)
-        did = ada.mem.recent(10, kinds=("did",))
-        self.assertEqual(len(did), 1)
-        self.assertIn("send one follow-up email", did[0]["text"])
-        self.assertEqual((did[0]["source"], did[0]["detail"]["status"]), ("did", "done"))
-        result = ada.mem.recent(10, kinds=("result",))[0]
-        self.assertEqual(result["source"], "seen")
-        self.assertIn(1.0, result["detail"]["figures"])
-        self.assertIn("Acme", result["detail"]["entities"])
-        self.assertEqual(ada.mem.counter("jobs_done"), 1)
-        self.assertEqual(ada.mem.counter("project_steps"), 1)   # the world really moved
-
-    def test_pending_approval_is_recorded_as_pending_and_never_as_done(self) -> None:
-        crew, ada = self.make(PENDING)
-        crew.work_one_step(ada)
-        self.assertNotIn("did", kinds_of(ada))
-        self.assertNotIn("did_own", kinds_of(ada))
-        pending = ada.mem.recent(10, kinds=("job_pending",))
-        self.assertEqual(len(pending), 1)
-        self.assertIn("has NOT run", pending[0]["text"])
-        self.assertEqual(pending[0]["detail"]["approval_id"], "ap-1")
-        self.assertEqual(ada.mem.counter("jobs_done"), 0)
-        self.assertEqual(ada.mem.counter("jobs_pending"), 1)
-        # and so she cannot say she did it
-        self.assertIsNone(crew.sim.talk.critic(ada, "I sent the follow-up email."))
-
-    def test_a_failed_job_relieves_no_purpose(self) -> None:
-        crew, ada = self.make(FAILED)
-        before = ada.drives.value["purpose"]
-        crew.work_one_step(ada)
-        self.assertLessEqual(ada.drives.value["purpose"], before)   # only decay, no relief
-        self.assertNotIn("did", kinds_of(ada))
-        tried = ada.mem.recent(10, kinds=("tried",))
-        self.assertTrue(any("mail relay refused" in e["text"] for e in tried))
-        self.assertEqual(ada.mem.counter("project_steps"), 0)
-        self.assertEqual(ada.mem.counter("project_steps_empty"), 1)
-        self.assertEqual(ada.mem.counter("jobs_failed"), 1)
-
-    def test_a_job_that_ran_but_changed_nothing_relieves_no_purpose(self) -> None:
-        # Pionir says ok, but the world the project measures did not move
-        crew, ada = self.make(done({"answer": "nothing to send"}))
-        before = ada.drives.value["purpose"]
-        crew.work_one_step(ada)
-        self.assertEqual(ada.mem.counter("jobs_done"), 1)
-        self.assertLessEqual(ada.drives.value["purpose"], before)
-        self.assertEqual(ada.mem.counter("project_steps"), 0)
-
-    def test_a_running_job_is_followed_to_its_real_outcome(self) -> None:
-        crew, ada = self.make({"status": "running", "running": True, "task_id": "t-9"})
-        crew.pionir.records["t-9"] = {"task_id": "t-9", "status": "done",
-                                      "result": done({"answer": "sent"}, "t-9")}
-        crew.work_one_step(ada)
-        self.assertEqual(crew.pionir.polls, ["t-9"])
-        self.assertEqual(ada.mem.counter("jobs_done"), 1)
-
-    def test_pionir_down_is_an_attempt_that_got_no_answer(self) -> None:
-        crew, ada = self.make(PionirUnreachable("ConnectionRefusedError: refused"))
-        crew.work_one_step(ada)
-        self.assertNotIn("did", kinds_of(ada))
-        self.assertTrue(any("did not answer" in e["text"]
-                            for e in ada.mem.recent(10, kinds=("tried",))))
-
-    def test_a_crew_without_hands_records_that_nothing_ran(self) -> None:
-        crew, ada = self.make(done({}))
-        crew.sim.hands = None
-        crew.work_one_step(ada)
-        self.assertEqual(crew.pionir.calls, [])
-        self.assertNotIn("did", kinds_of(ada))
-        self.assertEqual(ada.mem.counter("jobs_failed"), 1)
+from pionir.crew.hands import Job, JobOutcome, PionirClient, outcome_of
 
 
 class OutcomeTests(unittest.TestCase):
@@ -136,6 +41,44 @@ class OutcomeTests(unittest.TestCase):
         for url in ("http://example.com:8780", "https://127.0.0.1:8780", "http://10.0.0.2"):
             with self.assertRaises(ValueError):
                 PionirClient(url)
+
+
+class WorkerJobTests(unittest.TestCase):
+    """A worker's ``ctx.job`` goes through the hands to Pionir and waits for the outcome."""
+
+    def setUp(self) -> None:
+        tmp = temp_dir()
+        self.addCleanup(tmp.cleanup)
+        self.crew = make_crew(tmp.name)
+        self.addCleanup(self.crew.stop)
+        self.worker = self.crew.registry.require("alpha.a1")
+
+    def _job_from_a_worker(self, answer) -> JobOutcome:
+        self.crew.hands.client = FakePionir({"outreach.send": answer})
+        self.crew.hands.start()
+        ctx = self.crew.context_for(self.worker)
+        return ctx.job(Job("outreach.send", {"n": 1}, permissions=()))
+
+    def test_a_privileged_job_comes_back_parked_not_done(self) -> None:
+        out = self._job_from_a_worker(PENDING)
+        self.assertEqual(out.status, "pending_approval")
+        self.assertFalse(out.ran)
+        self.assertEqual(self.crew.hands.client.calls[0][0], "outreach.send")
+
+    def test_a_job_pionir_ran_comes_back_done(self) -> None:
+        out = self._job_from_a_worker(done({"sent": 1}))
+        self.assertTrue(out.ran)
+
+    def test_a_job_with_no_outcome_is_unreachable_never_done(self) -> None:
+        # the hands never start: nothing serves the queue, and the wait runs out
+        self.crew.hands.client = FakePionir({"x.y": done({})})
+        out: list = []
+        t = threading.Thread(target=lambda: out.append(
+            self.crew.hands.run_sync("alpha.a1", Job("x.y"), timeout=0.3)))
+        t.start()
+        t.join(5)
+        self.assertEqual(out[0].status, "unreachable")
+        self.assertFalse(out[0].ran)
 
 
 if __name__ == "__main__":

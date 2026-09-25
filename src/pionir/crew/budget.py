@@ -181,7 +181,7 @@ def boot_check(cfg, *, card: CardWatch | None = None,
 
 
 class Monitor:
-    """Re-measures every ``interval`` seconds on its own thread; the sim reads ``latest``."""
+    """Re-measures every ``interval`` seconds on its own thread; the crew reads ``latest``."""
 
     def __init__(self, cfg, store, interval: float = 30.0) -> None:
         self.cfg = cfg
@@ -216,10 +216,10 @@ class Monitor:
             "brain_ctx": ours["context"] if ours else None,
             "other_models": [{"name": x["name"], "gb": round(x["size_vram"] / GB, 2)}
                              for x in loaded if x is not ours],
-            "sim_rss_mb": round(rss, 1),
+            "process_rss_mb": round(rss, 1),
             "calls_last_hour": calls_hour,
             "limits": {"model_gb": b.model_gb, "card_gb": b.card_gb,
-                       "calls_per_hour": b.calls_per_hour, "sim_rss_mb": b.sim_rss_mb},
+                       "calls_per_hour": b.calls_per_hour, "process_rss_mb": b.process_rss_mb},
             "breaches": self.breaches,
         }
         problems, kinds = [], set()
@@ -231,8 +231,8 @@ class Monitor:
             problems.append(f"card {m['card_used_gb']} GB > {b.card_gb} GB "
                             f"({mine:.2f} GB ours, {m['card_used_gb'] - mine:.2f} GB other software)")
             kinds.add("card")
-        if rss > b.sim_rss_mb:
-            problems.append(f"sim RSS {rss:.0f} MB > {b.sim_rss_mb} MB")
+        if rss > b.process_rss_mb:
+            problems.append(f"crew RSS {rss:.0f} MB > {b.process_rss_mb} MB")
             kinds.add("rss")
         if calls_hour > b.calls_per_hour:
             problems.append(f"calls {calls_hour}/h > {b.calls_per_hour}/h")

@@ -1,143 +1,156 @@
-"""The crew's runtime rules: pause holds the brain, stale requests expire out loud, and
-``python -m pionir.crew`` starts, says what it started, and stops cleanly.
+"""The crew's runtime rules: pause holds the brain, the hands and the dispatcher; stale
+model requests expire out loud; ``python -m pionir.crew`` starts, says which workers are
+live and which are placeholders, and stops cleanly.
 
-Each test fails if the rule is reverted: a model call made while the crew is paused, a
-stale request served late or dropped without a word, an agent left believing a thought
-it never had is still on its way, or a foreground run that does not stop cleanly.
+Each test fails if the rule is reverted: a model call, a job or a worker run made while
+the crew is paused, a stale request served late or dropped without a word, or a
+foreground run that does not stop cleanly.
 """
 
 import threading
 import unittest
 
-from crew_support import FakeOllama, settings, temp_dir
-from test_crew_kit import Crew, FakePionir, member
+from crew_support import FakeTime, temp_dir
+from test_crew_fakes import FakeHttp, FakePionir, catalogue, done, make_crew
 
 from pionir.crew.__main__ import run
 from pionir.crew.brain import EXPIRED
-from pionir.crew.crew import build
-from pionir.crew.gpu import CardWatch
+from pionir.crew.hands import Job
+from pionir.crew.log import check_source
+from pionir.crew.registry import default_registry
 
 
-class PauseHoldsTheBrainTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.crew = Crew([member("ada", ["outreach"])])
-        self.addCleanup(self.crew.close)
-        self.brain = self.crew.sim.brain
-        self.got: list = []
+class _Case(unittest.TestCase):
+    def crew(self, **kw):
+        tmp = temp_dir()
+        self.addCleanup(tmp.cleanup)
+        crew = make_crew(tmp.name, **kw)
+        self.addCleanup(crew.stop)
+        return crew
 
-    def ask(self) -> None:
-        self.brain.request("ada", "thought", "system", "user", {},
-                           lambda text, meta, err: self.got.append((text, meta, err)))
 
+class PauseHoldsTests(_Case):
     def test_while_paused_no_model_call_is_made_and_the_work_waits(self) -> None:
-        self.ask()
-        self.crew.sim.pause("operator")
+        crew = self.crew()
+        got: list = []
+        crew.brain.request("leader.alpha", "distil", "s", "u", {},
+                           lambda text, meta, err: got.append(text))
+        crew.pause("operator")
         for _ in range(3):
-            self.assertTrue(self.brain.step())
-        self.assertEqual(self.crew.ollama.calls, [])
-        self.assertEqual(len(self.brain.waiting()), 1)        # still queued, not dropped
-        self.assertEqual(self.got, [])
-        self.assertGreaterEqual(self.brain.held_for_pause, 3)
-        self.assertTrue(self.brain.snapshot()["held"])
-        self.crew.sim.resume()
-        self.brain.step()
-        self.assertEqual(len(self.crew.ollama.calls), 1)
-        self.assertEqual(self.got[0][0], "hello")
+            self.assertTrue(crew.brain.step())
+        self.assertEqual(crew.brain._post.calls, [])
+        self.assertEqual(len(crew.brain.waiting()), 1)         # still queued, not dropped
+        self.assertTrue(crew.brain.snapshot()["held"])
+        crew.resume()
+        crew.brain.step()
+        self.assertEqual(got, ["hello"])
 
     def test_a_paused_crew_starts_no_job_either(self) -> None:
-        crew = Crew([member("ada", ["outreach"])], answers={"x.y": {"ok": True}})
-        self.addCleanup(crew.close)
-        crew.sim.hands.submit("ada", _job(), lambda out: None)
-        crew.sim.pause("operator")
-        crew.sim.hands.step()
-        self.assertEqual(crew.pionir.calls, [])
-        crew.sim.resume()
-        crew.sim.hands.step()
-        self.assertEqual(len(crew.pionir.calls), 1)
+        crew = self.crew()
+        crew.hands.client = FakePionir({"x.y": done({})})
+        crew.hands.submit("alpha.a1", Job("x.y", {}), lambda out: None)
+        crew.pause("operator")
+        crew.hands.step()
+        self.assertEqual(crew.hands.client.calls, [])
+        crew.resume()
+        crew.hands.step()
+        self.assertEqual(len(crew.hands.client.calls), 1)
+
+    def test_a_paused_crew_dispatches_no_worker(self) -> None:
+        crew = self.crew()
+        crew.pause("operator")
+        crew.step()
+        crew.dispatcher.shutdown(wait=True)
+        self.assertEqual(crew.store.last_attempts(), {})
+        crew.resume()
+        crew.dispatcher = type(crew.dispatcher)(crew.registry, crew.store,
+                                                context=crew.context_for, gate=crew.gate)
+        crew.step()
+        crew.dispatcher.shutdown(wait=True)
+        self.assertIn("alpha.a1", crew.store.last_attempts())   # and resumes after
 
 
-def _job():
-    from pionir.crew.actions import Job
-    return Job("x.y", {}, what="do the thing")
-
-
-class ExpiryTests(unittest.TestCase):
+class ExpiryTests(_Case):
     def test_a_stale_request_expires_with_the_explicit_signal_and_is_counted(self) -> None:
-        crew = Crew([member("ada", ["outreach"])])
-        self.addCleanup(crew.close)
-        brain = crew.sim.brain
-        self.assertEqual(brain.ttl, 600.0)                    # the default
+        t = FakeTime()
+        crew = self.crew(now=t.now)
+        brain = crew.brain
+        self.assertEqual(brain.ttl, 600.0)                     # the default
         got: list = []
-        brain.request("ada", "thought", "s", "u", {}, lambda t, m, e: got.append((t, m, e)))
-        crew.time.advance(599)
-        self.assertEqual(brain.expire_stale(), 0)             # not yet
-        crew.time.advance(2)
+        brain.request("leader.alpha", "distil", "s", "u", {},
+                      lambda text, meta, err: got.append((text, meta, err)),
+                      division="alpha")
+        t.advance(599)
+        self.assertEqual(brain.expire_stale(), 0)              # not yet
+        t.advance(2)
         brain.step()
         self.assertEqual(brain.expired, 1)
-        self.assertEqual(crew.ollama.calls, [])               # never served late
+        self.assertEqual(brain._post.calls, [])                # never served late
         text, meta, err = got[0]
         self.assertIsNone(text)
         self.assertEqual(err, EXPIRED)
         self.assertTrue(meta["expired"])
-        self.assertEqual(brain.waiting(), [])
-        self.assertEqual(crew.sim.store.calls_since(0)["ada"]["calls"], 1)   # in the ledger
+        self.assertEqual(crew.store.calls_since(0)["leader.alpha"]["calls"], 1)  # in the ledger
 
     def test_the_ttl_is_configurable(self) -> None:
-        crew = Crew([member("ada", ["outreach"])], request_ttl_seconds=5)
-        self.addCleanup(crew.close)
-        self.assertEqual(crew.sim.brain.ttl, 5.0)
+        crew = self.crew(request_ttl_seconds=5)
+        self.assertEqual(crew.brain.ttl, 5.0)
 
-    def test_an_expired_intention_tells_the_agent_it_did_not_happen(self) -> None:
-        crew = Crew([member("ada", ["outreach"])])
-        self.addCleanup(crew.close)
-        ada = crew["ada"]
-        ada.intend_pending = True
-        crew.sim.brain.request("ada", "intend", "s", "u", {},
-                               lambda t, m, e: ada._on_intend(crew.sim, 1, t, e))
-        crew.time.advance(601)
-        crew.sim.brain.step()
-        self.assertFalse(ada.intend_pending)                  # free to form one again
-        self.assertEqual(ada.mem.counter("intend_no_words"), 1)
-        self.assertEqual(ada.mem.counter("intentions_formed"), 0)
-
-    def test_an_expired_line_closes_the_conversation_and_says_why(self) -> None:
-        crew = Crew([member("ada", ["outreach"]), member("bram", ["outreach"])])
-        self.addCleanup(crew.close)
-        talk = crew.sim.talk
-        talk.start(crew["ada"], crew["bram"], "test", "Speak to Bram.")
-        crew.time.advance(601)
-        crew.sim.brain.step()
-        self.assertEqual(talk.active, {})
-        self.assertIsNone(crew["ada"].conversation)
-        self.assertEqual(crew.sim.store.count_utterances(), 0)
+    def test_ask_returns_at_once_when_the_brain_is_stopped(self) -> None:
+        crew = self.crew()
+        crew.brain.stop()
+        text, _meta, err = crew.brain.ask("leader.alpha", "distil", [], {}, division="alpha")
+        self.assertIsNone(text)
+        self.assertIn("stopped", err)
 
 
 class ForegroundRunTests(unittest.TestCase):
-    def test_run_starts_says_what_it_started_and_stops_cleanly(self) -> None:
+    def test_run_says_what_is_live_and_what_is_placeholder_and_stops_cleanly(self) -> None:
         with temp_dir() as root:
-            cfg = settings(root, tick_seconds=0.05)
-            sim = build(cfg, cast=[member("ada", ["outreach"]), member("bram", ["ops"])],
-                        post=FakeOllama(), client=FakePionir(),
-                        card=CardWatch(cfg.gpu_lock_path, probe=lambda: None,
-                                       poll_seconds=0.01))
+            http = FakeHttp()                  # every URL unreachable: nothing leaves the box
+            crew = make_crew(root, registry=default_registry(), http=http, tick_seconds=0.05)
             stop = threading.Event()
             lines: list = []
-            timer = threading.Timer(0.4, stop.set)
+            timer = threading.Timer(0.5, stop.set)
             timer.start()
             try:
-                self.assertEqual(run(sim, stop=stop, out=lines.append, monitor=False), 0)
+                self.assertEqual(run(crew, stop=stop, out=lines.append, monitor=False), 0)
             finally:
                 timer.cancel()
             text = "\n".join(lines)
-            self.assertIn("Ada", text)
-            self.assertIn("#outreach: Ada", text)
-            self.assertIn("NO project kinds", text)            # an idle crew says so up front
+            self.assertIn("treasury.ledger", text)
+            self.assertIn("LIVE but NOT CONFIGURED", text)        # no token file in the temp dir
+            self.assertIn("posting.blog", text)
+            self.assertIn("PLACEHOLDER", text)
+            self.assertIn("2 live, 5 placeholder(s)", text)
             self.assertIn("stopped cleanly", lines[-1])
-            self.assertTrue(sim.stopping)
-            self.assertGreater(sim.ticks, 0)
-            self.assertFalse(sim._thread.is_alive())
-            self.assertFalse(sim.brain._thread.is_alive())
-            self.assertFalse(sim.hands._thread.is_alive())
+            self.assertTrue(crew.stopping)
+            self.assertGreater(crew.steps, 0)
+            self.assertFalse(crew._thread.is_alive())
+            self.assertFalse(crew.brain._thread.is_alive())
+            self.assertFalse(crew.hands._thread.is_alive())
+            urls = {u for u, _h, _t in http.calls}
+            self.assertEqual(urls, {"https://api.dokaz.net/health"})  # the ledger never called
+
+    def test_a_restart_records_the_gap_it_was_not_running(self) -> None:
+        with temp_dir() as root:
+            t = FakeTime()
+            first = make_crew(root, cat=catalogue(), now=t.now)
+            first.stop()
+            t.advance(3600)
+            second = make_crew(root, cat=catalogue(), now=t.now)
+            try:
+                pause = second.store.last_pause()
+                self.assertEqual(pause["reason"], "process was not running")
+                self.assertAlmostEqual(pause["seconds"], 3600, delta=1)
+            finally:
+                second.stop()
+
+
+class SourceTests(unittest.TestCase):
+    def test_no_mangled_escapes_in_the_crew_source(self) -> None:
+        # a regex word boundary arriving as a literal 0x08 matches nothing, silently
+        self.assertEqual(check_source(), [])
 
 
 if __name__ == "__main__":

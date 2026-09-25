@@ -1,0 +1,78 @@
+{
+  "_how": "The crew as data. One entry per division, one per worker. Adding a worker is adding an entry here: 'impl' names its implementation in workers.IMPLS, 'provider' names an entry in 'providers' (the minimum seconds between two requests to that host, shared by every worker on it). Worker ids are '<division>.<name>' and must be unique; an unknown field, impl, provider or division is an error at load time. Moss is not in this file: she is a separate process (C:\\src\\Galatea) that reads the leaders' reports and sets each division's goal and compute share.",
+  "providers": {
+    "dokaz": 2.0,
+    "none": 0.0
+  },
+  "known_names": ["Moss", "Pionir", "Claude", "Ian", "Scrooge", "Dokaz"],
+  "divisions": [
+    {
+      "id": "treasury",
+      "title": "Treasury",
+      "leader_cadence_seconds": 3600,
+      "workers": [
+        {
+          "name": "ledger",
+          "impl": "scrooge_ledger",
+          "kind": "revenue",
+          "cadence_seconds": 3600,
+          "provider": "dokaz",
+          "entities": ["Scrooge"],
+          "note": "Scrooge's ledger, read-only",
+          "params": {
+            "url": "https://api.dokaz.net/dash/api.json",
+            "token_file": "scrooge-read-token.txt"
+          }
+        }
+      ]
+    },
+    {
+      "id": "watch",
+      "title": "Watch",
+      "leader_cadence_seconds": 1800,
+      "workers": [
+        {
+          "name": "health",
+          "impl": "http_health",
+          "kind": "uptime",
+          "cadence_seconds": 300,
+          "provider": "dokaz",
+          "entities": ["Dokaz", "Scrooge"],
+          "note": "is api.dokaz.net up",
+          "params": {"url": "https://api.dokaz.net/health"}
+        }
+      ]
+    },
+    {
+      "id": "posting",
+      "title": "Posting",
+      "leader_cadence_seconds": 21600,
+      "workers": [
+        {"name": "blog", "impl": "placeholder", "kind": "post", "cadence_seconds": 21600,
+         "provider": "none", "entities": ["Blog"], "note": "drafting and publishing blog posts"},
+        {"name": "instagram", "impl": "placeholder", "kind": "post", "cadence_seconds": 21600,
+         "provider": "none", "entities": ["Instagram"], "note": "posting to Instagram"}
+      ]
+    },
+    {
+      "id": "products",
+      "title": "Products",
+      "leader_cadence_seconds": 21600,
+      "workers": [
+        {"name": "gumroad", "impl": "placeholder", "kind": "product", "cadence_seconds": 21600,
+         "provider": "none", "entities": ["Gumroad"], "note": "Gumroad listings and sales"},
+        {"name": "api_builder", "impl": "placeholder", "kind": "product", "cadence_seconds": 21600,
+         "provider": "none", "entities": [], "note": "building new paid API products"}
+      ]
+    },
+    {
+      "id": "builds",
+      "title": "Builds",
+      "leader_cadence_seconds": 21600,
+      "workers": [
+        {"name": "daedalus", "impl": "placeholder", "kind": "build", "cadence_seconds": 21600,
+         "provider": "none", "entities": ["Daedalus"], "note": "coding jobs through Daedalus"}
+      ]
+    }
+  ]
+}

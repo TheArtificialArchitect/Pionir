@@ -14,13 +14,15 @@ Every answer is normalised into a ``JobOutcome`` whose ``status`` is one of:
     failed            Pionir answered, and it did not work (refused, invalid, errored)
     unreachable       no usable answer came back at all; we do not know that it ran
 
-Only ``done`` is ever recorded as something the agent did (agent.py). Anything Pionir
-said that is not plainly one of the others is ``failed``, never assumed done.
+Only ``done`` may ever be recorded as something done. Anything Pionir said that is not
+plainly one of the others is ``failed``, never assumed done.
 
-A call never runs inside the tick: the tick holds the crew's lock, and waiting on HTTP
-there would freeze every agent. ``Hands`` is one worker thread behind a queue, like the
-brain; the outcome comes back through a callback under the crew's lock, between ticks.
-The client is injected, so no test ever reaches a network.
+A worker that acts in the world does it ONLY through here: it builds a ``Job`` and calls
+``WorkContext.job`` (runtime.py), which is ``Hands.run_sync`` - the job goes on this
+queue, and the worker's pool thread waits for the outcome. ``Hands`` is one thread
+behind a queue, like the brain; the outcome comes back through a callback under the
+crew's lock. A paused crew starts no job. The client is injected, so no test ever
+reaches a network.
 """
 from __future__ import annotations
 
@@ -45,6 +47,25 @@ STATUSES = ("done", "pending_approval", "running", "failed", "unreachable")
 
 class PionirUnreachable(RuntimeError):
     pass
+
+
+@dataclass
+class Job:
+    """Something real, asked of Pionir: a capability and its payload."""
+
+    capability: str                 # a Pionir capability name, e.g. "reasoning.atani_answer"
+    payload: dict = field(default_factory=dict)
+    what: str = ""                  # in words: "send the follow-ups"
+    permissions: tuple = ()         # anything privileged without these is parked for the owner
+    wait: float = 30.0              # seconds Pionir may hold the call before handing back an id
+
+    def __post_init__(self) -> None:
+        if not self.capability or not isinstance(self.capability, str):
+            raise ValueError("a Job names the capability it asks Pionir to run")
+        if not isinstance(self.payload, dict):
+            raise TypeError("a Job's payload is an object")
+        if not self.what:
+            self.what = f"run {self.capability}"
 
 
 @dataclass
@@ -185,9 +206,9 @@ class _Req:
 class Hands:
     """One worker, one job at a time, outcome back under the crew's lock."""
 
-    def __init__(self, cfg, sim, client, *, now: Callable[[], float] = time.monotonic) -> None:
+    def __init__(self, cfg, crew, client, *, now: Callable[[], float] = time.monotonic) -> None:
         self.cfg = cfg
-        self.sim = sim
+        self.sim = crew
         self.client = client
         self._now = now
         self.follow_seconds = float(getattr(cfg, "job_follow_seconds", 600.0))
@@ -220,6 +241,31 @@ class Hands:
             self._cv.notify()
         self.counts["submitted"] += 1
         return rid
+
+    def run_sync(self, agent_id: str, job: Job, *, timeout: float | None = None) -> JobOutcome:
+        """Queue a job and wait for its outcome, for a caller on its own thread (a worker
+        in the pool). Not answered in time is ``unreachable`` - we do not know it ran."""
+        done = threading.Event()
+        box: list = []
+
+        def callback(out: JobOutcome) -> None:
+            box.append(out)
+            done.set()
+
+        if self._stop.is_set():
+            return JobOutcome("unreachable", job.capability,
+                              error="the hands are stopped; the job was not sent")
+        self.submit(agent_id, job, callback)
+        wait = timeout if timeout is not None else self.follow_seconds + job.wait + 120
+        deadline = time.monotonic() + wait
+        while not done.wait(0.25):
+            if self._stop.is_set() or time.monotonic() >= deadline:
+                if done.is_set():
+                    break
+                return JobOutcome("unreachable", job.capability,
+                                  error="no outcome (the hands stopped or time ran out); "
+                                        "not counted as done")
+        return box[0]
 
     def waiting(self) -> list:
         with self._cv:
