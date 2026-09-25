@@ -650,6 +650,14 @@ class PionirApp:
             # a tool action: show the whole command so Ian decides on the real thing
             args = payload.get("args")
             gist = " ".join([action, *[str(a) for a in args]]) if isinstance(args, list) else action
+        elif isinstance(payload.get("order_id"), str) and payload["order_id"].strip():
+            # a client order: name it, and what is being done to it (an email's subject)
+            gist = f"order {payload['order_id'].strip()}"
+            for key in ("subject", "status"):
+                value = payload.get(key)
+                if isinstance(value, str) and value.strip():
+                    gist += f": {value.strip()}" if key == "subject" else f" -> {value.strip()}"
+                    break
         else:
             gist = ""
             for key in ("content", "task", "goal", "command", "target", "request", "intent",

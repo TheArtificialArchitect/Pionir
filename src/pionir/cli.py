@@ -88,6 +88,15 @@ def _parser() -> argparse.ArgumentParser:
         help="check the dev.to API key: who it belongs to "
              "(reads only; never posts, never prints the key)",
     )
+    orders = commands.add_parser(
+        "orders",
+        help="list the paid client orders on Scrooge "
+             "(reads only; never emails anyone, never prints the ops token)",
+    )
+    orders.add_argument("--status", default=None,
+                        help="only orders in this status (one of: "
+                             "awaiting_payment, paid, in_progress, delivered, declined, "
+                             "refunded, quote_requested, quoted)")
     commands.add_parser("bryo-status", help="read Bryo's non-mutating status snapshot")
     commands.add_parser("nyx-status", help="read Nyx's redacted offensive-security health")
     commands.add_parser("voodoo-status", help="read Voodoo's redacted defensive posture")
@@ -656,6 +665,25 @@ def devto_check(settings: PionirSettings | None = None, *, opener: Any = None) -
     return code
 
 
+def orders(settings: PionirSettings | None = None, *, status: str | None = None,
+           opener: Any = None) -> int:
+    """``pionir orders``: 0 ok, 1 not configured (or could not list), 2 token rejected.
+    No runtime is built: it reads the ops token file and asks Scrooge one question (GET
+    /dash/orders). Never emails anyone, never prints the token."""
+    from .adapters.clients import ClientAdapter, ClientSettings
+
+    configured = settings or PionirSettings.from_environment()
+    if configured.content_url is None:
+        _print({"status": "not_configured", "message": "PIONIR_CONTENT_URL is off"})
+        return 1
+    adapter = ClientAdapter(ClientSettings(base_url=configured.content_url,
+                                           token_file=configured.ops_token_path),
+                            opener=opener)
+    code, report = adapter.list_orders(status)
+    _print(report)
+    return code
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     for name, check in (("instagram-check", instagram_check), ("devto-check", devto_check)):
@@ -666,6 +694,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 _print({"status": "error", "error_type": type(error).__name__,
                         "message": str(error)})
                 return 1
+    if args.command == "orders":
+        try:
+            return orders(status=args.status)
+        except (ValueError, OSError) as error:
+            _print({"status": "error", "error_type": type(error).__name__,
+                    "message": str(error)})
+            return 1
     if args.command == "bryo-feed":
         # A standalone poller: it reads the running server over HTTP and needs no
         # runtime of its own (no Cortex, no GPU lock), so it short-circuits here.

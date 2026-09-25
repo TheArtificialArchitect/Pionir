@@ -9,6 +9,8 @@ from .adapters import (
     AtaniCliSettings,
     BryoStatusAdapter,
     BryoStatusSettings,
+    ClientAdapter,
+    ClientSettings,
     ContentAdapter,
     ContentSettings,
     CrewAdapter,
@@ -201,6 +203,11 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         # and the token file is read then. content.publish always parks for approval.
         runtime.register(ContentAdapter(ContentSettings(
             base_url=configured.content_url, token_file=configured.content_token_path,
+        )))
+        # The paid client orders on the same Scrooge, with its own ops token (read when a
+        # client.* task runs). client.email always parks for approval.
+        runtime.register(ClientAdapter(ClientSettings(
+            base_url=configured.content_url, token_file=configured.ops_token_path,
         )))
     if configured.content_url is not None and configured.instagram_graph_url is not None:
         # Needs Scrooge to host the card image. No boot-time call: both token files are

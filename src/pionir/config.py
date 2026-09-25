@@ -178,6 +178,12 @@ class PionirSettings:
     # PIONIR_CONTENT_TOKEN_FILE points at another token file.
     content_url: str | None = "https://api.dokaz.net"
     content_token_file: Path | None = None
+    # Scrooge's ops token for the client.* capabilities (the paid client orders on the
+    # same content_url): client.email parks for the owner's yes on every call. None means
+    # ~/.pionir/secrets/scrooge-ops-token.txt (written by Scrooge's
+    # tools/setup-ops-token.ps1), read at call time: no network at boot. Registered only
+    # when content_url is on; PIONIR_OPS_TOKEN_FILE points at another token file.
+    ops_token_file: Path | None = None
     # The Instagram Graph API (Instagram API with Instagram Login) for
     # social.instagram_post, which parks for the owner's yes on every call. It also needs
     # Scrooge (content_url) to host the card image, so it is registered only when both are
@@ -262,6 +268,16 @@ class PionirSettings:
         except RuntimeError:
             return self.state_root / "secrets" / "scrooge-publish-token.txt"
         return home / ".pionir" / "secrets" / "scrooge-publish-token.txt"
+
+    @property
+    def ops_token_path(self) -> Path:
+        if self.ops_token_file is not None:
+            return self.ops_token_file
+        try:
+            home = Path.home()
+        except RuntimeError:
+            return self.state_root / "secrets" / "scrooge-ops-token.txt"
+        return home / ".pionir" / "secrets" / "scrooge-ops-token.txt"
 
     @property
     def instagram_token_path(self) -> Path:
@@ -389,6 +405,11 @@ class PionirSettings:
             content_token_file=(
                 Path(os.environ["PIONIR_CONTENT_TOKEN_FILE"]).expanduser()
                 if (os.environ.get("PIONIR_CONTENT_TOKEN_FILE") or "").strip()
+                else None
+            ),
+            ops_token_file=(
+                Path(os.environ["PIONIR_OPS_TOKEN_FILE"]).expanduser()
+                if (os.environ.get("PIONIR_OPS_TOKEN_FILE") or "").strip()
                 else None
             ),
             instagram_graph_url=_optional_url(

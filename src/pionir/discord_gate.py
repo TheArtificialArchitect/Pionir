@@ -9,7 +9,8 @@ command and payload, who asked, and any money it spends in bold at the top; a
 ``social.instagram_post`` card opens with POSTS PUBLICLY TO INSTAGRAM, shows the full
 caption and carries the rendered image itself as an attachment; a
 ``content.crosspost_devto`` card opens with CROSS-POSTS TO DEV.TO and shows the whole
-article),
+article; a ``client.email`` card opens with EMAILS A CLIENT, names the recipient and shows
+the whole message),
 adds ✅ and ❌ itself, and polls the reactions. Only the configured owner's
 reaction counts; with no owner configured nothing can ever be approved here.
 
@@ -54,6 +55,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from .adapters.clients import EMAIL as CLIENT_EMAIL
 from .adapters.content import PUBLISH, public_url
 from .adapters.devto import CROSSPOST as DEVTO_CROSSPOST
 from .adapters.instagram import POST as INSTAGRAM_POST
@@ -478,6 +480,30 @@ def _devto_lines(payload: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+def client_email_line(to: Any) -> str:
+    """The first line of a client.email card: who the message goes to."""
+    shown = f"`{_fence_safe(str(to))}`" if isinstance(to, str) and to else "(no address)"
+    return (f"✉️ **EMAILS A CLIENT** - the message below is sent to {shown} if "
+            "you approve.")
+
+
+def _client_email_lines(payload: Mapping[str, Any]) -> list[str]:
+    """The email as the owner must see it before it is sent: the order, the recipient,
+    the subject and the WHOLE message, verbatim in a plain-text block (split across
+    messages by split_message, never cut)."""
+
+    body = payload.get("body_text")
+    text = body if isinstance(body, str) else str(body)
+    return [
+        f"**Order:** `{_fence_safe(str(payload.get('order_id')))}`",
+        (f"**To:** `{_fence_safe(str(payload.get('to')))}` (Scrooge sends only to the "
+         "address stored on this order)"),
+        f"**Subject:** {_escape(str(payload.get('subject')))}",
+        f"**The message, in full ({len(text):,} characters), exactly as it will be sent:**",
+        _FENCE + "text", _fence_safe(text), _FENCE,
+    ]
+
+
 INSTAGRAM_LINE = ("\U0001f4f8 **POSTS PUBLICLY TO INSTAGRAM** - the image and caption below go "
                   "live on the Dokaz Instagram if you approve.")
 CARD_FILENAME = "card.jpg"
@@ -548,7 +574,10 @@ def render_request(row: Mapping[str, Any], owner: str | None) -> str:
     publishes = row.get("capability") == PUBLISH
     posts = row.get("capability") == INSTAGRAM_POST
     crossposts = row.get("capability") == DEVTO_CROSSPOST
+    emails = row.get("capability") == CLIENT_EMAIL
     lines: list[str] = []
+    if emails:
+        lines.append(client_email_line(payload.get("to")))
     if publishes:
         lines.append(PUBLISH_LINE)
     if posts:
@@ -591,6 +620,11 @@ def render_request(row: Mapping[str, Any], owner: str | None) -> str:
         if isinstance(payload.get("body_md"), str):
             shown = {**payload, "body_md": f"(the full article above, "
                                            f"{len(payload['body_md']):,} characters)"}
+    if emails:
+        lines += _client_email_lines(payload)
+        if isinstance(payload.get("body_text"), str):
+            shown = {**payload, "body_text": f"(the full message above, "
+                                             f"{len(payload['body_text']):,} characters)"}
     if posts:
         lines += _instagram_lines(payload)
         if isinstance(payload.get("caption"), str):
