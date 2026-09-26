@@ -23,7 +23,15 @@ around it. So:
   and the order is marked delivered. The link is a bearer link: logs show only its last
   six characters.
 
-All four are ``routable=False``: reached only by name.
+- ``client.find_report`` is PRIVILEGED with ``requires_approval=True``: a "Find it for me"
+  order's report of where to buy the client's item. It necessarily links to third-party
+  shops, which ``client.email`` refuses, so every link is declared in ``links`` (0-15, each
+  https: to a public DNS name - no IP, no localhost/.local/.internal, no password, no
+  port), every link in the body must be declared and every declared link must be in the
+  body, and the card lists each one by its domain above the whole report. It is sent
+  through the same Scrooge call as ``client.email``, with the same answers.
+
+All five are ``routable=False``: reached only by name.
 
 An email is checked here before anything is parked or sent - a bad one is refused by
 Pionir with ``AdapterProtocolError`` naming the field and why, in Scrooge's
@@ -40,6 +48,7 @@ faults, so the circuit breaker is not tripped and the plain answer is not hidden
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -56,11 +65,14 @@ from pionir.adapters.content import (
     _BAD_SCHEME,
     _BARE_WWW,
     _CONTROL_LINE,
+    _EMAIL,
     _HTML_COMMENT,
     _HTML_DECL,
     _HTML_TAG,
     _INVISIBLE,
     _OTHER_SCHEME,
+    _PHONE,
+    _PHONES_STRICT,
     _SCHEMED_URL,
     DEFAULT_CONTENT_URL,
     _link_problem,
@@ -81,6 +93,7 @@ ORDERS = "client.orders"
 EMAIL = "client.email"
 SET_STATUS = "client.set_status"
 DELIVER = "client.deliver"
+FIND_REPORT = "client.find_report"
 
 ORDER_STATUSES = ("awaiting_payment", "paid", "in_progress", "delivered", "declined",
                   "refunded", "quote_requested", "quoted")
@@ -90,6 +103,7 @@ SETTABLE_STATUSES = ("in_progress", "delivered", "declined", "refunded", "quoted
 EMAIL_FIELDS = frozenset({"order_id", "to", "subject", "body_text"})
 DELIVER_FIELDS = frozenset({"order_id", "to", "zip_name", "zip_sha256", "subject",
                             "body_text"})
+FIND_REPORT_FIELDS = frozenset({"order_id", "to", "subject", "body_text", "links"})
 # Where the download link goes in a delivery email: exactly once.
 LINK_PLACEHOLDER = "{link}"
 # The shape of the link, for checking the email before the upload (the real one is
@@ -244,6 +258,182 @@ def check_delivery(payload: Mapping[str, Any]) -> dict[str, str]:
     return {**email, "body_text": body, "zip_name": zip_name, "zip_sha256": sha}
 
 
+# ---- the find report rules ----------------------------------------------------------------
+# A "Find it for me" report links to the shops that sell the client's item: third-party
+# websites, which client.email (Dokaz links only) keeps refusing. So every link is declared
+# in ``links``, checked one by one, and listed by its domain on the owner's card - and the
+# report may carry no link that is not declared, nor declare one it does not carry.
+# Scrooge's POST /dash/orders/email refuses a body over 5,000 characters: a longer report
+# would be approved and then bounce, so it is refused here, before the owner is asked.
+FIND_BODY_LENGTH = BODY_LENGTH
+MAX_FIND_LINKS = 15
+MAX_LINK_LENGTH = 500
+# The owner's internal systems: never in text a client reads. Mirrors INTERNAL_NAMES in
+# crew/contentcheck.py (a test pins the two together).
+INTERNAL_NAMES = ("Pionir", "Moss", "Galatea", "Atani", "Scrooge", "Skopos", "Hearth", "Bryo",
+                  "Daedalus", "Melete", "Nyx", "Voodoo", "Theo")
+_INTERNAL_NAME = re.compile(r"(?i)(?<![a-z0-9])(" + "|".join(INTERNAL_NAMES) + r")(?![a-z0-9])")
+# One DNS label, and a top-level domain that is letters (or an IDNA xn-- name): an
+# all-digit last label is how 2130706433 or 0x7f.1 pass for an address.
+_DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?")
+_TLD = re.compile(r"[a-z]{2,63}|xn--[a-z0-9-]{1,59}")
+# Names that only mean something on a private network, never a public shop.
+_PRIVATE_SUFFIXES = frozenset({"localhost", "local", "internal", "localdomain", "lan", "home",
+                               "corp", "intranet", "private", "arpa", "test", "invalid",
+                               "onion"})
+_URL_TEXT = re.compile(r"[\x21-\x7e]+")
+
+
+def _find_link_problem(url: str) -> str | None:
+    """Why ``url`` cannot be a link in a find report, or None. The URL is not echoed
+    (it may carry a password); the host is, once it is known to be a plain DNS name."""
+    if len(url) > MAX_LINK_LENGTH:
+        return f"at most {MAX_LINK_LENGTH} characters (this is {len(url)})"
+    if not _URL_TEXT.fullmatch(url):
+        return "no spaces, control or non-ASCII characters (percent-encode them)"
+    if _BAD_SCHEME.search(url):
+        return "javascript:, data: and vbscript: are not allowed"
+    if not url.startswith("https://"):
+        return "must start with https://"
+    if "\\" in url:
+        # a browser reads a backslash as a slash: https://shop.example\@evil.example
+        return "no backslashes"
+    netloc = re.split(r"[/?#]", url[len("https://"):], maxsplit=1)[0]
+    if "@" in netloc:
+        return "cannot carry a user name or password"
+    if netloc.startswith("["):
+        return "an IP address, not a website's name"
+    if ":" in netloc:
+        return "cannot name a port"
+    host = netloc.lower()
+    if not host:
+        return "has no host"
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return "an IP address, not a website's name"
+    labels = host.split(".")
+    if labels[-1] in _PRIVATE_SUFFIXES and all(_DNS_LABEL.fullmatch(x) for x in labels):
+        return f"{host} is a local or internal name, not a public website"
+    if len(host) > 253 or len(labels) < 2 \
+            or not all(_DNS_LABEL.fullmatch(label) for label in labels):
+        return "the host must be a website's name (like www.example-shop.com)"
+    if not _TLD.fullmatch(labels[-1]):
+        return "the host must end in a name like .com, not a number (an IP in disguise)"
+    if not _SCHEMED_URL.fullmatch(url) or url != url.rstrip(_TRAILING):
+        # the body is read the same way: the link must read the same inside the report
+        return ("must read the same inside the report: no quotes, brackets, parentheses or "
+                "backticks, and no punctuation at the end")
+    return None
+
+
+def check_find_links(value: Any) -> list[str]:
+    """0-15 distinct https: links to public websites, or ValueError("links...: <why>")."""
+    if not isinstance(value, list):
+        raise ValueError("links: required, a list of https: links (it may be empty)")  # noqa: TRY004
+    if len(value) > MAX_FIND_LINKS:
+        raise ValueError(f"links: at most {MAX_FIND_LINKS} (this has {len(value)})")
+    seen: set[str] = set()
+    for i, link in enumerate(value):
+        if not isinstance(link, str) or not link:
+            raise ValueError(f"links[{i}]: must be a link, as text")
+        problem = _find_link_problem(link)
+        if problem:
+            raise ValueError(f"links[{i}]: {problem}")
+        if link in seen:
+            raise ValueError(f"links[{i}]: listed twice")
+        seen.add(link)
+    return list(value)
+
+
+def _report_text_problem(text: str, *, links_allowed: bool) -> str | None:
+    """Plain text, nothing tag-shaped, no contact details, no internal names; links only
+    written as https://... (and none at all in the subject)."""
+    if _INVISIBLE.search(text):
+        return "contains an invisible direction or zero-width character"
+    if (_HTML_COMMENT.search(text) or _HTML_DECL.search(text) or _HTML_TAG.search(text)
+            or _ANGLED.search(text)):
+        return "plain text only - nothing tag-shaped like <...>"
+    if _BAD_SCHEME.search(text):
+        return "javascript:, data: and vbscript: are not allowed"
+    if _OTHER_SCHEME.search(text):
+        return "mailto:, tel: and file: links are not allowed"
+    if not links_allowed and _SCHEMED_URL.search(text):
+        return "no links here - they belong in the report, listed in links"
+    for pattern in (_BARE_WWW, _BARE_HOST_PATH):
+        for match in pattern.finditer(text):
+            return (f"write a link as https://... and list it in links, not "
+                    f"{match.group(0)[:80]!r} (mail clients link it as it stands)")
+    # the rest reads the words, not the links (a product number in a URL is not a phone)
+    words = _SCHEMED_URL.sub(" ", text)
+    if _EMAIL.search(words):
+        # not echoed: it is someone's contact details
+        return ("no email addresses - of anyone; link to the shop instead of giving its "
+                "contact details")
+    if _PHONE.search(words) or any(
+            sum(c.isdigit() for c in m.group(0)) >= 8
+            for pattern in _PHONES_STRICT for m in pattern.finditer(words)):
+        return "no phone numbers - of anyone; link to the shop instead"
+    name = _INTERNAL_NAME.search(words)
+    if name:
+        return f"names the internal system {name.group(1)!r}"
+    return None
+
+
+def check_find_report(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """The report exactly as it will be sent (with its links), or ValueError("<field>:
+    <why>"). Every link in the body is in ``links`` and every one in ``links`` is in the
+    body, so the owner's card lists every website the client is sent to."""
+    unknown = sorted(set(payload) - FIND_REPORT_FIELDS)
+    if unknown:
+        raise ValueError(f"{unknown[0]}: not a find report field (allowed: "
+                         f"{', '.join(sorted(FIND_REPORT_FIELDS))})")
+    missing = sorted(FIND_REPORT_FIELDS - set(payload))
+    if missing:
+        raise ValueError(f"{missing[0]}: required")
+    report: dict[str, Any] = {"order_id": check_order_id(payload["order_id"]),
+                              "to": check_address(payload["to"])}
+    links = check_find_links(payload["links"])
+    for key, (low, high), control in (("subject", SUBJECT_LENGTH, _CONTROL_LINE),
+                                      ("body_text", FIND_BODY_LENGTH, _CONTROL_TEXT)):
+        text = payload[key]
+        if not isinstance(text, str):
+            raise ValueError(f"{key}: required, a string")  # noqa: TRY004
+        if not low <= len(text) <= high:
+            raise ValueError(f"{key}: {low}-{high} characters (this is {len(text)})")
+        if not text.strip():
+            raise ValueError(f"{key}: cannot be blank")
+        if control.search(text.replace("\r\n", "\n") if key == "body_text" else text):
+            raise ValueError(f"{key}: contains a control character"
+                             + (" (only line breaks are allowed)" if key == "body_text"
+                                else " or line break (one line only)"))
+        problem = _report_text_problem(text, links_allowed=key == "body_text")
+        if problem:
+            raise ValueError(f"{key}: {problem}")
+        report[key] = text
+    body = report["body_text"]
+    listed = set(links)
+    written: set[str] = set()
+    for match in _SCHEMED_URL.finditer(body):
+        url = match.group(0).rstrip(_TRAILING)
+        problem = _find_link_problem(url)
+        if problem:
+            raise ValueError(f"body_text: a link {problem}")
+        if url not in listed:
+            host = urllib.parse.urlsplit(url).hostname
+            raise ValueError(f"body_text: a link to {host} is not listed in links - every "
+                             "link in the report must be, so the owner sees it on the card")
+        written.add(url)
+    for i, link in enumerate(links):
+        if link not in written:
+            raise ValueError(f"links[{i}]: not in the report - every listed link must "
+                             "appear in body_text")
+    report["links"] = links
+    return report
+
+
 def link_tail(url: str) -> str:
     """How a download link is shown in a log: its last six characters only (the link
     itself is a bearer link - whoever has it can download the client's work)."""
@@ -377,6 +567,16 @@ class ClientAdapter:
                     routable=False,
                 ),
                 Capability(
+                    name=FIND_REPORT,
+                    description="Email the client of a \"Find it for me\" order the report "
+                                "of where to buy their item, with links to the shops "
+                                "(only after the owner approves it and every link)",
+                    risk=RiskLevel.PRIVILEGED,
+                    required_permissions=frozenset({FIND_REPORT}),
+                    requires_approval=True,
+                    routable=False,
+                ),
+                Capability(
                     name=SET_STATUS,
                     description="Move a client order to in_progress, delivered, declined, "
                                 "refunded or quoted (records only; nobody is contacted)",
@@ -422,7 +622,7 @@ class ClientAdapter:
                 raise AdapterProtocolError(f"{DELIVER} refused by Pionir - {error}") from error
         else:
             self._request(task)
-        if task.capability in (EMAIL, DELIVER) \
+        if task.capability in (EMAIL, DELIVER, FIND_REPORT) \
                 and read_token(self.settings.token_file) is None:
             # Asking the owner to approve an email that cannot be sent wastes his yes.
             raise AdapterUnavailable(self._not_configured())
@@ -437,6 +637,11 @@ class ClientAdapter:
                 return "GET", f"/dash/orders{query}", None
             if task.capability == EMAIL:
                 return "POST", "/dash/orders/email", check_email(task.payload)
+            if task.capability == FIND_REPORT:
+                # Scrooge takes the report as a plain-text email; the links were for the
+                # checks and the owner's card, and are all in the body
+                report = check_find_report(task.payload)
+                return "POST", "/dash/orders/email", {k: report[k] for k in sorted(EMAIL_FIELDS)}
             if task.capability == SET_STATUS:
                 return "POST", "/dash/orders/status", check_status_change(task.payload)
         except ValueError as error:
@@ -482,8 +687,10 @@ class ClientAdapter:
                                                    not_configured=True))
         status, document = self._http(method, path, body, token)
         output = self._answer(task.capability, status, document, token)
-        if task.capability == EMAIL:
-            _log.info("client: email for order %s: %s", body["order_id"] if body else "?",
+        if task.capability in (EMAIL, FIND_REPORT):
+            _log.info("client: %s for order %s: %s",
+                      "email" if task.capability == EMAIL else "find report",
+                      body["order_id"] if body else "?",
                       "sent" if output.get("ok") is True else "not sent")
         # Belt and braces: whatever Scrooge echoed, the token does not leave in the result.
         return self._result(task, json.loads(self._scrub(json.dumps(output), token)))
@@ -492,7 +699,7 @@ class ClientAdapter:
                 token: str) -> dict[str, Any]:
         doc = document if isinstance(document, Mapping) else {}
         said = self._scrub(str(doc.get("error") or ""), token)[:300]
-        emailing = capability == EMAIL
+        emailing = capability in (EMAIL, FIND_REPORT)
         if 200 <= status < 300:
             if doc.get("ok") is True:
                 return dict(doc)
@@ -730,7 +937,7 @@ class ClientAdapter:
         order_id = task.payload.get("order_id")
         if isinstance(order_id, str) and _ORDER_ID.fullmatch(order_id):
             evidence.append(f"client:order:{order_id}")
-        if task.capability == EMAIL and output.get("ok") is True and output.get("id"):
+        if task.capability in (EMAIL, FIND_REPORT) and output.get("ok") is True                 and output.get("id"):
             evidence.append(f"client:message:{output['id']}")
         evidence += extra_evidence or []
         return TaskResult(task_id=task.task_id, agent_id=self.manifest.agent_id,

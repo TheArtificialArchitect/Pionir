@@ -207,8 +207,9 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
             base_url=configured.content_url, token_file=configured.content_token_path,
         )))
         # The paid client orders on the same Scrooge, with its own ops token (read when a
-        # client.* task runs). client.email and client.deliver always park for approval;
-        # a delivery's zip is scanned for every secret Pionir is configured with.
+        # client.* task runs). client.email, client.find_report and client.deliver always
+        # park for approval; a delivery's zip is scanned for every secret Pionir is
+        # configured with.
         runtime.register(ClientAdapter(client_settings(configured)))
     if configured.content_url is not None and configured.instagram_graph_url is not None:
         # Needs Scrooge to host the card image. No boot-time call: both token files are

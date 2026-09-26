@@ -10,7 +10,9 @@ command and payload, who asked, and any money it spends in bold at the top; a
 caption and carries the rendered image itself as an attachment; a
 ``content.crosspost_devto`` card opens with CROSS-POSTS TO DEV.TO and shows the whole
 article; a ``client.email`` card opens with EMAILS A CLIENT, names the recipient and shows
-the whole message; a ``client.deliver`` card opens with DELIVERS TO A CLIENT and shows the
+the whole message; a ``client.find_report`` card opens with SENDS A FIND REPORT, lists every
+link it sends the client to with its domain in bold first, and shows the whole report; a
+``client.deliver`` card opens with DELIVERS TO A CLIENT and shows the
 zip's full file list as checked on disk, the secrets scan and the whole email; a
 ``product.gumroad_publish`` card opens with PUTS A PRODUCT ON SALE and the price, shows the
 whole listing - the FULL description, the zip's file list, the secrets scan and any
@@ -61,6 +63,7 @@ from uuid import uuid4
 
 from .adapters.clients import DELIVER as CLIENT_DELIVER
 from .adapters.clients import EMAIL as CLIENT_EMAIL
+from .adapters.clients import FIND_REPORT as CLIENT_FIND_REPORT
 from .adapters.clients import LINK_PLACEHOLDER
 from .adapters.content import PUBLISH, public_url
 from .adapters.devto import CROSSPOST as DEVTO_CROSSPOST
@@ -514,6 +517,51 @@ def _client_email_lines(payload: Mapping[str, Any]) -> list[str]:
     ]
 
 
+def find_report_line(to: Any) -> str:
+    """The first line of a client.find_report card: who the report goes to."""
+    shown = f"`{_fence_safe(str(to))}`" if isinstance(to, str) and to else "(no address)"
+    return (f"\U0001f50e **SENDS A FIND REPORT** - the report below goes to {shown} if "
+            "you approve.")
+
+
+def _link_domain(link: Any) -> str:
+    try:
+        host = urllib.parse.urlsplit(str(link)).hostname
+    except ValueError:
+        host = None
+    return host or "(no host)"
+
+
+def _find_report_lines(payload: Mapping[str, Any]) -> list[str]:
+    """The report as the owner must see it before it is sent: the order, the recipient,
+    the subject, EVERY website it sends the client to (each link with its domain in bold
+    first; the report can carry no link that is not on this list), and the WHOLE report,
+    verbatim in a plain-text block (split across messages by split_message, never cut)."""
+
+    raw = payload.get("links")
+    links = [str(link) for link in raw] if isinstance(raw, list) else []
+    domains = list(dict.fromkeys(_link_domain(link) for link in links))
+    lines = [
+        f"**Order:** `{_fence_safe(str(payload.get('order_id')))}`",
+        (f"**To:** `{_fence_safe(str(payload.get('to')))}` (Scrooge sends only to the "
+         "address stored on this order)"),
+        f"**Subject:** {_escape(str(payload.get('subject')))}",
+    ]
+    if links:
+        lines.append(f"**The websites it sends the client to ({len(domains)}):** "
+                     + ", ".join(f"**{_escape(d)}**" for d in domains))
+        lines.append(f"**Every link in the report ({len(links)}):**")
+        # <...> keeps Discord from fetching a preview of a third-party page into the card
+        lines += [f"• **{_escape(_link_domain(link))}** — <{link}>" for link in links]
+    else:
+        lines.append("**Links:** none - the report sends the client to no website")
+    body = payload.get("body_text")
+    text = body if isinstance(body, str) else str(body)
+    lines += [f"**The report, in full ({len(text):,} characters), exactly as it will be sent:**",
+              _FENCE + "text", _fence_safe(text), _FENCE]
+    return lines
+
+
 def client_deliver_line(to: Any) -> str:
     """The first line of a client.deliver card: the zip goes out, to whom."""
     shown = f"`{_fence_safe(str(to))}`" if isinstance(to, str) and to else "(no address)"
@@ -744,6 +792,7 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
     crossposts = row.get("capability") == DEVTO_CROSSPOST
     emails = row.get("capability") == CLIENT_EMAIL
     delivers = row.get("capability") == CLIENT_DELIVER
+    finds = row.get("capability") == CLIENT_FIND_REPORT
     sells = row.get("capability") == PRODUCT_PUBLISH
     lines: list[str] = []
     if sells:
@@ -755,6 +804,8 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
         lines.append(client_deliver_line(payload.get("to")))
     if emails:
         lines.append(client_email_line(payload.get("to")))
+    if finds:
+        lines.append(find_report_line(payload.get("to")))
     if publishes:
         lines.append(PUBLISH_LINE)
     if posts:
@@ -801,6 +852,11 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
         lines += _client_email_lines(payload)
         if isinstance(payload.get("body_text"), str):
             shown = {**payload, "body_text": f"(the full message above, "
+                                             f"{len(payload['body_text']):,} characters)"}
+    if finds:
+        lines += _find_report_lines(payload)
+        if isinstance(payload.get("body_text"), str):
+            shown = {**payload, "body_text": f"(the full report above, "
                                              f"{len(payload['body_text']):,} characters)"}
     if delivers:
         lines += _client_deliver_lines(payload, delivery)
