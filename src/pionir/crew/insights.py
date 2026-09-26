@@ -29,6 +29,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from pionir import atomic
+
 from .blog import _Unreadable, published_posts, read_record
 from .figures import Figure
 from .hands import Job
@@ -89,7 +91,7 @@ def _save(path: Path, doc: dict) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(doc, handle, indent=2)
-        os.replace(tmp, path)
+        atomic.replace(tmp, path)   # retried: Windows scanners hold files briefly
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise

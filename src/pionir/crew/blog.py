@@ -43,6 +43,8 @@ from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlsplit
 
+from pionir import atomic
+
 from . import contentcheck
 from .figures import Figure
 from .hands import Job, outcome_of
@@ -252,14 +254,7 @@ def save_record(path: Path, rec: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(rec, indent=1, sort_keys=True), encoding="utf-8")
-    for attempt in range(20):
-        try:
-            tmp.replace(path)
-            return
-        except PermissionError:
-            if attempt == 19:
-                raise
-            time.sleep(0.05)
+    atomic.replace(tmp, path)
 
 
 def published_posts(rec: dict | None) -> list:

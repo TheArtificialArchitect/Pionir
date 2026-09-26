@@ -2,6 +2,7 @@
 moment (an antivirus scan, the search indexer) must not fail the write - on Windows
 os.replace raises PermissionError until the holder lets go. Found by an approval
 whose job finished while its queue file was held: the record stayed "running"."""
+import ast
 import tempfile
 import unittest
 from pathlib import Path
@@ -59,6 +60,25 @@ class ReplaceTests(unittest.TestCase):
         atomic.write_text(self.dest, "written")
         self.assertEqual(self.dest.read_text(encoding="utf-8"), "written")
         self.assertEqual(sorted(p.name for p in self.root.iterdir()), ["q.json"])
+
+
+class NoRawSwapTests(unittest.TestCase):
+    def test_every_store_swaps_through_atomic_replace(self) -> None:
+        # A raw os.replace / tmp.replace in a store is the bug above waiting for a
+        # scanner to hold the file. Only pionir.atomic may call os.replace itself.
+        src = Path(atomic.__file__).resolve().parent
+        offenders = []
+        for path in sorted(src.rglob("*.py")):
+            if path.name == "atomic.py" and path.parent == src:
+                continue
+            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "replace" and isinstance(node.func.value, ast.Name)):
+                    continue
+                owner = node.func.value.id
+                if owner == "os" or ("tmp" in owner.lower() and len(node.args) == 1):
+                    offenders.append(f"{path.relative_to(src)}:{node.lineno}")
+        self.assertEqual(offenders, [], "use pionir.atomic.replace(tmp, dest)")
 
 
 if __name__ == "__main__":

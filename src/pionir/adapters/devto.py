@@ -45,7 +45,6 @@ import os
 import re
 import tempfile
 import threading
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -55,6 +54,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pionir import atomic
 from pionir.adapters.content import (
     _EMAIL,
     _LINK_TARGET,
@@ -248,26 +248,11 @@ _LOCKS_GUARD = threading.Lock()
 # What this process has cross-posted, per ledger, in case the ledger file could not be
 # written: a draft that went up is not posted again while Pionir runs, whatever the disk did.
 _POSTED: dict[Path, dict[str, dict[str, Any]]] = {}
-REPLACE_ATTEMPTS = 20
-REPLACE_BACKOFF_SECONDS = 0.05
 
 
 def _ledger_lock(path: Path) -> threading.Lock:
     with _LOCKS_GUARD:
         return _LOCKS.setdefault(path.resolve(), threading.Lock())
-
-
-def _replace(tmp: str, path: Path) -> None:
-    """os.replace, retried briefly: on Windows a scanner or indexer holding the old file
-    for a moment makes it fail with PermissionError."""
-    for attempt in range(REPLACE_ATTEMPTS):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            if attempt == REPLACE_ATTEMPTS - 1:
-                raise
-            time.sleep(REPLACE_BACKOFF_SECONDS)
 
 
 def _utc_now() -> str:
@@ -493,7 +478,7 @@ class DevtoAdapter:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(current, handle, indent=2, sort_keys=True)
-            _replace(tmp, path)
+            atomic.replace(tmp, path)
         except BaseException:
             Path(tmp).unlink(missing_ok=True)
             raise

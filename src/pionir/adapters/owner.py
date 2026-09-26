@@ -42,6 +42,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from pionir import atomic
 from pionir.contracts import AgentManifest, Capability, RiskLevel, Task, TaskResult
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
 
@@ -243,7 +244,7 @@ class OwnerNotifyAdapter:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"sent": sent}, ensure_ascii=False, indent=2),
                        encoding="utf-8")
-        tmp.replace(path)
+        atomic.replace(tmp, path)   # retried: Windows scanners hold files briefly
 
     @staticmethod
     def _recent(sent: list[dict[str, Any]], kind: str, now: datetime) -> list[datetime]:
