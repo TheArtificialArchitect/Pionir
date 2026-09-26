@@ -10,8 +10,9 @@ said so. The two confabulations that would hurt most:
   worker recorded FROM A REAL SOURCE backs - matched on value AND unit, so "$12" can
   never be backed by "12 replies". A structured figure in the report must match a
   recorded one on value, unit and what it measures (``unbacked_figures``).
-- NAMES. A customer, a platform, a product that never existed. ``proper_nouns`` finds
-  the capitalised names mid-sentence; ``unknown_names`` keeps those nothing recorded.
+- NAMES. A customer, a platform, a product that never existed. ``unknown_names`` finds
+  the capitalised words that are names rather than English (the shared dictionary in
+  words.py) and keeps those nothing recorded - see the names section below.
 
 A figure the MODEL wrote (a worker's drafted post, say) is not a real source: the store
 marks such outputs ``derived`` and they are never offered as backing, so one invented
@@ -27,6 +28,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from .figures import Figure
+from .words import COMPANY, DUAL, NAME, forms, word_kind
 
 
 def words(block: str) -> list:
@@ -221,9 +223,13 @@ def backs(fig: Figure, claim: Claim) -> bool:
     return True
 
 
-def unbacked_claims(text: str, recorded: Iterable[Figure]) -> list:
-    recorded = list(recorded)
-    return [c for c in claims_in(text) if not any(backs(f, c) for f in recorded)]
+def unbacked_claims(text: str, recorded: Iterable[Figure], values: Iterable[float] = ()) -> list:
+    """The claims in ``text`` nothing backs. ``values`` are numbers a real source wrote in
+    a payload (not as figures, e.g. "topics_left": 13): they back a BARE number only - a
+    claim with a unit ("$13", "13 replies") still needs a figure in that unit."""
+    recorded, values = list(recorded), list(values)
+    return [c for c in claims_in(text) if not any(backs(f, c) for f in recorded)
+            and not (c.unit is None and any(same(v, c.value) for v in values))]
 
 
 def figure_backed(stated: Figure, recorded: Iterable[Figure]) -> bool:
@@ -246,12 +252,31 @@ def unbacked_figures(stated: Iterable[Figure], recorded: Iterable[Figure]) -> li
 
 
 # ---- names ------------------------------------------------------------------------
+#
+# A name is a capitalised word that is not just English. The first version of this rule
+# treated EVERY capitalised word mid-sentence as a name, and the live crew's leaders were
+# rejected for "Division", "Report", "Data", "Stale" and "Target" in Title-Case headlines
+# ("Contracts Division Report: No New Paid Orders") - a false positive on nearly every
+# report, so Moss saw "rejected" where there was a true report. The content check had
+# already solved the same problem for blog posts with a dictionary (words.py), and this
+# reads the same one:
+#
+# - an ordinary English word ("Division", "Unconfigured") is not a name;
+# - a word the brief itself uses - a worker id, an output kind, what a figure measures, a
+#   name a worker recorded, the catalogue's own vocabulary - is not a name;
+# - an acronym ("API", "HTTP", "PDFs") is vocabulary, as before;
+# - a word the dictionary knows as BOTH ("Target", "Mark", "May", "No") is a word when
+#   context says so: it opens a sentence, it sits in a Title-Case run beside an ordinary
+#   word ("Revenue Target Missed"), or the report or the brief uses it in lower case.
+#   Alone mid-sentence and nowhere in lower case ("paid by Mark") it is a name;
+# - anything else - a proper noun ("Kimberly") or a word no dictionary holds ("Etsy") -
+#   is a name, anywhere in a sentence, and must have been recorded. Fail closed: the
+#   dictionary not knowing a word makes it a name, never a pass.
 
-# A proper noun: capitalised and containing a lower-case letter ("Gumroad", "RapidAPI",
-# "Etsy"). All-caps tokens ("API", "SEO", "CRM") are vocabulary and pass freely.
-_PROPER = r"[A-Z][A-Za-z0-9]*[a-z][A-Za-z0-9]*"
-# mid-sentence only, as Hearth did: a sentence-initial capital is grammar, not a name
-_MID = re.compile(rf"(?<=[a-z0-9,;:)]\s)({_PROPER})\b")
+_TOKEN = re.compile(r"[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)*")
+# the end of a sentence (or a clause a headline opens after "Revenue: ...")
+_BOUNDARY = re.compile(r"[.!?:;…][\"'”’)\]]*\s+$|^\s*$|[\n(\[\"“]\s*$"
+                       r"|\s[-–—]\s+$")
 
 ALWAYS_KNOWN = frozenset(words("""
 I Ok Okay Monday Tuesday Wednesday Thursday Friday Saturday Sunday January February March
@@ -259,27 +284,105 @@ April May June July August September October November December
 """))
 
 
-def proper_nouns(text: str) -> list:
-    """Capitalised names used mid-sentence."""
-    return [m.group(1) for m in _MID.finditer(text or "")]
+def _cap(tok: str) -> bool:
+    """Written like a name: a capital and a lower-case letter ("Gumroad", "RapidAPI"), or a
+    brand with its capital inside ("iPhone", "eBay"). All capitals is an acronym."""
+    if tok[0].isupper():
+        return any(c.islower() for c in tok)
+    return tok[0].isalpha() and any(c.isupper() for c in tok[1:])
 
 
-def unknown_names(text: str, known: Iterable[str]) -> list:
-    ok = {k.lower() for k in known} | {k.lower() for k in ALWAYS_KNOWN}
-    return [n for n in proper_nouns(text) if n.lower() not in ok]
+def _runs(text: str) -> list:
+    """Capitalised tokens grouped into runs joined by single spaces (a Title-Case phrase),
+    each as [(token, initial), ...]."""
+    text = text or ""
+    runs, run, last_end = [], [], None
+    for m in _TOKEN.finditer(text):
+        tok = m.group(0)
+        if not _cap(tok) and not (len(tok) > 1 and tok.isupper()):
+            if run:
+                runs.append(run)
+            run, last_end = [], None
+            continue
+        if run and text[last_end:m.start()] != " ":
+            runs.append(run)
+            run = []
+        run.append((tok, _BOUNDARY.search(text[:m.start()]) is not None))
+        last_end = m.end()
+    if run:
+        runs.append(run)
+    return runs
+
+
+def lower_words(texts: Iterable[str]) -> set:
+    """The words a text uses in lower case: what vouches for a dual-use word."""
+    return {t.lower() for text in texts for t in _TOKEN.findall(text or "")
+            if t == t.lower() and any(c.isalpha() for c in t)}
+
+
+def vocabulary_words(texts: Iterable[str]) -> set:
+    """Every word in some trusted text, lower-cased, split on punctuation, so a worker id
+    ("posting.instagram"), an output kind ("order.new_paid"), a stream ("card-press") or a
+    measure ("failing_products") vouches for the words it is made of."""
+    out: set = set()
+    for text in texts:
+        for t in re.split(r"[^A-Za-z0-9'’-]+", str(text or "")):
+            t = t.strip("-'’").lower()
+            if t:
+                out.add(t)
+                out.update(p for p in t.split("-") if p)
+    return out
+
+
+def unknown_names(text: str, known: Iterable[str], vocabulary: Iterable[str] = (), *,
+                  also_lower: Iterable[str] = ()) -> list:
+    """The capitalised words in ``text`` that are names nothing recorded, in order.
+
+    ``known`` are names (any case) the catalogue or a worker vouches for; ``vocabulary``
+    are lower-case words the brief is made of; ``also_lower`` are lower-case words other
+    texts of the same report use (they vouch only for a dual-use word)."""
+    names = {k.lower() for k in known}
+    ok = names | {k.lower() for k in ALWAYS_KNOWN} | set(vocabulary)
+    lower = lower_words([text]) | set(also_lower) | set(vocabulary)
+    out = []
+    # "Acme Corp": a company even when each word is English - only a recorded name vouches
+    for m in COMPANY.finditer(text or ""):
+        if m.group(0).lower() not in names and not all(
+                w.lower() in names for w in m.group(1).split()):
+            out.append(m.group(0))
+    for run in _runs(text):
+        kinds = [word_kind(tok) if _cap(tok) else "acronym" for tok, _i in run]
+        anchored = len(run) > 1 and any(k not in (DUAL, NAME) for k in kinds)
+        for (tok, initial), kind in zip(run, kinds):
+            if not _cap(tok) or kind not in (DUAL, NAME):
+                continue
+            fs = [f.replace("’", "'").lower() for f in forms(tok)]
+            if any(f in ok or all(p in ok for p in f.split("-")) for f in fs):
+                continue
+            if kind == DUAL and (initial or anchored or any(f in lower for f in fs)):
+                continue
+            out.append(tok)
+    return out
 
 
 def check_report(texts: Iterable[str], stated: Iterable[Figure], recorded: Iterable[Figure],
-                 known: Iterable[str]) -> list:
-    """Every reason this report may not go up, in words; empty means it may."""
+                 known: Iterable[str], vocabulary: Iterable[str] = (),
+                 values: Iterable[float] = ()) -> list:
+    """Every reason this report may not go up, in words; empty means it may.
+    ``vocabulary`` is the lower-case words the brief is made of (Brief.vocabulary), and
+    ``values`` the bare numbers its real-source payloads hold (Brief.recorded_values)."""
     recorded = list(recorded)
+    values = list(values)
     known = set(known)
+    vocabulary = set(vocabulary)
+    texts = [t for t in texts if t]
+    everywhere = lower_words(texts)
     problems = []
     for text in texts:
-        for c in unbacked_claims(text, recorded):
+        for c in unbacked_claims(text, recorded, values):
             problems.append(f"states {c.text!r}, which no worker recorded")
-        for n in unknown_names(text, known):
+        for n in unknown_names(text, known, vocabulary, also_lower=everywhere):
             problems.append(f"names {n!r}, which nothing recorded")
     for f in unbacked_figures(stated, recorded):
         problems.append(f"lists {f.display()}, which no worker recorded")
-    return problems
+    return list(dict.fromkeys(problems))            # each reason once, in order

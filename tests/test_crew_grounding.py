@@ -15,6 +15,7 @@ from pionir.crew.grounding import (
     unbacked_claims,
     unbacked_figures,
     unknown_names,
+    vocabulary_words,
 )
 
 REPLIES = Figure(12, "count", "replies")
@@ -46,6 +47,12 @@ class TypedFigureTests(unittest.TestCase):
         self.assertTrue(unbacked_claims("about $471", recorded))
         self.assertTrue(unbacked_claims("exactly $469.00", recorded))
 
+    def test_a_payload_number_backs_a_bare_number_only(self) -> None:
+        self.assertEqual(unbacked_claims("Topics left: 13.", [], [13.0]), [])
+        self.assertTrue(unbacked_claims("Topics left: 13.", [], [14.0]))
+        self.assertTrue(unbacked_claims("We made $13.", [], [13.0]))
+        self.assertTrue(unbacked_claims("We got 13 replies.", [], [13.0]))
+
     def test_other_currencies_are_never_backed(self) -> None:
         self.assertTrue(unbacked_claims("we made £12", [REVENUE]))
 
@@ -64,6 +71,54 @@ class NameTests(unittest.TestCase):
         self.assertEqual(unknown_names("Sales came from Etsy and Gumroad.", {"Gumroad"}),
                          ["Etsy"])
         self.assertEqual(unknown_names("Nothing new from Gumroad today.", {"gumroad"}), [])
+
+
+class OrdinaryWordTests(unittest.TestCase):
+    """The live crew's leaders were rejected for these, word for word."""
+
+    LIVE = (
+        "Posting Division Report: Two Drafts Blocked, One Post Pending Approval",
+        "Contracts Division Report: No New Paid Orders",
+        "Revenue Data Stale; Web Sales Minimal",
+        "Treasury Reporting Shows Recent Activity, Target Missed",
+        "Posting Status: Workers Unconfigured",
+        "The contracts Division Report says the Finder never ran.",
+    )
+
+    def test_ordinary_words_in_a_title_case_headline_are_not_names(self) -> None:
+        for text in self.LIVE:
+            self.assertEqual(unknown_names(text, set()), [], text)
+            self.assertEqual(check_report([text], [], [Figure(2, "count", "drafts blocked")],
+                                          set()), [], text)
+
+    def test_the_briefs_own_vocabulary_is_not_a_name(self) -> None:
+        vocab = vocabulary_words(["posting.instagram", "www.facebook.com", "card-press"])
+        self.assertEqual(unknown_names("Instagram and Facebook sent visits to Card-Press.",
+                                       set(), vocab), [])
+        self.assertEqual(unknown_names("Instagram sent visits.", set()), ["Instagram"])
+
+
+class InventedNameTests(unittest.TestCase):
+    def test_a_name_no_dictionary_holds_fails_anywhere_in_a_sentence(self) -> None:
+        self.assertEqual(unknown_names("Etsy sent two sales.", set()), ["Etsy"])
+        self.assertEqual(unknown_names("Two sales came from Etsy.", set()), ["Etsy"])
+        self.assertEqual(unknown_names("Sales Via Etsy Rose", set()), ["Etsy"])
+
+    def test_a_proper_noun_fails(self) -> None:
+        self.assertEqual(unknown_names("A client, Kimberly, paid.", set()), ["Kimberly"])
+
+    def test_a_dual_word_alone_mid_sentence_is_a_name(self) -> None:
+        self.assertEqual(unknown_names("It was paid by Mark yesterday.", set()), ["Mark"])
+        self.assertEqual(unknown_names("Most sales were on Amazon.", set()), ["Amazon"])
+        # ...and a word when the report uses it as one
+        self.assertEqual(unknown_names("Mark it done; we hit the mark.", set()), [])
+
+    def test_a_company_of_ordinary_words_fails(self) -> None:
+        self.assertEqual(unknown_names("A deal with Blue Sky Ltd is close.", set()),
+                         ["Blue Sky Ltd"])
+
+    def test_a_recorded_name_passes(self) -> None:
+        self.assertEqual(unknown_names("Etsy sent two sales.", {"Etsy"}), [])
 
 
 class ReportTests(unittest.TestCase):

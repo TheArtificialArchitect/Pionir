@@ -43,7 +43,6 @@ exactly how a shared vocabulary fails (HEAD 3.8).
 """
 from __future__ import annotations
 
-import gzip
 import ipaddress
 import json
 import re
@@ -54,6 +53,8 @@ from urllib.parse import parse_qs, urlsplit
 from pionir.adapters.content import check_draft, reserved_email
 from pionir.social.card import CardTooLong, layout
 from pionir.social.post import check_post
+
+from . import words as _words
 
 ALLOWLIST_PATH = Path(__file__).with_name("content_allowlist.json")
 
@@ -428,44 +429,17 @@ def _segments(body: str) -> list:
     return out
 
 
-WORDS_PATH = Path(__file__).with_name("words_en.txt.gz")
-
-
-@lru_cache(maxsize=1)
-def _dictionary() -> tuple:
-    """(common, proper): every surface form of Hunspell en_US, split by how the dictionary
-    enters it - common words in lower case, proper nouns (names, places, companies)
-    capitalised. Built by tools/build_wordlist.py; licence in words_en.LICENSE."""
-    text = gzip.decompress(WORDS_PATH.read_bytes()).decode("utf-8")
-    common, _, proper = text.partition("# proper\n")
-    return (frozenset(common.split("\n")[1:]) - {""}, frozenset(proper.split("\n")) - {""})
-
-
-def _ordinary_word(tok: str) -> bool:
-    """A capitalised token that is just an English word ("Verification", "Implementing",
-    "Real-time"), not a name. The first real drafting run blocked six of six drafts on
-    words like these: a names rule without a dictionary cannot tell "Verification" from
-    "Verizon", and a check that blocks everything is a worker that never posts.
-
-    Fail closed where it matters: a form the dictionary enters as a proper noun ("Mark",
-    "Target", "Seattle", "Kimberly") is never ordinary, a word it does not know ("Milica",
-    "Verizon") is never ordinary, and an all-capitals token (an acronym) needs the allowlist.
-    The input carries no private data - the drafting prompt holds a topic, nothing about
-    anyone - so what this rule guards against is an invented or real public name, and the
-    owner still reads every post before it goes live."""
-    common, proper = _dictionary()
-    for form in _forms(tok):
-        form = form.replace("\u2019", "'")
-        if len(form) > 1 and form.isupper():
-            return False
-        parts = form.split("-")
-        # A Title-Case compound ("Opt-In", "Real-Time") capitalises its later parts by
-        # habit, so only the first part's capital can mark a name: "In" is a proper noun
-        # (indium) in Hunspell, "in" is not.
-        if all(p and (i > 0 or p not in proper) and (p.lower() in common or p in common) and
-               not (len(p) > 1 and p.isupper()) for i, p in enumerate(parts)):
-            return True
-    return False
+# The dictionary and what counts as an ordinary word live in words.py, shared with the
+# leaders' grounding, so the crew's two names rules read one word list and cannot drift.
+# Here an ordinary word is one the dictionary holds ONLY as a common word: a form it also
+# enters as a proper noun ("Mark", "Target") is never ordinary in a post. The input carries
+# no private data - the drafting prompt holds a topic, nothing about anyone - so what this
+# rule guards against is an invented or real public name, and the owner still reads every
+# post before it goes live.
+WORDS_PATH = _words.WORDS_PATH
+_dictionary = _words.dictionary
+_ordinary_word = _words.ordinary_word
+_forms = _words.forms
 
 
 def _capitalised(tok: str, code: bool) -> bool:
@@ -473,16 +447,6 @@ def _capitalised(tok: str, code: bool) -> bool:
         return True
     # "iPhone", "eBay": a brand with its capital inside. In code that is just camelCase.
     return not code and tok[0].isalpha() and any(c.isupper() for c in tok[1:])
-
-
-def _forms(tok: str) -> list:
-    forms = [tok]
-    for suffix in ("'s", "\u2019s", "'", "\u2019"):
-        if tok.endswith(suffix) and len(tok) > len(suffix):
-            forms.append(tok[:-len(suffix)])
-    if re.fullmatch(r"[A-Z0-9]{2,}s", tok):          # APIs, PDFs, URLs, IDs
-        forms.append(tok[:-1])
-    return forms
 
 
 def _allowed(tokens: list, allow: frozenset) -> bool:
@@ -584,8 +548,7 @@ _ADVERB = re.compile(r"[A-Z][a-z]{3,}(?:ally|ously|ively|ately|ently|antly|arly|
 
 # "Acme Corp", "Blue Sky Ltd": a company is a company even when every word of its name is an
 # ordinary word, so a capitalised phrase before a company suffix blocks on its own.
-_COMPANY = re.compile(r"\b((?:[A-Z][\w&'\u2019-]*\s+){0,3}[A-Z][\w&'\u2019-]*)\s+"
-                      r"(?:Inc|Corp|Corporation|LLC|Ltd|Limited|GmbH|Co|Company|Group|Labs)\b")
+_COMPANY = _words.COMPANY
 
 
 def _names(draft: dict) -> list:
