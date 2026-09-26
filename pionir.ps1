@@ -98,9 +98,16 @@ function Stop-Bryo {
         Start-Sleep -Milliseconds 700
         if (-not (Get-Process -Id $org.ProcessId -ErrorAction SilentlyContinue)) { $gone = $true; break }
     }
-    Remove-Item $kill -ErrorAction SilentlyContinue
-    if ($gone) { Write-Host "  stopped Bryo (clean checkpoint + exit)." }
-    else { Write-Host "  ! Bryo did not exit within 90 s; he is still running (KILL withdrawn)." -ForegroundColor Yellow }
+    if ($gone) {
+        Remove-Item $kill -ErrorAction SilentlyContinue
+        Write-Host "  stopped Bryo (clean checkpoint + exit)."
+    } else {
+        # A tick can run far longer than the 60 s sleep (his work happens inside it),
+        # and KILL is only read between ticks. Leave it in place: he checkpoints and
+        # exits when this tick ends, and the next launch waits for that, then starts
+        # him fresh in the new window instead of leaving him in the old one.
+        Write-Host "  Bryo is finishing a long tick; he will checkpoint and exit when it ends (KILL left in place)." -ForegroundColor Yellow
+    }
 }
 
 # One pane = one process tree wt kills on close. The command sets the pane's
@@ -251,6 +258,23 @@ $bryoStarted = $false
 if (-not $NoBryo) {
     $bryoRunning = [bool](Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -match '-m bryo(\s|$)' -and $_.CommandLine -notmatch 'viewer' })
+    $killFile = Join-Path $terrariumDir "KILL"
+    $ourKill = (Test-Path $killFile) -and ((Get-Content $killFile -Raw -ErrorAction SilentlyContinue) -match '^pionir\.ps1 -Stop')
+    if ($bryoRunning -and $ourKill) {
+        # A -Stop asked him to go and he is finishing a long tick: wait for him (up to
+        # 5 min), so he restarts in this window rather than staying in the old one.
+        Write-Host "  waiting for Bryo to finish his tick and exit..." -ForegroundColor DarkCyan
+        for ($i = 0; $i -lt 300 -and $bryoRunning; $i++) {
+            Start-Sleep -Seconds 1
+            $bryoRunning = [bool](Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -match '-m bryo(\s|$)' -and $_.CommandLine -notmatch 'viewer' })
+        }
+        if ($bryoRunning) {
+            # Still busy: withdraw the request so he doesn't exit later with nothing to restart him.
+            Remove-Item $killFile -ErrorAction SilentlyContinue
+            Write-Host "  ! Bryo is still mid-tick after 5 min; KILL withdrawn, leaving him running where he is." -ForegroundColor Yellow
+        }
+    }
     if ($bryoRunning) { Write-Host "  Bryo already alive; leaving him be." -ForegroundColor DarkCyan }
     elseif (Test-Path $terrariumDir) {
         # Clear a stale KILL so he doesn't checkpoint-and-exit the moment he boots.
