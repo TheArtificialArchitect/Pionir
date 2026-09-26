@@ -42,26 +42,50 @@ class HermeticSuiteTests(unittest.TestCase):
         self.assertEqual(offenders, [])
 
     def test_every_runtime_a_test_builds_has_embeddings_off(self) -> None:
-        # Runtime-shaped settings: built straight into build_runtime(...), assigned to
-        # a name that is then passed to it, or carrying the specialist wiring
-        # (atani_command / galatea_url) that only a runtime needs - which is what
-        # catches the shared ``_settings()`` helpers. A bare defaults check is not one.
-        offenders = []
-        for path, tree in _sources():
-            for fn in ast.walk(tree):
-                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    continue
-                built = [c.args[0] for c in _calls(fn, "build_runtime") if c.args]
-                fed = {a.id for a in built if isinstance(a, ast.Name)}
-                assigned = {id(n.value) for n in ast.walk(fn) if isinstance(n, ast.Assign)
-                            and any(isinstance(t, ast.Name) and t.id in fed for t in n.targets)}
-                for call in _calls(fn, "PionirSettings"):
-                    kws = _keywords(call)
-                    runtime_shaped = (any(call is a for a in built) or id(call) in assigned
-                                      or "atani_command" in kws or "galatea_url" in kws)
-                    if runtime_shaped and "embed_model" not in kws:
-                        offenders.append(f"{path.name}:{call.lineno} in {fn.name}()")
+        offenders = [f"{path.name}:{call.lineno} in {fn.name}()"
+                     for path, fn, call in _runtime_settings()
+                     if "embed_model" not in _keywords(call)]
         self.assertEqual(offenders, [], "pass embed_model=None (see tests/standins.py)")
+
+    def test_no_runtime_turns_owner_notify_on_without_faking_discord(self) -> None:
+        # owner.notify is wired to the REAL bot token file and DISCORD_CHANNEL_ID (the
+        # Discord gate's settings, from the environment). The rule: a runtime-shaped
+        # PionirSettings whose owner_notify is anything but the literal False must sit in
+        # a function that patches the Discord client - a patch(...) naming DiscordRest.
+        offenders = []
+        for path, fn, call in _runtime_settings():
+            value = next((k.value for k in call.keywords if k.arg == "owner_notify"), None)
+            if value is None or (isinstance(value, ast.Constant) and value.value is False):
+                continue
+            fakes = [c for name in ("patch", "object") for c in _calls(fn, name)
+                     if any(isinstance(n, ast.Constant) and isinstance(n.value, str)
+                            and "DiscordRest" in n.value for n in ast.walk(c))]
+            if not fakes:
+                offenders.append(f"{path.name}:{call.lineno} in {fn.name}()")
+        self.assertEqual(offenders, [], "patch pionir.discord_gate.DiscordRest in that test "
+                                        "(or leave owner_notify off)")
+
+
+def _runtime_settings():
+    """(path, function, PionirSettings call) for every runtime-shaped settings in the
+    tests: built straight into build_runtime(...), assigned to a name that is then passed
+    to it, or carrying the specialist wiring (atani_command / galatea_url) that only a
+    runtime needs - which is what catches the shared ``_settings()`` helpers. A bare
+    defaults check is not one."""
+    for path, tree in _sources():
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            built = [c.args[0] for c in _calls(fn, "build_runtime") if c.args]
+            fed = {a.id for a in built if isinstance(a, ast.Name)}
+            assigned = {id(n.value) for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                        and any(isinstance(t, ast.Name) and t.id in fed for t in n.targets)}
+            for call in _calls(fn, "PionirSettings"):
+                kws = _keywords(call)
+                if (any(call is a for a in built) or id(call) in assigned
+                        or "atani_command" in kws or "galatea_url" in kws):
+                    yield path, fn, call
+
 
 if __name__ == "__main__":
     unittest.main()

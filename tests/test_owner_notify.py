@@ -510,6 +510,13 @@ class ThroughPionirTests(_WithApp):
 
 class WiringTests(unittest.TestCase):
     def test_bootstrap_registers_it_from_the_gate_settings_and_the_switch_removes_it(self) -> None:
+        from unittest import mock
+        # a runtime with owner.notify on is wired to the real bot token and channel: the
+        # Discord client is faked so nothing it could do reaches Discord (test_hermetic)
+        no_discord = mock.patch("pionir.discord_gate.DiscordRest",
+                                side_effect=AssertionError("a test reached for Discord"))
+        no_discord.start()
+        self.addCleanup(no_discord.stop)
         for on in (True, False):
             with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as root:
                 runtime = build_runtime(PionirSettings(
@@ -536,6 +543,16 @@ class WiringTests(unittest.TestCase):
             self.assertFalse(PionirSettings.from_environment().owner_notify)
         with mock.patch.dict(os.environ, {"PIONIR_OWNER_NOTIFY": "1"}):
             self.assertTrue(PionirSettings.from_environment().owner_notify)
+
+    def test_on_by_default_live_and_off_in_a_bare_settings(self) -> None:
+        """Live behaviour unchanged (on unless PIONIR_OWNER_NOTIFY=0); a PionirSettings
+        built by hand - every test runtime - is not wired to the real Discord bot."""
+        import os
+        from unittest import mock
+        with mock.patch.dict(os.environ):
+            os.environ.pop("PIONIR_OWNER_NOTIFY", None)
+            self.assertTrue(PionirSettings.from_environment().owner_notify)
+        self.assertFalse(PionirSettings().owner_notify)
 
 
 class LoopbackTests(Base):

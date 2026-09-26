@@ -175,8 +175,9 @@ class PionirSettings:
     # in the Discord gate's channel with the gate's bot token (read at send time: no
     # network at boot). Rate-limited in Pionir (2 briefs, 4 alerts per rolling 24 h).
     # Unavailable when the Discord gate is not configured; PIONIR_OWNER_NOTIFY=0 leaves it
-    # unregistered.
-    owner_notify: bool = True
+    # unregistered. On in from_environment (the live path); off in a bare PionirSettings,
+    # so a runtime built in a test is never wired to the real bot token and channel.
+    owner_notify: bool = False
     # Scrooge's publish endpoint for the content.* capabilities. content.publish parks
     # for the owner's yes on every call; the token is read from content_token_file
     # (None means ~/.pionir/secrets/scrooge-publish-token.txt) at call time, so no
