@@ -80,7 +80,7 @@ from pionir.adapters.deliveries import (
     load_secrets,
     scan_bytes,
 )
-from pionir.batching import BATCHED_GRANT
+from pionir.batching import BATCHED_GRANT, NEW_ONLY_GRANT
 from pionir.contracts import AgentManifest, Capability, RiskLevel, Task, TaskResult
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
 
@@ -759,9 +759,10 @@ class ProductAdapter:
                                        "not_configured": True})
         try:
             if task.capability == PUBLISH:
-                # Approved from the daily digest, it was approved as a NEW listing only.
-                output = self._publish(product, staged, token,
-                                       new_only=BATCHED_GRANT in task.granted_permissions)
+                # Approved as a NEW listing (its card said so; a batched one always
+                # is), it may only create one: an existing listing is refused untouched.
+                new_only = bool({BATCHED_GRANT, NEW_ONLY_GRANT} & task.granted_permissions)
+                output = self._publish(product, staged, token, new_only=new_only)
             elif task.capability == UNPUBLISH:
                 output = self._unpublish(slug, token)
             else:
@@ -792,7 +793,7 @@ class ProductAdapter:
         try:
             existing = self._find(slug, token)    # a failure here has touched nothing
             if existing is not None and new_only:
-                raise _refused("approved in the daily digest as a NEW listing, but Gumroad "
+                raise _refused("approved as a NEW listing, but Gumroad "
                                f"now has a product with the permalink {slug!r}; an update "
                                "needs its own card - park it again. Nothing was changed.")
             if existing is not None:

@@ -1119,6 +1119,8 @@ _LONGEST_LINK = "https://discord.com/channels/" + "/".join(["9" * 20] * 3)
 DIGEST_PART_TRIES = 3
 UNSEEN_NOTE = ("\u26a0\ufe0f its image did not attach - not approvable here; posted again "
                "with the next digest")
+PARTIAL_NOTE = ("\u26a0\ufe0f its preview did not arrive whole - not approvable here; "
+                "posted again with the next digest")
 LATE_NOTE = ("\u26a0\ufe0f its preview came after this card - not approvable here; answer "
              "it on its preview or the next digest")
 
@@ -1712,6 +1714,9 @@ class DiscordGate:
             "shown": _compose(status, head),
             "answer": previous.get("answer"),
             "final": False,
+            # True only once every chunk is posted: a card missing part of what it does
+            # is never approved (and is posted again)
+            "complete": False,
         }
         if row.get("capability") in (INSTAGRAM_POST, PRODUCT_PUBLISH) \
                 and (attachment is None or attach_failed is not None):
@@ -1739,6 +1744,7 @@ class DiscordGate:
             extra = self._call("POST", f"/channels/{channel}/messages",
                                {"content": chunk, "allowed_mentions": {"parse": []}})
             entry["extra_ids"].append(str(extra["id"]))
+        entry["complete"] = True
         self._save()
         if not status:
             self._add_reactions(entry)
@@ -1787,6 +1793,11 @@ class DiscordGate:
                          approval_id)
             self._post(row)
             return
+        if entry.get("complete") is False and not self._batched(row):
+            # part of it never reached the owner: post it whole again (a digest item waits
+            # for the next digest, which does the same)
+            self._repost_preview(row, entry, "it did not arrive whole here")
+            return
         if not entry.get("reactions_added"):
             # the owner can add the reaction himself, so a failure here must not
             # stop his answer from being read
@@ -1799,8 +1810,9 @@ class DiscordGate:
         if decision is None:
             return
         choice, by = decision
-        if choice == "approve" and entry.get("attach_failed") and self._batched(row):
-            return      # never approved blind: its image did not reach the owner (❌ works)
+        if choice == "approve" and (entry.get("complete") is False
+                                    or (entry.get("attach_failed") and self._batched(row))):
+            return      # never approved blind: not all of it reached the owner (❌ works)
         self._answer(approval_id, entry, choice, by)
 
     def _owner_decision(self, entry: Mapping[str, Any],
@@ -1974,6 +1986,9 @@ class DiscordGate:
                     break                   # in order: a later chunk waits for this one
                 if name in run["gave_up"]:
                     break                   # the rest would be refused the same way
+                # reported: only the rows this chunk (now posted) names
+                told = run.setdefault("expired_told", [])
+                told += [a for a in run["expired"] if f"id `{a}`" in chunk and a not in told]
             if not owed:
                 run["expired_posted"] = True
                 self._save()
@@ -1989,8 +2004,8 @@ class DiscordGate:
                 # from the card (never approved blind); the next digest tries again.
                 owed |= not self._part(run, f"preview {approval_id}",
                                        lambda row=row: self._post(row))
-            elif entry.get("attach_failed"):
-                # its image never reached the owner: post it again, the image may attach now
+            elif entry.get("attach_failed") or entry.get("complete") is False:
+                # its image, or part of its text, never reached the owner: post it again
                 owed |= not self._part(run, f"preview {approval_id}",
                                        lambda row=row, e=entry: self._repost_preview(row, e))
         total = len(run["pages"])
@@ -2002,7 +2017,9 @@ class DiscordGate:
             return                          # the rest is retried on the next pass
         run["complete"] = True
         self._dstate["last_run_at"] = run["started_at"]
-        self._dstate["reported_expired"] += [a for a in run["expired"]
+        # only what the owner was actually shown: a row in a report part that was given
+        # up stays unreported, and the next digest reports it
+        self._dstate["reported_expired"] += [a for a in run.get("expired_told", [])
                                              if a not in self._dstate["reported_expired"]]
         self._save()
 
@@ -2064,13 +2081,13 @@ class DiscordGate:
         rows = {a: self._approvals.get(a) for a in card["items"]}
         self._edit(card, self._card_text(card, rows))
 
-    def _repost_preview(self, row: Mapping[str, Any], old: dict[str, Any]) -> None:
-        """A preview whose image never attached is posted again (the image may attach
-        now); the old message says so and its reactions stop counting."""
+    def _repost_preview(self, row: Mapping[str, Any], old: dict[str, Any],
+                        why: str = "its image could not be attached here") -> None:
+        """A card whose image, or part of whose text, never reached the owner is posted
+        again; the old message says so and its reactions stop counting."""
         try:
-            self._edit(old, _compose("↪️ **Posted again below** - its image could "
-                                     "not be attached here. Answer the new one.",
-                                     old.get("head") or ""))
+            self._edit(old, _compose(f"\u21aa\ufe0f **Posted again below** - {why}. Answer "
+                                     "the new one.", old.get("head") or ""))
         except DiscordError as error:
             if isinstance(error, DiscordAuthError) or error.transport:
                 raise
@@ -2110,14 +2127,18 @@ class DiscordGate:
     def _approvable_from_card(self, approval_id: str) -> bool:
         """Never approved blind: only an item whose full preview reached the owner - posted,
         with its image when it has one - can be approved from a digest card."""
-        entry = self._entries.get(approval_id)
-        return bool(self._preview_link(approval_id)) and not (entry or {}).get("attach_failed")
+        entry = self._entries.get(approval_id) or {}
+        return (bool(self._preview_link(approval_id)) and not entry.get("attach_failed")
+                and entry.get("complete") is not False)
 
     def _unseen_note(self, card: Mapping[str, Any], approval_id: str) -> str | None:
         if not self._preview_link(approval_id):
             return None                     # the line already says the preview is missing
-        if (self._entries.get(approval_id) or {}).get("attach_failed"):
+        entry = self._entries.get(approval_id) or {}
+        if entry.get("attach_failed"):
             return UNSEEN_NOTE
+        if entry.get("complete") is False:
+            return PARTIAL_NOTE
         if approval_id not in (card.get("approvable") or []):
             return LATE_NOTE
         return None

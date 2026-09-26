@@ -72,6 +72,11 @@ NEVER_BATCH_WORDS = frozenset({
 # adapter that allowed batching only for a narrower case (product.gumroad_publish: a NEW
 # listing) refuses, touching nothing, if the case no longer holds when it runs.
 BATCHED_GRANT = "approval.batched"
+# Granted to any approval whose adapter found, as it was parked, that it creates something
+# NEW (a Gumroad listing whose permalink did not exist): its card promised a new listing,
+# so the run may only create one - batched or not. If the thing exists by then, the
+# adapter refuses and changes nothing.
+NEW_ONLY_GRANT = "approval.new_only"
 
 
 def batch_refusal(capability: Any, payload: Mapping[str, Any] | None,

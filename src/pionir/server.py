@@ -33,6 +33,7 @@ from . import atomic
 from .approvals import ApprovalQueue
 from .batching import (
     BATCHED_GRANT,
+    NEW_ONLY_GRANT,
     DigestSettings,
     batch_refusal,
     local_now,
@@ -921,6 +922,10 @@ class PionirApp:
         permissions = list(record["permissions"])
         if record.get("batch"):
             permissions.append(BATCHED_GRANT)
+        context = record.get("context")
+        if isinstance(context, Mapping) and context.get("listing") == "new":
+            # the card said A NEW LISTING: that is all the run may do, batched or not
+            permissions.append(NEW_ONLY_GRANT)
         response = self._submit(
             "approval",
             {"approval_id": approval_id, "capability": record["capability"],

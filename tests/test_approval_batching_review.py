@@ -209,12 +209,114 @@ class NeverWedgedTests(tab.BatchCase):
         state = self.state()["digest"]
         self.assertTrue(state["run"]["complete"])
         self.assertTrue(state["problems"])
-        self.assertEqual(sorted(state["reported_expired"]), sorted(stale))
+        # reported: exactly the rows the posted message named - the rest were never shown
+        told = [a for a in stale if f"id `{a}`" in heads[0]["content"]]
+        self.assertTrue(0 < len(told) < len(stale))
+        self.assertEqual(sorted(state["reported_expired"]), sorted(told))
         self.at(9, 0, days=1)
         fresh = self.page("Fresh")
         gate = self.dgate()
         gate.run_once()
         self.assertEqual(self.cards()[-1]["items"], [fresh])
+        # ...so the next digest, with Discord taking it, reports the others - once
+        later = "\n".join(p["content"] for p in self.fake.posts()[len(heads):]
+                          if "Stale page" in p["content"])
+        for aid in stale:
+            self.assertEqual(aid in later, aid not in told, aid)
+        self.assertEqual(sorted(self.state()["digest"]["reported_expired"]), sorted(stale))
+
+    def test_a_report_whose_first_part_is_given_up_reports_nobody(self):
+        gate = self.primed()
+        stale = [self.page(f"Stale {i}") for i in range(3)]
+        for aid in stale:
+            self.expire(aid)
+
+        def refuse(request: Any) -> None:
+            if request.get_method() == "POST" and request.data \
+                    and "Expired, not run" in json.loads(request.data).get("content", ""):
+                _refuse(self.fake, request)
+
+        stuck = self.dgate(opener=_Wrap(self.fake, refuse))
+        self.at(9, 0)
+        for _ in range(DIGEST_PART_TRIES + 1):
+            stuck.run_once()
+        state = self.state()["digest"]
+        self.assertTrue(state["run"]["complete"])
+        self.assertEqual(state["reported_expired"], [])     # none of them was shown
+        self.at(9, 0, days=1)
+        gate.run_once()
+        [report] = [p for p in self.fake.posts() if "Expired, not run" in p["content"]]
+        for aid in stale:
+            self.assertIn(aid, report["content"])
+
+
+# ---------------------------------------------------------------- a card not whole
+LONG_BODY = " ".join(f"step-{i:04d}" for i in range(900))      # a preview of several messages
+
+
+def _refuse_continuations(fake: Any, armed: list[bool], once: bool = False):
+    def hook(request: Any) -> None:
+        # a message continuing a split card reopens its code block
+        if armed[0] and request.get_method() == "POST" and request.data \
+                and json.loads(request.data).get("content", "").startswith("```"):
+            if once:
+                armed[0] = False
+            _refuse(fake, request)
+    return hook
+
+
+class IncompleteCardTests(tab.BatchCase):
+    def test_a_preview_missing_a_part_is_never_approved_and_is_posted_whole_later(self):
+        self.primed()
+        aid = self.app.run_task(tab.PAGE, {"title": "Long", "body": LONG_BODY})["approval_id"]
+        armed = [True]
+        stuck = self.dgate(opener=_Wrap(self.fake, _refuse_continuations(self.fake, armed)))
+        self.at(9, 0)
+        for _ in range(DIGEST_PART_TRIES + 1):
+            stuck.run_once()
+        preview = self.state()["messages"][aid]
+        self.assertIs(preview["complete"], False)
+        [card] = self.cards()
+        self.assertIn("did not arrive whole", self.fake.content(card["message_id"]))
+        self.fake.react(card["message_id"], NUMBERS[0], OWNER)
+        self.fake.react(card["message_id"], APPROVE, OWNER)
+        self.fake.react(preview["message_id"], APPROVE, OWNER)
+        for _ in range(2):
+            stuck.run_once()
+        self.assertEqual(self.app.approvals.get(aid)["status"], "pending")
+        self.assertEqual(self.runs, [])
+        armed[0] = False                                  # Discord takes it again
+        self.at(9, 0, days=1)
+        stuck.run_once()
+        again = self.state()["messages"][aid]
+        self.assertIs(again["complete"], True)
+        self.assertNotEqual(again["message_id"], preview["message_id"])
+        new = self.cards()[-1]
+        self.assertNotIn("did not arrive whole", self.fake.content(new["message_id"]))
+        self.fake.react(new["message_id"], NUMBERS[0], OWNER)
+        stuck.run_once()
+        self.assertEqual(self.settle(aid)["status"], "approved")
+        self.assertEqual(len(self.runs), 1)
+
+    def test_an_individual_card_missing_a_part_is_posted_again_before_any_answer(self):
+        self.app.digest = DigestSettings(enabled=False)
+        aid = self.park({"content": LONG_BODY})
+        armed = [True]
+        gate = self.dgate(opener=_Wrap(self.fake, _refuse_continuations(self.fake, armed,
+                                                                        once=True)))
+        gate.run_once()
+        first = self.state()["messages"][aid]
+        self.assertIs(first["complete"], False)
+        self.fake.react(first["message_id"], APPROVE, OWNER)
+        gate.run_once()                                   # posted again, whole
+        again = self.state()["messages"][aid]
+        self.assertIs(again["complete"], True)
+        self.assertNotEqual(again["message_id"], first["message_id"])
+        self.assertEqual(self.app.approvals.get(aid)["status"], "pending")
+        self.assertEqual(self.runs, [])
+        self.fake.react(again["message_id"], APPROVE, OWNER)
+        gate.run_once()
+        self.assertEqual(self.settle(aid)["status"], "approved")
 
 
 # ---------------------------------------------------------------- 4. money on listings
@@ -244,6 +346,19 @@ class ListingTests(tgp._Case):
     def setUp(self) -> None:
         super().setUp()
         self.app.digest = DigestSettings(enabled=True, at=time(9, 0), expire_days=7)
+
+    def test_a_card_that_says_new_listing_never_updates_one_even_unbatched(self):
+        self.app.digest = DigestSettings(enabled=False)
+        out = self.park()
+        row = self.app.approvals.get(out["approval_id"])
+        self.assertFalse(row["batch"])
+        self.assertIn("A NEW LISTING", render_request(row, OWNER))
+        self.world.add(custom_permalink=tgp.SLUG, published=True, price=500)
+        row = self.approve(out)
+        self.assertEqual(row["status"], "approved_failed")
+        self.assertIn("needs its own card", row["result"]["result"]["refused"])
+        self.assertEqual(set(self.world.steps()), {"list"})   # nothing was changed
+        self.assertEqual(self.world.product(tgp.SLUG)["price"], 500)
 
     def test_a_new_listing_waits_for_the_digest(self):
         out = self.park()
