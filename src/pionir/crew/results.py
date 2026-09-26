@@ -28,13 +28,17 @@ source ``devto`` and the same campaign (devto.py keeps it); its page views are t
 
 The rows, per run: ``traffic.site`` (site-wide and per-channel figures), ``traffic.posts``
 (each published post's figures), ``traffic.sales`` (sales and net revenue per campaign,
-where Scrooge attributed any), and ``traffic.working`` - the plain "what's working"
-summary the posting leader reads first, built only from the figures above.
+where Scrooge attributed any), ``traffic.instagram`` (each published Instagram post's
+lifetime reach, likes, comments, saves, shares, interactions and views, from Instagram's own
+Media Insights - read through Pionir at most once per 6 h; insights.py), and
+``traffic.working`` - the plain "what's working" summary the posting leader reads first,
+built only from the figures above (including the best Instagram post by reach).
 """
 from __future__ import annotations
 
 import re
 
+from . import insights
 from .blog import _Unreadable, published_posts, read_record
 from .contentcheck import utm_campaign
 from .figures import Figure
@@ -44,6 +48,7 @@ from .worker import ErrorKind, WorkContext, make_output, never_raises
 from .workers import DashReader, _Malformed
 
 BLOG_WORKER = "posting.blog"
+INSTAGRAM_WORKER = insights.INSTAGRAM_WORKER
 WINDOW = "last30"
 LIST_CAP = 20              # Scrooge's LIMIT on every top_* and sales_* list (traffic.ts)
 TOO_EARLY_VIEWS = 20       # a post with fewer views than this is too early to tell
@@ -142,9 +147,11 @@ class TrafficWorker(DashReader):
     unknown = "traffic"
 
     def __init__(self, spec, *, url: str, token_file: str,
-                 blog_worker: str = BLOG_WORKER) -> None:
+                 blog_worker: str = BLOG_WORKER,
+                 instagram_worker: str = INSTAGRAM_WORKER) -> None:
         super().__init__(spec, url=url, token_file=token_file)
         self.blog_worker = blog_worker
+        self.instagram_worker = instagram_worker
 
     @never_raises()
     def run(self, ctx: WorkContext) -> Result:
@@ -162,10 +169,22 @@ class TrafficWorker(DashReader):
         try:
             if not isinstance(traffic, dict):
                 raise _Malformed("traffic is not an object")
-            outputs = self._outputs(ctx, traffic, posts, record_note, resp)
+            ig = self._instagram(ctx)
+            outputs = self._outputs(ctx, traffic, posts, record_note, resp, ig)
         except (TypeError, ValueError, KeyError) as exc:
             return self._err(ErrorKind.MALFORMED, f"{type(exc).__name__}: {exc}")
         return Ok(tuple(outputs))
+
+    def _instagram(self, ctx: WorkContext) -> insights.Insights | None:
+        """The Instagram posts' insights. A fault there is said in words and never sinks
+        the site's traffic report."""
+        try:
+            return insights.gather(self, ctx, self.instagram_worker)
+        except Exception as exc:  # noqa: BLE001 - one source failing is not the report failing
+            log.warning("%s: Instagram insights failed: %s: %s", self.worker_id,
+                        type(exc).__name__, exc)
+            return insights.Insights([], why=f"the Instagram insights could not be read "
+                                             f"({type(exc).__name__})")
 
     def _posts(self, ctx: WorkContext) -> tuple:
         """(the blog's published posts, oldest first, a note about the record or "")."""
@@ -184,7 +203,7 @@ class TrafficWorker(DashReader):
 
     # ---- the figures -------------------------------------------------------------------------
     def _outputs(self, ctx: WorkContext, t: dict, posts: list, record_note: str,
-                 resp) -> list:
+                 resp, ig: insights.Insights | None = None) -> list:
         since = t.get("since")
         if not isinstance(since, str):
             raise _Malformed(f"traffic.since is {since!r}")
@@ -205,9 +224,14 @@ class TrafficWorker(DashReader):
                                figures=figures, entities=self.entities,
                                provenance={**prov, "source_detail": source})
 
+        ig_rows = [insights.row(self, ctx, ig)] if ig is not None else []
+        ig_line, ig_figs = insights.working_line(ig)
         if views == 0 and not paths and not campaigns and not referrers and not sales:
-            return [out("traffic.working", {"summary": NO_DATA, "posts": record_note or
-                                            f"{len(posts)} published blog posts"}, [])]
+            # the site's counter is empty; Instagram's own counts are a separate source
+            summary = NO_DATA + (f"; {ig_line}" if ig_line else "")
+            return ig_rows + [out("traffic.working", {"summary": summary, "posts": record_note
+                                                      or f"{len(posts)} published blog posts"},
+                                  ig_figs, sourced=not ig_figs)]
 
         path_views = {p: c["n"] for p, c in paths}
         paths_capped = _capped(paths)
@@ -308,11 +332,13 @@ class TrafficWorker(DashReader):
                 sale_figs.append(Figure(c["net"], "usd_cents", "net revenue", name, WINDOW))
             rows.append(out("traffic.sales", {"campaigns": len(sales)}, sale_figs))
 
-        rows.append(self._working(out, views, ranked, channels, record_note))
+        rows += ig_rows
+        rows.append(self._working(out, views, ranked, channels, record_note, ig_line, ig_figs))
         return rows
 
     @staticmethod
-    def _working(out, views: int, ranked: list, channels: dict, record_note: str):
+    def _working(out, views: int, ranked: list, channels: dict, record_note: str,
+                 ig_line: str | None = None, ig_figs: list | None = None):
         """The plain summary: the top posts by views and by clicks, and the channels that
         sent anyone - each only from a real, non-zero number, and nothing more."""
         by_views = [s for s in ranked if s["views"]][:TOP_N]
@@ -336,11 +362,14 @@ class TrafficWorker(DashReader):
             parts.append(f"every post is too early to tell (under {TOO_EARLY_VIEWS} views)")
         parts.append("visitors came from: " + ", ".join(f"{k} ({n})" for k, n in sent)
                      if sent else "no tracked channel sent a visitor yet")
+        if ig_line:
+            parts.append(ig_line)
         figures = [Figure(s["views"], "count", "post page views", s["slug"], WINDOW)
                    for s in by_views]
         figures += [Figure(s["clicks"], "count", "post clicks to product pages", s["slug"],
                            WINDOW) for s in by_clicks]
         figures += [Figure(n, "count", f"visits from {k}", k, WINDOW) for k, n in sent]
+        figures += ig_figs or []
         # "summary" sorts first, so the brief (which clips a row's details) shows it first;
         # every number in it is also a figure below, which the brief shows in full
         return out("traffic.working", {
