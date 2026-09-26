@@ -171,6 +171,12 @@ class PionirSettings:
     # by default like Daedalus/Melete; a crew that is not running answers "the crew
     # is not running" at once. PIONIR_CREW_URL set to "off" leaves it unregistered.
     crew_url: str | None = "http://127.0.0.1:8782"
+    # owner.notify: Moss's daily brief and rare alerts to the owner, as one plain message
+    # in the Discord gate's channel with the gate's bot token (read at send time: no
+    # network at boot). Rate-limited in Pionir (2 briefs, 4 alerts per rolling 24 h).
+    # Unavailable when the Discord gate is not configured; PIONIR_OWNER_NOTIFY=0 leaves it
+    # unregistered.
+    owner_notify: bool = True
     # Scrooge's publish endpoint for the content.* capabilities. content.publish parks
     # for the owner's yes on every call; the token is read from content_token_file
     # (None means ~/.pionir/secrets/scrooge-publish-token.txt) at call time, so no
@@ -455,6 +461,8 @@ class PionirSettings:
             melete_url=_optional_url("PIONIR_MELETE_URL", _declared("melete_url")),
             melete_token=(os.environ.get("PIONIR_MELETE_TOKEN") or "").strip() or None,
             crew_url=_optional_url("PIONIR_CREW_URL", _declared("crew_url")),
+            owner_notify=(os.environ.get("PIONIR_OWNER_NOTIFY", "1").strip().lower()
+                          not in {"0", "off", "false", "no"}),
             content_url=_optional_url("PIONIR_CONTENT_URL", _declared("content_url")),
             content_token_file=(
                 Path(os.environ["PIONIR_CONTENT_TOKEN_FILE"]).expanduser()

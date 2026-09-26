@@ -26,6 +26,8 @@ from .adapters import (
     MeleteSettings,
     NyxStatusAdapter,
     NyxStatusSettings,
+    OwnerNotifyAdapter,
+    OwnerNotifySettings,
     ProductAdapter,
     VoodooStatusAdapter,
     VoodooStatusSettings,
@@ -200,6 +202,14 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         # No boot-time call: the crew is reached only when a crew.* task runs (or
         # doctor asks), so a runtime without a running crew builds exactly the same.
         runtime.register(CrewAdapter(CrewAdapterSettings(base_url=configured.crew_url)))
+    if configured.owner_notify:
+        # Moss's brief/alert to the owner, in the Discord gate's channel with its bot
+        # token. No boot-time call: the token is read when a note is sent, and a gate
+        # that is not configured makes owner.notify answer "unavailable".
+        from .discord_gate import DiscordGateSettings
+
+        runtime.register(OwnerNotifyAdapter(OwnerNotifySettings.from_gate(
+            DiscordGateSettings.from_environment(configured.state_root))))
     if configured.content_url is not None:
         # No boot-time call either: Scrooge is reached only when a content.* task runs,
         # and the token file is read then. content.publish always parks for approval.
