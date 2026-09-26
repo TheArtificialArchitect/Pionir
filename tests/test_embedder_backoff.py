@@ -83,5 +83,19 @@ class BackoffTests(unittest.TestCase):
         self.assertEqual(self.emb.paused_for(), 0.0)
 
 
+class StatsTests(unittest.TestCase):
+    def test_the_dashboard_stats_show_a_paused_embedder(self) -> None:
+        from pionir.cortex import Cortex
+        clock, opener = _Clock(), _Opener()
+        emb = OllamaEmbedder(clock=clock)
+        emb._opener = opener
+        c = Cortex(":memory:", embedder=emb)
+        self.assertEqual(c.stats()["embed_paused_s"], 0.0)
+        with self.assertLogs("pionir.cortex", "WARNING"):
+            emb.embed(["a"])
+        self.assertEqual(c.stats()["embed_paused_s"], 60.0)
+        c.close()
+
+
 if __name__ == "__main__":
     unittest.main()

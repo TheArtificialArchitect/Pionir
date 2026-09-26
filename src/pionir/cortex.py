@@ -660,6 +660,9 @@ class Cortex:
             "recall": "hybrid" if (model and embedded) else "lexical",
             "embed_model": model,
             "embedded": embedded,
+            # >0 while the embedder is paused after a timeout: recall is lexical only
+            "embed_paused_s": round(paused(), 1) if callable(paused := getattr(
+                self.embedder, "paused_for", None)) else 0.0,
         }
 
     @_synchronized
