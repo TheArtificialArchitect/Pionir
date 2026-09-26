@@ -313,6 +313,19 @@ class TopicAndSlugTests(_Case):
         self.assertIn("QR codes", brain.calls[0]["user"])
         self.assertIn("more search traffic", brain.calls[0]["user"])
 
+    def test_a_goal_that_matches_no_seed_is_never_the_posts_subject(self) -> None:
+        # live: Moss's instruction to the division would have become a post about itself,
+        # linking to "/"; it only steers among the seeds, so the rotation goes on
+        goal = ("report only what the workers actually measured, so the report passes the "
+                "checks - then publish one good post a day")
+        brain = FakeBrain(good(), good(slug="second-post", title="A second post to publish"))
+        self.run_at(T0, brain, goal=goal)
+        self.run_at(T0 + DAY, brain, goal=goal)
+        self.assertTrue(brain.calls[0]["user"].startswith(f"Topic: {SEEDS[0].subject}."))
+        self.assertTrue(brain.calls[1]["user"].startswith(f"Topic: {SEEDS[1].subject}."))
+        self.assertIn(SEEDS[0].path, self.hands.jobs[0].payload["body_md"])
+        self.assertEqual(self.record()["used_topics"], [SEEDS[0].key, SEEDS[1].key])
+
     def test_without_a_goal_it_takes_the_next_evergreen_seed(self) -> None:
         brain = FakeBrain()
         self.run_at(T0, brain)

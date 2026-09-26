@@ -11,9 +11,10 @@ One run:
    else is still waiting. Nothing is ever assumed published.
 2. **At most one draft per day** (``draft_every_seconds``): the owner reads each one by
    hand, and a flood of them would only teach him to stop reading.
-3. **A topic**: from the division's goal as Moss set it, if there is one - the seed topic
-   that matches it best, else the goal itself once - otherwise the next evergreen seed tied
-   to a real product. A topic or slug already used is never used again (the record).
+3. **A topic**: the evergreen seed, tied to a real product, that the division's goal as
+   Moss set it matches best - otherwise, or with no goal, the next seed in the rotation.
+   The goal steers among the seeds; it is never a post's subject itself. A topic or slug
+   already used is never used again (the record).
 4. **Words from the shared brain only** (``ctx.words``: JSON schema, temperature 0,
    charged to this division). This module imports no model.
 5. **The worker inserts the links itself**, each carrying the blog's UTM tags, and only
@@ -34,7 +35,6 @@ is published.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import time
@@ -405,6 +405,10 @@ class DailyPoster(_Base):
 
     # ---- 2-6. one draft, checked, and submitted if it passed ------------------------------
     def choose_topic(self, rec: dict, goal: str | None) -> Topic | None:
+        """The free seed the goal's words match best; with no goal, or a goal that matches
+        no seed, the next seed in the rotation. The goal only steers among the seeds: it is
+        an instruction to the division, never a post's subject (Moss's "report only what the
+        workers measured ... publish one good post a day" once would have been one)."""
         used = set(rec["used_topics"])
         free = [t for t in SEEDS if t.key not in used]
         if goal:
@@ -413,12 +417,6 @@ class DailyPoster(_Base):
                             key=lambda x: (-x[0], x[1]))
             if scored and scored[0][0] > 0:
                 return scored[0][2]
-            key = "goal-" + hashlib.sha256(goal.strip().lower().encode()).hexdigest()[:10]
-            if key not in used:
-                return Topic(key, f"a post that serves this goal: {goal.strip()}", "Dokaz",
-                             "sells small paid web APIs: invoice PDFs, email verification, QR "
-                             "codes, site checks and text utilities", (), "/",
-                             "all Dokaz APIs")
         return free[0] if free else None
 
     def _draft_and_submit(self, ctx: WorkContext, rec: dict, events: list) -> Result | None:

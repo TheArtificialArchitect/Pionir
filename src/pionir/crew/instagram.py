@@ -13,10 +13,11 @@ One run:
    done-without-a-permalink is not; anything else is still waiting. Nothing is ever
    assumed published.
 2. **At most one draft per day** (``draft_every_seconds``).
-3. **A topic**: from the division's goal as Moss set it, if there is one - the blog seed
-   topic that matches it best, else the goal itself once - otherwise the next blog seed
-   (``blog.SEEDS``) this worker has not used. Its own record: a topic the blog used is
-   fine here too. A blocked day does not use a topic up (``MAX_TOPIC_BLOCKS``).
+3. **A topic**: the blog seed that the division's goal as Moss set it matches best -
+   otherwise, or with no goal, the next blog seed (``blog.SEEDS``) this worker has not
+   used. The goal steers among the seeds; it is never a post's subject itself. Its own
+   record: a topic the blog used is fine here too. A blocked day does not use a topic up
+   (``MAX_TOPIC_BLOCKS``).
 4. **Words from the shared brain only** (``ctx.words``: JSON schema, temperature 0,
    charged to this division). This module imports no model.
 5. **The worker assembles the payload** - ``{draft_id, headline, points, caption, hashtags,

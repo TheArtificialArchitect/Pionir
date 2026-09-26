@@ -324,6 +324,16 @@ class TopicTests(_Case):
         self.assertIn("QR codes", brain.calls[0]["user"])
         self.assertIn("more traffic", brain.calls[0]["user"])
 
+    def test_a_goal_that_matches_no_seed_is_never_the_posts_subject(self) -> None:
+        goal = ("report only what the workers actually measured, so the report passes the "
+                "checks - then publish one good post a day")
+        brain = FakeBrain(good(), good())
+        self.run_at(T0, brain, goal=goal)
+        self.run_at(T0 + DAY, brain, goal=goal)
+        self.assertTrue(brain.calls[0]["user"].startswith(f"Topic: {SEEDS[0].subject}."))
+        self.assertTrue(brain.calls[1]["user"].startswith(f"Topic: {SEEDS[1].subject}."))
+        self.assertEqual(self.record()["used_topics"], [SEEDS[0].key, SEEDS[1].key])
+
     def test_a_blocked_day_does_not_use_up_the_topic(self) -> None:
         brain = FakeBrain(bad(), bad(), good())
         self.run_at(T0, brain)
