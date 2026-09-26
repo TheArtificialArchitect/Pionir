@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlsplit
 
+from pionir import atomic
 from pionir.social.card import CardTooLong, card_sha, render_card
 
 from . import contentcheck
@@ -156,7 +157,7 @@ class InstagramWorker(DailyPoster):
             path = folder / f"{draft['draft_id']}.jpg"
             tmp = path.with_suffix(".tmp")
             tmp.write_bytes(jpeg)
-            tmp.replace(path)
+            atomic.replace(tmp, path)
             post["card"] = f"{folder.name}/{path.name}"
             for old in sorted(folder.glob("*.jpg"))[:-KEEP_CARDS]:
                 old.unlink()

@@ -36,6 +36,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from pionir import atomic
+
 DEFAULT_URL = "http://127.0.0.1:8780"
 DEFAULT_OUT = os.environ.get("PIONIR_BRYO_FEED_PATH", r"C:\src\terrarium\state\pionir.json")
 DEFAULT_INTERVAL = 10.0
@@ -118,7 +120,7 @@ def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False)
-        os.replace(tmp, path)  # atomic; a half-written file never reaches Bryo
+        atomic.replace(tmp, path)  # atomic, retried on Windows; a half-written file never reaches Bryo
     finally:
         if os.path.exists(tmp):
             try:

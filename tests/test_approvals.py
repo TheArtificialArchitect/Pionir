@@ -7,6 +7,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from standins import down_url
+
 from pionir.approvals import ApprovalQueue
 from pionir.bootstrap import build_runtime
 from pionir.config import PionirSettings
@@ -19,10 +21,11 @@ def _app(tmp: str) -> PionirApp:
             PionirSettings(
                 state_root=Path(tmp),
                 atani_command=("pionir-test-no-such-binary",),
-                galatea_url="http://127.0.0.1:8799",
+                galatea_url=down_url(),
                 galatea_model_id="stub-model",
-                daedalus_url="http://127.0.0.1:9998",
-                melete_url="http://127.0.0.1:9999",
+                embed_model=None,  # never reach the live Ollama embedder from a test
+                daedalus_url=down_url(),
+                melete_url=down_url(),
                 bryo_status_command=None,
                 nyx_status_command=None,
                 voodoo_status_command=None,
@@ -69,7 +72,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(len(self.app.approvals.pending()), 1)
 
     def test_granted_permission_bypasses_the_gate(self):
-        # with the permission, it runs (daedalus is a dead port here, so it errors -
+        # with the permission, it runs (daedalus is a 503 stand-in here, so it errors -
         # but it is NOT parked); the gate only holds the UN-permitted.
         out = self.app.run_task("coding.daedalus_solve", {"content": "x"},
                                 permissions=["daedalus.solve"])
@@ -84,7 +87,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(res["status"], "running")
         self.assertFalse(self.app.approve(aid)["ok"])       # already claimed: no re-run
         self.assertTrue(self.app.jobs.wait(res["task_id"], 30))
-        # daedalus is a dead port here, so it ran and failed: approved_failed,
+        # daedalus answers 503 here, so it ran and failed: approved_failed,
         # with the outcome on the record - never silently "approved".
         record = self.app.approvals.get(aid)
         self.assertEqual(record["status"], "approved_failed")

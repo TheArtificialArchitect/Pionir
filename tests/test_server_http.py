@@ -13,6 +13,8 @@ import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+from standins import down_url
+
 from pionir.bootstrap import build_runtime
 from pionir.config import PionirSettings
 from pionir.server import PionirApp, _make_handler
@@ -23,10 +25,11 @@ def _runtime(tmp: str):
         PionirSettings(
             state_root=Path(tmp),
             atani_command=("pionir-test-no-such-binary",),
-            galatea_url="http://127.0.0.1:8799",
+            galatea_url=down_url(),
             galatea_model_id="stub-model",
-            daedalus_url="http://127.0.0.1:9998",
-            melete_url="http://127.0.0.1:9999",
+            embed_model=None,  # never reach the live Ollama embedder from a test
+            daedalus_url=down_url(),
+            melete_url=down_url(),
             bryo_status_command=None,
             nyx_status_command=None,
             voodoo_status_command=None,

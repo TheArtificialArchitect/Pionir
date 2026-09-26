@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
+from standins import down_url
+
 from pionir.bootstrap import build_runtime
 from pionir.config import PionirSettings
 from pionir.runtime import AuditEvent
@@ -18,20 +20,21 @@ from pionir.server import PionirApp, _ui_bytes
 
 
 def _runtime(tmp: str):
-    # Hermetic: every specialist registers, but Daedalus/Melete point at dead
-    # ports and Galatea's model is pinned (no /health probe), so bootstrap does
-    # no network and an executed intent fails fast instead of running for real.
+    # Hermetic: every specialist registers, but Galatea/Daedalus/Melete point at a
+    # 503 stand-in, Galatea's model is pinned (no /health probe) and embeddings are
+    # off, so bootstrap reaches nothing live and an executed intent fails fast.
     return build_runtime(
         PionirSettings(
             state_root=Path(tmp),
-            # A bogus command and dead ports: every specialist registers, but
+            # A bogus command and a 503 stand-in: every specialist registers, but
             # executing one fails fast instead of invoking the real Atani CLI or
             # a live model. Routing/policy is what these tests exercise.
             atani_command=("pionir-test-no-such-binary",),
-            galatea_url="http://127.0.0.1:8799",
+            galatea_url=down_url(),
             galatea_model_id="stub-model",
-            daedalus_url="http://127.0.0.1:9998",
-            melete_url="http://127.0.0.1:9999",
+            embed_model=None,  # never reach the live Ollama embedder from a test
+            daedalus_url=down_url(),
+            melete_url=down_url(),
             bryo_status_command=None,  # no real subprocess from a test
             nyx_status_command=None,  # ditto: don't invoke the real nyx/voodoo CLIs
             voodoo_status_command=None,

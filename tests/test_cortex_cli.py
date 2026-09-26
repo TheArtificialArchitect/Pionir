@@ -25,7 +25,14 @@ class CortexCliTests(unittest.TestCase):
     def _runtime(self):
         from pionir.config import PionirSettings
 
-        settings = PionirSettings(state_root=self.state_root)
+        # Hermetic: nothing live - no Moss /health probe, no Ollama embedder.
+        settings = PionirSettings(
+            state_root=self.state_root,
+            atani_command=("pionir-test-no-such-binary",),
+            daedalus_url=None, melete_url=None, galatea_url=None, crew_url=None,
+            bryo_status_command=None, nyx_status_command=None, voodoo_status_command=None,
+            embed_model=None, evict_to_fit=False,
+        )
         runtime = build_runtime(settings)
         self._runtimes.append(runtime)
         return runtime

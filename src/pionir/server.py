@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from . import atomic
 from .approvals import ApprovalQueue
 from .bootstrap import PionirRuntime
 from .cli import _capabilities, _doctor, _jsonable
@@ -84,7 +85,7 @@ class Jobs:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 json.dump(record, handle, ensure_ascii=False, default=str)
-            os.replace(tmp, self._path(record["task_id"]))
+            atomic.replace(tmp, self._path(record["task_id"]))
         finally:
             if os.path.exists(tmp):
                 try:

@@ -20,6 +20,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from pionir import atomic
+
 # A parked action is a question for Ian; a question nobody answered for a day is
 # stale, not still open. Expired rows are auto-denied (reason "expired") the next
 # time anyone looks, and resolved rows are dropped after a week so the queue file
@@ -93,7 +95,7 @@ class ApprovalQueue:
         rows = self._retain(rows)
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self._path)   # atomic; a half-written queue never reaches a reader
+        atomic.replace(tmp, self._path)   # atomic, retried on Windows; a half-written queue never reaches a reader
 
     @staticmethod
     def _retain(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

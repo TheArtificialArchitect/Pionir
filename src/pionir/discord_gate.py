@@ -61,6 +61,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from . import atomic
 from .adapters.clients import DELIVER as CLIENT_DELIVER
 from .adapters.clients import EMAIL as CLIENT_EMAIL
 from .adapters.clients import FIND_REPORT as CLIENT_FIND_REPORT
@@ -1460,7 +1461,7 @@ class DiscordGate:
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps({"messages": self._entries}, ensure_ascii=False, indent=2),
                        encoding="utf-8")
-        tmp.replace(path)
+        atomic.replace(tmp, path)
 
     def _prune(self) -> None:
         cutoff = _now() - RETAIN_FINAL

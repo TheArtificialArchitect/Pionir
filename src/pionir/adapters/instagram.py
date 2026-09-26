@@ -43,6 +43,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from pionir import atomic
 from pionir.adapters.content import ContentSettings, read_token
 from pionir.contracts import AgentManifest, Capability, RiskLevel, Task, TaskResult
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
@@ -120,7 +121,7 @@ def _write_token_file(path: Path, document: Mapping[str, Any]) -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(document, handle, indent=2)
-        os.replace(tmp, path)
+        atomic.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
