@@ -5,7 +5,8 @@ returns it) its media id. At most once per ``REFRESH_SECONDS`` the results worke
 ``Job("social.instagram_insights", {"media_ids": [...]})`` for those posts - or, when an older
 post has no media id, ``{"recent": 25}`` and matches by permalink - and keeps the answer in
 ``<state_dir>/<worker_id>.instagram.json``, so a run between refreshes reports the last
-reading with the time it was measured, and asks nothing.
+reading with the time it was measured, and asks nothing. A media id found by permalink is
+kept in that file too (``media_ids``), so the fallback is needed once, not on every read.
 
 The ledger's rule, again: honest numbers only.
 
@@ -142,8 +143,14 @@ def _media(answer) -> list:
     return out
 
 
-def _job(posts: list) -> Job:
-    ids = [m for m in (media_id(p) for p in posts) if m is not None]
+def _known_id(post: dict, backfill: dict) -> str | None:
+    """The post's media id: recorded with it, or learned since from a reading whose media
+    had its permalink (``backfill``, kept in the cache)."""
+    return media_id(post) or media_id({"media_id": backfill.get(post.get("draft_id"))})
+
+
+def _job(posts: list, backfill: dict | None = None) -> Job:
+    ids = [m for m in (_known_id(p, backfill or {}) for p in posts) if m is not None]
     if ids and len(ids) == len(posts):
         payload: dict = {"media_ids": ids}
     else:
@@ -174,9 +181,10 @@ def gather(worker, ctx, instagram_worker: str = INSTAGRAM_WORKER) -> Insights | 
     ins = Insights(posts)
     last = cache.get("attempted_at")
     due = not isinstance(last, (int, float)) or ctx.now - float(last) >= REFRESH_SECONDS
+    backfill = cache.get("media_ids") if isinstance(cache.get("media_ids"), dict) else {}
     if due and ctx.job is not None:
         ins.asked = True
-        out = ctx.job(_job(posts))
+        out = ctx.job(_job(posts, backfill))
         cache["attempted_at"] = ctx.now
         answer = out.result if out.ran else None
         if out.ran and isinstance(answer, dict) and answer.get("ok") is True \
@@ -187,11 +195,7 @@ def gather(worker, ctx, instagram_worker: str = INSTAGRAM_WORKER) -> Insights | 
             cache["error"] = (out.error or f"Pionir said {out.status}")[:300]
             log.warning("%s: Instagram insights unavailable: %s", worker.worker_id,
                         cache["error"])
-        try:
-            _save(path, cache)
-        except OSError as exc:
-            log.warning("%s: the Instagram insights cache could not be saved: %s",
-                        worker.worker_id, exc)
+        _keep(worker, path, cache)
     elif due:
         ins.stale = "Pionir is not reachable from this run"
     answer = cache.get("answer")
@@ -206,11 +210,31 @@ def gather(worker, ctx, instagram_worker: str = INSTAGRAM_WORKER) -> Insights | 
     rows = _media(answer)
     by_id = {mid: (m, u) for mid, _k, m, u in rows}
     by_link = {k: (m, u) for _mid, k, m, u in rows if k}
+    ids_by_link = {k: mid for mid, k, _m, _u in rows if k}
+    learned = {}
     for p in posts:
-        got = by_id.get(p.get("media_id")) or by_link.get(_link_key(p.get("permalink")))
+        known = _known_id(p, backfill)
+        link = _link_key(p.get("permalink"))
+        got = by_id.get(known) or by_link.get(link)
         ins.per_post[p["draft_id"]] = ({"metrics": got[0], "unavailable": got[1]}
                                        if got else None)
+        if known is None and media_id({"media_id": ids_by_link.get(link)}):
+            # a post recorded before its media id was kept, found by its permalink: keep
+            # the id, so the next reading asks for it by id instead of the latest 25 media
+            # (which the owner's own posts can push it out of)
+            learned[p["draft_id"]] = ids_by_link[link]
+    if learned:
+        cache["media_ids"] = {**backfill, **learned}
+        _keep(worker, path, cache)
     return ins
+
+
+def _keep(worker, path: Path, cache: dict) -> None:
+    try:
+        _save(path, cache)
+    except OSError as exc:
+        log.warning("%s: the Instagram insights cache could not be saved: %s",
+                    worker.worker_id, exc)
 
 
 def _figures(ins: Insights) -> list:

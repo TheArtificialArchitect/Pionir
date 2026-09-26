@@ -593,6 +593,24 @@ class ResultsInsightsTests(_CrewCase):
         self.assertEqual(f[("instagram reach", P2)].value, 120)   # by media id
         self.assertEqual(ig.payload["not_in_reading"], [])
 
+    def test_a_media_id_found_by_permalink_is_kept_and_the_fallback_is_needed_once(
+            self) -> None:
+        """Reverted backfill: every read asks for the latest 25 media, and the owner's own
+        posts push Pionir's older post out of that window - its numbers vanish."""
+        self.instagram([ig_post(P1, None, 1.0), ig_post(P2, M1, 2.0)])
+        self.hands.outcome = answer([row(M2, FULL2), row(M1, FULL1)])
+        self.run_at(T0)
+        self.assertEqual(self.hands.jobs[0].payload, {"recent": 25})
+        # the next reading asks by id, the older post's id learned from its permalink -
+        # even from a restart (a fresh read of the cache)
+        self.hands.outcome = answer([row(M2, FULL2), row(M1, FULL1)])
+        ig = self.run_at(T0 + 6 * 3600)["traffic.instagram"]
+        self.assertEqual(self.hands.jobs[1].payload, {"media_ids": [M2, M1]})
+        self.assertEqual(self.figs(ig)[("instagram reach", P1)].value, 480)
+        cache = json.loads(insights_module.cache_path(self.state, "posting.results")
+                           .read_text(encoding="utf-8"))
+        self.assertEqual(cache["media_ids"], {P1: M2})
+
     def test_a_post_not_in_the_reading_is_unknown_not_zero(self) -> None:
         self.instagram([ig_post(P1, M1, 1.0), ig_post(P2, M3, 2.0)])
         self.hands.outcome = answer([row(M1, FULL1)])
