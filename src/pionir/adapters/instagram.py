@@ -23,7 +23,8 @@ appear in a log, an error or a result: every text that could echo one is scrubbe
 the other side says no to comes back as ``ok: false`` with ``refused``; a missing or rejected
 token, or a service that does not answer, as ``ok: false`` with ``unavailable`` - answers,
 not faults, so the circuit breaker is not tripped. Nothing here runs in the background: the
-Instagram token is refreshed (when it is over 7 days old) on the way to a post.
+Instagram token is refreshed (when it is over 7 days old) on the way to a post or an insights
+read (``_fresh_token`` says why a read may refresh its own credential).
 
 ``social.instagram_insights`` is the other direction: READ_ONLY, ``routable=False``, no
 approval (it reads the account's own numbers and changes nothing). Payload
@@ -39,7 +40,8 @@ https://developers.facebook.com/documentation/instagram-platform/reference/insta
 Honest numbers only. Meta returns an empty data set, not 0, for a metric it has no data for;
 that metric is listed in ``unavailable`` and given no number. A metric Meta rejects for a
 media (Graph code 100 on the combined call) degrades only that metric: the call is retried
-one metric at a time. A media Meta will not answer for at all has every metric unavailable
+one metric at a time, and a metric rejected that way is not asked again for the call's later
+media (it is unavailable for them - asking again for every media is what trips the rate limit). A media Meta will not answer for at all has every metric unavailable
 and says why. A rejected token (190), a missing permission, a rate limit or a Graph that
 does not answer fails the whole call - a partial answer read through a dead token is not
 an answer.
@@ -482,9 +484,10 @@ class InstagramAdapter:
                                  "timestamp": _text(item, "timestamp")})
         else:
             rows = [self._media_row(mid, secrets, access) for mid in request["media_ids"]]
+        rejected: set[str] = set()      # metrics Meta refused (code 100) earlier in this call
         for row in rows:
             if row.get("error") is None:
-                row.update(self._media_metrics(row["media_id"], secrets, access))
+                row.update(self._media_metrics(row["media_id"], secrets, access, rejected))
             else:
                 row.update(metrics={}, unavailable=list(IMAGE_METRICS))
         return {"ok": True, "period": INSIGHTS_PERIOD, "measured_at": _iso(self._clock()),
@@ -506,13 +509,20 @@ class InstagramAdapter:
         row["timestamp"] = _text(info, "timestamp")
         return row
 
-    def _media_metrics(self, mid: str, secrets: list[str], access: str) -> dict[str, Any]:
+    def _media_metrics(self, mid: str, secrets: list[str], access: str,
+                       rejected: set[str]) -> dict[str, Any]:
         """``{metrics, unavailable[, error]}`` for one media: every metric in one call, and
-        only when Meta rejects a metric (code 100), one call per metric."""
+        only when Meta rejects a metric (code 100), one call per metric. A metric rejected
+        with code 100 is remembered in ``rejected`` for the rest of the call and not asked
+        again for later media (unavailable, never zero): retrying it for each of 25 media
+        is ~200 extra calls, and the rate limit that brings is fatal to the whole reading."""
         path = f"/{urllib.parse.quote(mid, safe='')}/insights"
+        wanted = tuple(n for n in IMAGE_METRICS if n not in rejected)
+        if not wanted:
+            return {"metrics": {}, "unavailable": list(IMAGE_METRICS)}
         try:
             got = self._insight_call(path, "insights", secrets, access,
-                                     {"metric": ",".join(IMAGE_METRICS)})
+                                     {"metric": ",".join(wanted)})
         except _Fatal:
             raise
         except _Failure as failure:
@@ -520,17 +530,19 @@ class InstagramAdapter:
                 return {"metrics": {}, "unavailable": list(IMAGE_METRICS),
                         "error": failure.output.get("error")}
             metrics: dict[str, int] = {}
-            for name in IMAGE_METRICS:
+            for name in wanted:
                 try:
                     one = self._insight_call(path, "insights", secrets, access,
                                              {"metric": name})
                 except _Fatal:
                     raise
-                except _Failure:
+                except _Failure as one_failure:
+                    if one_failure.output.get("graph_code") == 100:
+                        rejected.add(name)
                     continue            # this metric only: listed as unavailable below
                 metrics.update(self._parse_metrics(one, (name,)))
         else:
-            metrics = self._parse_metrics(got, IMAGE_METRICS)
+            metrics = self._parse_metrics(got, wanted)
         return {"metrics": metrics,
                 "unavailable": [n for n in IMAGE_METRICS if n not in metrics]}
 
@@ -593,7 +605,16 @@ class InstagramAdapter:
     # ---- the token refresh ------------------------------------------------------------
     def _fresh_token(self, ig: InstagramToken, secrets: list[str]) -> str:
         """The token to post with: refreshed first if it is over 7 days old. A failed
-        refresh does not block the post - the old token is used, and says so if dead."""
+        refresh does not block the post - the old token is used, and says so if dead.
+
+        ``social.instagram_insights`` is READ_ONLY and still comes through here, so a read
+        may rewrite instagram.json. That is deliberate: a long-lived Instagram token dies
+        60 days after its last refresh, and posts are rare while insights are read every
+        6 h - were only posts to refresh it, a quiet fortnight of reading would let it
+        expire and the next post (and every reading) would need the owner to run the
+        setup again. The write touches only Pionir's own credential file, never the
+        account's data: READ_ONLY is about the Instagram account, which a refresh does
+        not change."""
         now = self._clock()
         if ig.refreshed_at is not None:
             age = now - ig.refreshed_at

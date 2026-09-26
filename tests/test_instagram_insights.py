@@ -241,13 +241,33 @@ class InsightsAdapterTests(_AdapterCase):
         self.assertNotIn("views", one["metrics"])               # no number, not a zero
         expected = {k: v for k, v in self.graph.values[M1].items() if k != "views"}
         self.assertEqual(one["metrics"], expected)
-        self.assertEqual(two["unavailable"], [])                # the other post untouched
-        self.assertEqual(two["metrics"], self.graph.values[M2])
+        # the other post keeps every other metric; views, rejected with code 100 on M1,
+        # is not asked again this call - unavailable for M2, never a zero
+        self.assertEqual(two["unavailable"], ["views"])
+        self.assertEqual(two["metrics"], {k: v for k, v in self.graph.values[M2].items()
+                                          if k != "views"})
         # M1: the combined call, then one call per metric; M2: the combined call only
         m1 = [c for c in self.graph.calls if c["media"] == M1 and c["step"] == "insights"]
         self.assertEqual([c["query"]["metric"] for c in m1[1:]], list(IMAGE_METRICS))
         m2 = [c for c in self.graph.calls if c["media"] == M2 and c["step"] == "insights"]
-        self.assertEqual(len(m2), 1)
+        self.assertEqual([c["query"]["metric"] for c in m2],
+                         ["reach,likes,comments,saved,shares,total_interactions"])
+
+    def test_a_metric_rejected_once_is_not_retried_for_every_later_media(self) -> None:
+        """Reverted memory: every media repeats the per-metric retry (~200 calls for 25
+        media), which trips Instagram's rate limit - fatal to the whole reading."""
+        self.graph.rejected = {M1: {"views"}, M2: {"views"}, M3: {"views"}}
+        out = self.read({"media_ids": [M1, M2, M3]})
+        self.assertIs(out["ok"], True, out)
+        insights = [c for c in self.graph.calls if c["step"] == "insights"]
+        # M1: combined + one per metric; M2 and M3: one combined call each, views left out
+        self.assertEqual(len(insights), 1 + len(IMAGE_METRICS) + 1 + 1)
+        self.assertFalse(any("views" in c["query"]["metric"] for c in insights[-2:]))
+        for mid in (M2, M3):
+            got = self.by_id(out)[mid]
+            self.assertEqual(got["unavailable"], ["views"])     # unavailable, never zero
+            self.assertNotIn("views", got["metrics"])
+            self.assertEqual(got["metrics"]["reach"], self.graph.values[mid]["reach"])
 
     def test_a_metric_with_no_data_is_unavailable_never_zero(self) -> None:
         del self.graph.values[M1]["saved"]
