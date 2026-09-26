@@ -178,6 +178,12 @@ class PionirSettings:
     # unregistered. On in from_environment (the live path); off in a bare PionirSettings,
     # so a runtime built in a test is never wired to the real bot token and channel.
     owner_notify: bool = False
+    # quotes.card: the one quote card per custom order, posted in the Discord gate's
+    # channel for the owner to reply to with a price (pionir/quotes.py). Same wiring and the
+    # same rule as owner_notify: on in from_environment (PIONIR_QUOTE_CARDS=0 leaves it
+    # unregistered), off in a bare PionirSettings so a test runtime never reaches the real
+    # bot. Registered only when content_url is on (the replies become client.quote).
+    quote_cards: bool = False
     # Scrooge's publish endpoint for the content.* capabilities. content.publish parks
     # for the owner's yes on every call; the token is read from content_token_file
     # (None means ~/.pionir/secrets/scrooge-publish-token.txt) at call time, so no
@@ -462,6 +468,8 @@ class PionirSettings:
             melete_url=_optional_url("PIONIR_MELETE_URL", _declared("melete_url")),
             melete_token=(os.environ.get("PIONIR_MELETE_TOKEN") or "").strip() or None,
             crew_url=_optional_url("PIONIR_CREW_URL", _declared("crew_url")),
+            quote_cards=(os.environ.get("PIONIR_QUOTE_CARDS", "1").strip().lower()
+                         not in {"0", "off", "false", "no"}),
             owner_notify=(os.environ.get("PIONIR_OWNER_NOTIFY", "1").strip().lower()
                           not in {"0", "off", "false", "no"}),
             content_url=_optional_url("PIONIR_CONTENT_URL", _declared("content_url")),

@@ -73,6 +73,13 @@ class FakePionir:
             n = len(self.emails())
             return JobOutcome("pending_approval", EMAIL, task_id=f"t-{n}",
                               approval_id=f"em-{n}")
+        if job.capability in (desk.QUOTE_CARD,):
+            # the quote card for a custom order waiting on a price (test_quote_paid.py)
+            return JobOutcome("done", job.capability, result={"ok": True, "message_id": "m-1"})
+        if job.capability == desk.REMIND:
+            n = len(self.emails())
+            return JobOutcome("pending_approval", job.capability, task_id=f"t-{n}",
+                              approval_id=f"em-{n}")
         if job.capability == SET_STATUS:
             if self.status_outcome is not None:
                 return self.status_outcome
@@ -93,7 +100,10 @@ class FakePionir:
         self.approvals[approval_id] = {"id": approval_id, "status": "denied", "reason": "no"}
 
     def emails(self) -> list:
-        return [j for j in self.jobs if j.capability == EMAIL]
+        return [j for j in self.jobs if j.capability in (EMAIL, desk.REMIND)]
+
+    def cards(self) -> list:
+        return [j for j in self.jobs if j.capability == desk.QUOTE_CARD]
 
     def statuses(self) -> list:
         return [j.payload for j in self.jobs if j.capability == SET_STATUS]

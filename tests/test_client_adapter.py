@@ -214,9 +214,10 @@ class GateTests(_Case):
     def test_the_declarations(self) -> None:
         caps = {c.name: c for c in self.adapter.manifest.capabilities}
         # client.deliver is pinned in test_client_deliver.py, client.find_report in
-        # test_client_find_report.py
+        # test_client_find_report.py, the quote capabilities in test_quote_paid.py
         self.assertEqual(set(caps), {ORDERS, EMAIL, SET_STATUS, "client.deliver",
-                                     "client.find_report"})
+                                     "client.find_report", "client.quote",
+                                     "client.quote_reminder", "client.release"})
         self.assertTrue(caps[EMAIL].requires_approval)
         self.assertIs(caps[EMAIL].risk, RiskLevel.PRIVILEGED)
         self.assertIs(caps[ORDERS].risk, RiskLevel.READ_ONLY)

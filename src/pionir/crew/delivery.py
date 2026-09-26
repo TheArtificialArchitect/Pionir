@@ -31,6 +31,15 @@ One run:
    its folder is looked at - an older one the owner has superseded is never sent - and only
    once it has sat unchanged for ``SETTLE_SECONDS`` (not half-copied).
 
+**Half the price still owed.** A quoted order paid 50% up front (pionir/quotes.py) owes the
+other 50% on delivery, and the client never gets the work before it is paid. So for an
+order that owes its balance (``balance_owed``: its quote's deposit is paid, its balance is
+not) the zip is submitted with ``hold_for_balance: true`` and the ``BALANCE_*`` template:
+Scrooge stores it with NO link, and ``{link}`` becomes the link to PAY the balance. Once the
+webhook has marked the balance paid (``balance_paid``), this desk asks the owner to release
+the held delivery: ``Job("client.release", {order_id, to, delivery_id, subject,
+body_text})`` with the ``RELEASE_*`` template, whose ``{link}`` becomes the download link.
+
 **Never twice.** Every zip is known by its sha256. A zip submitted for an order is never
 submitted for it again - delivered, denied, refused by Pionir's checks, blocked by the
 template check or failed - except a submission that never reached Pionir (``unreachable``,
@@ -63,22 +72,29 @@ from .orders import (
     RETRY_UNDELIVERED,
     RETRY_UNREACHABLE,
     OrderDesk,
+    _cents_of,
     _epoch,
     _oldest_first,
+    balance_owed,
     greeting_name,
     package_of,
+    price_text,
 )
 from .result import Err, Ok, Result
 from .worker import ErrorKind, WorkContext, make_output, never_raises
 from .workers import _Base
 
 DELIVER = "client.deliver"
+RELEASE_CAP = "client.release"
 LINK = "{link}"                     # Pionir puts the private download link here
 MAX_DELIVERIES_PER_RUN = 1
 RETRYABLE = {"unreachable": RETRY_UNREACHABLE, "undelivered": RETRY_UNDELIVERED}
 SETTLE_SECONDS = 120                # a zip changed more recently may still be being copied
 PAYLOAD_KEYS = frozenset({"order_id", "to", "zip_name", "zip_sha256", "subject", "body_text"})
+RELEASE_KEYS = frozenset({"order_id", "to", "delivery_id", "subject", "body_text"})
 FIRST, REVISION = "delivery", "revision"
+HELD, RELEASE = "held_delivery", "release"      # the balance request; the files, once paid
+_DELIVERY_ID = re.compile(r"dl_[0-9a-f]{24}")
 
 # ---- the templates: every word a client gets with the work -------------------------------
 # {name} is the name the client gave (or "there" when it is not a plain name), {order_id} the
@@ -129,13 +145,52 @@ _PASSING = re.compile(r"(?i)\b(?:unavailable|timed out|timeout|circuit (?:is )?o
                       r"try again later|not answering|temporarily)\b")
 
 
+# The work is ready but half the price is still owed: {link} is the balance pay link, never
+# the files. {balance} is the balance Scrooge recorded for the owner's quote.
+BALANCE_SUBJECT = "Your Dokaz order {order_id} is ready - balance due"
+BALANCE_BODY = """Hello {name},
+
+Your order {order_id} is ready.
+
+The balance of {balance} is now due. Pay it securely here:
+{link}
+
+As soon as it is paid, we'll email you the private link to download your files. This \
+payment link is valid for 14 days.
+
+Thank you,
+Dokaz"""
+
+# The balance is paid: {link} is the private download link of the files held until now.
+RELEASE_SUBJECT = "Your files for Dokaz order {order_id}"
+RELEASE_BODY = """Hello {name},
+
+Thank you - your balance is paid. Your order {order_id} is ready to download:
+{link}
+
+The link works for 30 days. The zip file contains the build, plus a README or HOWTO that \
+explains how to set it up and use it.
+
+One round of revisions is included free: if anything needs changing, reply to this email \
+and tell us what.
+
+Thank you,
+Dokaz"""
+
+
 # ---- the check: fail closed, on the exact payload that would be submitted ------------------
-def check_delivery(payload: dict, order: dict) -> list:
-    """Every reason this delivery may not be submitted; empty is the only pass."""
+def check_delivery(payload: dict, order: dict, balance_cents: int | None = None) -> list:
+    """Every reason this delivery may not be submitted; empty is the only pass. With
+    ``balance_cents`` it is a held delivery's balance request: it must say so
+    (``hold_for_balance``) and may state that one amount."""
     reasons: list = []
-    if set(payload) != PAYLOAD_KEYS:
+    keys = PAYLOAD_KEYS | ({"hold_for_balance"} if balance_cents is not None else set())
+    if set(payload) != keys:
         reasons.append("the payload is not exactly order_id, to, zip_name, zip_sha256, "
-                       "subject, body_text")
+                       "subject, body_text" + (", hold_for_balance" if balance_cents is not None
+                                               else ""))
+    if balance_cents is not None and payload.get("hold_for_balance") is not True:
+        reasons.append("a delivery for an order that owes its balance must be held")
     oid, to = payload.get("order_id"), payload.get("to")
     subject, body = payload.get("subject"), payload.get("body_text")
     name, sha = payload.get("zip_name"), payload.get("zip_sha256")
@@ -173,24 +228,59 @@ def check_delivery(payload: dict, order: dict) -> list:
         for m in _DOMAIN.finditer(rest):
             reasons.append(f"the {field} names an address or a domain: {m.group(0)}")
         for m in _MONEY.finditer(text):
+            if balance_cents is not None and _cents_of(m.group(0)) == balance_cents:
+                continue
             reasons.append(f"the {field} states the amount {m.group(0).strip()}, which a "
                            "delivery email may not")
+    return reasons
+
+
+def check_release(payload: dict, order: dict) -> list:
+    """Every reason this release may not be submitted; empty is the only pass. The email is
+    checked by the delivery rules (one {link}, no link or amount of its own)."""
+    reasons: list = []
+    if set(payload) != RELEASE_KEYS:
+        reasons.append("the payload is not exactly order_id, to, delivery_id, subject, "
+                       "body_text")
+    held = order.get("held_delivery") if isinstance(order.get("held_delivery"), dict) else {}
+    did = payload.get("delivery_id")
+    if not isinstance(did, str) or not _DELIVERY_ID.fullmatch(did) or did != held.get("id"):
+        reasons.append("delivery_id is not the delivery Scrooge holds for this order")
+    as_delivery = {k: v for k, v in payload.items() if k != "delivery_id"}
+    as_delivery.update(zip_name="held.zip", zip_sha256="0" * 64)
+    reasons += [r for r in check_delivery(as_delivery, order) if not r.startswith("the payload")]
     return reasons
 
 
 def build_delivery(kind: str, order: dict, zip_name: str, zip_sha256: str) -> dict:
     """The exact ``client.deliver`` payload for this order and zip. Pure."""
     oid = order.get("id")
+    extra: dict = {}
+    fill: dict = {}
     if kind == FIRST:
         subject_t, body_t = DELIVERY_SUBJECT, DELIVERY_BODY
     elif kind == REVISION:
         subject_t, body_t = REVISION_SUBJECT, REVISION_BODY
+    elif kind == HELD:
+        subject_t, body_t = BALANCE_SUBJECT, BALANCE_BODY
+        fill["balance"] = price_text(balance_owed(order))
+        extra["hold_for_balance"] = True
     else:
         raise ValueError(f"no template for {kind!r}")
     return {"order_id": oid, "to": order.get("email"), "zip_name": zip_name,
             "zip_sha256": zip_sha256, "subject": subject_t.format(order_id=oid),
             "body_text": body_t.format(name=greeting_name(order.get("name")), order_id=oid,
-                                       link=LINK)}
+                                       link=LINK, **fill), **extra}
+
+
+def build_release(order: dict) -> dict:
+    """The exact ``client.release`` payload for this order's held delivery. Pure."""
+    oid = order.get("id")
+    return {"order_id": oid, "to": order.get("email"),
+            "delivery_id": (order.get("held_delivery") or {}).get("id"),
+            "subject": RELEASE_SUBJECT.format(order_id=oid),
+            "body_text": RELEASE_BODY.format(name=greeting_name(order.get("name")),
+                                             order_id=oid, link=LINK)}
 
 
 # ---- the turnaround ------------------------------------------------------------------------
@@ -289,6 +379,7 @@ class DeliveryDesk(_Base):
         events: list = []
         self._follow_up(ctx, rec, by_id, events)
         looked = self._deliver_new(ctx, rec, orders, events)
+        self._release_new(ctx, rec, orders, events)
         self.save(ctx.state_dir, rec)
         return Ok((*events, self._tally(ctx, rec, orders, looked, malformed=malformed)))
 
@@ -341,11 +432,16 @@ class DeliveryDesk(_Base):
 
     def _approved(self, ctx: WorkContext, rec: dict, e: dict, order, result,
                   events: list) -> None:
-        out = outcome_of(DELIVER, result)
+        out = outcome_of(e.get("capability") or DELIVER, result)
         if not out.ran:
             out.error = _inner_why(result) or out.error
         done = out.result if isinstance(out.result, dict) else {}
-        if out.ran and done.get("emailed") is True:
+        if out.ran and done.get("emailed") is True and done.get("held") is True:
+            # the balance request went; the files wait for the balance (a release, later)
+            e["delivery_id"] = done.get("delivery_id")
+            self._settle(ctx, e, "held", "approved by the owner: stored WITHOUT a link, and the "
+                         "balance pay link emailed", events)
+        elif out.ran and done.get("emailed") is True:
             for key in ("delivery_id", "expires_at"):
                 if isinstance(done.get(key), (str, int, float)) and not isinstance(
                         done.get(key), bool):
@@ -383,8 +479,13 @@ class DeliveryDesk(_Base):
         root = Path(ctx.deliveries_dir)
         for order in sorted(orders, key=_oldest_first):
             oid, status = order["id"], order.get("status")
-            if status not in ("in_progress", "delivered") or package_of(order) == FIND:
+            if status not in ("in_progress", "delivered", "balance_due") \
+                    or package_of(order) == FIND:
                 continue        # a "Find it for me" order is the finder's (finder.py): no zip
+            if status == "balance_due" and (balance_owed(order) is None or any(
+                    e.get("kind") == HELD and e.get("status") == "held"
+                    for e in self._of(rec, oid))):
+                continue        # the balance request went: the client's move now
             last = self._last_delivered(rec, oid)
             if status == "delivered" and last is None:
                 continue        # delivered some other way: not this desk's to revise
@@ -415,7 +516,8 @@ class DeliveryDesk(_Base):
             if submitted >= MAX_DELIVERIES_PER_RUN:
                 looked["ready_next_run"] += 1
                 continue
-            kind = FIRST if last is None else REVISION
+            owed = balance_owed(order) if status in ("in_progress", "balance_due") else None
+            kind = HELD if owed is not None else FIRST if last is None else REVISION
             payload = build_delivery(kind, order, path.name, sha)
             entry = {"order_id": oid, "kind": kind, "zip_name": path.name, "zip_sha256": sha,
                      "zip_mtime": mtime, "zip_bytes": size, "to": payload["to"],
@@ -426,13 +528,42 @@ class DeliveryDesk(_Base):
                 self._settle(ctx, entry, "delivered", "the order's messages already show this "
                              "delivery sent; not sent again", events)
                 continue
-            reasons = check_delivery(payload, order)
+            reasons = check_delivery(payload, order, owed)
             if reasons:
                 self._template_blocked(ctx, rec, entry, reasons, events)
                 continue
             if self._submit(ctx, rec, entry, payload, events, looked):
                 submitted += 1
         return looked
+
+    # ---- 4. held deliveries, once the balance is paid ----------------------------------------
+    def _release_new(self, ctx: WorkContext, rec: dict, orders: list, events: list) -> None:
+        """For each order whose balance the webhook marked paid: ask the owner to release the
+        delivery Scrooge holds for it. Once per held delivery (retried like a delivery)."""
+        for order in sorted(orders, key=_oldest_first):
+            held = order.get("held_delivery")
+            if order.get("status") != "balance_paid" or not isinstance(held, dict) \
+                    or not isinstance(held.get("id"), str):
+                continue
+            oid, did = order["id"], held["id"]
+            tries = [e for e in self._of(rec, oid) if e.get("kind") == RELEASE
+                     and e.get("delivery_id") == did]
+            if any(e.get("status") not in RETRYABLE for e in tries) or any(
+                    sum(1 for e in tries if e.get("status") == st) >= cap
+                    for st, cap in RETRYABLE.items()):
+                continue
+            payload = build_release(order)
+            source = next((e for e in reversed(self._of(rec, oid)) if e.get("kind") == HELD
+                           and e.get("status") == "held"), {})
+            entry = {"order_id": oid, "kind": RELEASE, "delivery_id": did,
+                     "zip_name": source.get("zip_name"), "zip_sha256": source.get("zip_sha256"),
+                     "zip_mtime": source.get("zip_mtime"), "to": payload["to"],
+                     "subject": payload["subject"]}
+            reasons = check_release(payload, order)
+            if reasons:
+                self._template_blocked(ctx, rec, entry, reasons, events)
+                continue
+            self._submit(ctx, rec, entry, payload, events, {"not_set_up": None})
 
     def _template_blocked(self, ctx: WorkContext, rec: dict, entry: dict, reasons: list,
                           events: list) -> None:
@@ -449,16 +580,19 @@ class DeliveryDesk(_Base):
 
     def _submit(self, ctx: WorkContext, rec: dict, entry: dict, payload: dict, events: list,
                 looked: dict) -> bool:
-        """Submit one delivery. False when nothing was attempted (client.deliver is not set up
-        in Pionir: no zip was looked at, so none is held against the order)."""
-        out = ctx.job(Job(DELIVER, dict(payload),
+        """Submit one delivery (or release). False when nothing was attempted (the capability
+        is not set up in Pionir: no zip was looked at, so none is held against the order)."""
+        capability = RELEASE_CAP if entry.get("kind") == RELEASE else DELIVER
+        if capability != DELIVER:
+            entry["capability"] = capability
+        out = ctx.job(Job(capability, dict(payload),
                           what=f"deliver order {entry['order_id']}'s work to its client"))
         why = out.error or f"Pionir said {out.status}"
         if out.status == "failed" and (_NOT_SET_UP.search(why)
-                                       or why.strip() in (DELIVER, "CapabilityNotFound")):
+                                       or why.strip() in (capability, "CapabilityNotFound")):
             looked["not_set_up"] = _clip(why, 160)
             log.error("%s: %s is not set up in Pionir (%s); nothing delivered", self.worker_id,
-                      DELIVER, why)
+                      capability, why)
             events.append(self._event(ctx, "delivery.not_set_up", {
                 "order_id": entry["order_id"], "why": _clip(why, 160)}))
             return False
@@ -577,6 +711,10 @@ class DeliveryDesk(_Base):
             Figure(len(pending), "count", "deliveries pending the owner's approval",
                    window="now"),
             Figure(n("delivered"), "count", "deliveries delivered", window="all_time"),
+            Figure(n("held"), "count", "deliveries held for the balance (balance requested)",
+                   window="all_time"),
+            Figure(n("delivered", kind=RELEASE), "count",
+                   "held deliveries released once the balance was paid", window="all_time"),
             Figure(n("delivered", kind=REVISION), "count", "revised deliveries delivered",
                    window="all_time"),
             Figure(len(blocked), "count", "deliveries blocked by the checks", window="now"),

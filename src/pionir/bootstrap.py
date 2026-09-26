@@ -221,6 +221,15 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         # park for approval; a delivery's zip is scanned for every secret Pionir is
         # configured with.
         runtime.register(ClientAdapter(client_settings(configured)))
+        if configured.quote_cards:
+            # The one quote card per custom order, in the Discord gate's channel with its
+            # bot token (read when a card is posted: no network at boot). The owner's reply
+            # to it becomes a client.quote approval (discord_gate.py, quotes.py).
+            from .adapters.quote_cards import QuoteCardAdapter, QuoteCardSettings
+            from .discord_gate import DiscordGateSettings
+
+            runtime.register(QuoteCardAdapter(QuoteCardSettings.from_gate(
+                DiscordGateSettings.from_environment(configured.state_root))))
     if configured.content_url is not None and configured.instagram_graph_url is not None:
         # Needs Scrooge to host the card image. No boot-time call: both token files are
         # read when a post runs. social.instagram_post always parks for approval.

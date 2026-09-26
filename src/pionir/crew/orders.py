@@ -29,8 +29,21 @@ One run:
    - a paid order, not flagged: the ACKNOWLEDGEMENT (only when its package and amount are
      the ones sold; anything else is held for the owner, and no email goes);
    - a quote request, not flagged: the QUOTE acknowledgement;
+   - a quote paid through its pay link (``paid``, a custom order with its quote's first part
+     paid): the QUOTE-PAID acknowledgement, stating what was paid and, for a deposit, the
+     balance due on delivery; its sending moves the order to ``in_progress``;
+   - ``quoted``, from day 10 of its quote while the pay link is still open and unpaid: the
+     ONE reminder (``client.quote_reminder``; Scrooge also refuses a second);
    - awaiting payment: nothing (older than ``ABANDONED_AFTER``: an abandoned checkout);
    - every other status is the owner's already: nothing.
+
+   **Quote cards.** Every custom order waiting on a price (``quote_requested`` or ``quoted``,
+   its brief not flagged - or flagged and the owner denied the decline) gets ONE quote card
+   in the owner's Discord channel (``quotes.card``, at most ``MAX_CARDS_PER_RUN`` a run). The
+   owner replies to it with the price; the Discord gate turns that reply into the quote
+   email card for his yes (pionir/quotes.py). This desk never writes, suggests or checks a
+   price: the only amounts it ever puts in an email are the ones Scrooge says were quoted
+   and paid.
 
    Each email is built, then **checked** (``check_email``, fail closed) on the exact payload
    that would be submitted, then submitted as ``Job("client.email", {order_id, to, subject,
@@ -66,6 +79,9 @@ from .workers import _Base
 ORDERS = "client.orders"
 EMAIL = "client.email"
 SET_STATUS = "client.set_status"
+REMIND = "client.quote_reminder"
+QUOTE_CARD = "quotes.card"
+MAX_CARDS_PER_RUN = 3
 HIRE_URL = "https://api.dokaz.net/hire"     # the one link an email may carry
 MAX_EMAILS_PER_RUN = 2
 RETRY_UNREACHABLE = 5                       # runs a never-delivered email is retried
@@ -80,13 +96,17 @@ RETRY_STATUS = 5                            # runs a status update is retried
 ABANDONED_AFTER = 3 * 86400                 # an unpaid checkout older than this is abandoned
 
 STATUSES = ("awaiting_payment", "paid", "in_progress", "delivered", "declined", "refunded",
-            "quote_requested", "quoted")
-PAID_OR_LATER = frozenset({"paid", "in_progress", "delivered"})
+            "quote_requested", "quoted", "balance_due", "balance_paid")
+PAID_OR_LATER = frozenset({"paid", "in_progress", "delivered", "balance_due", "balance_paid"})
 
 ACK, QUOTE_ACK, DECLINE = "acknowledgement", "quote_acknowledgement", "decline"
+QUOTE_PAID_ACK, REMINDER = "quote_paid_acknowledgement", "quote_reminder"
 # the order status an email's sending moves the order to, and the statuses it moves it from
 AFTER_SENT = {ACK: ("in_progress", ("paid",)),
+              QUOTE_PAID_ACK: ("in_progress", ("paid",)),
               DECLINE: ("declined", ("paid", "quote_requested"))}
+# the capability each kind of email is sent through (anything not listed: client.email)
+CAPABILITY = {REMINDER: REMIND}
 
 
 @dataclass(frozen=True)
@@ -183,6 +203,44 @@ Thank you,
 Dokaz"""
 DECLINE_PAID = "You'll receive a full refund of your payment."
 DECLINE_UNPAID = "You haven't been charged anything."
+
+# A quote paid through its pay link. {paid} and {balance} are the amounts Scrooge recorded
+# for the owner's quote - never computed here.
+QUOTE_PAID_SUBJECT = "Payment received for your Dokaz order {order_id}"
+QUOTE_PAID_BODY = """Hello {name},
+
+Thank you - your payment of {paid} for request {order_id} has been received, and work has \
+started.
+
+Order: {order_id}
+Package: Custom (as quoted)
+Delivery: within {days} of your payment
+
+{balance_line}
+
+How it works:
+- Every update, and the delivery itself, comes by email only, to this address.
+- One round of revisions is included free.
+- If we can't deliver, you'll receive a full refund.
+
+Thank you,
+Dokaz"""
+QUOTE_PAID_FULL = "That is the full price of your quote: there is nothing more to pay."
+QUOTE_PAID_DEPOSIT = ("The balance of {balance} is due when the work is delivered: we'll email "
+                      "you a payment link with it, and your files are released once it is paid.")
+
+# The ONE reminder of an unpaid quote, from day 10. No link: it points to the quote email.
+REMINDER_SUBJECT = "A reminder about your Dokaz quote {order_id}"
+REMINDER_BODY = """Hello {name},
+
+A short reminder: our quote for your request {order_id} ({price}) is still open. Its payment \
+link, in our quote email, is valid until {expires} (UTC).
+
+If you'd like to go ahead, use that link. If you have a question, or the quote doesn't suit \
+you, just reply to this email.
+
+Thank you,
+Dokaz"""
 
 
 # ---- the screening list: what the owner declines ------------------------------------------
@@ -411,9 +469,12 @@ def _cents_of(amount: str) -> int | None:
     return round(value * 100)
 
 
-def check_email(payload: dict, order: dict, allowed_cents: int | None) -> list:
+def check_email(payload: dict, order: dict, allowed_cents) -> list:
     """Every reason this email may not go out; empty is the only pass. ``allowed_cents`` is
-    the order's package price, the one money amount the body may state (None: none)."""
+    the one money amount the body may state - the order's package price - or a collection of
+    them (a quote: what Scrooge recorded as quoted and paid); None: none."""
+    allowed = (frozenset() if allowed_cents is None else frozenset({allowed_cents})
+               if isinstance(allowed_cents, int) else frozenset(allowed_cents))
     reasons: list = []
     if set(payload) != {"order_id", "to", "subject", "body_text"}:
         reasons.append("the payload is not exactly order_id, to, subject, body_text")
@@ -445,9 +506,9 @@ def check_email(payload: dict, order: dict, allowed_cents: int | None) -> list:
         for m in _DOMAIN.finditer(rest):
             reasons.append(f"the {field} names an address or a domain: {m.group(0)}")
         for m in _MONEY.finditer(text):
-            if allowed_cents is None or _cents_of(m.group(0)) != allowed_cents:
+            if _cents_of(m.group(0)) not in allowed:
                 reasons.append(f"the {field} states the amount {m.group(0).strip()}, which is "
-                               + ("not the order's package price" if allowed_cents is not None
+                               + ("not the order's package price" if allowed
                                   else "not allowed in this email"))
     return reasons
 
@@ -460,7 +521,44 @@ def greeting_name(name) -> str:
 
 
 def price_text(cents: int) -> str:
-    return f"${cents // 100:,}" if cents % 100 == 0 else f"${cents / 100:,.2f}"
+    return f"${cents // 100:,}" if cents % 100 == 0 else f"${cents // 100:,}.{cents % 100:02d}"
+
+
+# ---- the quote, as Scrooge lists it ------------------------------------------------------
+def _cents_ok(v) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and v > 0
+
+
+def quote_of(order: dict) -> dict | None:
+    """The order's current quote as Scrooge listed it, when its shape is whole; else None.
+    Every amount this desk ever writes about a quote comes from here."""
+    q = order.get("quote") if isinstance(order, dict) else None
+    if not isinstance(q, dict) or not isinstance(q.get("id"), str):
+        return None
+    total, deposit, days = q.get("total_cents"), q.get("deposit_cents"), q.get("days")
+    first = q.get("first")
+    if not (_cents_ok(total) and isinstance(deposit, int) and not isinstance(deposit, bool)
+            and 0 <= deposit < total and isinstance(days, int) and not isinstance(days, bool)
+            and days > 0 and isinstance(first, dict)):
+        return None
+    return q
+
+
+def balance_owed(order: dict) -> int | None:
+    """The balance (cents) a deposit order owes now - its deposit paid, its balance not -
+    or None."""
+    q = quote_of(order)
+    if q is None or q["deposit_cents"] <= 0 or q["first"].get("state") != "paid":
+        return None
+    balance = q.get("balance")
+    if isinstance(balance, dict) and balance.get("state") == "paid":
+        return None
+    return q["total_cents"] - q["deposit_cents"]
+
+
+def _day(stamp) -> str | None:
+    at = _epoch(stamp)
+    return None if at is None else _dt.datetime.fromtimestamp(at, _dt.UTC).strftime("%Y-%m-%d")
 
 
 def build_email(kind: str, order: dict, flags: tuple = ()) -> dict:
@@ -478,6 +576,22 @@ def build_email(kind: str, order: dict, flags: tuple = ()) -> dict:
     elif kind == QUOTE_ACK:
         subject = QUOTE_SUBJECT.format(order_id=oid)
         body = QUOTE_BODY.format(name=name, order_id=oid)
+    elif kind == QUOTE_PAID_ACK:
+        q = quote_of(order)
+        paid = q["first"]["amount_cents"]
+        days = q["days"]
+        subject = QUOTE_PAID_SUBJECT.format(order_id=oid)
+        body = QUOTE_PAID_BODY.format(
+            name=name, order_id=oid, paid=price_text(paid),
+            days=f"{days} business day{'' if days == 1 else 's'}",
+            balance_line=(QUOTE_PAID_DEPOSIT.format(
+                balance=price_text(q["total_cents"] - q["deposit_cents"]))
+                if q["deposit_cents"] else QUOTE_PAID_FULL))
+    elif kind == REMINDER:
+        q = quote_of(order)
+        subject = REMINDER_SUBJECT.format(order_id=oid)
+        body = REMINDER_BODY.format(name=name, order_id=oid, price=price_text(q["total_cents"]),
+                                    expires=_day(q["first"].get("expires_at")))
     elif kind == DECLINE:
         subject = DECLINE_SUBJECT.format(order_id=oid)
         category = " and ".join(s.plain for s in flags[:2]) or "work outside what we do"
@@ -565,7 +679,7 @@ class OrderDesk(_Base):
 
     @staticmethod
     def _blank() -> dict:
-        return {"emails": [], "seen_paid": []}
+        return {"emails": [], "seen_paid": [], "cards": []}
 
     def load(self, state_dir) -> dict:
         doc = read_record(state_dir, self.worker_id)
@@ -599,6 +713,7 @@ class OrderDesk(_Base):
         new_paid = self._note_new_paid(ctx, rec, orders, events)
         self._follow_up(ctx, rec, by_id, events)
         ready, held = self._send_new(ctx, rec, orders, events)
+        self._post_cards(ctx, rec, orders, events)
         self._set_statuses(ctx, rec, by_id, events)
         self.save(ctx.state_dir, rec)
         return Ok((*events, self._tally(ctx, rec, orders, malformed=malformed, ready=ready,
@@ -672,14 +787,14 @@ class OrderDesk(_Base):
                 self._settle(ctx, rec, e, "denied", f"the owner did not approve it "
                              f"({got.get('reason') or 'denied'}); left to him", events)
             elif state == "approved":
-                out = outcome_of(EMAIL, got.get("result"))
+                out = outcome_of(e.get("capability") or EMAIL, got.get("result"))
                 if out.ran:
                     self._settle(ctx, rec, e, "sent", "approved by the owner and sent", events)
                 else:
                     self._settle(ctx, rec, e, "failed", out.error or f"Pionir said "
                                  f"{out.status}", events)
             elif state == "approved_failed":
-                out = outcome_of(EMAIL, got.get("result"))
+                out = outcome_of(e.get("capability") or EMAIL, got.get("result"))
                 order = by_id.get(e.get("order_id"))
                 if order is not None and _already_sent(order, e.get("subject")):
                     self._settle(ctx, rec, e, "sent", "the send reported a failure, but the "
@@ -695,10 +810,21 @@ class OrderDesk(_Base):
                             self.worker_id, e["approval_id"], state)
 
     # ---- 3. new emails ---------------------------------------------------------------------
-    def _plan(self, order: dict) -> tuple:
+    def _plan(self, order: dict, now: float | None = None) -> tuple:
         """``(kind, flags)`` for the email this order needs, ``("held", why)``, or ``(None,
         ())`` for nothing."""
         status = order.get("status")
+        if status == "quoted":
+            return (REMINDER, ()) if _reminder_due(order, now) else (None, ())
+        if status == "paid" and package_of(order) == "custom":
+            q = quote_of(order)
+            if q is None or q["first"].get("state") != "paid" \
+                    or not _cents_ok(q["first"].get("amount_cents")):
+                return "held", ("a custom order paid without a quote paid through its pay link: "
+                                "the owner confirms it by hand")
+            if not _ORDER_ID.fullmatch(order["id"]):
+                return "held", "its id is not a plain order id"
+            return QUOTE_PAID_ACK, ()
         if status not in ("paid", "quote_requested"):
             return None, ()
         flags = tuple(screen(order.get("brief")))
@@ -719,14 +845,15 @@ class OrderDesk(_Base):
         submitted = ready = 0
         held: list = []
         for order in sorted(orders, key=_oldest_first):
-            kind, extra = self._plan(order)
+            kind, extra = self._plan(order, ctx.now)
             if kind is None:
                 continue
             if kind == "held":
                 if order.get("status") == "paid" and not self._touched(rec, order["id"]):
                     held.append({"order_id": order["id"], "why": extra})
                 continue
-            if self._closed(rec, order["id"], kind):
+            quote_id = (quote_of(order) or {}).get("id") if kind == REMINDER else None
+            if self._closed(rec, order["id"], kind, quote_id):
                 continue
             flags = extra
             email = build_email(kind, order, flags)
@@ -734,38 +861,44 @@ class OrderDesk(_Base):
                      "subject": email["subject"], "was_paid": order.get("status") == "paid",
                      "from_status": order.get("status"),
                      "flags": [s.key for s in flags]}
+            if quote_id:
+                entry["quote_id"] = quote_id
             if _already_sent(order, email["subject"]):
                 rec["emails"].append(entry)
                 self._settle(ctx, rec, entry, "sent", "the order's messages already show "
                              "this email sent; not sent again", events)
                 continue
             pkg = PACKAGES.get(package_of(order))
-            reasons = check_email(email, order, pkg.price_cents if kind == ACK and pkg
-                                  else None)
+            reasons = check_email(email, order, _allowed_amounts(kind, order, pkg))
             if reasons:
                 self._blocked(ctx, rec, entry, reasons, events)
                 continue
             if submitted >= MAX_EMAILS_PER_RUN:
                 ready += 1
                 continue
+            if quote_id:
+                email = {**email, "quote_id": quote_id}
             self._submit(ctx, rec, entry, email, events)
             submitted += 1
         return ready, held
 
     @staticmethod
-    def _attempts(rec: dict, oid: str, kind: str) -> list:
-        return [e for e in rec["emails"] if e.get("order_id") == oid and e.get("kind") == kind]
+    def _attempts(rec: dict, oid: str, kind: str, quote_id: str | None = None) -> list:
+        return [e for e in rec["emails"] if e.get("order_id") == oid and e.get("kind") == kind
+                and (quote_id is None or e.get("quote_id") == quote_id)]
 
-    def _closed(self, rec: dict, oid: str, kind: str) -> bool:
+    def _closed(self, rec: dict, oid: str, kind: str, quote_id: str | None = None) -> bool:
         """True when this order must never get this email (again): one was submitted, sent,
-        blocked or given up on - or it got the opposite answer (acknowledged vs declined)."""
-        tries = self._attempts(rec, oid, kind)
+        blocked or given up on - or it got the opposite answer (acknowledged vs declined). A
+        reminder is once per QUOTE: a re-quote may have its own."""
+        tries = self._attempts(rec, oid, kind, quote_id)
         if any(e.get("status") not in RETRYABLE for e in tries):
             return True
         for status, cap in RETRYABLE.items():
             if sum(1 for e in tries if e.get("status") == status) >= cap:
                 return True
-        opposite = {ACK: (DECLINE,), QUOTE_ACK: (DECLINE,), DECLINE: (ACK, QUOTE_ACK)}[kind]
+        opposite = {ACK: (DECLINE,), QUOTE_ACK: (DECLINE,), QUOTE_PAID_ACK: (DECLINE,),
+                    DECLINE: (ACK, QUOTE_ACK, QUOTE_PAID_ACK)}.get(kind, ())
         return any(e.get("status") not in RETRYABLE
                    for k in opposite for e in self._attempts(rec, oid, k))
 
@@ -789,7 +922,10 @@ class OrderDesk(_Base):
 
     def _submit(self, ctx: WorkContext, rec: dict, entry: dict, email: dict,
                 events: list) -> None:
-        out = ctx.job(Job(EMAIL, dict(email),
+        capability = CAPABILITY.get(entry["kind"], EMAIL)
+        if capability != EMAIL:
+            entry["capability"] = capability
+        out = ctx.job(Job(capability, dict(email),
                           what=f"email the client of order {entry['order_id']} the "
                                f"{entry['kind'].replace('_', ' ')}"))
         entry.update(submitted_at=ctx.now, status=out.status, task_id=out.task_id,
@@ -805,7 +941,7 @@ class OrderDesk(_Base):
             # sent without being parked: the owner did NOT approve it. His rule is broken and
             # it is Pionir's gate that must hold it - said loudly; the email did go out.
             log.error("%s: %s ran WITHOUT the owner's approval for %s; it must be "
-                      "approval-gated in Pionir", self.worker_id, EMAIL, entry["order_id"])
+                      "approval-gated in Pionir", self.worker_id, capability, entry["order_id"])
             entry["approved_by_owner"] = False
             self._settle(ctx, rec, entry, "sent", "Pionir sent it without parking it for the "
                          "owner", events)
@@ -834,6 +970,47 @@ class OrderDesk(_Base):
         events.append(self._event(ctx, "order.email_not_sent", {
             "order_id": e["order_id"], "email": e["kind"], "status": status,
             "why": _clip(why, 160)}))
+
+    # ---- the quote cards: one per custom order waiting on the owner's price ---------------
+    def _wants_card(self, rec: dict, order: dict) -> bool:
+        if order.get("status") not in ("quote_requested", "quoted") \
+                or package_of(order) != "custom" or not _ORDER_ID.fullmatch(order["id"]):
+            return False
+        if not isinstance(order.get("brief"), str) or not order["brief"].strip():
+            return False
+        if screen(order.get("brief")):
+            # flagged: the decline is the owner's first question; a card only once he has
+            # denied the decline (he wants to quote it after all)
+            return any(e.get("status") == "denied" for e in self._attempts(rec, order["id"],
+                                                                           DECLINE))
+        return True
+
+    def _post_cards(self, ctx: WorkContext, rec: dict, orders: list, events: list) -> None:
+        posted = 0
+        for order in sorted(orders, key=_oldest_first):
+            if posted >= MAX_CARDS_PER_RUN or not self._wants_card(rec, order):
+                continue
+            tries = [c for c in rec["cards"] if c.get("order_id") == order["id"]]
+            if any(c.get("status") == "posted" for c in tries) \
+                    or len(tries) >= RETRY_UNREACHABLE:
+                continue
+            out = ctx.job(Job(QUOTE_CARD, {"order_id": order["id"], "package": "Custom",
+                                           "brief": order["brief"][:6000]},
+                              what=f"post the quote card of order {order['id']}"))
+            posted += 1
+            ok = out.status == "done" and isinstance(out.result, dict) \
+                and out.result.get("ok") is not False
+            entry = {"order_id": order["id"], "at": ctx.now,
+                     "status": "posted" if ok else "not_posted",
+                     "why": None if ok else _clip(out.error or f"Pionir said {out.status}", 200)}
+            rec["cards"].append(entry)
+            if ok:
+                log.info("%s: the quote card for %s is up for the owner", self.worker_id,
+                         order["id"])
+                events.append(self._event(ctx, "order.quote_card", {"order_id": order["id"]}))
+            else:
+                log.warning("%s: the quote card for %s was not posted: %s", self.worker_id,
+                            order["id"], entry["why"])
 
     # ---- 4. the order's status, once its email is sent -------------------------------------
     def _set_statuses(self, ctx: WorkContext, rec: dict, by_id: dict, events: list) -> None:
@@ -931,6 +1108,12 @@ class OrderDesk(_Base):
             if o.get("status") == "awaiting_payment" and at is not None \
                     and ctx.now - at > ABANDONED_AFTER:
                 abandoned += 1
+        quote_states = {"open": 0, "expired": 0}
+        for o in orders:
+            q = quote_of(o)
+            if o.get("status") == "quoted" and q is not None \
+                    and q["first"].get("state") in quote_states:
+                quote_states[q["first"]["state"]] += 1
         revenue = 0
         for o in orders:
             amount = o.get("amount_cents")
@@ -960,6 +1143,16 @@ class OrderDesk(_Base):
                    window="all_time"),
             Figure(len(quotes_waiting), "count", "quote requests waiting for the owner",
                    window="now"),
+            Figure(quote_states["open"], "count", "quotes emailed, waiting for payment",
+                   window="now"),
+            Figure(quote_states["expired"], "count", "quotes expired unpaid", window="now"),
+            Figure(sum(1 for o in orders if o.get("status") == "balance_due"), "count",
+                   "deliveries held for an unpaid balance", window="now"),
+            Figure(len(sent(QUOTE_PAID_ACK)), "count", "quote payment confirmations sent",
+                   window="all_time"),
+            Figure(len(sent(REMINDER)), "count", "quote reminders sent", window="all_time"),
+            Figure(sum(1 for c in rec.get("cards") or [] if c.get("status") == "posted"),
+                   "count", "quote cards posted for the owner", window="all_time"),
             Figure(len(flagged_waiting), "count", "flagged orders awaiting the owner",
                    window="now"),
             Figure(len(sent(DECLINE)), "count", "declines sent", window="all_time"),
@@ -1008,3 +1201,29 @@ def _already_sent(order: dict, subject) -> bool:
     msgs = order.get("messages")
     return isinstance(subject, str) and isinstance(msgs, list) and any(
         isinstance(m, dict) and m.get("subject") == subject for m in msgs)
+
+
+def _allowed_amounts(kind: str, order: dict, pkg):
+    """The money amounts an email of this kind may state: the package price for an ACK;
+    for a quote email, exactly what Scrooge recorded as quoted and paid; else none."""
+    if kind == ACK and pkg:
+        return pkg.price_cents
+    q = quote_of(order)
+    if kind == QUOTE_PAID_ACK and q is not None:
+        return {q["first"]["amount_cents"], q["total_cents"] - q["deposit_cents"]} \
+            if q["deposit_cents"] else {q["first"]["amount_cents"]}
+    if kind == REMINDER and q is not None:
+        return {q["total_cents"]}
+    return None
+
+
+def _reminder_due(order: dict, now: float | None) -> bool:
+    """Day 10 of the quote or later, its pay link still open and unpaid, no reminder yet."""
+    q = quote_of(order)
+    if q is None or now is None or q.get("reminded_at"):
+        return False
+    first = q["first"]
+    if first.get("state") != "open":
+        return False
+    remind_from, expires = _epoch(q.get("remind_from")), _epoch(first.get("expires_at"))
+    return remind_from is not None and expires is not None and remind_from <= now < expires
