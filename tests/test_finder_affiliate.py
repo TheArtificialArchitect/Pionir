@@ -18,6 +18,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from crew_support import temp_dir
+from test_crew_fakes import catalogue, make_crew
 from test_crew_finder import GOOD, NOT_FOUND, FakeResearch, FinderPionir, find_order
 
 from pionir.adapters.clients import AFFILIATE_DISCLOSURE, FIND_REPORT, check_find_report
@@ -199,6 +201,16 @@ class SettingsTests(unittest.TestCase):
             for key in ENV:
                 os.environ.pop(key, None)
             self.assertEqual(CrewSettings.from_environment().affiliates, ())
+
+    def test_the_crew_hands_its_programs_to_every_worker_it_runs(self) -> None:
+        with temp_dir() as root:
+            crew = make_crew(root, cat=catalogue({"contracts": [{"name": "w"}]}),
+                             affiliates=PROGRAMS)
+            try:
+                ctx = crew.context_for(crew.registry.require("contracts.w"))
+                self.assertEqual(ctx.affiliates, PROGRAMS)
+            finally:
+                crew.stop()
 
 
 class _nothing:
