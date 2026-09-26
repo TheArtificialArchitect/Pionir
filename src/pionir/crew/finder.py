@@ -444,13 +444,15 @@ def build_report(order: dict, data: dict, programs=()) -> dict:
 
     ``programs`` (affiliate.py) are the owner's affiliate programs: a link to one of their
     product pages becomes his affiliate link, in the same place, and the report then carries
-    ``affiliate.DISCLOSURE`` above the links and names them in ``affiliate_links``. None set
+    ``affiliate.DISCLOSURE`` above the links (and, with an Amazon link among them, Amazon's
+    required ``affiliate.AMAZON_STATEMENT``) and names them in ``affiliate_links``. None set
     up (the default) leaves the payload exactly as it was without them."""
     oid = order.get("id")
     common = {"name": greeting_name(order.get("name")), "order_id": oid,
               "item": quoted_item(order.get("brief")), "summary": data["summary"],
               "caveats": CAVEATS.format(caveats=data["caveats"]) if data["caveats"] else ""}
     options = list(data["options"]) if data["found"] else []
+    programs = tuple(programs)
     options, tagged = affiliate.apply(options, programs)
     tagged = set(tagged)
 
@@ -460,8 +462,9 @@ def build_report(order: dict, data: dict, programs=()) -> dict:
         block = "\n\n".join(_option(i, o) for i, o in enumerate(opts, 1))
         if trimmed:
             block += TRIMMED.format(n=trimmed, options="option" if trimmed == 1 else "options")
-        disclosure = (affiliate.DISCLOSURE + "\n\n"
-                      if any(o["url"] in tagged for o in opts) else "")
+        left = [o["url"] for o in opts if o["url"] in tagged]
+        disclosure = ("\n".join([affiliate.DISCLOSURE, *affiliate.statements(left, programs)])
+                      + "\n\n" if left else "")
         return REPORT_BODY.format(**common, disclosure=disclosure, options=block)
 
     body = body_of(options, 0)
@@ -530,6 +533,9 @@ def check_report(payload: dict, order: dict) -> list:
     if bool(tagged) != (affiliate.DISCLOSURE in body):
         reasons.append("the affiliate disclosure must be in the report exactly when a link "
                        "is an affiliate link")
+    if any(affiliate.is_amazon(t) for t in tagged) != (affiliate.AMAZON_STATEMENT in body):
+        reasons.append("Amazon's affiliate statement must be in the report exactly when an "
+                       "affiliate link is an Amazon link")
     rest = _BODY_URL.sub(" ", body)
     for field, text in (("subject", subject if isinstance(subject, str) else ""),
                         ("body", rest)):

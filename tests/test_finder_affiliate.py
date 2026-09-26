@@ -22,9 +22,16 @@ from crew_support import temp_dir
 from test_crew_fakes import catalogue, make_crew
 from test_crew_finder import GOOD, NOT_FOUND, FakeResearch, FinderPionir, find_order
 
-from pionir.adapters.clients import AFFILIATE_DISCLOSURE, FIND_REPORT, check_find_report
+from pionir.adapters.clients import (
+    AFFILIATE_DISCLOSURE,
+    AMAZON_ASSOCIATE_STATEMENT,
+    FIND_REPORT,
+    check_find_report,
+)
 from pionir.crew.affiliate import (
+    AMAZON_STATEMENT,
     DISCLOSURE,
+    EBAY_SITES,
     apply,
     programs_from_environment,
     rewrite,
@@ -50,8 +57,10 @@ AMAZON_OURS = f"https://www.amazon.com/dp/B07B43WPVK?tag={TAG}"
 EBAY_FOUND = ("https://www.ebay.com/itm/Sony-a7-III-body/204991337712?mkcid=1"
               "&mkrid=711-53200-19255-0&siteid=0&campid=5338000000&customid=theirs"
               "&toolid=10001&mkevt=1&_trkparms=abc")
-EBAY_OURS = ("https://www.ebay.com/itm/204991337712?mkcid=1&mkrid=711-53200-19255-0"
-             f"&siteid=0&campid={CAMPID}&toolid=10001&mkevt=1")
+# eBay's documented shape: target URL, then mkevt, mkcid, mkrid, campid, toolid
+# (https://developer.ebay.com/api-docs/buy/static/ref-epn-link.html)
+EBAY_OURS = ("https://www.ebay.com/itm/204991337712?mkevt=1&mkcid=1&mkrid=711-53200-19255-0"
+             f"&campid={CAMPID}&toolid=10001")
 SHOP = "https://www.cameraworld.co.uk/sony-a7-iii-used-8812"
 
 MIXED = {
@@ -115,9 +124,8 @@ class RewriteTests(unittest.TestCase):
     def test_an_ebay_variation_is_kept(self) -> None:
         self.assertEqual(rewrite("https://www.ebay.com/itm/204991337712?var=5012&campid=1",
                                  PROGRAMS),
-                         "https://www.ebay.com/itm/204991337712?var=5012&mkcid=1"
-                         f"&mkrid=711-53200-19255-0&siteid=0&campid={CAMPID}&toolid=10001"
-                         "&mkevt=1")
+                         "https://www.ebay.com/itm/204991337712?var=5012&mkevt=1&mkcid=1"
+                         f"&mkrid=711-53200-19255-0&campid={CAMPID}&toolid=10001")
 
     def test_rewriting_our_own_link_again_changes_nothing(self) -> None:
         self.assertEqual(rewrite(AMAZON_OURS, PROGRAMS), AMAZON_OURS)
@@ -265,7 +273,8 @@ class ReportTests(unittest.TestCase):
         self.assertEqual([urlsplit(u).hostname for u in plain["links"]],
                          [urlsplit(u).hostname for u in tagged["links"]])
         self.assertEqual(plain["body_text"],
-                         tagged["body_text"].replace(DISCLOSURE + "\n\n", "")
+                         tagged["body_text"]
+                         .replace(DISCLOSURE + "\n" + AMAZON_STATEMENT + "\n\n", "")
                          .replace(AMAZON_OURS, AMAZON_FOUND).replace(EBAY_OURS, EBAY_FOUND))
         # every option, reversed: still the same order through the rewrite
         rev = dict(MIXED, options=list(reversed(MIXED["options"])))
@@ -322,6 +331,61 @@ class ReportTests(unittest.TestCase):
 
     def test_the_disclosure_is_the_same_words_on_both_sides(self) -> None:
         self.assertEqual(DISCLOSURE, AFFILIATE_DISCLOSURE)
+        self.assertEqual(AMAZON_STATEMENT, AMAZON_ASSOCIATE_STATEMENT)
+
+    def test_amazons_required_statement_is_there_exactly_when_an_amazon_link_is(self) -> None:
+        # Operating Agreement, section 5 (affiliate-program.amazon.com/help/operating/agreement)
+        self.assertEqual(AMAZON_STATEMENT,
+                         "As an Amazon Associate I earn from qualifying purchases.")
+        both = build_report(ORDER, checked(MIXED), PROGRAMS)
+        self.assertIn(DISCLOSURE + "\n" + AMAZON_STATEMENT + "\n\n", both["body_text"])
+        self.assertLess(both["body_text"].index(AMAZON_STATEMENT),
+                        both["body_text"].index(SHOP))
+        ebay_only = build_report(ORDER, checked(MIXED), programs_from_environment(
+            {"PIONIR_AFFILIATE_EBAY_CAMPID": CAMPID}))
+        self.assertEqual(ebay_only["affiliate_links"], [EBAY_OURS])
+        self.assertIn(DISCLOSURE, ebay_only["body_text"])
+        self.assertNotIn(AMAZON_STATEMENT, ebay_only["body_text"])
+        # Amazon set up too, but no Amazon link in this report: still no Amazon statement
+        no_amazon = dict(MIXED, options=[MIXED["options"][0], MIXED["options"][2]])
+        ebay_link = build_report(ORDER, checked(no_amazon), PROGRAMS)
+        self.assertEqual(ebay_link["affiliate_links"], [EBAY_OURS])
+        self.assertIn(DISCLOSURE, ebay_link["body_text"])
+        self.assertNotIn(AMAZON_STATEMENT, ebay_link["body_text"])
+        for payload in (both, ebay_only, ebay_link):
+            self.assertEqual(check_report(payload, ORDER), [])
+            check_find_report(payload)
+        broken = {
+            "Amazon link, no statement": {**both, "body_text": both["body_text"].replace(
+                AMAZON_STATEMENT + "\n", "")},
+            "statement, no Amazon link": {**ebay_only, "body_text": ebay_only[
+                "body_text"].replace(DISCLOSURE, DISCLOSURE + "\n" + AMAZON_STATEMENT)},
+        }
+        for name, payload in broken.items():
+            with self.subTest(name):
+                reasons = check_report(payload, ORDER)
+                self.assertTrue(reasons and all("Amazon" in r for r in reasons), reasons)
+                with self.assertRaisesRegex(ValueError, "Amazon's statement"):
+                    check_find_report(payload)
+
+    def test_the_ebay_rotation_ids_are_ebays_own_table(self) -> None:
+        # "Creating an EPN Tracking Link", https://developer.ebay.com/api-docs/buy/static/
+        # ref-epn-link.html (archived 2026-01-25): marketplace -> rotation id, verbatim
+        self.assertEqual(EBAY_SITES, {
+            "ebay.at": "5221-53469-19255-0", "ebay.com.au": "705-53470-19255-0",
+            "ebay.be": "1553-53471-19255-0", "ebay.ca": "706-53473-19255-0",
+            "ebay.ch": "5222-53480-19255-0", "ebay.de": "707-53477-19255-0",
+            "ebay.es": "1185-53479-19255-0", "ebay.fr": "709-53476-19255-0",
+            "ebay.ie": "5282-53468-19255-0", "ebay.co.uk": "710-53481-19255-0",
+            "ebay.it": "724-53478-19255-0", "ebay.nl": "1346-53482-19255-0",
+            "ebay.pl": "4908-226936-19255-0", "ebay.com": "711-53200-19255-0"})
+        (ebay,) = programs_from_environment({"PIONIR_AFFILIATE_EBAY_CAMPID": CAMPID,
+                                             "PIONIR_AFFILIATE_EBAY_SITES": "ebay.de"})
+        # the page's own example, with our campid and the default tool id
+        self.assertEqual(rewrite("https://www.ebay.de/itm/312345678907?var=612345678907",
+                                 (ebay,)),
+                         "https://www.ebay.de/itm/312345678907?var=612345678907&mkevt=1"
+                         f"&mkcid=1&mkrid=707-53477-19255-0&campid={CAMPID}&toolid=10001")
 
 
 # ---- the worker, the card and the counts --------------------------------------------------------

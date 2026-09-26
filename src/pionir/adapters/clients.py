@@ -32,8 +32,8 @@ around it. So:
   through the same Scrooge call as ``client.email``, with the same answers. A report whose
   links carry the owner's affiliate tag (crew/affiliate.py) names them in the optional
   ``affiliate_links`` (each one of ``links``, once) and must then carry
-  ``AFFILIATE_DISCLOSURE`` word for word - and a report that names none must not; the card
-  marks each affiliate link.
+  ``AFFILIATE_DISCLOSURE`` word for word - and a report that names none must not - plus, with
+  an Amazon link among them, ``AMAZON_ASSOCIATE_STATEMENT``; the card marks each one.
 
 - ``client.quote`` is PRIVILEGED with ``requires_approval=True``: the owner's price for a
   custom order, from his Discord reply (pionir/quotes.py). The card shows the price, the
@@ -140,6 +140,10 @@ FIND_REPORT_OPTIONAL = frozenset({"affiliate_links"})
 AFFILIATE_DISCLOSURE = ("Some links below are affiliate links: we may earn a commission if "
                         "you buy through them, at no extra cost to you. It doesn't change "
                         "what we recommend.")
+# Amazon's required statement (Associates Operating Agreement, section 5), word for word, in
+# any report with an Amazon affiliate link - and in no other (crew/affiliate.py pins it).
+AMAZON_ASSOCIATE_STATEMENT = "As an Amazon Associate I earn from qualifying purchases."
+_AMAZON_HOST = re.compile(r"(?:www\.)?amazon\.[a-z.]{2,10}")
 # Where the download link goes in a delivery email: exactly once.
 LINK_PLACEHOLDER = "{link}"
 # The shape of the link, for checking the email before the upload (the real one is
@@ -582,6 +586,12 @@ def check_find_report(payload: Mapping[str, Any]) -> dict[str, Any]:
                          "word exactly when affiliate_links names a link" if "affiliate_links"
                          in report else "body_text: the report says it has affiliate links "
                          "but affiliate_links names none")
+    amazon = any(_AMAZON_HOST.fullmatch(urllib.parse.urlsplit(link).netloc)
+                 for link in report.get("affiliate_links", []))
+    if amazon != (AMAZON_ASSOCIATE_STATEMENT in body):
+        raise ValueError("body_text: Amazon's statement (" + AMAZON_ASSOCIATE_STATEMENT + ") "
+                         "must be in the report word for word exactly when an affiliate link "
+                         "is an Amazon link")
     return report
 
 

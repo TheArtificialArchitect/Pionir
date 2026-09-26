@@ -19,6 +19,8 @@ rules, each pinned by a test:
   same product on the same host; it never adds a link the finder did not find, never drops
   one, and never reorders them. Which shop is recommended is Claude's research, checked,
   and is decided before this module is consulted.
+- **Amazon's own statement.** A report with an Amazon Associates link also carries, word for
+  word, the sentence Amazon's Operating Agreement requires (``AMAZON_STATEMENT``).
 - **No model.** Pure string work on the checked research: the same input and settings give
   the same links, every time.
 
@@ -52,6 +54,12 @@ from .log import log
 # (adapters/clients.py AFFILIATE_DISCLOSURE; a test pins the two together).
 DISCLOSURE = ("Some links below are affiliate links: we may earn a commission if you buy "
               "through them, at no extra cost to you. It doesn't change what we recommend.")
+# Amazon's own required statement, word for word, whenever a report carries an Amazon
+# Associates link (Associates Program Operating Agreement, section 5: "As an Amazon Associate
+# I earn from qualifying purchases." shown clearly and prominently where the links are;
+# https://affiliate-program.amazon.com/help/operating/agreement). Pionir's client.find_report
+# holds the same words (adapters/clients.py AMAZON_ASSOCIATE_STATEMENT; a test pins them).
+AMAZON_STATEMENT = "As an Amazon Associate I earn from qualifying purchases."
 
 # What the finder's tally says about the money, so nobody reads a count as revenue.
 COMMISSION_UNSEEN = ("not observed: a commission shows only in the program's own reporting "
@@ -76,6 +84,7 @@ class Program:
     key: str                                      # "amazon", "ebay" - names its rule
     name: str                                     # for the owner: "Amazon Associates"
     stores: tuple[Store, ...]
+    statement: str = ""                           # a sentence the program requires, if any
 
     def store_for(self, host: str) -> Store | None:
         return next((s for s in self.stores if host in s.hosts), None)
@@ -141,6 +150,28 @@ def rewrite(url: str, programs: Iterable[Program]) -> str | None:
     return None
 
 
+def is_amazon(url) -> bool:
+    """True for a link on one of Amazon's own stores (www. or not)."""
+    try:
+        host = urlsplit(url).netloc if isinstance(url, str) else ""
+    except ValueError:
+        return False
+    return host.removeprefix("www.") in AMAZON_STORES
+
+
+def statements(links: Iterable[str], programs: Iterable[Program]) -> list[str]:
+    """The statements the programs require for these affiliate links, once each, in the
+    programs' order: Amazon's only when an Amazon link is among them."""
+    hosts = set()
+    for link in links:
+        try:
+            hosts.add(urlsplit(link).netloc)
+        except ValueError:
+            continue
+    return list(dict.fromkeys(p.statement for p in programs if p.statement
+                              and any(p.store_for(h) for h in hosts)))
+
+
 def apply(options: list, programs: Iterable[Program]) -> tuple[list, list]:
     """``(options, affiliate_urls)``: the same options in the same order, each link either
     exactly as found or its affiliate link. A link whose affiliate form another option
@@ -168,17 +199,27 @@ AMAZON_STORES = frozenset({
     "amazon.fr", "amazon.it", "amazon.es", "amazon.nl", "amazon.se", "amazon.pl",
     "amazon.com.be", "amazon.ie", "amazon.co.jp", "amazon.in", "amazon.com.au", "amazon.sg",
     "amazon.ae", "amazon.sa", "amazon.com.tr", "amazon.eg"})
-# eBay Partner Network: each site's rotation id (mkrid) and site id, as EPN's own link
-# generator writes them. A site not listed here cannot be configured.
+# eBay Partner Network: each marketplace's rotation id (mkrid), copied from eBay's own table
+# in "Creating an EPN Tracking Link" (https://developer.ebay.com/api-docs/buy/static/
+# ref-epn-link.html, as archived 2026-01-25). The link is the target URL
+# (https://www.ebay.<tld>/itm/<listing id>?var=<variation id>) followed by, in the page's own
+# order, mkevt=1 (click), mkcid=1 (EPN), mkrid, campid and toolid=10001 (the documented
+# default). A site not in that table cannot be configured.
 EBAY_SITES = {
-    "ebay.com": ("711-53200-19255-0", "0"),
-    "ebay.co.uk": ("710-53481-19255-0", "3"),
-    "ebay.de": ("707-53477-19255-0", "77"),
-    "ebay.ca": ("706-53473-19255-0", "2"),
-    "ebay.com.au": ("705-53470-19255-0", "15"),
-    "ebay.fr": ("709-53476-19255-0", "71"),
-    "ebay.it": ("724-53478-19255-0", "101"),
-    "ebay.es": ("1185-53479-19255-0", "186"),
+    "ebay.at": "5221-53469-19255-0",
+    "ebay.com.au": "705-53470-19255-0",
+    "ebay.be": "1553-53471-19255-0",
+    "ebay.ca": "706-53473-19255-0",
+    "ebay.ch": "5222-53480-19255-0",
+    "ebay.de": "707-53477-19255-0",
+    "ebay.es": "1185-53479-19255-0",
+    "ebay.fr": "709-53476-19255-0",
+    "ebay.ie": "5282-53468-19255-0",
+    "ebay.co.uk": "710-53481-19255-0",
+    "ebay.it": "724-53478-19255-0",
+    "ebay.nl": "1346-53482-19255-0",
+    "ebay.pl": "4908-226936-19255-0",
+    "ebay.com": "711-53200-19255-0",
 }
 _AMAZON_TAG = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,62}")
 _EBAY_CAMPID = re.compile(r"\d{10}")
@@ -210,7 +251,8 @@ def _amazon_program(env: Mapping[str, str]) -> Program | None:
             log.error("affiliate: the Amazon tag for %s is not a tracking id; ignored", domain)
             continue
         stores.append(Store(domain, (("tag", value),)))
-    return Program("amazon", "Amazon Associates", tuple(stores)) if stores else None
+    return (Program("amazon", "Amazon Associates", tuple(stores), AMAZON_STATEMENT)
+            if stores else None)
 
 
 def _ebay_program(env: Mapping[str, str]) -> Program | None:
@@ -226,10 +268,9 @@ def _ebay_program(env: Mapping[str, str]) -> Program | None:
         if not _EBAY_CAMPID.fullmatch(value):
             log.error("affiliate: the eBay campid for %s is not 10 digits; ignored", domain)
             continue
-        mkrid, siteid = EBAY_SITES[domain]
-        stores.append(Store(domain, (("mkcid", "1"), ("mkrid", mkrid), ("siteid", siteid),
-                                     ("campid", value), ("toolid", "10001"),
-                                     ("mkevt", "1"))))
+        stores.append(Store(domain, (("mkevt", "1"), ("mkcid", "1"),
+                                     ("mkrid", EBAY_SITES[domain]), ("campid", value),
+                                     ("toolid", "10001"))))
     return Program("ebay", "eBay Partner Network", tuple(stores)) if stores else None
 
 
