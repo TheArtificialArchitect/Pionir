@@ -167,7 +167,7 @@ def catalogue(divisions: dict | None = None, providers: dict | None = None,
 
 
 def make_crew(root, *, cat: dict | None = None, http=None, post=None, claude=None,
-              registry=None, now=time.time, **cfg):
+              registry=None, now=time.time, research=None, **cfg):
     """A whole, unstarted Crew on fakes. Caller must ``crew.stop()``."""
     cfg.setdefault("secrets_dir", __import__("pathlib").Path(root) / "secrets")
     cfg.setdefault("deliveries_dir", __import__("pathlib").Path(root) / "deliveries")
@@ -177,4 +177,6 @@ def make_crew(root, *, cat: dict | None = None, http=None, post=None, claude=Non
     return Crew(s, reg, http=http or FakeHttp(), post=post or FakeOllama(),
                 client=FakePionir(),
                 card=CardWatch(s.gpu_lock_path, probe=lambda: None, poll_seconds=0.01),
-                claude_runner=claude if claude is not None else FakeClaude(), now=now)
+                claude_runner=claude if claude is not None else FakeClaude(),
+                # never the real claude_research_runner from a test
+                research_runner=research if research is not None else FakeClaude(), now=now)

@@ -3,8 +3,11 @@ owner's yes.
 
 Dokaz sells work done for the client: **Small $149** (one script or automation, 3 business
 days), **Standard $399** (a small tool with a simple interface, 5 business days) and
-**Custom** (quoted by the owner). Paid in full up front through Stripe; email only, no
-calls; every client email approved by the owner on Discord first.
+**Custom** (quoted by the owner) - and **Find it for me $19** (``find``: a report of where
+to buy something, within 2 business days, a full refund if nothing is found; researched and
+reported by ``contracts.finder``, finder.py). Paid in full up front through Stripe; email
+only, no calls; every client email approved by the owner on Discord first. A paid ``find``
+order gets its own acknowledgement (``FIND_ACK_*``, still the ACK kind).
 
 **No model, no words.** Every email this worker sends is one of the three templates below
 (``ACK_*``, ``QUOTE_*``, ``DECLINE_*``) with the order's own id, package and the name the
@@ -95,9 +98,12 @@ class Package:
 
 
 # What is sold. A paid order for anything else, or for another amount, is held for the owner.
+FIND = "find"          # "Find it for me": researched by contracts.finder (finder.py)
 PACKAGES = {
     "small": Package("Small", 14900, 3, "one script or automation"),
     "standard": Package("Standard", 39900, 5, "a small tool with a simple interface"),
+    FIND: Package("Find it for me", 1900, 2,
+                  "a report of where to buy it, with prices and links"),
 }
 
 # ---- the templates: every word a client ever gets from this worker ------------------------
@@ -121,6 +127,28 @@ How it works:
 - If we can't deliver, you'll receive a full refund.
 
 If we need anything more from you, we'll ask by email.
+
+Thank you,
+Dokaz"""
+
+# A paid "Find it for me" order gets this acknowledgement instead of ACK_* (same kind, ACK:
+# it moves the order to in_progress once sent, and the finder then researches it).
+FIND_ACK_SUBJECT = "Your Dokaz find order {order_id} is confirmed"
+FIND_ACK_BODY = """Hello {name},
+
+Thank you for your order. Your payment has been received, and we're now searching for \
+what you asked us to find.
+
+Order: {order_id}
+Package: {package} ({price})
+What's included: {included}
+Turnaround: a report within {days} business days from your payment
+
+How it works:
+- The report comes by email only, to this address.
+- It lists where you can buy what you asked for, with prices and links.
+- If we can't find it, you'll receive a full refund.
+- If your request is unclear, we'll ask you one follow-up question by reply.
 
 Thank you,
 Dokaz"""
@@ -184,6 +212,21 @@ _PERSONAL = _words(r"e-?mails?", r"e-?mail address\w*", "phones?", "phone number
 _SOCIAL = _words("instagram", "facebook", "tiktok", "twitter", r"x\.com", "linkedin", "reddit",
                  "youtube", "discord", "telegram", "whatsapp", "snapchat", "pinterest",
                  "threads", "social media", "social networks?")
+# for the find screens: looking for something, and a person being looked for
+_SEEK = _words(r"find\w*", r"locat\w*", r"track\w*(?: down)?", r"trac(?:e|es|ed|ing)",
+               r"search\w* for", r"look\w* (?:up|for)", r"hunt\w* down", r"dig\w* up",
+               r"identif\w*", "who is", "who owns")
+_EX = r"ex(?:-?(?:wife|husband|girlfriend|boyfriend|partner|fiance\w*))?"
+_PERSON = _words(r"some(?:one|body)(?! (?:to|who|that|selling|with|in|near)\b)", "a person", "this person", "that person",
+                 "the person", "a man", "a woman", "a guy", "a girl", "my " + _EX,
+                 _EX + "'?s?", r"(?:old|former|lost|long-lost) (?:friend|classmate|colleague|"
+                 r"partner|flame|lover|roommate)s?", r"birth (?:mother|father|parents?)",
+                 r"(?:biological|real) (?:mother|father|parents?)", "relatives?", "tenants?",
+                 "debtors?", "neighbou?rs?", "a stranger")
+_THEIRS = r"(?:his|her|their|someone'?s|somebody'?s|a person'?s|this person'?s|my " + _EX \
+          + r"'?s|the owner'?s)"
+_GUN = (r"(?<!glue )(?<!heat )(?<!nail )(?<!spray )(?<!paint )(?<!staple )(?<!grease )"
+        r"(?<!caulk )(?<!massage )(?<!solder )(?<!caulking )(?<!soldering )guns?")
 
 # Errs on flagging: a flag costs the owner one look; a miss costs him a job he refuses to do.
 # A pattern flags the brief; a tuple of patterns flags it only when ALL of them match.
@@ -250,6 +293,79 @@ SCREENS = (
     Screen("harm", "breaking into systems, or software meant to cause harm", (
         _words(r"hack\w*", "malware", "ddos", r"exploit\w*", "ransomware", "botnets?",
                "spyware", "trojans?", "viruses"),
+    )),
+    # ---- written for "Find it for me" briefs, and screening every brief ----------------------
+    Screen("people_finding", "finding a person, or anyone's address, contact details or "
+           "whereabouts", (
+               _near(_SEEK, _PERSON, 15),
+               _near(_SEEK, _THEIRS + r"\s+(?:home |current |new |street |email |e-mail )?"
+                     r"(?:address\w*|home|house|location|whereabouts|phone|number|mobile|"
+                     r"e-?mail|contact\w*|workplace|job|employer|instagram|facebook|socials?)",
+                     30),
+               _words(r"where (?:he|she|they|my " + _EX + r"|this person|that person|"
+                      r"the person) (?:lives?|lived|living|works?|working|moved|stays?|"
+                      r"staying|is now|are now|is living|is staying|went|hangs? out)"),
+               _words("whereabouts", r"home address\w*", r"current address\w*",
+                      r"reverse (?:phone|number|email|e-mail|address|image) (?:lookup|search)",
+                      r"people[- ]?search\w*", r"people[- ]?finders?", r"skip[- ]?trac\w*",
+                      "background checks?",
+                      r"(?:phone|mobile|cell) numbers? (?:of|for) (?:a|this|that|my|his|her|"
+                      r"their|someone|somebody)",
+                      r"(?:owner|owners) of (?:this|that|the|a) (?:car|number|phone|house|"
+                      r"property|home|plate|licen[cs]e plate|vehicle|account)",
+                      r"who owns (?:this|that|the|a) (?:car|number|phone|house|property|home|"
+                      r"plate|licen[cs]e plate|vehicle|account)",
+                      r"licen[cs]e plate (?:lookup|search|owner)"),
+           )),
+    Screen("weapons", "weapons, ammunition or weapon parts", (
+        _words(_GUN, "firearms?", "handguns?", "rifles?", "shotguns?", "pistols?", "revolvers?",
+               "carbines?", r"ammo\w*", "ammunition", "bullets",
+               r"cartridges? for (?:a |my )?(?:gun|rifle|pistol|shotgun)",
+               r"(?<!exhaust )(?<!car )(?<!muffler )(?:suppressors?|silencers?)"
+               r"(?![^.]{0,40}\b(?:exhaust|muffler|car|van|motorbike|motorcycle|scooter|"
+               r"generator|engine)\b)",
+               r"glocks?", r"ar-?15s?", r"ak-?47s?", "ruger", "mossberg", "sig sauer",
+               r"smith (?:&|and) wesson", "desert eagle", "uzis?", "mp5", "beretta",
+               r"(?:lower|upper) receivers?", "80% lowers?", "bump stocks?",
+               "auto sears?", "binary triggers?", r"high[- ]capacity magazines?",
+               "switchblades?", r"butterfly kni(?:fe|ves)", "balisongs?",
+               r"gravity kni(?:fe|ves)", "push daggers?", "daggers?", "brass knuckles?",
+               "knuckle dusters?", r"(?:combat|fighting|tactical|throwing|assault|boot) "
+               r"kni(?:fe|ves)", r"kni(?:fe|ves) (?:as|for) (?:a )?(?:weapon|self[- ]defen[cs]e)",
+               "tasers?", "crossbows?", "explosives?", "grenades?", "detonators?",
+               r"body armou?r", r"armou?r plates?", "weapons?", r"nunchak\w*", r"nunchuc?ks?"),
+    )),
+    Screen("drugs", "drugs, or medicines that need a prescription", (
+        _words("drugs?", r"narcotic\w*", "controlled substances?",
+               r"without (?:a |any )?(?:prescription|rx|script)",
+               r"no (?:prescription|rx|script) (?:needed|required)",
+               r"prescription[- ](?:only|drugs?|medicines?|medications?|meds|pills|tablets)",
+               r"(?:online|overseas|canadian|mexican|indian|foreign) pharmac\w*",
+               "opioids?", "opiates?", "oxycodone", "oxycontin", "fentanyl", "xanax",
+               "alprazolam", "adderall", "valium", "diazepam", "codeine", "tramadol",
+               "percocet", "vicodin", "hydrocodone", "morphine", "ritalin", "modafinil",
+               "ketamine", "mdma", "ecstasy", "lsd", "cocaine", "heroin", r"meth(?:amphetamine)?",
+               "psilocybin", "magic mushrooms", "shrooms", "dmt", "ghb", "cannabis",
+               "marijuana", "thc",
+               r"weed(?!\s*(?:killer|whacker|wacker|eater|trimmer|barrier|control|puller|"
+               r"burner|block\w*|fabric|membrane|wand))",
+               "kratom", "steroids?", "anabolic", "sarms?", "semaglutide", "ozempic", "wegovy",
+               "mounjaro", "tirzepatide", "viagra", "cialis", "sildenafil", "tadalafil",
+               "benzos?", "benzodiazepines?", "painkillers?", "sleeping pills", "antibiotics",
+               r"research chemicals?", "poppers"),
+    )),
+    Screen("counterfeit", "counterfeit, replica, stolen or other illegal goods", (
+        _words(r"counterfeit\w*", "replicas?", r"knock-?offs?", r"super ?fakes?",
+               r"fake (?:ids?|id cards?|passports?|driver'?s? licen[cs]es?|licen[cs]es?|"
+               r"documents?|papers|designer\w*|rolex\w*|watch(?:es)?|bags?|handbags?|purses?|"
+               r"sneakers|shoes|jordans|diplomas?|degrees?|certificates?|money|bills|notes|"
+               r"banknotes|currency|dollars|euros|pounds)",
+               r"(?:mirror|aaa|1:1|1 ?to ?1) (?:quality|grade|copy|copies|replicas?)",
+               r"(?<!was )(?<!were )(?<!got )(?<!been )(?<!my )(?<!is )(?<!our )stolen",
+               "no questions asked", r"(?:fell|falls|fallen) off (?:a|the) (?:back of a )?"
+               r"(?:truck|lorry)", r"serial numbers? (?:removed|filed|scratched|ground)",
+               "unregistered", "untraceable", "black market", r"dark ?web", "darknet",
+               r"illegal\w*", r"smuggl\w*", "under the counter", r"cloned (?:cards?|phones?)"),
     )),
 )
 
@@ -353,10 +469,12 @@ def build_email(kind: str, order: dict, flags: tuple = ()) -> dict:
     name = greeting_name(order.get("name"))
     if kind == ACK:
         pkg = PACKAGES[package_of(order)]
-        subject = ACK_SUBJECT.format(order_id=oid)
-        body = ACK_BODY.format(name=name, order_id=oid, package=pkg.title,
-                               price=price_text(pkg.price_cents), included=pkg.included,
-                               days=pkg.days)
+        subject_t, body_t = ((FIND_ACK_SUBJECT, FIND_ACK_BODY) if package_of(order) == FIND
+                             else (ACK_SUBJECT, ACK_BODY))
+        subject = subject_t.format(order_id=oid)
+        body = body_t.format(name=name, order_id=oid, package=pkg.title,
+                             price=price_text(pkg.price_cents), included=pkg.included,
+                             days=pkg.days)
     elif kind == QUOTE_ACK:
         subject = QUOTE_SUBJECT.format(order_id=oid)
         body = QUOTE_BODY.format(name=name, order_id=oid)

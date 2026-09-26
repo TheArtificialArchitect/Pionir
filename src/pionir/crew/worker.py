@@ -135,6 +135,10 @@ class WorkContext:
     deliveries_dir: Path | None = None
     # where the owner stages each product for Gumroad (config.CrewSettings.products_dir)
     products_dir: Path | None = None
+    # (prompt, timeout) -> Result[str, escalation.ClaudeRefusal]: one web-research call to
+    # Claude on the owner's Max, web tools only, counted against the daily Claude cap and
+    # charged to the worker's division (escalation.Escalator.research). None: no Claude.
+    research: Callable[..., Result] | None = None
 
 
 @runtime_checkable

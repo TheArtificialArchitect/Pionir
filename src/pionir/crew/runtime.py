@@ -3,7 +3,8 @@
 ``build`` wires everything and starts NOTHING - no thread runs and no network, model or
 Pionir call is made until ``Crew.start`` (``python -m pionir.crew`` does, in the
 foreground). Every outside dependency is injectable: the HTTP client workers read with,
-the model's POST, Pionir's client, the Claude runner, the card watch and the clocks, so
+the model's POST, Pionir's client, the Claude runners (the leaders' escalation and the
+finder's web research), the card watch and the clocks, so
 a test crew never reaches a network.
 
 One loop thread looks at the wall clock every ``tick_seconds`` and:
@@ -36,7 +37,7 @@ from .api import CrewApi
 from .brain import Brain, Post, http_post_json
 from .clock import WallClock
 from .direction import Allocation, Direction
-from .escalation import Escalator, Runner, claude_cli_runner
+from .escalation import Escalator, Runner, claude_cli_runner, claude_research_runner
 from .gpu import CardWatch
 from .hands import Hands, Job, JobOutcome, PionirClient
 from .leader import Leader, parse_json_object
@@ -57,6 +58,7 @@ class Crew:
     def __init__(self, cfg, registry: Registry, *, http=None, post: Post = http_post_json,
                  client=None, card: CardWatch | None = None,
                  claude_runner: Runner | None = claude_cli_runner,
+                 research_runner: Runner | None = claude_research_runner,
                  clock: WallClock | None = None,
                  monotonic: Callable[[], float] = time.monotonic,
                  now: Callable[[], float] = time.time) -> None:
@@ -84,7 +86,9 @@ class Crew:
         self.escalator = Escalator(self.store, self.allocation,
                                    runner=claude_runner if cfg.claude_daily_cap > 0 else None,
                                    daily_cap=cfg.claude_daily_cap,
-                                   timeout=cfg.escalation_timeout_seconds, clock=now)
+                                   timeout=cfg.escalation_timeout_seconds, clock=now,
+                                   research_runner=(research_runner
+                                                    if cfg.claude_daily_cap > 0 else None))
         self.leaders = {d: Leader(d, registry, self.store, ask=self.brain.ask,
                                   escalator=self.escalator, model=cfg.model, clock=now)
                         for d in registry.division_ids()}
@@ -114,7 +118,8 @@ class Crew:
                            approval=self.hands.approval, goal=goal,
                            state_dir=self.cfg.state_dir / "workers",
                            deliveries_dir=getattr(self.cfg, "deliveries_dir", None),
-                           products_dir=getattr(self.cfg, "products_dir", None))
+                           products_dir=getattr(self.cfg, "products_dir", None),
+                           research=partial(self.escalator.research, worker.division))
 
     def _words(self, worker, purpose: str, system: str, user: str, schema: dict) -> Result:
         """The ONLY way a worker reaches a model: the shared brain, JSON-schema output,
