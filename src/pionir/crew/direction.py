@@ -194,6 +194,11 @@ class Direction:
                     e.update(attention=r["attention"], headline=r["headline"],
                              text=r["summary"],
                              figures=[_fig_text(f) for f in r["figures"]][:8])
+                    if r["provenance"].get("composed") == "figures_only":
+                        # the model's words failed their checks: this is the workers'
+                        # own record, composed without a model - say so, and why in kind
+                        e["composed"] = "figures_only"
+                        e["model_failed"] = r["provenance"].get("rejected_for") or []
                     esc = r.get("escalation") or {}
                     if esc.get("answer"):
                         e["claude"] = esc["answer"][:600]

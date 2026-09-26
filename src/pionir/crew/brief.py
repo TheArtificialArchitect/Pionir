@@ -26,9 +26,11 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 
 from .figures import Figure
+from .grounding import HEALTHY, UNCLEAR, UNHEALTHY, values_in_data, vocabulary_words
 
 DEFAULT_QUOTA = 6
 TOTAL_LIMIT = 40
@@ -46,6 +48,7 @@ class Brief:
     goal: dict | None            # Moss's direction for this division, if any
     last_considered: float | None
     known: tuple                 # names the catalogue itself vouches for
+    notes: str = ""              # the catalogue's leader notes for this division
 
     @property
     def new_outputs(self) -> tuple:
@@ -97,6 +100,70 @@ class Brief:
                 names |= set(o.entities)
         return names
 
+    def health_states(self) -> dict:
+        """worker_id -> (verdict, the brief's words for it), for the health-claim check:
+        HEALTHY only when the last run was ok, fresh, with no failure since and something
+        written; UNHEALTHY when it last failed, never succeeded, is not wired or not
+        configured, or is stale; UNCLEAR otherwise (say, succeeding silently)."""
+        out = {}
+        for h in self.health:
+            if (h.worker_id in self.not_wired or h.not_configured or h.has_never_succeeded
+                    or h.last_outcome == "err" or h.is_stale):
+                verdict = UNHEALTHY
+            elif h.last_outcome == "ok" and not h.consecutive_failures and not h.silent_streak:
+                verdict = HEALTHY
+            else:
+                verdict = UNCLEAR
+            out[h.worker_id] = (verdict, worker_state(self, h))
+        return out
+
+    def counted_items(self) -> set:
+        """The words this brief's figures count ("drafts blocked" -> drafts, blocked)."""
+        return {w for o in self.outputs for f in o.figures
+                for w in re.split(r"[^a-z]+", f.measures.lower()) if len(w) > 2}
+
+    def recorded_values(self) -> set:
+        """Numbers real-source payloads hold outside their figures ("topics_left": 13).
+        They may back a bare number in a report, never a typed claim (grounding.py)."""
+        vals: set = set()
+        for o in self.outputs:
+            if not o.derived:
+                vals |= values_in_data(o.payload)
+        return vals
+
+    def vocabulary(self) -> set:
+        """The lower-case words this brief is made of, which a report may write with a
+        capital without naming anything new ("Posting.instagram", "Tally", "Card-Press",
+        "Facebook" for a recorded referrer www.facebook.com): the division, its workers'
+        ids, every output kind and payload key, what each figure measures and its stream
+        and window, the words of real-source payload values, and the catalogue's leader
+        notes. A model-written payload's VALUES are never vocabulary - a name a model
+        invented cannot vouch for itself - only its keys, which code wrote."""
+        texts = [self.division, self.title, self.notes, *self.live, *self.known]
+        texts += [h.worker_id for h in self.health]
+        for o in self.outputs:
+            texts += [o.worker_id, o.kind]
+            texts += [t for f in o.figures for t in (f.measures, f.stream, f.window)]
+            texts += _strings(o.payload, values=not o.derived)
+        return vocabulary_words(texts)
+
+
+def _strings(obj, *, values: bool, depth: int = 0) -> list:
+    """The keys of a JSON-ish payload, and (``values``) its string leaves."""
+    out: list = []
+    if depth > 6:
+        return out
+    if isinstance(obj, dict):
+        for k, v in list(obj.items())[:200]:
+            out.append(str(k))
+            out += _strings(v, values=values, depth=depth + 1)
+    elif isinstance(obj, (list, tuple)):
+        for v in list(obj)[:200]:
+            out += _strings(v, values=values, depth=depth + 1)
+    elif isinstance(obj, str) and values:
+        out.append(obj)
+    return out
+
 
 def _quota(division_spec, kind: str) -> int:
     return int(division_spec.brief_quota.get(kind, DEFAULT_QUOTA))
@@ -126,7 +193,8 @@ def build_brief(store, registry, division: str, *, now: float, goal: dict | None
         division=division, title=spec.title, built_at=now, stamp=stamp,
         outputs=tuple(gathered), health=tuple(store.health(registry.cadences(division), now)),
         live={w.worker_id: bool(w.live) for w in workers}, goal=goal,
-        last_considered=store.last_considered_at(division), known=tuple(sorted(known)))
+        last_considered=store.last_considered_at(division), known=tuple(sorted(known)),
+        notes=spec.leader_notes)
 
 
 def ago(seconds: float | None) -> str:
@@ -150,8 +218,57 @@ def _payload_line(payload: dict) -> str:
     return text if len(text) <= 300 else text[:297] + "..."
 
 
+def _by_kind(brief: Brief) -> list:
+    """The outputs grouped by kind, kinds in order: how the brief is read and numbered."""
+    by_kind: dict = {}
+    for o in brief.outputs:
+        by_kind.setdefault(o.kind, []).append(o)
+    return [(k, by_kind[k]) for k in sorted(by_kind)]
+
+
+def figure_table(brief: Brief) -> list:
+    """Every figure a worker recorded FROM A REAL SOURCE in this brief, numbered as the
+    brief shows it ("F3"): [(number, output, figure), ...]. A report lists its figures by
+    these numbers, so a figure it lists is a recorded one by construction - the model
+    never retypes a value, a unit or what it measures (which is where it went wrong: a
+    16-figure list, an answer cut off mid-figure). Model-written outputs' figures get no
+    number: they back nothing."""
+    out, n = [], 0
+    for _kind, rows in _by_kind(brief):
+        for o in rows:
+            if o.derived:
+                continue
+            for f in o.figures:
+                n += 1
+                out.append((n, o, f))
+    return out
+
+
+def worker_state(brief: Brief, h) -> str:
+    """One worker's health in words - the same words for the model and for a person."""
+    now = brief.built_at
+    if h.worker_id in brief.not_wired:
+        state = "NOT WIRED YET (a placeholder; it produces nothing)"
+    elif h.not_configured:
+        state = f"NOT CONFIGURED: {h.last_error}"
+    elif h.has_never_succeeded:
+        state = (f"NEVER SUCCEEDED in {h.attempts} attempts"
+                 + (f"; last error {h.last_error_kind}: {h.last_error}" if h.last_error else ""))
+    elif h.is_stale:
+        state = f"STALE: last success {ago(now - h.last_success_at)}"
+    else:
+        state = f"ok, last success {ago(now - h.last_success_at)}"
+    if h.silent_streak:
+        state += f"; succeeded {h.silent_streak} times in a row producing NOTHING"
+    if h.consecutive_failures and not h.has_never_succeeded:
+        state += f"; {h.consecutive_failures} failures since"
+    return state
+
+
 def render(brief: Brief) -> str:
-    """The brief as plain text: the same text the model reads and a person would."""
+    """The brief as plain text: the same text the model reads and a person would. Each
+    recorded figure carries its number ("F3: $12.00 revenue (mtd)"), which is how a report
+    lists it; a model-written output's figures are shown, unnumbered."""
     now = brief.built_at
     lines = [f"DIVISION {brief.title} ({brief.division})"]
     if brief.stamp is None:
@@ -164,34 +281,20 @@ def render(brief: Brief) -> str:
     lines.append("")
     lines.append("WORKERS:")
     for h in brief.health:
-        if h.worker_id in brief.not_wired:
-            state = "NOT WIRED YET (a placeholder; it produces nothing)"
-        elif h.not_configured:
-            state = f"NOT CONFIGURED: {h.last_error}"
-        elif h.has_never_succeeded:
-            state = (f"NEVER SUCCEEDED in {h.attempts} attempts"
-                     + (f"; last error {h.last_error_kind}: {h.last_error}" if h.last_error else ""))
-        elif h.is_stale:
-            state = f"STALE: last success {ago(now - h.last_success_at)}"
-        else:
-            state = f"ok, last success {ago(now - h.last_success_at)}"
-        if h.silent_streak:
-            state += f"; succeeded {h.silent_streak} times in a row producing NOTHING"
-        if h.consecutive_failures and not h.has_never_succeeded:
-            state += f"; {h.consecutive_failures} failures since"
-        lines.append(f"- {h.worker_id}: {state}")
+        lines.append(f"- {h.worker_id}: {worker_state(brief, h)}")
     new = {o.output_id for o in brief.new_outputs}
-    by_kind: dict = {}
-    for o in brief.outputs:
-        by_kind.setdefault(o.kind, []).append(o)
-    for kind in sorted(by_kind):
-        rows = by_kind[kind]
+    n = 0
+    for kind, rows in _by_kind(brief):
         lines += ["", f"-- {kind} ({len(rows)}) --"]
         for o in rows:
             tag = "NEW " if o.output_id in new else ""
             src = "model-written" if o.derived else "recorded"
             lines.append(f"{tag}[{ago(now - o.observed_at)}] {o.worker_id} ({src}):")
             for f in o.figures:
-                lines.append(f"    {f.display()} = {json.dumps(f.to_dict(), sort_keys=True)}")
+                if o.derived:
+                    lines.append(f"    {f.display()} (model-written: backs nothing)")
+                else:
+                    n += 1                      # the same order as figure_table
+                    lines.append(f"    F{n}: {f.display()}")
             lines.append(f"    details: {_payload_line(o.payload)}")
     return "\n".join(lines)

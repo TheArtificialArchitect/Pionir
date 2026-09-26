@@ -16,7 +16,14 @@ from crew_support import FakeOllama, temp_dir
 from test_crew_fakes import FakeClaude, ScriptedWorker, catalogue, make_crew
 
 from pionir.crew.brief import DEFAULT_QUOTA, TOTAL_LIMIT, build_brief
-from pionir.crew.leader import REPORT_SCHEMA, Abstention, Leader, Report
+from pionir.crew.leader import (
+    FIGURES_ONLY,
+    REPORT_SCHEMA,
+    Abstention,
+    Leader,
+    Report,
+    report_schema,
+)
 from pionir.crew.registry import WorkerSpec
 from pionir.crew.result import Err, Ok
 from pionir.crew.worker import make_output
@@ -38,15 +45,22 @@ def reply(summary="Revenue is $12.00 so far this month, recorded by the ledger."
 
 
 class FakeAsk:
-    def __init__(self, text: str | None = None, err: str | None = None) -> None:
+    """Answers ``text`` every time - or, given ``script``, each answer in turn (the last
+    one repeating)."""
+
+    def __init__(self, text: str | None = None, err: str | None = None,
+                 script: list | None = None) -> None:
         self.text = text if text is not None else reply()
+        self.script = list(script or [])
         self.err = err
         self.calls: list = []
 
     def __call__(self, agent_id, purpose, messages, options, *, fmt=None, division=None):
-        self.calls.append({"agent": agent_id, "messages": messages, "options": options,
-                           "fmt": fmt, "division": division})
-        return (None if self.err else self.text), {"prompt_eval_count": 9}, self.err
+        self.calls.append({"agent": agent_id, "purpose": purpose, "messages": messages,
+                           "options": options, "fmt": fmt, "division": division})
+        text = self.script[min(len(self.calls), len(self.script)) - 1] if self.script \
+            else self.text
+        return (None if self.err else text), {"prompt_eval_count": 9}, self.err
 
 
 class _Case(unittest.TestCase):
@@ -164,7 +178,10 @@ class ReportTests(_Case):
         self.assertIsInstance(result.value, Report)
         _url, body = post.calls[0]
         self.assertEqual(body["options"]["temperature"], 0)
-        self.assertEqual(body["format"], REPORT_SCHEMA)
+        # the report schema, with figures held to the brief's own numbered figures (F1)
+        self.assertEqual(body["format"], report_schema([1]))
+        self.assertEqual(body["format"]["required"], REPORT_SCHEMA["required"])
+        self.assertEqual(body["format"]["properties"]["figures"]["items"]["enum"], [1])
         row = crew.store.reports(division="alpha")[0]
         self.assertEqual(row["status"], "report")
         self.assertEqual(row["figures"], [{"value": 1200, "unit": "usd_cents",
@@ -181,11 +198,14 @@ class ReportTests(_Case):
         self.assertIsInstance(result, Err)
         self.assertEqual(result.error.kind, "ungrounded")
         row = crew.store.reports(division="alpha")[0]
-        self.assertEqual(row["status"], "rejected")
+        # the model's report never goes up: the figures-only report does, in its place
+        self.assertEqual(row["provenance"]["composed"], FIGURES_ONLY)
+        self.assertEqual(row["provenance"]["rejected_for"], ["ungrounded"])
         self.assertIn("$470", row["reason"])                 # the record says exactly why
         digest = json.dumps(crew.direction.digest())
         self.assertNotIn("470", digest)                      # Moss never sees the number
-        self.assertIn("rejected (unbacked figure)", digest)
+        self.assertIn('"model_failed": ["ungrounded"]', digest)
+        self.assertIn("$12.00 revenue", digest)              # but she does see the true one
 
     def test_a_structured_figure_in_the_wrong_unit_is_rejected(self) -> None:
         crew = self.crew()
@@ -206,7 +226,10 @@ class ReportTests(_Case):
         crew.dispatcher.dispatch(only=["alpha.ledger"], wait=True)
         result = self.leader(crew, "alpha", FakeAsk('{"headline": 3}')).run()
         self.assertEqual(result.error.kind, "malformed")
-        self.assertEqual(crew.store.reports(division="alpha")[0]["status"], "rejected")
+        row = crew.store.reports(division="alpha")[0]
+        self.assertEqual(row["provenance"]["composed"], FIGURES_ONLY)
+        self.assertIn("figures only", row["headline"])
+        self.assertIn('"headline" must be a non-empty string', row["reason"])
 
     def test_the_leader_run_is_recorded_like_a_workers(self) -> None:
         crew = self.crew()
@@ -214,6 +237,187 @@ class ReportTests(_Case):
         self.leader(crew, "alpha", FakeAsk(err="refused: share used up")).run()
         run = crew.store.runs("leader.alpha")[0]
         self.assertEqual((run["outcome"], run["error_kind"]), ("err", "no_words"))
+
+
+CANARY = "Quillfeather"      # a word no worker recorded and no dictionary holds
+
+
+class ReliabilityTests(_Case):
+    """What the live crew measured: leaders rejected for ordinary words in a Title-Case
+    headline, answers too long or cut off, and Moss told only "rejected" when the model's
+    prose failed. Now: ordinary words pass, one repair, then the workers' own figures."""
+
+    def test_a_title_case_headline_of_ordinary_words_is_not_a_name(self) -> None:
+        crew = self.crew()
+        crew.dispatcher.dispatch(only=["alpha.ledger"], wait=True)
+        ask = FakeAsk(json.dumps({
+            "headline": "Alpha Division Report: Revenue Steady, No New Paid Orders",
+            "summary": "The Division Report shows revenue is $12.00 so far; Stale Data none.",
+            "attention": "none", "figures": [1], "routine": [], "escalate": False}))
+        result = self.leader(crew, "alpha", ask).run()
+        self.assertIsInstance(result, Ok, result)
+        row = crew.store.reports(division="alpha")[0]
+        self.assertEqual(row["status"], "report")
+        self.assertNotIn("composed", row["provenance"])      # the model's own report
+        self.assertEqual(len(ask.calls), 1)                  # and no repair was needed
+
+    def test_the_briefs_own_words_are_not_names(self) -> None:
+        # "Devto" is in no dictionary: it passes because the brief is made of it (a worker
+        # id), not because unknown words pass
+        crew = self.crew({"alpha": [{"name": "devto"}], "beta": [{"name": "ledger"}]})
+        crew.dispatcher.dispatch(wait=True)
+        ask = FakeAsk(reply(summary="Devto recorded revenue of $12.00."))
+        self.assertIsInstance(self.leader(crew, "alpha", ask).run(), Ok)
+        # ...and only its OWN brief: beta's workers never recorded anything called that
+        result = self.leader(crew, "beta", ask).run()
+        self.assertEqual(result.error.kind, "ungrounded")
+        self.assertIn("names 'Devto'", crew.store.reports(division="beta")[0]["reason"])
+
+    def test_an_invented_name_still_fails_even_opening_a_sentence(self) -> None:
+        crew = self.crew()
+        crew.dispatcher.dispatch(only=["alpha.ledger"], wait=True)
+        ask = FakeAsk(reply(summary="Etsy sent all of it: revenue is $12.00."))
+        result = self.leader(crew, "alpha", ask).run()
+        self.assertEqual(result.error.kind, "ungrounded")
+        self.assertIn("names 'Etsy'", crew.store.reports(division="alpha")[0]["reason"])
+
+    def test_a_figure_listed_by_number_is_the_recorded_figure(self) -> None:
+        crew = self.crew({"alpha": [
+            {"name": "ledger"},
+            {"name": "visits", "kind": "traffic",
+             "params": {"value": 38, "unit": "count", "measures": "visits"}}]})
+        crew.dispatcher.dispatch(wait=True)
+        ask = FakeAsk(reply(summary="There were 38 visits and $12.00 of revenue.",
+                            figures=(2, 1)))
+        self.assertIsInstance(self.leader(crew, "alpha", ask).run(), Ok)
+        user = ask.calls[0]["messages"][1]["content"]
+        self.assertIn("F1: $12.00 revenue", user)
+        self.assertIn("F2: 38 visits", user)
+        self.assertEqual(crew.store.reports(division="alpha")[0]["figures"],
+                         [{"value": 38, "unit": "count", "measures": "visits"},
+                          {"value": 1200, "unit": "usd_cents", "measures": "revenue"}])
+
+    def test_a_figure_number_the_brief_does_not_have_is_malformed(self) -> None:
+        crew = self.crew()
+        crew.dispatcher.dispatch(only=["alpha.ledger"], wait=True)
+        result = self.leader(crew, "alpha", FakeAsk(reply(figures=(7,)))).run()
+        self.assertEqual(result.error.kind, "malformed")
+        self.assertIn("figure 7 is not a numbered figure",
+                      crew.store.reports(division="alpha")[0]["reason"])
+
+    def test_malformed_gets_one_repair_with_the_reasons_then_the_real_figures(self) -> None:
+        crew = self.crew()
+        crew.dispatcher.dispatch(only=["alpha.ledger"], wait=True)
+        too_long = reply(summary="Revenue is $12.00. " * 100)       # 1900 characters
+        ask = FakeAsk(script=[too_long, '{"headline": "cut off'])
+        result = self.leader(crew, "alpha", ask).run()
+        self.assertEqual(len(ask.calls), 2)                  # exactly ONE repair
+        self.assertEqual([c["purpose"] for c in ask.calls], ["distil", "repair"])
+        repair = ask.calls[1]["messages"][-1]["content"]
+        self.assertIn('"summary" is 1900 characters; the limit is 1200', repair)
+        self.assertEqual(result.error.kind, "malformed")
+        row = crew.store.reports(division="alpha")[0]
+        self.assertEqual((row["status"], row["provenance"]["composed"]),
+                         ("report", FIGURES_ONLY))
+        self.assertEqual(row["provenance"]["attempts"], 2)
+        self.assertEqual(row["figures"], [{"value": 1200, "unit": "usd_cents",
+                                           "measures": "revenue"}])
+        self.assertIn("alpha.ledger revenue: $12.00 revenue", row["summary"])
+        self.assertIn("alpha.ledger ok, last success", row["summary"])
+        run = crew.store.runs("leader.alpha")[0]
+        self.assertEqual((run["outcome"], run["error_kind"]), ("err", "malformed"))
+        entry = next(e for e in crew.direction.digest()["divisions"]
+                     if e["division"] == "alpha")
+        self.assertEqual((entry["status"], entry["composed"]), ("report", FIGURES_ONLY))
+        self.assertEqual(entry["figures"], ["$12.00 revenue"])
+
+    def test_a_repair_that_passes_is_the_models_report(self) -> None:
+        crew = self.crew()
+        crew.dispatcher.dispatch(only=["alpha.ledger"], wait=True)
+        ask = FakeAsk(script=[reply(summary="Revenue is $470."), reply()])
+        result = self.leader(crew, "alpha", ask).run()
+        self.assertIsInstance(result, Ok, result)
+        row = crew.store.reports(division="alpha")[0]
+        self.assertEqual(row["summary"], json.loads(reply())["summary"])
+        self.assertEqual((row["provenance"]["attempts"], row["provenance"]["repaired"]),
+                         (2, "ungrounded"))
+        self.assertIn("states '$470', which no worker recorded",
+                      ask.calls[1]["messages"][-1]["content"])
+
+    def test_the_figures_only_report_never_contains_model_text(self) -> None:
+        crew = self.crew({"alpha": [{"name": "ledger"}, {"name": "drafter", "kind": "draft"}]})
+        crew.dispatcher.dispatch(only=["alpha.ledger"], wait=True)
+        drafter = crew.registry.require("alpha.drafter")
+        t = time.time()
+        crew.store.record_attempt(
+            worker_id=drafter.worker_id, division="alpha", started_at=t, finished_at=t,
+            error=None, outputs=[make_output(
+                drafter, valid_at=t, observed_at=t, payload={"title": f"{CANARY} draft"},
+                figures=[{"value": 99900, "unit": "usd_cents", "measures": "revenue"}],
+                provenance={"derived": True, "model": "x"})])
+        answer = json.dumps({"headline": f"{CANARY} says hello",
+                             "summary": f"{CANARY} made $999.00 for us.",
+                             "attention": "act", "figures": [1],
+                             "routine": [f"{CANARY} routine"], "escalate": True,
+                             "question": f"{CANARY}?"})
+        ask = FakeAsk(answer)
+        result = self.leader(crew, "alpha", ask).run()
+        self.assertEqual(result.error.kind, "ungrounded")
+        row = crew.store.reports(division="alpha")[0]
+        self.assertEqual(row["provenance"]["composed"], FIGURES_ONLY)
+        sent = json.dumps({k: row[k] for k in ("headline", "summary", "attention", "figures",
+                                                "routine", "escalation")})
+        self.assertNotIn(CANARY, sent)                       # not the answer, not the draft
+        self.assertNotIn("999", sent)                        # nor the model-written figure
+        self.assertNotIn(CANARY, json.dumps(crew.direction.digest()))
+        self.assertIn(CANARY, row["reason"])                 # the record still says why
+        self.assertIn("alpha.drafter draft x1 (model-written)", row["summary"])
+        self.assertEqual(row["attention"], "watch")          # not the model's "act"
+
+
+class HealthClaimTests(_Case):
+    """A report that misstates worker health goes through the same repair, then the
+    figures-only report - the runs table decides, not the model."""
+
+    def run_leader(self, *answers):
+        crew = self.crew({"alpha": [{"name": "ledger"},
+                                    {"name": "broken", "params": {"mode": "err"}}]})
+        crew.dispatcher.dispatch(wait=True)
+        ask = FakeAsk(script=[reply(summary=s) for s in answers])
+        return crew, ask, self.leader(crew, "alpha", ask).run()
+
+    def test_a_healthy_worker_called_failing_is_repaired(self) -> None:
+        crew, ask, result = self.run_leader(
+            "Revenue is $12.00, but alpha.ledger has not succeeded.",
+            "Revenue is $12.00; alpha.broken is failing.")
+        self.assertIsInstance(result, Ok, result)
+        self.assertIn("says 'has not succeeded' about alpha.ledger",
+                      ask.calls[1]["messages"][-1]["content"])
+        row = crew.store.reports(division="alpha")[0]
+        self.assertEqual(row["provenance"]["repaired"], "ungrounded")
+
+    def test_a_correct_failure_claim_is_accepted_at_once(self) -> None:
+        _crew, ask, result = self.run_leader(
+            "Revenue is $12.00. 1 worker failed: alpha.broken is failing.")
+        self.assertIsInstance(result, Ok, result)
+        self.assertEqual(len(ask.calls), 1)
+
+    def test_a_silent_worker_is_not_judged_healthy(self) -> None:
+        crew = self.crew({"alpha": [{"name": "ledger"},
+                                    {"name": "quiet", "params": {"mode": "silent"}}]})
+        crew.dispatcher.dispatch(wait=True)
+        ask = FakeAsk(reply(summary="Revenue is $12.00; alpha.quiet has stalled."))
+        self.assertIsInstance(self.leader(crew, "alpha", ask).run(), Ok)
+        self.assertEqual(len(ask.calls), 1)
+
+    def test_a_false_all_healthy_claim_ends_in_the_figures(self) -> None:
+        crew, ask, result = self.run_leader("Revenue is $12.00 and all workers are healthy.")
+        self.assertEqual(result.error.kind, "ungrounded")
+        self.assertEqual(len(ask.calls), 2)
+        row = crew.store.reports(division="alpha")[0]
+        self.assertEqual(row["provenance"]["composed"], FIGURES_ONLY)
+        self.assertIn("alpha.broken: NEVER SUCCEEDED", row["reason"])
+        self.assertNotIn("healthy", row["summary"])
 
 
 class EscalationTests(_Case):
