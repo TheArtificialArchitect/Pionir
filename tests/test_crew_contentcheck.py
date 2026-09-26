@@ -313,6 +313,19 @@ class PersonalDataTests(unittest.TestCase):
                                     for r in reasons), reasons)
                 self.assertFalse(any("phone" in r for r in reasons), reasons)
 
+    def test_a_real_year_range_passes(self) -> None:
+        # tax years and seasons: neither an invented id nor a phone number
+        for text in ("It covers 2024-2025 in full.", "It covers 2024–2025 in full.",
+                     "It covers the FY2024-25 budget.", "Use it for the 2023-24 tax year.",
+                     "It ran from 1999-00 on."):
+            with self.subTest(text):
+                self.assertEqual(cc.check(with_body(text)), [])
+
+    def test_what_is_not_a_plausible_year_range_still_blocks(self) -> None:
+        for ref in ("2024-001", "INV-2024-001", "2025-2024", "2024-2099"):
+            with self.subTest(ref):
+                self.assertBlocked(f"The reference is {ref} here.", "invented id")
+
     def test_an_ip_address_blocks(self) -> None:
         self.assertBlocked("The server sits at 192.168.10.24.", "IP address")
         self.assertBlocked("Or at 2001:db8:85a3::8a2e:370:7334 instead.", "IP address")

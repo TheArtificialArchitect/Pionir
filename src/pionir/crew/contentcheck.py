@@ -373,6 +373,24 @@ _PO_BOX = re.compile(r"(?i)\bp\.?\s*o\.?\s*box\b|\b(?:suite|apt|apartment)\s*#?\
 _PREFIXED_ID = re.compile(r"(?<![\w-])[A-Za-z]{2,8}[-#]\d{1,6}(?:-\d{1,6})+(?![\w-])")
 
 
+# A year range is neither: "2024-2025", "2023-24 tax year", "FY2024-25" (tax years,
+# seasons). Both years plausible (1900-2099), the second 1-10 years after the first - for
+# a two-digit end, the year it implies ("1999-00" is 2000). Anything else ("2025-2024",
+# "2024-2099") is still an id or a phone.
+_YEAR_RANGE = re.compile(r"((?:19|20)\d\d)[-\u2013]((?:19|20)\d\d|\d\d)")
+
+
+def _is_year_range(s: str) -> bool:
+    m = _YEAR_RANGE.fullmatch(s.strip())
+    if not m:
+        return False
+    start, end = int(m.group(1)), m.group(2)
+    stop = int(end) if len(end) == 4 else start // 100 * 100 + int(end)
+    if len(end) == 2 and stop < start:
+        stop += 100
+    return 1 <= stop - start <= 10 and stop <= 2099
+
+
 def _is_invented_id(s: str) -> bool:
     groups = s.strip().split("-")
     if len(groups) < 2 or not all(g.isdigit() for g in groups) or len(groups[0]) != 4:
@@ -407,7 +425,7 @@ def _personal(texts: list) -> list:
         for a, b in ids:
             reasons.append(f"{field} has {_INVENTED_ID} ({text[a:b]!r}) - use no example ids")
         for m in _PHONE.finditer(text):
-            if any(a <= m.start() < b for a, b in ids) or not _is_phone(m.group(0)):
+            if any(a <= m.start() < b for a, b in ids) or _is_year_range(m.group(0))                     or not _is_phone(m.group(0)):
                 continue
             if _is_invented_id(m.group(0)):
                 reasons.append(f"{field} has {_INVENTED_ID} ({m.group(0).strip()!r}) - use "
@@ -554,6 +572,8 @@ def _uncovered(phrase: list, initial: bool, allow: frozenset, common: frozenset,
             step = 1
         if not step and _ordinary_word(phrase[k]):
             step = 1
+        if not step and phrase[k].startswith("FY") and _is_year_range(phrase[k][2:]):
+            step = 1        # a fiscal year ("FY2024-25") names nobody
         if step:
             if run:
                 out.append(" ".join(run))
