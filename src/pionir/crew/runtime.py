@@ -119,7 +119,8 @@ class Crew:
                            state_dir=self.cfg.state_dir / "workers",
                            deliveries_dir=getattr(self.cfg, "deliveries_dir", None),
                            products_dir=getattr(self.cfg, "products_dir", None),
-                           research=partial(self.escalator.research, worker.division))
+                           research=partial(self.escalator.research, worker.division),
+                           affiliates=tuple(getattr(self.cfg, "affiliates", ()) or ()))
 
     def _words(self, worker, purpose: str, system: str, user: str, schema: dict) -> Result:
         """The ONLY way a worker reaches a model: the shared brain, JSON-schema output,

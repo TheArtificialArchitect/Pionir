@@ -574,12 +574,19 @@ def _find_report_lines(payload: Mapping[str, Any]) -> list[str]:
          "address stored on this order)"),
         f"**Subject:** {_escape(str(payload.get('subject')))}",
     ]
+    tagged = payload.get("affiliate_links")
+    tagged = {str(link) for link in tagged} if isinstance(tagged, list) else set()
     if links:
         lines.append(f"**The websites it sends the client to ({len(domains)}):** "
                      + ", ".join(f"**{_escape(d)}**" for d in domains))
+        if tagged:
+            lines.append(f"\U0001f4b5 **AFFILIATE LINKS: {len(tagged)} of {len(links)}** carry "
+                         "your affiliate tag (rewritten from the links found; any other tag "
+                         "removed). The report tells the client so.")
         lines.append(f"**Every link in the report ({len(links)}):**")
         # <...> keeps Discord from fetching a preview of a third-party page into the card
-        lines += [f"• **{_escape(_link_domain(link))}** — <{link}>" for link in links]
+        lines += [f"• **{_escape(_link_domain(link))}** — <{link}>"
+                  + (" - **affiliate link**" if link in tagged else "") for link in links]
     else:
         lines.append("**Links:** none - the report sends the client to no website")
     body = payload.get("body_text")

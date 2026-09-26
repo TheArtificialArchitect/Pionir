@@ -31,6 +31,12 @@ One run:
      data, its links exactly the options' URLs, checked again on the exact payload
      (``check_report``) and submitted as ``Job("client.find_report", {order_id, to, subject,
      body_text, links})``. Pionir parks it for the owner.
+   - **Affiliate links** (affiliate.py), only when the owner has set a program up: a link to
+     a supported retailer's own product page gets his tag (anyone else's stripped), in the
+     same place and order; the report then says so to the client (``affiliate.DISCLOSURE``)
+     and the payload names those links (``affiliate_links``) for his card. Nothing set up is
+     the report exactly as before. Reports and links that carried his tag are counted;
+     commissions are not observed here, so none is ever reported.
 4. **Status**, only once the report is SENT: ``client.set_status delivered`` (from
    ``in_progress`` only). A not-found report sent is also a REFUND for the owner to issue by
    hand in Stripe: counted, never automated.
@@ -52,6 +58,7 @@ import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import affiliate
 from .blog import FORGOTTEN_AFTER, _clip, _Unreadable, read_record, record_path, save_record
 from .delivery import _PASSING, PASSING_TYPES, _inner_why, _refused
 from .figures import Figure
@@ -94,6 +101,8 @@ MAX_ITEM = 300                      # the client's words quoted back to them
 MAX_BRIEF_IN_PROMPT = 2000
 MAX_PRICE = 10_000_000
 PAYLOAD_KEYS = frozenset({"order_id", "to", "subject", "body_text", "links"})
+# only when a link is an affiliate link (affiliate.py): which ones, for the owner's card
+OPTIONAL_KEYS = frozenset({"affiliate_links"})
 TOP_KEYS = frozenset({"found", "summary", "options", "caveats"})
 OPTION_KEYS = frozenset({"seller", "url", "price", "currency", "condition", "availability",
                          "notes"})
@@ -162,7 +171,7 @@ You asked us to find:
 
 Where to buy it:
 
-{options}
+{disclosure}{options}
 
 {caveats}Prices and stock change quickly — check before buying.
 
@@ -426,17 +435,24 @@ def _option(n: int, o: dict) -> str:
     return text + (OPTION_NOTES.format(notes=o["notes"]) if o["notes"] else "")
 
 
-def build_report(order: dict, data: dict) -> dict:
+def build_report(order: dict, data: dict, programs=()) -> dict:
     """The exact ``client.find_report`` payload for this order and its checked research.
     Pure. It always fits Pionir's ``MAX_BODY``: when it would not, the options' notes are
     trimmed first (to ``SHORT_NOTES``, then dropped), then the lowest options are dropped
     and the client told how many ("(N more options trimmed)"). The links are exactly the
-    options that remain."""
+    options that remain.
+
+    ``programs`` (affiliate.py) are the owner's affiliate programs: a link to one of their
+    product pages becomes his affiliate link, in the same place, and the report then carries
+    ``affiliate.DISCLOSURE`` above the links and names them in ``affiliate_links``. None set
+    up (the default) leaves the payload exactly as it was without them."""
     oid = order.get("id")
     common = {"name": greeting_name(order.get("name")), "order_id": oid,
               "item": quoted_item(order.get("brief")), "summary": data["summary"],
               "caveats": CAVEATS.format(caveats=data["caveats"]) if data["caveats"] else ""}
     options = list(data["options"]) if data["found"] else []
+    options, tagged = affiliate.apply(options, programs)
+    tagged = set(tagged)
 
     def body_of(opts: list, trimmed: int) -> str:
         if not data["found"]:
@@ -444,7 +460,9 @@ def build_report(order: dict, data: dict) -> dict:
         block = "\n\n".join(_option(i, o) for i, o in enumerate(opts, 1))
         if trimmed:
             block += TRIMMED.format(n=trimmed, options="option" if trimmed == 1 else "options")
-        return REPORT_BODY.format(**common, options=block)
+        disclosure = (affiliate.DISCLOSURE + "\n\n"
+                      if any(o["url"] in tagged for o in opts) else "")
+        return REPORT_BODY.format(**common, disclosure=disclosure, options=block)
 
     body = body_of(options, 0)
     for notes_limit in (SHORT_NOTES, 0):            # the notes first ...
@@ -457,17 +475,22 @@ def build_report(order: dict, data: dict) -> dict:
     while len(body) > MAX_BODY and len(options) > 1:  # ... then the lowest options
         options = options[:-1]
         body = body_of(options, total - len(options))
-    return {"order_id": oid, "to": order.get("email"),
-            "subject": REPORT_SUBJECT.format(order_id=oid), "body_text": body,
-            "links": [o["url"] for o in options]}
+    payload = {"order_id": oid, "to": order.get("email"),
+               "subject": REPORT_SUBJECT.format(order_id=oid), "body_text": body,
+               "links": [o["url"] for o in options]}
+    affiliate_links = [link for link in payload["links"] if link in tagged]
+    if affiliate_links:
+        payload["affiliate_links"] = affiliate_links
+    return payload
 
 
 def check_report(payload: dict, order: dict) -> list:
     """Every reason this report may not be submitted (Pionir's own contract, checked here
     first); empty is the only pass."""
     reasons: list = []
-    if set(payload) != PAYLOAD_KEYS:
-        reasons.append("the payload is not exactly order_id, to, subject, body_text, links")
+    if not PAYLOAD_KEYS <= set(payload) <= PAYLOAD_KEYS | OPTIONAL_KEYS:
+        reasons.append("the payload is not exactly order_id, to, subject, body_text, links "
+                       "(and affiliate_links, when there are any)")
     oid, to = payload.get("order_id"), payload.get("to")
     subject, body, links = payload.get("subject"), payload.get("body_text"), payload.get("links")
     if oid != order.get("id") or not isinstance(oid, str) or not _ORDER_ID.fullmatch(oid):
@@ -487,6 +510,13 @@ def check_report(payload: dict, order: dict) -> list:
             reasons.append(f"a link: {why}")
     if len(set(map(str, links))) != len(links):
         reasons.append("a link is listed twice")
+    tagged = payload.get("affiliate_links", [])
+    if "affiliate_links" in payload and (not isinstance(tagged, list) or not tagged):
+        reasons.append("affiliate_links, when given, is a list of at least one link")
+        tagged = []
+    elif not all(isinstance(t, str) and t in links for t in tagged) \
+            or len(set(tagged)) != len(tagged):
+        reasons.append("affiliate_links are not each one of the links, once")
     if not isinstance(body, str) or not MIN_BODY <= len(body) <= MAX_BODY:
         reasons.append(f"the body must be {MIN_BODY} to {MAX_BODY} characters")
         return reasons
@@ -497,6 +527,9 @@ def check_report(payload: dict, order: dict) -> list:
         reasons.append("the body has a link that is not a full https link")
     if set(in_body) != set(links):
         reasons.append("the links in the body are not exactly the links listed")
+    if bool(tagged) != (affiliate.DISCLOSURE in body):
+        reasons.append("the affiliate disclosure must be in the report exactly when a link "
+                       "is an affiliate link")
     rest = _BODY_URL.sub(" ", body)
     for field, text in (("subject", subject if isinstance(subject, str) else ""),
                         ("body", rest)):
@@ -755,10 +788,12 @@ class Finder(_Base):
                 looked: dict) -> None:
         if self._closed(entry):
             return
-        payload = build_report(order, entry["research"])
+        payload = build_report(order, entry["research"], ctx.affiliates)
         sub = {"subject": payload["subject"], "links": list(payload["links"]),
                "found": bool(entry["research"]["found"]),
                "options_sent": len(payload["links"])}
+        if payload.get("affiliate_links"):
+            sub["affiliate_links"] = len(payload["affiliate_links"])
         if _already_sent(order, payload["subject"]):
             entry["reports"].append(sub)
             self._settle(ctx, entry, sub, "sent", "the order's messages already show this "
@@ -932,6 +967,13 @@ class Finder(_Base):
                    window="all_time"),
             Figure(sum(1 for _, s in subs if s.get("status_state") == "failed"), "count",
                    "find order status updates failed", window="all_time"),
+            # affiliate links (affiliate.py): what carried the owner's tag, never revenue -
+            # a commission is seen only in the program's own reporting, not here
+            Figure(len(ctx.affiliates), "count", "affiliate programs set up", window="now"),
+            Figure(sum(1 for _, s in sent if s.get("affiliate_links")), "count",
+                   "find reports sent with affiliate links", window="all_time"),
+            Figure(sum(int(s.get("affiliate_links") or 0) for _, s in sent), "count",
+                   "affiliate links in find reports sent", window="all_time"),
         ]
         return make_output(self, kind="find.tally", valid_at=ctx.now, observed_at=ctx.now,
                            payload={"waiting_for_research": waiting[:10],
@@ -941,7 +983,9 @@ class Finder(_Base):
                                     "refunds_to_issue": refunds[:10],
                                     "find_report_not_set_up": looked["not_set_up"],
                                     "worked_on": looked["worked_on"],
-                                    "malformed_orders": malformed},
+                                    "malformed_orders": malformed,
+                                    "affiliate_programs": [p.public() for p in ctx.affiliates],
+                                    "affiliate_commission": affiliate.COMMISSION_UNSEEN},
                            figures=figures, entities=self.entities,
                            provenance={"source": "real", "provider": self.provider,
                                        "record": self.record_what})

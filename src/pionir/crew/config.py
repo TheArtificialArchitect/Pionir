@@ -21,6 +21,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from ..config import PionirSettings
+from .affiliate import programs_from_environment
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -85,6 +86,9 @@ class CrewSettings:
     # (``<products_dir>/<slug>/`` with listing.json, the zip and the cover); products.shelf
     # submits it through Pionir, which reads the same folder. None -> ~/.pionir/products
     products_dir: Path | None = None
+    # The owner's affiliate programs (affiliate.py), from PIONIR_AFFILIATE_*: the finder puts
+    # his tag on the shop links they cover, and discloses it. Empty: nothing is rewritten.
+    affiliates: tuple = ()
 
     def __post_init__(self) -> None:
         if self.tick_seconds <= 0:
@@ -157,6 +161,7 @@ class CrewSettings:
         raw = os.environ.get("PIONIR_CREW_CALLS_PER_HOUR", "").strip()
         if raw:
             overrides["budget"] = CrewBudget(calls_per_hour=int(raw))
+        overrides["affiliates"] = programs_from_environment(os.environ)
         return cls.from_pionir(settings, **overrides)
 
     def public(self) -> dict:
@@ -167,6 +172,7 @@ class CrewSettings:
         d["deliveries_dir"] = str(self.deliveries_dir)
         d["products_dir"] = str(self.products_dir)
         d["catalogue_path"] = str(self.catalogue_path) if self.catalogue_path else None
+        d["affiliates"] = [p.public() for p in self.affiliates]
         return d
 
 

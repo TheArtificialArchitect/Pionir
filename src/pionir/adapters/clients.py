@@ -29,7 +29,11 @@ around it. So:
   https: to a public DNS name - no IP, no localhost/.local/.internal, no password, no
   port), every link in the body must be declared and every declared link must be in the
   body, and the card lists each one by its domain above the whole report. It is sent
-  through the same Scrooge call as ``client.email``, with the same answers.
+  through the same Scrooge call as ``client.email``, with the same answers. A report whose
+  links carry the owner's affiliate tag (crew/affiliate.py) names them in the optional
+  ``affiliate_links`` (each one of ``links``, once) and must then carry
+  ``AFFILIATE_DISCLOSURE`` word for word - and a report that names none must not; the card
+  marks each affiliate link.
 
 - ``client.quote`` is PRIVILEGED with ``requires_approval=True``: the owner's price for a
   custom order, from his Discord reply (pionir/quotes.py). The card shows the price, the
@@ -129,6 +133,13 @@ QUOTE_FIELDS = frozenset({"order_id", "to", "quote_ref", "total_cents", "deposit
 REMIND_FIELDS = frozenset({"order_id", "quote_id", "to", "subject", "body_text"})
 RELEASE_FIELDS = frozenset({"order_id", "to", "delivery_id", "subject", "body_text"})
 FIND_REPORT_FIELDS = frozenset({"order_id", "to", "subject", "body_text", "links"})
+# only a report with affiliate links: which of its links carry the owner's tag
+FIND_REPORT_OPTIONAL = frozenset({"affiliate_links"})
+# What the client reads whenever a link in the report is an affiliate link. The finder
+# writes the same words (crew/affiliate.py DISCLOSURE; a test pins the two together).
+AFFILIATE_DISCLOSURE = ("Some links below are affiliate links: we may earn a commission if "
+                        "you buy through them, at no extra cost to you. It doesn't change "
+                        "what we recommend.")
 # Where the download link goes in a delivery email: exactly once.
 LINK_PLACEHOLDER = "{link}"
 # The shape of the link, for checking the email before the upload (the real one is
@@ -519,10 +530,10 @@ def check_find_report(payload: Mapping[str, Any]) -> dict[str, Any]:
     """The report exactly as it will be sent (with its links), or ValueError("<field>:
     <why>"). Every link in the body is in ``links`` and every one in ``links`` is in the
     body, so the owner's card lists every website the client is sent to."""
-    unknown = sorted(set(payload) - FIND_REPORT_FIELDS)
+    unknown = sorted(set(payload) - FIND_REPORT_FIELDS - FIND_REPORT_OPTIONAL)
     if unknown:
         raise ValueError(f"{unknown[0]}: not a find report field (allowed: "
-                         f"{', '.join(sorted(FIND_REPORT_FIELDS))})")
+                         f"{', '.join(sorted(FIND_REPORT_FIELDS | FIND_REPORT_OPTIONAL))})")
     missing = sorted(FIND_REPORT_FIELDS - set(payload))
     if missing:
         raise ValueError(f"{missing[0]}: required")
@@ -564,7 +575,28 @@ def check_find_report(payload: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError(f"links[{i}]: not in the report - every listed link must "
                              "appear in body_text")
     report["links"] = links
+    if "affiliate_links" in payload:
+        report["affiliate_links"] = _check_affiliate_links(payload["affiliate_links"], links)
+    if bool(report.get("affiliate_links")) != (AFFILIATE_DISCLOSURE in body):
+        raise ValueError("body_text: the affiliate disclosure must be in the report word for "
+                         "word exactly when affiliate_links names a link" if "affiliate_links"
+                         in report else "body_text: the report says it has affiliate links "
+                         "but affiliate_links names none")
     return report
+
+
+def _check_affiliate_links(value: Any, links: list[str]) -> list[str]:
+    """1-15 of the report's own links, each once: the ones carrying the owner's tag."""
+    if not isinstance(value, list) or not value:
+        raise ValueError("affiliate_links: when given, a list of at least one of the links")
+    seen: set[str] = set()
+    for i, link in enumerate(value):
+        if not isinstance(link, str) or link not in links:
+            raise ValueError(f"affiliate_links[{i}]: not one of the report's links")
+        if link in seen:
+            raise ValueError(f"affiliate_links[{i}]: listed twice")
+        seen.add(link)
+    return list(value)
 
 
 def link_tail(url: str) -> str:

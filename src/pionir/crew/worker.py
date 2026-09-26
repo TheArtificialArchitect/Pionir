@@ -143,6 +143,9 @@ class WorkContext:
     # Claude on the owner's Max, web tools only, counted against the daily Claude cap and
     # charged to the worker's division (escalation.Escalator.research). None: no Claude.
     research: Callable[..., Result] | None = None
+    # the owner's affiliate programs (affiliate.Program, config.CrewSettings.affiliates):
+    # the finder tags the shop links they cover. Empty: no link is ever rewritten.
+    affiliates: tuple = ()
 
 
 @runtime_checkable
