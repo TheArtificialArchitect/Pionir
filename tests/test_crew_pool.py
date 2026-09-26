@@ -38,19 +38,34 @@ class ConcurrencyTests(_Case):
         self.assertLess(took, 0.9)              # one at a time would take 1.2 s
 
     def test_the_per_provider_interval_holds_under_concurrency(self) -> None:
+        # Checks the slots the gate reserves, on a high-resolution clock - not wall-clock
+        # wake-ups: on the Windows CI runner the coarse monotonic clock (~15.6 ms ticks) read
+        # a correct 0.15 s gap as 0.13999999999998636 and failed this test on every push.
         ScriptedWorker.starts.clear()
         crew = self.crew({"alpha": [{"name": f"s{i}", "provider": "slow"} for i in range(4)]
                           + [{"name": f"f{i}", "provider": "fast"} for i in range(2)]},
                          providers={"slow": 0.15, "fast": 0.0}, pool_size=6)
-        t0 = time.monotonic()
+        slots: list = []
+        lock = threading.Lock()
+
+        def sleep(seconds: float) -> None:          # a waiter sleeps until its reserved slot
+            with lock:
+                slots.append(time.perf_counter() + seconds)
+            time.sleep(seconds)
+
+        crew.gate._clock = time.perf_counter
+        crew.gate._sleep = sleep
         report = crew.dispatcher.dispatch(wait=True)
         self.assertEqual(report.succeeded, 6)
+        self.assertEqual(sum(1 for w, _t in ScriptedWorker.starts if ".s" in w), 4)
+        slots.sort()
+        self.assertEqual(len(slots), 3, slots)      # the first slow worker goes at once
+        gaps = [b - a for a, b in pairwise(slots)]
+        self.assertTrue(all(g >= 0.149 for g in gaps), gaps)
+        # another host is not held up: both fast workers start before the last slow one
         slow = sorted(t for w, t in ScriptedWorker.starts if ".s" in w)
-        gaps = [b - a for a, b in pairwise(slow)]
-        self.assertEqual(len(slow), 4)
-        self.assertTrue(all(g >= 0.14 for g in gaps), gaps)
-        fast = [t - t0 for w, t in ScriptedWorker.starts if ".f" in w]
-        self.assertTrue(all(d < 0.1 for d in fast), fast)   # another host is not held up
+        fast = [t for w, t in ScriptedWorker.starts if ".f" in w]
+        self.assertTrue(all(f < slow[-1] for f in fast), (fast, slow))
 
     def test_the_gate_reserves_before_it_sleeps(self) -> None:
         # Checks the slots the gate hands out, not wall-clock wake-ups: timestamping after the
