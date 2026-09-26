@@ -126,8 +126,6 @@ DELIVER_FIELDS = frozenset({"order_id", "to", "zip_name", "zip_sha256", "subject
 DELIVER_OPTIONAL = frozenset({"hold_for_balance"})
 QUOTE_FIELDS = frozenset({"order_id", "to", "quote_ref", "total_cents", "deposit_cents", "days",
                           "subject", "body_text"})
-# Shown on the owner's card, never sent to Scrooge.
-QUOTE_SHOWN_ONLY = frozenset({"reply_text", "days_defaulted"})
 REMIND_FIELDS = frozenset({"order_id", "quote_id", "to", "subject", "body_text"})
 RELEASE_FIELDS = frozenset({"order_id", "to", "delivery_id", "subject", "body_text"})
 FIND_REPORT_FIELDS = frozenset({"order_id", "to", "subject", "body_text", "links"})
@@ -313,10 +311,10 @@ def check_quote(payload: Mapping[str, Any], threshold_cents: int) -> dict[str, A
     words of the email agree - so the card the owner approves is what the client gets."""
     from pionir.quotes import MAX_CENTS, MAX_DAYS, MIN_CENTS, days_text, deposit_for, usd
 
-    unknown = sorted(set(payload) - QUOTE_FIELDS - QUOTE_SHOWN_ONLY)
+    unknown = sorted(set(payload) - QUOTE_FIELDS)
     if unknown:
         raise ValueError(f"{unknown[0]}: not a quote field (allowed: "
-                         f"{', '.join(sorted(QUOTE_FIELDS | QUOTE_SHOWN_ONLY))})")
+                         f"{', '.join(sorted(QUOTE_FIELDS))})")
     missing = sorted(QUOTE_FIELDS - set(payload))
     if missing:
         raise ValueError(f"{missing[0]}: required")
@@ -621,6 +619,12 @@ class ClientSettings:
     # client.quote: at or above this many cents, half up front and half on delivery. Must
     # equal Scrooge's QUOTE_DEPOSIT_THRESHOLD_CENTS (Scrooge refuses, unsent, a mismatch).
     deposit_threshold_cents: int = 50_000
+    # client.quote is accepted only as the owner's own Discord reply: the card record the gate
+    # keeps (quote-cards.json), his Discord user id, and the days used when a reply gives none.
+    # No record or no owner: every quote is refused.
+    quote_store: Path | None = None
+    owner_user_id: str | None = None
+    default_days: int = 7
 
     def __post_init__(self) -> None:
         parsed = urllib.parse.urlparse(self.base_url)
@@ -661,16 +665,21 @@ def client_settings(configured: Any) -> ClientSettings:
         ("the Daedalus token (PIONIR_DAEDALUS_TOKEN)", getattr(configured, "daedalus_token", None)),
         ("the Melete token (PIONIR_MELETE_TOKEN)", getattr(configured, "melete_token", None)),
     ) if token)
-    from pionir.quotes import QuoteSettings
+    from pionir.discord_gate import DiscordGateSettings
+    from pionir.quotes import QuoteCardStore, QuoteSettings
 
+    quotes = QuoteSettings.from_environment()
     return ClientSettings(base_url=configured.content_url or DEFAULT_CONTENT_URL,
                           token_file=configured.ops_token_path,
                           deliveries_dir=configured.deliveries_path,
                           secrets_dir=configured.secrets_path,
                           secret_files=tuple(token_files),
                           secret_values=values,
-                          deposit_threshold_cents=(
-                              QuoteSettings.from_environment().deposit_threshold_cents))
+                          deposit_threshold_cents=quotes.deposit_threshold_cents,
+                          quote_store=QuoteCardStore.for_state_root(configured.state_root).path,
+                          owner_user_id=DiscordGateSettings.from_environment(
+                              configured.state_root).owner,
+                          default_days=quotes.default_days)
 
 
 def _refused(why: str, **extra: Any) -> dict[str, Any]:
@@ -803,6 +812,8 @@ class ClientAdapter:
         try:
             if task.capability == QUOTE:
                 quote = check_quote(task.payload, self.settings.deposit_threshold_cents)
+                # ...and only as the owner's own reply: before it is parked AND when it runs
+                self._provenance(task.payload)
                 return "POST", "/dash/orders/quote", {k: quote[k] for k in sorted(QUOTE_FIELDS)}
             if task.capability == REMIND:
                 return "POST", "/dash/orders/quote/remind", check_reminder(task.payload)
@@ -825,6 +836,12 @@ class ClientAdapter:
         except ValueError as error:
             raise AdapterProtocolError(f"{task.capability} refused by Pionir - {error}") from error
         raise AdapterProtocolError(f"client has no capability {task.capability!r}")
+
+    def _provenance(self, payload: Mapping[str, Any]) -> None:
+        from pionir.quotes import QuoteCardStore, check_provenance
+
+        store = QuoteCardStore(self.settings.quote_store) if self.settings.quote_store else None
+        check_provenance(payload, store, self.settings.owner_user_id, self.settings.default_days)
 
     @staticmethod
     def _delivery(task: Task) -> dict[str, str]:
@@ -997,7 +1014,9 @@ class ClientAdapter:
                                   "emailed": True}
         if held:
             # The client was sent the balance pay link; Scrooge has already moved the order
-            # to balance_due. The files wait for the balance (client.release).
+            # to balance_due. The files wait for the balance (client.release). The pay link
+            # is a bearer link: the record keeps the delivery id, never the link.
+            result.pop("url", None)
             result.update(held=True, balance_cents=uploaded.get("balance_cents"))
             _log.info("client: delivery %s for order %s: HELD, balance request emailed",
                       uploaded["delivery_id"], order_id)
@@ -1149,7 +1168,9 @@ class ClientAdapter:
                     "released": True}, evidence
         if answer.get("id"):
             evidence.append(f"client:message:{answer['id']}")
-        result: dict[str, Any] = {"ok": True, "delivery_id": release["delivery_id"], "url": url,
+        # The download link went to the client; the approval and job records keep only the id.
+        result: dict[str, Any] = {"ok": True, "delivery_id": release["delivery_id"],
+                                  "link_tail": link_tail(url),
                                   "expires_at": doc.get("expires_at"), "emailed": True}
         status, document = self._http("POST", "/dash/orders/status",
                                       {"order_id": order_id, "status": "delivered"}, token)

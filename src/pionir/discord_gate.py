@@ -88,7 +88,15 @@ from .adapters.devto import CROSSPOST as DEVTO_CROSSPOST
 from .adapters.instagram import POST as INSTAGRAM_POST
 from .adapters.products import PUBLISH as PRODUCT_PUBLISH
 from .adapters.products import price_text
-from .quotes import LINK_DAYS, QuoteCardStore, QuoteReplies, days_text, usd
+from .quotes import (
+    LINK_DAYS,
+    QuoteCardStore,
+    QuoteReplies,
+    days_text,
+    owner_reply,
+    parse_reply,
+    usd,
+)
 from .social.card import render_card
 from .social.post import full_caption
 
@@ -663,14 +671,28 @@ def quote_line(to: Any) -> str:
             f"email below goes to {shown}. Nothing happens before that.")
 
 
-def _quote_lines(payload: Mapping[str, Any]) -> list[str]:
-    """The quote as the owner must see it before it goes: his price as read from his reply,
-    the deposit split, the delivery time, what the pay link does, and the WHOLE email."""
+NOT_YOUR_REPLY = ("\u26d4 **NOT FROM YOUR REPLY** - no reply of yours on Discord is recorded "
+                  "for this quote. Deny it: a quote is only ever your own price.")
+
+
+def _quote_lines(payload: Mapping[str, Any],
+                 reply: Mapping[str, Any] | None = None) -> list[str]:
+    """The quote as the owner must see it before it goes: his reply AS THE GATE RECORDED IT
+    (never anything the payload says he wrote), the price, the deposit split, the delivery
+    time, what the pay link does, and the WHOLE email."""
     total, deposit, days = (payload.get("total_cents"), payload.get("deposit_cents"),
                             payload.get("days"))
     lines = [f"**Order:** `{_fence_safe(str(payload.get('order_id')))}`"]
-    if isinstance(payload.get("reply_text"), str):
-        lines.append(f"**Your reply:** `{_fence_safe(payload['reply_text'])}`")
+    defaulted = False
+    if reply is None:
+        lines.append(NOT_YOUR_REPLY)
+    else:
+        text = str(reply.get("text"))
+        lines.append(f"**Your reply:** `{_fence_safe(text)}`")
+        try:
+            defaulted = parse_reply(text).days is None
+        except ValueError:
+            lines.append(NOT_YOUR_REPLY)
     lines.append(f"**Price:** **{_cents(total)}** (USD)")
     if isinstance(deposit, int) and not isinstance(deposit, bool) and deposit > 0 \
             and isinstance(total, int):
@@ -682,8 +704,7 @@ def _quote_lines(payload: Mapping[str, Any]) -> list[str]:
     shown_days = days_text(days) if isinstance(days, int) and not isinstance(days, bool) \
         else repr(days)
     lines.append(f"**Delivery:** {shown_days} from payment"
-                 + (" - **the default: your reply gave no days**"
-                    if payload.get("days_defaulted") is True else ""))
+                 + (" - **the default: your reply gave no days**" if defaulted else ""))
     lines.append(f"**Pay link:** created only on your \u2705; valid {LINK_DAYS} days, then it "
                  "says the quote expired and to reply. Unpaid on day 10: one reminder is "
                  "drafted for your \u2705. A newer reply replaces this quote and stops its link.")
@@ -886,7 +907,8 @@ def _instagram_lines(payload: Mapping[str, Any]) -> list[str]:
 
 def render_request(row: Mapping[str, Any], owner: str | None, *,
                    delivery: Mapping[str, Any] | None = None,
-                   product: Mapping[str, Any] | None = None) -> str:
+                   product: Mapping[str, Any] | None = None,
+                   quote_reply: Mapping[str, Any] | None = None) -> str:
     """The whole text of an approval message, before it is split to fit Discord.
     Nothing that says what the action does is ever cut; long text is split
     across messages instead. ``delivery`` is a client.deliver's zip as inspected on
@@ -974,7 +996,7 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
             shown = {**payload, "body_text": f"(the full message above, "
                                              f"{len(payload['body_text']):,} characters)"}
     if quotes:
-        lines += _quote_lines(payload)
+        lines += _quote_lines(payload, quote_reply)
         if isinstance(payload.get("body_text"), str):
             shown = {**payload, "body_text": f"(the full email above, "
                                              f"{len(payload['body_text']):,} characters)"}
@@ -1200,6 +1222,14 @@ class DiscordGate:
         return preview
 
     def _render(self, row: Mapping[str, Any], preview: Mapping[str, Any] | None) -> str:
+        if row.get("capability") == CLIENT_QUOTE:
+            payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
+            store = (self._quotes.store if self._quotes is not None
+                     else QuoteCardStore.for_state_root(self.settings.state_root))
+            reply = owner_reply(store, payload.get("order_id"), payload.get("quote_ref"))
+            if reply is not None and str(reply.get("by")) != str(self.settings.owner):
+                reply = None
+            return render_request(row, self.settings.owner, quote_reply=reply)
         if row.get("capability") == PRODUCT_PUBLISH:
             return render_request(row, self.settings.owner, product=preview)
         return render_request(row, self.settings.owner, delivery=preview)

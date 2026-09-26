@@ -76,9 +76,16 @@ class ReplyTests(unittest.TestCase):
     def test_anything_else_is_not_guessed_at(self) -> None:
         for text in ["", "   ", "abc", "350k", "$3507d", "1,20", "$350.5", "about 350",
                      "$350 7", "350 or 400", "0", "$5", "$60,000", "$350 0d", "$350 400d",
-                     "-350", "$350 7d please"]:
+                     "-350", "$350 7d please",
+                     # the review's ambiguous ones: never a guess
+                     "15,100d", "$15,100d", "1.2k", "$0", "-5", "$1,200.5", "12,00",
+                     "99999999999999999999", "$50,000.01", "$350,7d", "$350;7d"]:
             with self.assertRaises(ValueError, msg=text):
                 parse_reply(text)
+
+    def test_unambiguous_cents_and_days_still_read(self) -> None:
+        self.assertEqual(parse_reply("$1,200.50 7d"), Price(120_050, 7))
+        self.assertEqual(parse_reply("$15,100 7d"), Price(1_510_000, 7))
 
     def test_the_split_is_a_rule_not_a_suggestion(self) -> None:
         self.assertEqual(deposit_for(49_999, 50_000), 0)
@@ -91,10 +98,10 @@ class ReplyTests(unittest.TestCase):
 
     def test_the_email_states_exactly_what_is_charged(self) -> None:
         order = {"id": ORDER, "email": CLIENT, "name": "Cy"}
-        q = build_quote(order, Price(120_000, None), QuoteSettings(), "1300000000000000999",
-                        "$1,200")
-        self.assertEqual((q["total_cents"], q["deposit_cents"], q["days"], q["days_defaulted"]),
-                         (120_000, 60_000, 7, True))
+        q = build_quote(order, Price(120_000, None), QuoteSettings(), "1300000000000000999")
+        self.assertEqual((q["total_cents"], q["deposit_cents"], q["days"]), (120_000, 60_000, 7))
+        # nothing the owner "wrote" rides in the payload: the card reads it from the record
+        self.assertNotIn("reply_text", q)
         self.assertEqual(q["quote_ref"], "discord-1300000000000000999")
         for words in ("Price: $1,200 (USD)", "within 7 business days of your payment",
                       "- $600 now, a 50% deposit, before work starts",
@@ -102,20 +109,21 @@ class ReplyTests(unittest.TestCase):
                       "{pay_link}", "valid for 14 days"):
             self.assertIn(words, q["body_text"])
         check_quote(q, 50_000)                                     # passes the adapter's check
-        small = build_quote(order, Price(35_000, 5), QuoteSettings(), "1", "$350 5d")
+        small = build_quote(order, Price(35_000, 5), QuoteSettings(), "1")
         self.assertIn("Payment: in full, up front", small["body_text"])
         self.assertEqual(small["deposit_cents"], 0)
 
     def test_the_adapter_refuses_a_quote_whose_words_or_split_disagree(self) -> None:
         order = {"id": ORDER, "email": CLIENT, "name": "Cy"}
-        q = build_quote(order, Price(120_000, 10), QuoteSettings(), "1300000000000000999", "x")
+        q = build_quote(order, Price(120_000, 10), QuoteSettings(), "1300000000000000999")
         for change, why in [({"deposit_cents": 0}, "deposit_cents"),
                             ({"total_cents": 130_000, "deposit_cents": 65_000},
                              r"must state \$1,300"),
                             ({"days": 9}, "9 business days"),
                             ({"body_text": q["body_text"].replace("{pay_link}", "")},
                              "exactly once"),
-                            ({"note": "x"}, "not a quote field")]:
+                            ({"note": "x"}, "not a quote field"),
+                            ({"reply_text": "$1,200 10d"}, "not a quote field")]:
             with self.assertRaisesRegex(ValueError, why):
                 check_quote({**q, **change}, 50_000)
         # the other Pionir's rule: a threshold of $2,000 takes no deposit on $1,200
@@ -233,7 +241,9 @@ class _Gate(unittest.TestCase):
         self.discord = ReplyDiscord()
         self.state = self.root / "state"
         runtime = build_runtime(_settings(self.state, content_url=None))
-        runtime.register(ClientAdapter(ClientSettings(base_url=SCROOGE, token_file=self.ops_file),
+        runtime.register(ClientAdapter(ClientSettings(
+            base_url=SCROOGE, token_file=self.ops_file, owner_user_id=OWNER,
+            quote_store=QuoteCardStore.for_state_root(self.state).path),
                                        opener=self.scrooge))
         runtime.register(QuoteCardAdapter(
             QuoteCardSettings.from_gate(self.settings()), opener=self.discord))
@@ -444,9 +454,10 @@ class ReplyToCardTests(_Gate):
         self.assertEqual(len({q["quote_ref"] for q in self.scrooge.quotes()}), 2)
 
     def test_the_quote_parks_every_time_even_with_its_permission(self) -> None:
-        order = an_order()
-        payload = build_quote(order, Price(35_000, 7), QuoteSettings(), "1300000000000000001", "x")
-        out = self.app.run_task(QUOTE, payload, permissions=[QUOTE])
+        self.discord.reply(self.card(), "$350 7d")
+        self.gate().run_once()
+        (row,) = self.quotes_pending()
+        out = self.app.run_task(QUOTE, dict(row["payload"]), permissions=[QUOTE])
         self.assertEqual(out["status"], "pending_approval")
         self.assertEqual(self.scrooge.quotes(), [])
         caps = {c.name: c for m in self.app.runtime.executive.registry.manifests()
@@ -767,10 +778,107 @@ class HeldDeliveryTests(DeliverCase):
         self.assertIn("<private download link>", text)
 
 
+class ProvenanceTests(_Gate):
+    """A quote is only ever the owner's own Discord reply - not a model's, not a script's."""
+
+    def parked(self) -> list[dict[str, Any]]:
+        return self.quotes_pending()
+
+    def test_a_quote_nobody_replied_is_refused_before_it_is_parked(self) -> None:
+        self.card()
+        forged = build_quote(an_order(), Price(99_000, 3), QuoteSettings(), "1300000000000000001")
+        out = self.app.run_task(QUOTE, forged)
+        self.assertEqual(out["status"], "error")
+        self.assertIn("no reply of the owner's is recorded", out["error"]["message"])
+        self.assertEqual(self.parked(), [])
+
+    def test_a_real_reply_with_another_price_is_refused(self) -> None:
+        mine = self.discord.reply(self.card(), "$350 7d")
+        self.gate().run_once()
+        (row,) = self.parked()
+        for change in ({"total_cents": 90_000}, {"days": 2}):
+            forged = build_quote(an_order(), Price(change.get("total_cents", 35_000),
+                                                   change.get("days", 7)),
+                                 QuoteSettings(), mine)
+            out = self.app.run_task(QUOTE, forged)
+            self.assertEqual(out["status"], "error", change)
+            self.assertIn("the owner replied $350, 7 business days", out["error"]["message"])
+        self.assertEqual([r["id"] for r in self.parked()], [row["id"]])
+
+    def test_someone_elses_reply_in_the_record_does_not_count(self) -> None:
+        head = self.card()
+        other = self.discord.reply(head, "$350 7d", user=STRANGER)
+        # as if the record held a stranger's reply (it never does: the gate does not read them)
+        store = QuoteCardStore.for_state_root(self.state)
+        store.update(lambda d: d["cards"][ORDER]["replies"].__setitem__(other, {
+            "state": "claimed", "by": STRANGER, "text": "$350 7d"}))
+        out = self.app.run_task(QUOTE, build_quote(an_order(), Price(35_000, 7), QuoteSettings(),
+                                                   other))
+        self.assertEqual(out["status"], "error")
+        self.assertIn("not the owner's", out["error"]["message"])
+
+    def test_a_forged_card_says_so_and_shows_no_words_from_the_payload(self) -> None:
+        self.card()
+        forged = {**build_quote(an_order(), Price(99_000, 3), QuoteSettings(), "1300000000000000002"),
+                  "reply_text": "$990 3d"}
+        # parked by going around the check (it cannot be parked through Pionir any more)
+        aid = self.app.approvals.enqueue(QUOTE, forged, [QUOTE], summary="forged")
+        gate = self.gate()
+        gate.run_once()
+        text = self.discord.content(gate._entries[aid]["message_id"])
+        self.assertIn("**NOT FROM YOUR REPLY**", text)
+        self.assertNotIn("**Your reply:** `$990 3d`", text)
+        # and the owner's yes would still send nothing: it is checked again when it runs
+        self.assertEqual(self.approve(aid)["status"], "approved_failed")
+        self.assertEqual(self.scrooge.quotes(), [])
+
+    def test_a_replaced_reply_cannot_be_sent_even_on_a_yes(self) -> None:
+        head = self.card()
+        self.discord.reply(head, "$350 7d")
+        gate = self.gate()
+        gate.run_once()
+        (first,) = self.parked()
+        self.discord.reply(head, "$420 7d")
+        gate.run_once()
+        # the older card was withdrawn; even a claim on it now is refused at execute
+        self.app.approvals.enqueue(QUOTE, first["payload"], [QUOTE], summary="old")
+        old = next(a for a in self.app.approvals.pending() if a["summary"] == "old")
+        self.assertEqual(self.approve(old["id"])["status"], "approved_failed")
+        self.assertEqual(self.scrooge.quotes(), [])
+
+    def test_an_ambiguous_reply_is_answered_and_nothing_is_guessed(self) -> None:
+        head = self.card()
+        for text in ("15,100d", "1.2k", "$0"):
+            self.discord.reply(head, text)
+        self.gate().run_once()
+        self.assertEqual(self.parked(), [])
+        self.assertEqual(len([a for a in self.discord.answers()
+                              if "couldn't read that as a price" in a["content"]]), 3)
+
+
+class LinkRecordTests(HeldDeliveryTests):
+    """No bearer link in Pionir's approval or job records: an id, not the link."""
+
+    def test_a_release_records_the_delivery_id_not_the_link(self) -> None:
+        out = self.app.run_task(RELEASE, self.release())
+        row = self.approve(out)
+        self.assertEqual(row["status"], "approved")
+        dumped = json.dumps([row, self.app.jobs.get(row["task_id"])])
+        self.assertNotIn("b" * 64, dumped)
+        self.assertEqual(row["result"]["result"]["delivery_id"], "dl_" + "9" * 24)
+
+    def test_a_held_delivery_records_no_pay_link(self) -> None:
+        row = self.deliver(self.held())
+        self.assertEqual(row["status"], "approved")
+        self.assertNotIn("a" * 64, json.dumps([row, self.app.jobs.get(row["task_id"])]))
+
+
 class RenderTests(unittest.TestCase):
     def test_the_quote_card_shows_the_default_days_plainly(self) -> None:
-        payload = build_quote(an_order(), Price(35_000, None), QuoteSettings(), "1", "350")
-        text = render_request({"id": "a1", "capability": QUOTE, "payload": payload}, OWNER)
+        payload = build_quote(an_order(), Price(35_000, None), QuoteSettings(), "1")
+        text = render_request({"id": "a1", "capability": QUOTE, "payload": payload}, OWNER,
+                              quote_reply={"text": "350", "by": OWNER, "state": "claimed"})
+        self.assertIn("**Your reply:** `350`", text)
         self.assertIn("**the default: your reply gave no days**", text)
         self.assertIn(f"**Payment:** in full, **{usd(35_000)}**, up front", text)
         self.assertNotIn("SPENDS MONEY", text)

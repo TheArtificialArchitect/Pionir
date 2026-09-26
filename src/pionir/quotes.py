@@ -124,7 +124,8 @@ class QuoteSettings:
 # ---- the reply ------------------------------------------------------------------------------
 _REPLY = re.compile(
     r"\$?\s*(?P<amount>\d{1,3}(?:,\d{3})+|\d+)(?:\.(?P<cents>\d{2}))?(?:\s*(?:usd|dollars?))?"
-    r"(?:(?:\s+|\s*[,;/]\s*)(?P<days>\d{1,3})\s*(?:d|days?|business\s+days?)\.?)?",
+    # the days only after whitespace: "15,100d" is not "$15 over 100 days", it is unreadable
+    r"(?:\s+(?P<days>\d{1,3})\s*(?:d|days?|business\s+days?)\.?)?",
     re.IGNORECASE)
 
 
@@ -199,9 +200,9 @@ def greeting_name(name: Any) -> str:
 
 
 def build_quote(order: Mapping[str, Any], price: Price, settings: QuoteSettings,
-                reply_id: str, reply_text: str) -> dict[str, Any]:
-    """The exact ``client.quote`` payload for this order and the owner's price. Pure.
-    ``reply_text`` and ``days_defaulted`` are shown on the card and never sent."""
+                reply_id: str) -> dict[str, Any]:
+    """The exact ``client.quote`` payload for this order and the owner's price. Pure. What
+    the owner wrote is NOT in it: the card reads his reply from the card record."""
     days = price.days if price.days is not None else settings.default_days
     total = price.total_cents
     deposit = deposit_for(total, settings.deposit_threshold_cents)
@@ -219,9 +220,48 @@ def build_quote(order: Mapping[str, Any], price: Price, settings: QuoteSettings,
         "body_text": QUOTE_BODY.format(name=greeting_name(order.get("name")), order_id=oid,
                                        price=usd(total), days_text=days_text(days),
                                        payment=payment, pay_link=PAY_LINK),
-        "reply_text": reply_text[:200],
-        "days_defaulted": price.days is None,
     }
+
+
+_REF = re.compile(r"discord-(\d{5,25})")
+
+
+def owner_reply(store: QuoteCardStore | None, order_id: Any,
+                quote_ref: Any) -> Mapping[str, Any] | None:
+    """The owner's reply a quote was made from, as the Discord gate recorded it, or None."""
+    m = _REF.fullmatch(quote_ref) if isinstance(quote_ref, str) else None
+    if store is None or m is None or not isinstance(order_id, str):
+        return None
+    card = store.read()["cards"].get(order_id)
+    reply = ((card or {}).get("replies") or {}).get(m.group(1))
+    return reply if isinstance(reply, dict) else None
+
+
+def check_provenance(payload: Mapping[str, Any], store: QuoteCardStore | None,
+                     owner: str | None, default_days: int) -> None:
+    """ValueError unless this quote is exactly what the OWNER replied on Discord: its quote_ref
+    names a reply the gate recorded from the configured owner for this order, still standing
+    (not replaced by a newer reply), and its price and days are what that reply says. A quote
+    made up anywhere else - by a model, a script, a hand - is refused before it is parked."""
+    if store is None or not owner:
+        raise ValueError("quote_ref: a quote comes only from the owner's reply on Discord, "
+                         "and no reply record or owner is configured here")
+    reply = owner_reply(store, payload.get("order_id"), payload.get("quote_ref"))
+    if reply is None:
+        raise ValueError("quote_ref: no reply of the owner's is recorded for this order - a "
+                         "quote comes only from his reply to the quote card")
+    if str(reply.get("by")) != str(owner):
+        raise ValueError("quote_ref: that reply is not the owner's")
+    if reply.get("state") not in ("claimed", "submitted"):
+        raise ValueError(f"quote_ref: that reply is {reply.get('state')}, not a live quote")
+    try:
+        price = parse_reply(reply.get("text"))
+    except ValueError as error:
+        raise ValueError(f"quote_ref: the owner's reply is not a price ({error})") from None
+    days = price.days if price.days is not None else default_days
+    if payload.get("total_cents") != price.total_cents or payload.get("days") != days:
+        raise ValueError(f"total_cents/days: the owner replied {usd(price.total_cents)}, "
+                         f"{days_text(days)}; this quote says otherwise")
 
 
 # ---- the card record --------------------------------------------------------------------------
@@ -360,6 +400,7 @@ class QuoteReplies:
         self._prune()
 
     def _consider(self, call: Call, owner: str, channel: str, message: dict[str, Any]) -> None:
+        # (the reply record carries who wrote it: client.quote checks it is the owner)
         ref = (message.get("message_reference") or {}).get("message_id")
         if ref is None:
             return
@@ -384,7 +425,7 @@ class QuoteReplies:
 
         def claim(d: dict[str, Any]) -> None:
             d["cards"][order_id].setdefault("replies", {})[reply_id] = {
-                "state": "claimed", "at": _now().isoformat(),
+                "state": "claimed", "at": _now().isoformat(), "by": author,
                 "text": str(message.get("content") or "")[:200], "tries": 0,
                 "no_content": empty}
 
@@ -445,7 +486,7 @@ class QuoteReplies:
                          f"⛔ Order `{order_id}` is {shown}, so it can't be quoted. "
                          "Nothing was sent.")
             return
-        payload = build_quote(order, price, self.settings, reply_id, str(reply.get("text")))
+        payload = build_quote(order, price, self.settings, reply_id)
         out = self._submit(QUOTE, payload)
         approval_id = out.get("approval_id") if isinstance(out, Mapping) else None
         if not approval_id or out.get("status") != "pending_approval":
@@ -461,7 +502,7 @@ class QuoteReplies:
                  f"{usd(payload['total_cents'] - payload['deposit_cents'])} on delivery"
                  if payload["deposit_cents"] else "in full up front")
         days = days_text(payload["days"]) + (" (the default - your reply gave no days)"
-                                             if payload["days_defaulted"] else "")
+                                             if price.days is None else "")
         note = (f" Your earlier reply's card (`{'`, `'.join(superseded)}`) was withdrawn."
                 if superseded else "")
         self._answer(call, channel, reply_id,
@@ -478,7 +519,7 @@ class QuoteReplies:
             answer = self._deny(str(r["approval_id"]))
             if isinstance(answer, Mapping) and answer.get("ok"):
                 withdrawn.append(str(r["approval_id"]))
-            self._set(order_id, rid, state="superseded", by=keep)
+            self._set(order_id, rid, state="superseded", superseded_by=keep)
         return withdrawn
 
     def _retry(self, call: Call, channel: str) -> None:
