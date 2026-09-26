@@ -269,15 +269,79 @@ class LimitTests(Base):
         self.assertTrue(self.run_note(adapter, _note())["ok"])
         self.assertTrue(self.run_note(adapter, _note())["ok"])
 
-    def test_an_unreadable_record_sends_nothing(self) -> None:
-        """Fail closed: a record that cannot be read means the limit is unknown."""
+    def test_an_unreadable_record_is_set_aside_and_holds_for_a_day_then_recovers(self) -> None:
+        """Fail safe, with a way back: a record that cannot be read means the count is
+        unknown, so the window is full - until 24 hours pass, with no one deleting a file.
+        Reverted: every note is unavailable forever, and nothing is logged."""
         path = self.root / "discord" / "owner-notify.json"
         path.parent.mkdir(parents=True)
         path.write_text("{not json", encoding="utf-8")
-        out = self.run_note(self.adapter(), _note())
+        with self.assertLogs("pionir.adapters.owner", level=logging.ERROR) as logs:
+            out = self.run_note(self.adapter(), _note())
         self.assertFalse(out["ok"])
-        self.assertIn("unreadable", out["unavailable"])
+        self.assertIn("unreadable and was set aside", out["refused"])
+        self.assertIn("unreadable", "\n".join(logs.output))
+        aside = [p.name for p in path.parent.iterdir() if ".corrupt-" in p.name]
+        self.assertEqual(len(aside), 1)
+        self.assertEqual((path.parent / aside[0]).read_text(encoding="utf-8"), "{not json")
+        # the hold survives a restart, and holds alerts too
+        self.clock.at += timedelta(hours=23)
+        self.assertIn("refused", self.run_note(self.adapter(), _note("alert", title="Order")))
         self.assertEqual(self.discord.calls, [])
+        # a day on, it recovers by itself
+        self.clock.at += timedelta(hours=1, seconds=1)
+        self.assertTrue(self.run_note(self.adapter(), _note())["ok"])
+        self.assertEqual(len(self.discord.posts()), 1)
+
+    def test_a_record_that_cannot_be_saved_after_the_send_is_ok_and_still_counted(
+            self) -> None:
+        """Reverted (send, then record): the save error escapes, the breaker trips, the
+        send is uncounted and Moss's retry posts it twice, past the cap."""
+        adapter = self.adapter()
+        real = adapter._save
+        calls = {"n": 0}
+
+        def flaky(sent: list[dict[str, Any]]) -> None:
+            calls["n"] += 1
+            if calls["n"] == 2:                  # the write after the first send
+                raise PermissionError("held by a scanner")
+            real(sent)
+
+        adapter._save = flaky  # type: ignore[method-assign]
+        with self.assertLogs("pionir.adapters.owner", level=logging.ERROR):
+            first = self.run_note(adapter, _note())
+        self.assertIs(first["ok"], True)
+        self.assertIs(first["record_saved"], False)
+        self.assertTrue(self.run_note(adapter, _note())["ok"])
+        self.assertIn("refused", self.run_note(adapter, _note()))   # the first still counts
+        self.assertEqual(len(self.discord.posts()), BRIEFS_PER_DAY)
+
+    def test_status_does_not_wait_on_a_slow_send(self) -> None:
+        """Reverted (the send under the state lock): health and doctor hang for as long
+        as Discord takes - minutes, with 429 retries."""
+        release, entered = threading.Event(), threading.Event()
+        fake = self.discord
+
+        def slow(request: Any, timeout: float | None = None) -> Any:
+            entered.set()
+            release.wait(10)
+            return fake(request, timeout)
+
+        adapter = OwnerNotifyAdapter(self.settings(), opener=slow, clock=self.clock)
+        sender = threading.Thread(target=lambda: self.run_note(adapter, _note()))
+        sender.start()
+        self.addCleanup(sender.join, 10)
+        self.addCleanup(release.set)
+        self.assertTrue(entered.wait(5))
+        got: list[Any] = []
+        probe = threading.Thread(target=lambda: got.append(adapter.status()))
+        probe.start()
+        probe.join(2)
+        self.assertFalse(probe.is_alive(), "status() waited on the send")
+        self.assertEqual(got[0]["sent_24h"], {"brief": 1, "alert": 0})   # the reservation
+        release.set()
+        sender.join(10)
+        self.assertEqual(adapter.status()["sent_24h"], {"brief": 1, "alert": 0})
 
     def test_concurrent_notes_never_squeeze_past_the_limit(self) -> None:
         adapter = self.adapter()

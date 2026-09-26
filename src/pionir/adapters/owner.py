@@ -18,6 +18,11 @@ does not reset it. Over the limit is ``ok: false`` with ``refused`` (Moss's side
 it as refused, not as a fault). Discord not configured, the token rejected, Discord not
 answering: ``ok: false`` with ``unavailable``. Neither trips the circuit breaker.
 
+A slot is reserved in the record before the send and settled after it; the send itself
+holds no lock, so a slow Discord never holds up ``status()``. An unreadable record is set
+aside (``.corrupt-<time>``) and logged, and the window counts as full for 24 hours - then
+it recovers by itself.
+
 The payload is checked before anything is sent (``validate``, which Pionir's /api/task
 runs first): ``title`` 5-80 characters on one line, ``body_text`` 20-1800 characters of
 plain text, ``kind`` "brief" or "alert", and no other field. Mentions are neutralised in
@@ -36,6 +41,7 @@ import json
 import logging
 import re
 import threading
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -179,6 +185,7 @@ class OwnerNotifyAdapter:
         self._opener = opener
         self._clock = clock or _now
         self._lock = threading.Lock()
+        self._stand_ins: list[dict[str, Any]] = []   # an unreadable record's full window
         self._manifest = AgentManifest(
             agent_id="owner", version="pionir/owner",
             capabilities=(Capability(
@@ -200,6 +207,8 @@ class OwnerNotifyAdapter:
     def status(self) -> Mapping[str, Any]:
         if not self.settings.configured:
             raise AdapterUnavailable(f"{NOTIFY}: {self.settings.why_not()}")
+        # the lock is only ever held for a file read or write, never across a send, so
+        # health and doctor do not wait on Discord
         with self._lock:
             sent = self._load()
         now = self._clock()
@@ -223,20 +232,47 @@ class OwnerNotifyAdapter:
 
     # ---- the record ----------------------------------------------------------------
     def _load(self) -> list[dict[str, Any]]:
-        """What was sent, from Pionir's state. ValueError when the record exists but
-        cannot be read: the limit is then unknown, so nothing is sent (fail closed)."""
+        """What was sent (and is being sent), from Pionir's state. A record that exists
+        but cannot be read is set aside (``_quarantine``): the count is then unknown, so
+        the window is treated as full until 24 hours have passed, and then it recovers."""
         path = self.settings.state_path
-        if not path.exists():
-            return []
+        sent: list[dict[str, Any]] = []
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                listed = data.get("sent") if isinstance(data, dict) else None
+                if not isinstance(listed, list):
+                    raise ValueError("no 'sent' list")  # noqa: TRY004 - one unreadable path
+            except (OSError, ValueError) as error:
+                return self._quarantine(path, error)
+            sent = [e for e in listed if isinstance(e, dict)]
+        # stand-ins for an unreadable record count even when they could not be saved
+        now = self._clock()
+        self._stand_ins = [e for e in self._stand_ins if self._recent([e], e["kind"], now)]
+        return sent + [e for e in self._stand_ins if e not in sent]
+
+    def _quarantine(self, path: Path, error: Exception) -> list[dict[str, Any]]:
+        """As the Discord gate does with its own corrupt state: keep the bad file aside for
+        a look and say so loudly. Failing safe means the rolling window is full - a
+        stand-in for every slot, dated now - so nothing is sent for 24 hours; then the
+        stand-ins age out like any send and notes flow again, with no one deleting a file."""
+        now = self._clock()
+        keep = path.with_name(f"{path.name}.corrupt-{int(now.timestamp())}")
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as error:
-            raise ValueError(f"its send record {path} is unreadable ({type(error).__name__})"
-                             ) from None
-        sent = data.get("sent") if isinstance(data, dict) else None
-        if not isinstance(sent, list):
-            raise ValueError(f"its send record {path} has no 'sent' list")  # noqa: TRY004
-        return [e for e in sent if isinstance(e, dict)]
+            path.replace(keep)
+        except OSError:
+            keep = path
+        at = now.isoformat(timespec="seconds")
+        self._stand_ins = [{"kind": k, "at": at, "message_id": None, "stand_in": True}
+                           for k in KINDS for _ in range(LIMITS[k])]
+        _log.error("%s: send record unreadable (%s: %s), kept at %s; no note is sent until "
+                   "24 hours have passed", NOTIFY, type(error).__name__, error, keep)
+        try:
+            self._save(list(self._stand_ins))
+        except OSError as save_error:
+            _log.error("%s: the stand-in record could not be saved (%s); held in memory",
+                       NOTIFY, type(save_error).__name__)
+        return list(self._stand_ins)
 
     def _save(self, sent: list[dict[str, Any]]) -> None:
         path = self.settings.state_path
@@ -268,16 +304,13 @@ class OwnerNotifyAdapter:
         if not self.settings.configured:
             why = f"{NOTIFY}: {self.settings.why_not()}"
             return self._result(task, note, {"ok": False, "unavailable": why, "error": why})
-        # One note at a time, check-send-record under one lock: two at once must not
-        # both squeeze under the limit.
+        # Reserve, send, settle. The slot is recorded (under the lock) BEFORE the send, so
+        # two notes at once cannot both squeeze under the limit and a send whose record
+        # fails afterwards is still counted; the send itself runs outside the lock, so a
+        # slow Discord (429 retries, 20 s timeouts) never holds up status() or health.
         with self._lock:
             now = self._clock()
-            try:
-                sent = self._load()
-            except ValueError as error:
-                why = f"{NOTIFY}: {error}; nothing is sent until it is fixed or removed"
-                return self._result(task, note, {"ok": False, "unavailable": why,
-                                                 "error": why})
+            sent = self._load()
             recent = self._recent(sent, note.kind, now)
             limit = LIMITS[note.kind]
             if len(recent) >= limit:
@@ -285,20 +318,61 @@ class OwnerNotifyAdapter:
                 plural = "briefs" if note.kind == "brief" else "alerts"
                 why = (f"{NOTIFY}: the limit of {limit} {plural} in any 24 hours is reached; "
                        f"the next one can go at {next_at}")
+                if any(e.get("stand_in") and self._recent([e], note.kind, now) for e in sent):
+                    why = (f"{NOTIFY}: the send record was unreadable and was set aside, so "
+                           "the count is unknown and treated as full; the next one can go "
+                           f"at {next_at}")
                 return self._result(task, note, {"ok": False, "refused": why, "error": why,
                                                  "kind": note.kind, "limit": limit,
                                                  "next_at": next_at})
-            outcome = self._send(note)
-            if outcome.get("ok") is not True:
-                return self._result(task, note, outcome)
             at = now.isoformat(timespec="seconds")
+            slot = uuid.uuid4().hex
             # only the last 24 hours are kept: the record never grows past the limits
             keep = [e for e in sent if e.get("kind") in KINDS
                     and self._recent([e], str(e["kind"]), now)]
-            keep.append({"kind": note.kind, "at": at, "message_id": outcome["message_id"]})
-            self._save(keep)
-            remaining = {k: max(0, LIMITS[k] - len(self._recent(keep, k, now))) for k in KINDS}
-        return self._result(task, note, {**outcome, "sent_at": at, "remaining": remaining})
+            keep.append({"kind": note.kind, "at": at, "message_id": None, "slot": slot})
+            try:
+                self._save(keep)
+            except OSError as error:
+                why = (f"{NOTIFY}: the send record could not be written "
+                       f"({type(error).__name__}); nothing was sent")
+                _log.error("%s", why)
+                return self._result(task, note, {"ok": False, "unavailable": why,
+                                                 "error": why})
+        outcome = self._send(note)
+        sent_ok = outcome.get("ok") is True
+        with self._lock:
+            saved = self._settle(slot, outcome["message_id"] if sent_ok else None)
+            recorded = self._load()
+        if not sent_ok:
+            return self._result(task, note, outcome)
+        remaining = {k: max(0, LIMITS[k] - len(self._recent(recorded, k, now))) for k in KINDS}
+        done = {**outcome, "sent_at": at, "remaining": remaining}
+        if not saved:
+            done["record_saved"] = False
+        return self._result(task, note, done)
+
+    def _settle(self, slot: str, message_id: str | None) -> bool:
+        """The reserved slot: given its message id when the note went, removed when it did
+        not (a note Discord did not take does not count). False when the record could not
+        be written - logged, never raised: a sent note then stays counted by its
+        reservation, and a failed one holds its slot until it ages out (never an extra
+        send)."""
+        sent = self._load()
+        if message_id is None:
+            sent = [e for e in sent if e.get("slot") != slot]
+        else:
+            for entry in sent:
+                if entry.get("slot") == slot:
+                    entry.pop("slot")
+                    entry["message_id"] = message_id
+        try:
+            self._save(sent)
+        except OSError as error:
+            _log.error("%s: the send record could not be updated after the send (%s); the "
+                       "slot stays reserved", NOTIFY, type(error).__name__)
+            return False
+        return True
 
     def _send(self, note: Note) -> dict[str, Any]:
         # Imported here: pionir.discord_gate imports this package, so a module-level
