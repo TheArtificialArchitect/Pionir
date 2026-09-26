@@ -24,6 +24,25 @@ the other side says no to comes back as ``ok: false`` with ``refused``; a missin
 token, or a service that does not answer, as ``ok: false`` with ``unavailable`` - answers,
 not faults, so the circuit breaker is not tripped. Nothing here runs in the background: the
 Instagram token is refreshed (when it is over 7 days old) on the way to a post.
+
+``social.instagram_insights`` is the other direction: READ_ONLY, ``routable=False``, no
+approval (it reads the account's own numbers and changes nothing). Payload
+``{"media_ids": [<= 25 ids]}``, or ``{"recent": N <= 25}`` for the account's latest media
+(``GET /{user_id}/media?fields=id,permalink,timestamp,caption`` - the caption is not passed
+on: it is words, not a figure). For each media: ``GET /{media_id}/insights?metric=...``
+with the metrics Meta documents for an IMAGE (FEED) post under Instagram Login
+(``IMAGE_METRICS``; reference:
+https://developers.facebook.com/documentation/instagram-platform/reference/instagram-media/insights
+). The endpoint needs the ``instagram_business_manage_insights`` permission on top of
+``instagram_business_basic``: a token without it gets a plain unavailable naming the scope.
+
+Honest numbers only. Meta returns an empty data set, not 0, for a metric it has no data for;
+that metric is listed in ``unavailable`` and given no number. A metric Meta rejects for a
+media (Graph code 100 on the combined call) degrades only that metric: the call is retried
+one metric at a time. A media Meta will not answer for at all has every metric unavailable
+and says why. A rejected token (190), a missing permission, a rate limit or a Graph that
+does not answer fails the whole call - a partial answer read through a dead token is not
+an answer.
 """
 
 from __future__ import annotations
@@ -53,6 +72,16 @@ from pionir.social.post import check_post, full_caption
 _log = logging.getLogger(__name__)
 
 POST = "social.instagram_post"
+INSIGHTS = "social.instagram_insights"
+INSIGHTS_SCOPE = "instagram_business_manage_insights"
+# The Media Insights metrics valid for an IMAGE (FEED) post under Instagram Login, per
+# https://developers.facebook.com/documentation/instagram-platform/reference/instagram-media/insights
+# (total_likes / total_comments / total_views are Facebook Login only; impressions is
+# deprecated for media created after 2024-07-02). Every one is a lifetime total.
+IMAGE_METRICS = ("reach", "likes", "comments", "saved", "shares", "total_interactions",
+                 "views")
+MAX_INSIGHT_MEDIA = 25
+INSIGHTS_PERIOD = "lifetime"
 DEFAULT_GRAPH_URL = "https://graph.instagram.com/v25.0"
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_MEDIA_BYTES = 1_500_000            # Scrooge's /dash/content/media limit
@@ -62,6 +91,13 @@ REFRESH_AFTER = timedelta(days=7)
 REFRESH_MIN_AGE = timedelta(hours=24)  # Meta refuses to refresh a token younger than this
 SETUP_HINT = r"run tools\setup-instagram.ps1"
 TOKEN_REJECTED = f"the Instagram token was rejected or has expired - {SETUP_HINT}"
+PERMISSION_MISSING = (f"the Instagram token does not carry the {INSIGHTS_SCOPE} permission, "
+                      "so insights are unavailable - add it to the app's Instagram Login "
+                      f"permissions, generate a new token and {SETUP_HINT}")
+# Graph codes that mean the token lacks a permission (10 only when it says so: code 10 is
+# also "not enough viewers" and "posted before the business conversion", which are per-media).
+_PERMISSION_CODES = frozenset(range(200, 300))
+_MEDIA_ID_CHARS = frozenset("0123456789")
 # Graph codes that mean "not now" rather than "no": rate limits and throttling.
 _RATE_LIMIT_CODES = frozenset({4, 17, 32, 613})
 
@@ -127,6 +163,11 @@ def _write_token_file(path: Path, document: Mapping[str, Any]) -> None:
         raise
 
 
+def _text(document: Any, key: str) -> str | None:
+    value = document.get(key) if isinstance(document, Mapping) else None
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def _check_url(url: str, what: str) -> None:
     parsed = urllib.parse.urlparse(url)
     loopback = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
@@ -175,6 +216,11 @@ class _Failure(Exception):
         self.output = output
 
 
+class _Fatal(_Failure):
+    """A failure that is not about one media or metric (the token, the permission, a rate
+    limit, no answer): it ends an insights read instead of degrading one entry."""
+
+
 def _refused(why: str, **extra: Any) -> _Failure:
     return _Failure({"ok": False, "refused": why, "error": why, **extra})
 
@@ -183,8 +229,58 @@ def _unavailable(why: str, **extra: Any) -> _Failure:
     return _Failure({"ok": False, "unavailable": why, "error": why, **extra})
 
 
+def check_insights(payload: Any) -> dict[str, Any]:
+    """``{"media_ids": [...]}`` (at most 25 numeric ids, repeats dropped) or ``{"recent": N}``
+    (1..25), exactly one of them - or ValueError("<field>: <why>")."""
+    if not isinstance(payload, Mapping):
+        raise ValueError("insights: must be an object")  # noqa: TRY004
+    unknown = sorted(set(payload) - {"media_ids", "recent"})
+    if unknown:
+        raise ValueError(f"insights: unknown field(s) {', '.join(unknown)}")
+    if ("media_ids" in payload) == ("recent" in payload):
+        raise ValueError("insights: give media_ids or recent, not both and not neither")
+    if "recent" in payload:
+        n = payload["recent"]
+        if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= MAX_INSIGHT_MEDIA:
+            raise ValueError(f"recent: a whole number from 1 to {MAX_INSIGHT_MEDIA}")
+        return {"recent": n}
+    ids = payload["media_ids"]
+    if not isinstance(ids, list) or not ids:
+        raise ValueError("media_ids: a non-empty list")
+    out: list[str] = []
+    for raw in ids:
+        mid = str(raw) if isinstance(raw, int) and not isinstance(raw, bool) else raw
+        if not isinstance(mid, str) or not mid or len(mid) > 40 \
+                or not set(mid) <= _MEDIA_ID_CHARS:
+            raise ValueError(f"media_ids: {raw!r} is not an Instagram media id")
+        if mid not in out:
+            out.append(mid)
+    if len(out) > MAX_INSIGHT_MEDIA:
+        raise ValueError(f"media_ids: at most {MAX_INSIGHT_MEDIA}, not {len(out)}")
+    return {"media_ids": out}
+
+
+def _metric_value(row: Mapping[str, Any]) -> int | None:
+    """A metric row's lifetime value as a whole count, or None: never a default zero."""
+    total = row.get("total_value")
+    if isinstance(total, Mapping) and "value" in total:
+        value = total.get("value")
+    else:
+        values = row.get("values")
+        if not isinstance(values, list) or len(values) != 1 \
+                or not isinstance(values[0], Mapping):
+            return None
+        value = values[0].get("value")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < 0 or not float(value).is_integer():
+        return None
+    return int(value)
+
+
 class InstagramAdapter:
-    """Posting to the Dokaz Instagram as a gated, audited Pionir capability."""
+    """Posting to the Dokaz Instagram as a gated, audited Pionir capability, and reading
+    what its posts did."""
 
     def __init__(self, settings: InstagramSettings | None = None, *,
                  opener: Opener | None = None,
@@ -207,6 +303,13 @@ class InstagramAdapter:
                     risk=RiskLevel.PRIVILEGED,
                     required_permissions=frozenset({POST}),
                     requires_approval=True,
+                    routable=False,
+                ),
+                Capability(
+                    name=INSIGHTS,
+                    description="Read the lifetime insights (reach, likes, comments, saves, "
+                                "shares, interactions, views) of the Dokaz Instagram's posts",
+                    risk=RiskLevel.READ_ONLY,
                     routable=False,
                 ),
             ),
@@ -241,6 +344,9 @@ class InstagramAdapter:
     # ---- the request -----------------------------------------------------------------
     def validate(self, task: Task) -> None:
         """Refuse a bad post, or a post that cannot run, before it is parked."""
+        if task.capability == INSIGHTS:
+            self._check_insights(task)
+            return
         self._check(task)
         why = self._not_configured()
         if why:
@@ -256,8 +362,17 @@ class InstagramAdapter:
         except ValueError as error:
             raise AdapterProtocolError(f"{POST} refused by Pionir - {error}") from error
 
+    @staticmethod
+    def _check_insights(task: Task) -> dict[str, Any]:
+        try:
+            return check_insights(task.payload)
+        except ValueError as error:
+            raise AdapterProtocolError(f"{INSIGHTS} refused by Pionir - {error}") from error
+
     # ---- the call --------------------------------------------------------------------
     def execute(self, task: Task) -> TaskResult:
+        if task.capability == INSIGHTS:
+            return self._execute_insights(task)
         post = self._check(task)
         why = self._not_configured()
         ig = read_instagram_token(self.settings.token_file)
@@ -328,6 +443,127 @@ class InstagramAdapter:
         except _Failure as failure:
             result["permalink_error"] = failure.output.get("error")
         return result
+
+    # ---- insights -----------------------------------------------------------------------
+    def _execute_insights(self, task: Task) -> TaskResult:
+        request = self._check_insights(task)
+        ig = read_instagram_token(self.settings.token_file)
+        if ig is None:
+            why = (f"not configured: no usable Instagram token at {self.settings.token_file} "
+                   f"- {SETUP_HINT}")
+            return self._result(task, {"ok": False, "unavailable": why, "error": why,
+                                       "not_configured": True})
+        secrets = [ig.access_token]
+        try:
+            output = self._insights(request, ig, secrets)
+        except _Failure as failure:
+            output = failure.output
+        # the same belt and braces as a post: no secret leaves in the result
+        return self._result(task, json.loads(self._scrub(json.dumps(output), secrets)))
+
+    def _insights(self, request: Mapping[str, Any], ig: InstagramToken,
+                  secrets: list[str]) -> dict[str, Any]:
+        access = self._fresh_token(ig, secrets)
+        secrets.append(access)
+        if "recent" in request:
+            listing = self._insight_call(
+                f"/{urllib.parse.quote(ig.user_id, safe='')}/media", "media list", secrets,
+                access, {"fields": "id,permalink,timestamp,caption",
+                         "limit": str(request["recent"])})
+            data = listing.get("data")
+            if not isinstance(data, list):
+                raise _unavailable("Instagram answered the media list without a data list")
+            rows = []
+            for item in data[:request["recent"]]:
+                mid = item.get("id") if isinstance(item, Mapping) else None
+                if isinstance(mid, (str, int)) and not isinstance(mid, bool) \
+                        and set(str(mid)) <= _MEDIA_ID_CHARS and str(mid):
+                    rows.append({"media_id": str(mid), "permalink": _text(item, "permalink"),
+                                 "timestamp": _text(item, "timestamp")})
+        else:
+            rows = [self._media_row(mid, secrets, access) for mid in request["media_ids"]]
+        for row in rows:
+            if row.get("error") is None:
+                row.update(self._media_metrics(row["media_id"], secrets, access))
+            else:
+                row.update(metrics={}, unavailable=list(IMAGE_METRICS))
+        return {"ok": True, "period": INSIGHTS_PERIOD, "measured_at": _iso(self._clock()),
+                "metrics_requested": list(IMAGE_METRICS), "media": rows}
+
+    def _media_row(self, mid: str, secrets: list[str], access: str) -> dict[str, Any]:
+        """The media's permalink and time; a media Instagram will not describe keeps its
+        row, with every metric unavailable and the reason."""
+        row: dict[str, Any] = {"media_id": mid, "permalink": None, "timestamp": None}
+        try:
+            info = self._insight_call(f"/{urllib.parse.quote(mid, safe='')}", "media",
+                                      secrets, access, {"fields": "id,permalink,timestamp"})
+        except _Fatal:
+            raise
+        except _Failure as failure:
+            row["error"] = failure.output.get("error")
+            return row
+        row["permalink"] = _text(info, "permalink")
+        row["timestamp"] = _text(info, "timestamp")
+        return row
+
+    def _media_metrics(self, mid: str, secrets: list[str], access: str) -> dict[str, Any]:
+        """``{metrics, unavailable[, error]}`` for one media: every metric in one call, and
+        only when Meta rejects a metric (code 100), one call per metric."""
+        path = f"/{urllib.parse.quote(mid, safe='')}/insights"
+        try:
+            got = self._insight_call(path, "insights", secrets, access,
+                                     {"metric": ",".join(IMAGE_METRICS)})
+        except _Fatal:
+            raise
+        except _Failure as failure:
+            if failure.output.get("graph_code") != 100:
+                return {"metrics": {}, "unavailable": list(IMAGE_METRICS),
+                        "error": failure.output.get("error")}
+            metrics: dict[str, int] = {}
+            for name in IMAGE_METRICS:
+                try:
+                    one = self._insight_call(path, "insights", secrets, access,
+                                             {"metric": name})
+                except _Fatal:
+                    raise
+                except _Failure:
+                    continue            # this metric only: listed as unavailable below
+                metrics.update(self._parse_metrics(one, (name,)))
+        else:
+            metrics = self._parse_metrics(got, IMAGE_METRICS)
+        return {"metrics": metrics,
+                "unavailable": [n for n in IMAGE_METRICS if n not in metrics]}
+
+    @staticmethod
+    def _parse_metrics(document: Mapping[str, Any], wanted: tuple[str, ...]) -> dict[str, int]:
+        data = document.get("data")
+        out: dict[str, int] = {}
+        for row in data if isinstance(data, list) else []:
+            if not isinstance(row, Mapping) or row.get("name") not in wanted:
+                continue
+            value = _metric_value(row)
+            if value is not None:
+                out[str(row["name"])] = value
+        return out
+
+    def _insight_call(self, path: str, step: str, secrets: list[str], access: str,
+                      query: Mapping[str, str]) -> Mapping[str, Any]:
+        """A read for insights. A failure about the token, the permission or the service
+        (not about this media) is raised as fatal and stops the whole call; a refusal about
+        this media or metric is raised for the caller to degrade."""
+        try:
+            return self._graph_call("GET", path, step, secrets, access, query=query)
+        except _Failure as failure:
+            out = failure.output
+            code = out.get("graph_code")
+            said = str(out.get("error") or "").lower()
+            if code in _PERMISSION_CODES or (code == 10 and "permission" in said):
+                raise _Fatal(_unavailable(
+                    PERMISSION_MISSING, permission_missing=True, scope=INSIGHTS_SCOPE,
+                    step=step, status=out.get("status"), graph_code=code).output) from None
+            if out.get("unavailable") is not None:
+                raise _Fatal(out) from None
+            raise
 
     def _wait_for(self, container: str, secrets: list[str], access: str,
                   image_url: str) -> None:
@@ -519,6 +755,9 @@ class InstagramAdapter:
         return text
 
     def _result(self, task: Task, output: dict[str, Any]) -> TaskResult:
+        if task.capability == INSIGHTS:
+            return TaskResult(task_id=task.task_id, agent_id=self.manifest.agent_id,
+                              output=output, evidence=("instagram:insights",))
         evidence = ["instagram:post"]
         if output.get("ok") is True and output.get("media_id"):
             evidence.append(f"instagram:media:{output['media_id']}")

@@ -111,6 +111,16 @@ def permalink(result) -> str | None:
     return None
 
 
+def media_id(result) -> str | None:
+    """The published post's Instagram media id from Pionir's result (the adapter's
+    ``media_id``), or None. Only an all-digit id counts: it goes into a Graph path."""
+    raw = result.get("media_id") if isinstance(result, dict) else None
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        raw = str(raw)
+    ok = isinstance(raw, str) and raw.isascii() and raw.isdigit() and len(raw) <= 40
+    return raw if ok else None
+
+
 def _clean_tags(tags) -> object:
     """Hashtags as Instagram wants them - lower case, no #, no spaces, no repeats, at most
     ``MAX_HASHTAGS``. Anything that is not a list of strings is left for the check to
@@ -219,6 +229,15 @@ class InstagramWorker(DailyPoster):
 
     def published_link(self, result, post: dict) -> str | None:
         return permalink(result)
+
+    def _settle_done(self, ctx: WorkContext, rec: dict, post: dict, out, events: list) -> None:
+        """As every poster, and a published post also keeps Instagram's media id: the
+        results worker reads its insights by it (``social.instagram_insights``)."""
+        super()._settle_done(ctx, rec, post, out, events)
+        if post.get("status") == "published":
+            mid = media_id(out.result)
+            if mid is not None:
+                post["media_id"] = mid
 
     def _describe(self, draft: dict) -> dict:
         return {"headline": draft.get("headline")}

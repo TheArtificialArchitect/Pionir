@@ -277,8 +277,9 @@ class _Case(unittest.TestCase):
 # ---- the gate ---------------------------------------------------------------------
 class GateTests(_Case):
     def test_it_is_declared_as_always_approved_and_never_routed(self) -> None:
-        (cap,) = self.adapter.manifest.capabilities
-        self.assertEqual(cap.name, "social.instagram_post")
+        caps = {c.name: c for c in self.adapter.manifest.capabilities}
+        self.assertEqual(set(caps), {"social.instagram_post", "social.instagram_insights"})
+        cap = caps["social.instagram_post"]
         self.assertTrue(cap.requires_approval)
         self.assertIs(cap.risk, RiskLevel.PRIVILEGED)
         self.assertFalse(cap.routable)

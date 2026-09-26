@@ -15,7 +15,10 @@
   Where the token comes from (Instagram API with Instagram Login): Meta for Developers >
   your app > Instagram > API setup with Instagram login > Generate access tokens, for the
   Dokaz account. It is a long string that usually starts with IG. A token that starts
-  with EAA is a Facebook Login token and will not work here.
+  with EAA is a Facebook Login token and will not work here. The app needs the
+  instagram_business_basic and instagram_business_content_publish permissions to post, and
+  instagram_business_manage_insights for the posts' insights (social.instagram_insights):
+  add any that are missing on the app's permissions page BEFORE generating the token.
 
   After this, check it any time with:  python -m pionir instagram-check
 
