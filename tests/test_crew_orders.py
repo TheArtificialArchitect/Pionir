@@ -133,11 +133,11 @@ class _Case(unittest.TestCase):
 
 
 class CatalogueTests(unittest.TestCase):
-    def test_the_order_desk_is_the_contracts_division_every_fifteen_minutes(self) -> None:
+    def test_the_order_desk_is_the_contracts_division_every_five_minutes(self) -> None:
         reg = default_registry()
         w = reg.require("contracts.orders")
         self.assertIsInstance(w, OrderDesk)
-        self.assertEqual((w.division, w.cadence_seconds, w.live), ("contracts", 900, True))
+        self.assertEqual((w.division, w.cadence_seconds, w.live), ("contracts", 300, True))
         notes = reg.division("contracts").leader_notes
         self.assertIn("NEW PAID ORDERS", notes)
         self.assertIn("Never promise", notes)

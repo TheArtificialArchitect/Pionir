@@ -84,7 +84,7 @@
                       "delivery.delivered": 5, "delivery.not_delivered": 5,
                       "delivery.template_blocked": 3, "delivery.not_set_up": 2},
       "workers": [
-        {"name": "orders", "impl": "order_desk", "kind": "order", "cadence_seconds": 900,
+        {"name": "orders", "impl": "order_desk", "kind": "order", "cadence_seconds": 300,
          "provider": "none", "entities": ["Dokaz", "Stripe"],
          "note": "every client order answered by fixed template (acknowledgement, quote acknowledgement or decline), each email for the owner's approval; no model"},
         {"name": "delivery", "impl": "delivery_desk", "kind": "delivery", "cadence_seconds": 600,
