@@ -32,6 +32,7 @@ from urllib.parse import parse_qs, urlparse
 from . import atomic
 from .approvals import ApprovalQueue
 from .batching import (
+    BATCHED_GRANT,
     DigestSettings,
     batch_refusal,
     local_now,
@@ -667,6 +668,24 @@ class PionirApp:
         return (cap.risk is RiskLevel.PRIVILEGED
                 and not set(cap.required_permissions).issubset(set(granted)))
 
+    def _park_context(self, capability: str, payload: dict[str, Any],
+                      granted: list[str]) -> dict[str, Any] | None:
+        """What the capability's adapter finds about this request as it is parked (a
+        product: is there already a listing with this permalink, at what price), kept on
+        the approval row for the card and the batching decision. Never blocks parking: a
+        failure is recorded as a context that refuses batching."""
+        agent_id, _cap = self._cap_and_agent(capability)
+        adapter = self.runtime.adapters.get(agent_id) if agent_id else None
+        look = getattr(adapter, "park_context", None)
+        if not callable(look):
+            return None
+        try:
+            found = look(Task(capability, payload, frozenset(granted)))
+        except Exception as error:  # noqa: BLE001 - shown on the card, never batched
+            return {"listing": "unknown", "batch_refusal": "could not check before parking",
+                    "problem": f"{type(error).__name__}: {error}"[:300]}
+        return dict(found) if isinstance(found, Mapping) else None
+
     def _summarize(self, capability: str, payload: dict[str, Any]) -> str:
         agent, _cap = self._cap_and_agent(capability)
         who = agent or capability.split(".")[0]
@@ -736,12 +755,15 @@ class PionirApp:
             summary = self._summarize(capability, payload)
             # Routine public items wait for the owner's daily digest; money and clients
             # never do (pionir/batching.py). Either way it is the same queue record.
-            batch = self.digest.enabled and batch_refusal(cap, payload) is None
-            digest_date = self.digest.next_digest(local_now()).date().isoformat()                 if batch else None
+            context = self._park_context(capability, payload, granted)
+            batch = self.digest.enabled and batch_refusal(cap, payload, context) is None
+            digest_date = self.digest.next_digest(local_now()).date().isoformat() \
+                    if batch else None
             approval_id = self.approvals.enqueue(
                 capability, payload, sorted(cap.required_permissions), summary=summary,
                 batch=batch, digest_date=digest_date,
                 expires_after=self.digest.expires_after if batch else None,
+                context=context,
             )
             response = {
                 "ok": False,
@@ -893,13 +915,18 @@ class PionirApp:
             if not self.approvals.resolve(approval_id, status, response, from_status="running"):
                 _log.warning("approval %s was not running when its job finished", approval_id)
 
-        # run it with exactly the permission it needed - never wider
+        # run it with exactly the permission it needed - never wider. A batched row also
+        # carries BATCHED_GRANT (a restriction, not a power): its adapter refuses if the
+        # case it was batched for no longer holds (a "new" listing that now exists).
+        permissions = list(record["permissions"])
+        if record.get("batch"):
+            permissions.append(BATCHED_GRANT)
         response = self._submit(
             "approval",
             {"approval_id": approval_id, "capability": record["capability"],
-             "payload": record["payload"], "permissions": record["permissions"]},
+             "payload": record["payload"], "permissions": permissions},
             lambda: self._execute_task(record["capability"], record["payload"],
-                                       list(record["permissions"])),
+                                       permissions),
             wait, task_id=task_id, on_finish=finish,
         )
         if response.get("status") == "running":

@@ -114,6 +114,11 @@ class Capability:
     capability is never batched by accident (fail closed). A batchable capability must
     need the owner's yes on every call and must never spend money (enforced below); the
     server applies pionir.batching.batch_refusal on top, per call."""
+    sale_price_keys: frozenset[str] = frozenset()
+    """Payload keys that are this item's own SALE price (money coming in from buyers, not
+    going out), e.g. a product listing's ``price_cents``. A batchable capability may carry
+    them in the digest only as a listing its adapter confirmed is new when it was parked;
+    every other money field keeps an item out of the digest."""
 
     def __post_init__(self) -> None:
         if not self.name or any(char.isspace() for char in self.name):

@@ -402,13 +402,15 @@ class GateTests(_Case):
         for _ in range(3):
             self.park()
         self.assertEqual(len(self.app.approvals.pending()), 3)
-        self.assertEqual(self.world.calls, [])
+        # parking only READS the listing (is it new, or an update of a live one?)
+        self.assertEqual(self.world.steps(), ["list"] * 3)
         self.assertEqual(self.world.products, [])
 
     def test_an_approved_publish_creates_a_draft_then_files_cover_and_enables_once(self) -> None:
         row = self.publish()
         self.assertEqual(row["status"], "approved", row)
-        self.assertEqual(self.world.steps(), CREATE_SEQUENCE)
+        # the park-time listing check, then the publish
+        self.assertEqual(self.world.steps(), ["list", *CREATE_SEQUENCE])
         calls = {c["step"]: c for c in self.world.calls}
         create = calls["create"]["body"]
         self.assertIs(create["draft"], True)                     # draft first
@@ -447,13 +449,13 @@ class GateTests(_Case):
             "created": True, "published": True, "version": "1.2.0"})
         self.assertIn("product:id:prod-1", row["result"]["evidence"])
         self.assertFalse(self.app.approve(row["id"])["ok"])    # never twice
-        self.assertEqual(len(self.world.calls), len(CREATE_SEQUENCE))
+        self.assertEqual(len(self.world.calls), 1 + len(CREATE_SEQUENCE))
 
     def test_a_denied_publish_never_runs(self) -> None:
         aid = self.park()["approval_id"]
         self.assertTrue(self.app.deny(aid)["ok"])
         self.assertFalse(self.app.approve(aid)["ok"])
-        self.assertEqual(self.world.calls, [])
+        self.assertEqual(self.world.steps(), ["list"])      # the park-time read, nothing else
 
     def test_a_missing_token_is_unavailable_before_parking(self) -> None:
         self.token_file.unlink()
@@ -474,6 +476,7 @@ class UpdatePathTests(_Case):
         row = self.publish()
         self.assertEqual(row["status"], "approved", row)
         self.assertEqual(self.world.steps(), [
+            "list", "list",                             # the park-time check (two pages)
             "list", "list", "disable", "update", "presign", "part", "complete", "update",
             "direct_upload", "blob", "covers", "enable"])
         self.assertNotIn("create", self.world.steps())
@@ -485,7 +488,7 @@ class UpdatePathTests(_Case):
         self.assertIs(product["published"], True)
         self.assertEqual(row["result"]["result"]["product_id"], "prod-2")
         self.assertIs(row["result"]["result"]["created"], False)
-        self.assertEqual(self.world.calls[3]["url"], f"{GUMROAD}/products/prod-2")
+        self.assertEqual(self.world.calls[5]["url"], f"{GUMROAD}/products/prod-2")
 
     def test_an_existing_draft_is_not_disabled_first(self) -> None:
         self.world.add(custom_permalink=SLUG, published=False)
@@ -674,7 +677,7 @@ class FileRuleTests(_Case):
         result = row["result"]["result"]
         self.assertIn("not the pinned", result["refused"])
         self.assertIn("nothing was published", result["refused"])
-        self.assertEqual(self.world.calls, [])
+        self.assertEqual(self.world.steps(), ["list"])      # the park-time read only
 
 
 # ---- failures part-way -------------------------------------------------------------------
@@ -945,7 +948,7 @@ class CardTests(_Case):
                       "secret values checked)", text)
         self.assertIn("1600x900 PNG", text)
         self.assertNotIn("EXECUTABLE", text)
-        self.assertEqual(self.world.calls, [])                # showing it sells nothing
+        self.assertEqual(self.world.steps(), ["list"])        # showing it sells nothing
         for secret in (GUMROAD_TOKEN, PLANTED):
             self.assertNotIn(secret, text)
 

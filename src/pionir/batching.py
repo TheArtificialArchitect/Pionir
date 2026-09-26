@@ -36,6 +36,7 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -51,6 +52,9 @@ DEFAULT_TIME = "09:00"
 DEFAULT_EXPIRE_DAYS = 7
 MAX_EXPIRE_DAYS = 60
 REQUEST_NAME = "digest-request.json"
+# The server (asking) and the gate thread (answering) share the request file: every
+# read-modify-write of it holds this lock, so an answer can never land on a newer request.
+_REQUEST_LOCK = threading.RLock()
 
 # Words that, anywhere in a capability's name, mean money or a client: such a capability
 # is never batched even if someone marks it batchable. Belt and braces over the
@@ -64,9 +68,22 @@ NEVER_BATCH_WORDS = frozenset({
 })
 
 
-def batch_refusal(capability: Any, payload: Mapping[str, Any] | None) -> str | None:
+# Granted, alongside the row's own permissions, to an action approved as a BATCHED row: an
+# adapter that allowed batching only for a narrower case (product.gumroad_publish: a NEW
+# listing) refuses, touching nothing, if the case no longer holds when it runs.
+BATCHED_GRANT = "approval.batched"
+
+
+def batch_refusal(capability: Any, payload: Mapping[str, Any] | None,
+                  context: Mapping[str, Any] | None = None) -> str | None:
     """None if this parked action may wait for the daily digest; otherwise why it must
-    be its own card at once. Fails closed: anything unknown or odd is refused."""
+    be its own card at once. Fails closed: anything unknown or odd is refused.
+
+    ``context`` is what the capability's adapter found when it was parked
+    (``park_context``): it can refuse by itself (``batch_refusal``), and a capability that
+    carries its own sale price (``sale_price_keys``) is batchable only as a listing the
+    adapter confirmed is NEW - an update of a live listing, and so any price change, is
+    always its own card."""
 
     if capability is None:
         return "unknown capability"
@@ -81,8 +98,17 @@ def batch_refusal(capability: Any, payload: Mapping[str, Any] | None) -> str | N
         return "a money or client capability"
     if not isinstance(payload, Mapping):
         return "no payload"
+    context = context if isinstance(context, Mapping) else {}
+    refused = context.get("batch_refusal")
+    if refused:
+        return str(refused)
+    price_keys = getattr(capability, "sale_price_keys", frozenset())
+    if not isinstance(price_keys, frozenset):
+        return "odd sale price keys"
+    if price_keys and context.get("listing") != "new":
+        return "not confirmed a new listing (an update or a price change is its own card)"
     from .discord_gate import money_line  # the card's own money check, not a copy of it
-    if money_line({"capability": name, "payload": payload}):
+    if money_line({"capability": name, "payload": payload}, allowed=price_keys):
         return "the payload moves money"
     return None
 
@@ -186,14 +212,14 @@ def request_path(state_root: Path) -> Path:
 def request_digest(state_root: Path, *, now: datetime | None = None) -> dict[str, Any]:
     """Ask the gate for the digest now (the owner's urgent override). A request is
     answered once, by id; asking twice before it is answered is the same request."""
-    path = request_path(state_root)
-    current = read_request(state_root)
-    if current is not None and current.get("answered") is not True:
-        return current
-    request = {"id": uuid.uuid4().hex[:12],
-               "requested_at": (now or local_now()).isoformat(), "answered": False}
-    _write(path, request)
-    return request
+    with _REQUEST_LOCK:
+        current = read_request(state_root)
+        if current is not None and current.get("answered") is not True:
+            return current
+        request = {"id": uuid.uuid4().hex[:12],
+                   "requested_at": (now or local_now()).isoformat(), "answered": False}
+        _write(request_path(state_root), request)
+        return request
 
 
 def read_request(state_root: Path) -> dict[str, Any] | None:
@@ -205,13 +231,17 @@ def read_request(state_root: Path) -> dict[str, Any] | None:
 
 
 def answer_request(state_root: Path, request_id: str) -> None:
-    current = read_request(state_root)
-    if current is not None and current.get("id") == request_id:
-        _write(request_path(state_root), {**current, "answered": True})
+    """Mark request ``request_id`` answered - only that one: a newer request stays open."""
+    with _REQUEST_LOCK:
+        current = read_request(state_root)
+        if current is not None and current.get("id") == request_id:
+            _write(request_path(state_root), {**current, "answered": True})
 
 
 def _write(path: Path, data: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
+    # A tmp of its own per write: two writers (the server asking, the gate answering) can
+    # never publish each other's half - an answer never lands on a newer request.
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     tmp.write_text(json.dumps(dict(data), ensure_ascii=False, indent=2), encoding="utf-8")
     atomic.replace(tmp, path)

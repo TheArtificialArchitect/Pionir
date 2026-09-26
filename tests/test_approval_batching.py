@@ -27,6 +27,7 @@ from test_discord_gate import APPROVE, CHANNEL, DENY, OWNER, STRANGER, GateCase
 
 from pionir.adapters.content import ContentAdapter, ContentSettings
 from pionir.batching import (
+    BATCHED_GRANT,
     NEVER_BATCH_WORDS,
     DigestSettings,
     batch_refusal,
@@ -94,8 +95,13 @@ class AllowlistTests(unittest.TestCase):
         for name in ("client.email", "client.quote", "client.deliver", "client.release",
                      "client.find_report", "client.quote_reminder"):
             self.assertIn(name, names)
-        batchable = {c.name for c in caps if batch_refusal(c, {}) is None}
+        # (a product listing may wait only as a listing its adapter confirmed is new)
+        batchable = {c.name for c in caps
+                     if batch_refusal(c, {}, {"listing": "new"}) is None}
         self.assertEqual(batchable, EXPECTED_BATCHABLE)
+        product = next(c for c in caps if c.name == "product.gumroad_publish")
+        for context in (None, {}, {"listing": "existing"}, {"listing": "unknown"}):
+            self.assertIsNotNone(batch_refusal(product, {"price_cents": 1900}, context))
         for cap in caps:
             words = set(cap.name.replace("_", ".").split("."))
             if cap.spends_money or cap.name.startswith("client.") or words & MONEY_WORDS:
@@ -349,7 +355,9 @@ class DigestTests(BatchCase):
         self.assertEqual(row["status"], "approved")
         # exactly as its own card would have run it: an approval job, its own permission
         self.assertEqual(self.app.jobs.get(row["task_id"])["kind"], "approval")
-        self.assertEqual(self.runs, [(PAGE, {"title": "Two", "body": "the page"}, [PAGE])])
+        # (plus the batched marker: a restriction its adapter may check, never a power)
+        self.assertEqual(self.runs, [(PAGE, {"title": "Two", "body": "the page"},
+                                      [PAGE, BATCHED_GRANT])])
         self.assertEqual(self.app.approvals.get(first)["status"], "pending")
         for _ in range(3):
             gate.run_once()

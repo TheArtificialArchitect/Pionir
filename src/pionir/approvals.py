@@ -61,6 +61,7 @@ class Approval:
     task_id: str | None = None     # the job that ran it, once claimed
     batch: bool = False            # waits for the owner's daily digest (pionir/batching.py)
     digest_date: str | None = None # the digest it is (or will next be) listed in, local date
+    context: dict[str, Any] | None = None  # what its adapter found when it was parked
 
 
 class ApprovalQueue:
@@ -139,7 +140,8 @@ class ApprovalQueue:
     def enqueue(self, capability: str, payload: dict[str, Any], permissions: list[str],
                 summary: str, requester: str = "moss", *, batch: bool = False,
                 digest_date: str | None = None,
-                expires_after: timedelta | None = None) -> str:
+                expires_after: timedelta | None = None,
+                context: dict[str, Any] | None = None) -> str:
         """Park one action. ``batch`` rows are the same record - same checks, same claim,
         same settle - that wait for the daily digest instead of their own card, with
         their own (longer) ``expires_after``; nothing else about them differs."""
@@ -153,6 +155,7 @@ class ApprovalQueue:
                 requester=requester,
                 expires_at=(now + (expires_after or EXPIRES_AFTER)).isoformat(),
                 batch=bool(batch), digest_date=digest_date if batch else None,
+                context=dict(context) if context else None,
             )
             rows.append(asdict(approval))
             self._save(rows)
@@ -181,7 +184,8 @@ class ApprovalQueue:
             rows = self._load()
             changed = 0
             for row in rows:
-                if row.get("id") in wanted and row.get("status") == "pending"                         and row.get("batch") and row.get("digest_date") != digest_date:
+                if row.get("id") in wanted and row.get("status") == "pending" \
+                        and row.get("batch") and row.get("digest_date") != digest_date:
                     row["digest_date"] = digest_date
                     changed += 1
             if changed:

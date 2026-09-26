@@ -80,6 +80,7 @@ from pionir.adapters.deliveries import (
     load_secrets,
     scan_bytes,
 )
+from pionir.batching import BATCHED_GRANT
 from pionir.contracts import AgentManifest, Capability, RiskLevel, Task, TaskResult
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
 
@@ -586,9 +587,11 @@ class ProductAdapter:
                     risk=RiskLevel.PRIVILEGED,
                     required_permissions=frozenset({PUBLISH}),
                     requires_approval=True,
-                    # routine and public, no money, no client: waits for the
-                    # owner's daily digest (pionir/batching.py)
+                    # routine and public, no money out, no client: a NEW listing waits
+                    # for the owner's daily digest (pionir/batching.py); an update of an
+                    # existing listing - and so any price change - is always its own card
                     batchable=True,
+                    sale_price_keys=frozenset({"price_cents"}),
                     routable=False,
                 ),
                 Capability(
@@ -704,6 +707,32 @@ class ProductAdapter:
                           "width": staged.cover.width, "height": staged.cover.height},
                 "cover_bytes": staged.cover.data}
 
+    def park_context(self, task: Task) -> dict[str, Any] | None:
+        """As a publish is parked: is there already a Gumroad product with this permalink,
+        live or not, and at what price? Only a confirmed NEW listing may wait for the daily
+        digest; an update (and so any price change) is its own card, and the card shows the
+        price going from what is live to what the payload says. Read-only: one listing
+        call. Anything that stops the check is recorded as "unknown" - never batched."""
+        if task.capability != PUBLISH:
+            return None
+        slug = check_slug(task.payload.get("slug"))
+        token = read_token(self.settings.token_file)
+        if token is None:
+            return {"listing": "unknown", "batch_refusal": "Gumroad is not configured"}
+        try:
+            existing = self._find(slug, token)
+        except _Failure as failure:
+            why = str(failure.output.get("error") or "Gumroad could not be checked")
+            return {"listing": "unknown", "problem": self._scrub(why, token)[:300],
+                    "batch_refusal": "could not check Gumroad for an existing listing"}
+        if existing is None:
+            return {"listing": "new"}
+        row = _row(existing)
+        return {"listing": "existing", "product_id": row["id"], "live": row["published"],
+                "live_price_cents": row["price_cents"],
+                "live_pay_what_you_want": existing.get("customizable_price") is True,
+                "batch_refusal": "updates an existing Gumroad listing"}
+
     # ---- the call --------------------------------------------------------------------
     def execute(self, task: Task) -> TaskResult:
         if task.capability == PUBLISH:
@@ -730,7 +759,9 @@ class ProductAdapter:
                                        "not_configured": True})
         try:
             if task.capability == PUBLISH:
-                output = self._publish(product, staged, token)
+                # Approved from the daily digest, it was approved as a NEW listing only.
+                output = self._publish(product, staged, token,
+                                       new_only=BATCHED_GRANT in task.granted_permissions)
             elif task.capability == UNPUBLISH:
                 output = self._unpublish(slug, token)
             else:
@@ -741,7 +772,7 @@ class ProductAdapter:
         return self._result(task, json.loads(self._scrub(json.dumps(output), token)))
 
     def _publish(self, product: Mapping[str, Any], staged: Staged,
-                 token: str) -> dict[str, Any]:
+                 token: str, *, new_only: bool = False) -> dict[str, Any]:
         slug = product["slug"]
         fields = {
             "name": product["name"],
@@ -760,6 +791,10 @@ class ProductAdapter:
         step = "find the product by its permalink"
         try:
             existing = self._find(slug, token)    # a failure here has touched nothing
+            if existing is not None and new_only:
+                raise _refused("approved in the daily digest as a NEW listing, but Gumroad "
+                               f"now has a product with the permalink {slug!r}; an update "
+                               "needs its own card - park it again. Nothing was changed.")
             if existing is not None:
                 found_id = existing.get("id")
                 if not isinstance(found_id, str) or not found_id:
