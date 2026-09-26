@@ -268,7 +268,7 @@ class GateTests(_Case):
         self.assertEqual(email["timeout"], 30)
         self.assertEqual(status["body"], {"order_id": ORDER_ID, "status": "delivered"})
         self.assertEqual(row["result"]["result"], {
-            "ok": True, "delivery_id": "dlv1", "url": LINK,
+            "ok": True, "delivery_id": "dlv1", "link_tail": f"...{LINK[-6:]}",
             "expires_at": "2026-10-02T00:00:00Z", "emailed": True, "status": "delivered"})
         self.assertIn("client:delivery:dlv1", row["result"]["evidence"])
         self.assertFalse(self.app.approve(row["id"])["ok"])       # never twice
@@ -614,10 +614,13 @@ class ExecuteTests(_Case):
         finally:
             root.removeHandler(handler)
             root.setLevel(old)
-        # the results carry it - the owner needs the link
-        self.assertEqual(ok["result"]["result"]["url"], LINK)
+        # emailed: the client has it, the records keep its tail only; NOT emailed: the owner
+        # must hand it over, so that record keeps the whole link
+        for done in (ok, lagging):
+            self.assertEqual(done["result"]["result"]["link_tail"], f"...{LINK[-6:]}")
+            self.assertNotIn(LINK[:-6], json.dumps(done))
+            self.assertNotIn(LINK[:-6], json.dumps(self.app.jobs.get(done["task_id"])))
         self.assertEqual(failed["result"]["result"]["uploaded"]["url"], LINK)
-        self.assertEqual(lagging["result"]["result"]["url"], LINK)
         logs = capture.getvalue()
         self.assertIn(f"...{LINK[-6:]}", logs)                  # the log shows its tail
         self.assertNotIn(LINK, logs)
@@ -835,7 +838,7 @@ class RealOpenerTests(unittest.TestCase):
                 ssh_dir=None))
             adapter.validate(Task(DELIVER, a_delivery(data)))
             out = dict(adapter.execute(Task(DELIVER, a_delivery(data))).output)
-        self.assertEqual(out, {"ok": True, "delivery_id": "d1", "url": LINK,
+        self.assertEqual(out, {"ok": True, "delivery_id": "d1", "link_tail": f"...{LINK[-6:]}",
                                "expires_at": "2026-10-02T00:00:00Z", "emailed": True,
                                "status": "delivered"})
         self.assertEqual([(r["method"], urllib.parse.urlsplit(r["path"]).path)

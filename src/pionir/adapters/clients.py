@@ -1009,14 +1009,14 @@ class ClientAdapter:
             return not_emailed(answer), evidence
         if answer.get("id"):
             evidence.append(f"client:message:{answer['id']}")
+        # Emailed: the client has the link. The approval and job records keep its tail only;
+        # the whole link is kept only when it was NOT emailed (the owner must hand it over).
         result: dict[str, Any] = {"ok": True, "delivery_id": uploaded["delivery_id"],
-                                  "url": url, "expires_at": uploaded["expires_at"],
-                                  "emailed": True}
+                                  "link_tail": link_tail(url),
+                                  "expires_at": uploaded["expires_at"], "emailed": True}
         if held:
             # The client was sent the balance pay link; Scrooge has already moved the order
-            # to balance_due. The files wait for the balance (client.release). The pay link
-            # is a bearer link: the record keeps the delivery id, never the link.
-            result.pop("url", None)
+            # to balance_due. The files wait for the balance (client.release).
             result.update(held=True, balance_cents=uploaded.get("balance_cents"))
             _log.info("client: delivery %s for order %s: HELD, balance request emailed",
                       uploaded["delivery_id"], order_id)
