@@ -25,7 +25,7 @@ The rules, one function each:
                   is ``blog`` unless the caller names another from ``UTM_SOURCES`` (the
                   dev.to cross-post's is ``devto``); nothing else about the rule changes
 - ``_personal``   no email addresses or @-handles, phone numbers, IP addresses, street
-                  addresses
+                  addresses, invented ids or reference numbers (INV-2024-001)
 - ``_names``      the proper-noun allowlist
 - ``_business``   no business numbers: no first-person claims with figures, no "our
                   revenue" / "we made", no counts of customers or users, no money amounts
@@ -344,6 +344,7 @@ _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 _HANDLE = re.compile(r"(?<![\w@])@[A-Za-z0-9_][A-Za-z0-9_.]*")
 _OBFUSCATED_AT = re.compile(r"(?i)[\[(]\s*at\s*[\])]")
 _PHONE = re.compile(r"(?<![\w+.])\+?\(?\d[\d\s().\-]{5,22}\d(?![\w])")
+_INVENTED_ID = "an invented id or reference number"
 _ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 _IPV4 = re.compile(r"(?<!\d)(?<!\d\.)(?:\d{1,3}\.){3}\d{1,3}(?!\d|\.\d)")
 # a run of hex digits and colons with at least two colons; ipaddress decides (so a clock
@@ -361,6 +362,24 @@ _STREET_SUFFIX = (r"(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive
 _STREET = re.compile(rf"\b\d{{1,5}}[A-Za-z]?,?\s+(?:[A-Z][\w.'-]*\s+){{1,4}}{_STREET_SUFFIX}\b")
 _STREET_AFTER = re.compile(rf"\b(?:[A-Z][\w.'-]*\s+){{1,4}}{_STREET_SUFFIX}\.?,?\s+\d{{1,5}}\b")
 _PO_BOX = re.compile(r"(?i)\bp\.?\s*o\.?\s*box\b|\b(?:suite|apt|apartment)\s*#?\s*\d+")
+
+
+# An invented id or reference number: the model's example invoice or order number. It is
+# invented example data (the prompt forbids it), not a phone number, and saying "phone"
+# sends the redraft after the wrong thing ("INV-2024-001" came back as "2024-001"). Two
+# shapes: a letter prefix glued to hyphenated digit groups (INV-2024-001, ORD-17-3), and
+# hyphen-only digit groups that open with four digits (2024-001, 1234-567, 2024-0001) -
+# except the four-four shape of a local phone (9123-4567) that does not open with a year.
+_PREFIXED_ID = re.compile(r"(?<![\w-])[A-Za-z]{2,8}[-#]\d{1,6}(?:-\d{1,6})+(?![\w-])")
+
+
+def _is_invented_id(s: str) -> bool:
+    groups = s.strip().split("-")
+    if len(groups) < 2 or not all(g.isdigit() for g in groups) or len(groups[0]) != 4:
+        return False
+    local_phone = (len(groups) == 2 and len(groups[1]) == 4
+                   and not groups[0].startswith(("19", "20")) and groups[1][0] != "0")
+    return not local_phone
 
 
 def _is_phone(s: str) -> bool:
@@ -384,8 +403,16 @@ def _personal(texts: list) -> list:
             reasons.append(f"{field} has an @-handle ({m.group(0)!r})")
         if _OBFUSCATED_AT.search(text):
             reasons.append(f"{field} has a spelled-out email address")
+        ids = [m.span() for m in _PREFIXED_ID.finditer(text)]
+        for a, b in ids:
+            reasons.append(f"{field} has {_INVENTED_ID} ({text[a:b]!r}) - use no example ids")
         for m in _PHONE.finditer(text):
-            if _is_phone(m.group(0)):
+            if any(a <= m.start() < b for a, b in ids) or not _is_phone(m.group(0)):
+                continue
+            if _is_invented_id(m.group(0)):
+                reasons.append(f"{field} has {_INVENTED_ID} ({m.group(0).strip()!r}) - use "
+                               "no example ids")
+            else:
                 reasons.append(f"{field} has a phone number ({m.group(0).strip()!r})")
         for m in _IPV4.finditer(text):
             reasons.append(f"{field} has an IP address ({m.group(0)!r})")

@@ -297,6 +297,22 @@ class PersonalDataTests(unittest.TestCase):
         for phone in ("+381 64 123 4567", "(555) 123-4567", "555.123.4567"):
             self.assertBlocked(f"Call {phone} to ask.", "phone number")
 
+    def test_real_phone_numbers_still_block_as_phone_numbers(self) -> None:
+        for phone in ("425-555-0134", "+1 (206) 555 0100", "206.555.0100", "555-1234"):
+            with self.subTest(phone):
+                self.assertBlocked(f"Call {phone} to ask.", "phone number")
+
+    def test_an_invented_id_blocks_under_its_own_rule_not_as_a_phone(self) -> None:
+        # live: the model's "INV-2024-001" was blocked as "a phone number ('2024-001')", so
+        # the redraft dropped "INV-" and kept "2024-001", and was blocked again
+        for ref, named in (("INV-2024-001", "'INV-2024-001'"), ("2024-001", "'2024-001'"),
+                           ("2024-0001", "'2024-0001'"), ("1234-567", "'1234-567'")):
+            with self.subTest(ref):
+                reasons = cc.check(with_body(f"The invoice number is {ref} here."))
+                self.assertTrue(any("invented id" in r and named in r and "no example ids" in r
+                                    for r in reasons), reasons)
+                self.assertFalse(any("phone" in r for r in reasons), reasons)
+
     def test_an_ip_address_blocks(self) -> None:
         self.assertBlocked("The server sits at 192.168.10.24.", "IP address")
         self.assertBlocked("Or at 2001:db8:85a3::8a2e:370:7334 instead.", "IP address")
