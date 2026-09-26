@@ -13,7 +13,12 @@ article; a ``client.email`` card opens with EMAILS A CLIENT, names the recipient
 the whole message; a ``client.find_report`` card opens with SENDS A FIND REPORT, lists every
 link it sends the client to with its domain in bold first, and shows the whole report; a
 ``client.deliver`` card opens with DELIVERS TO A CLIENT and shows the
-zip's full file list as checked on disk, the secrets scan and the whole email; a
+zip's full file list as checked on disk, the secrets scan and the whole email (and, for an
+order that still owes half its price, HELD FOR THE BALANCE: the email carries the balance
+pay link, never the files); a ``client.quote`` card opens with SENDS A QUOTE and shows the
+owner's price, the deposit split, the delivery time, the pay link's validity and the whole
+email; a ``client.quote_reminder`` card opens with SENDS THE QUOTE REMINDER; a
+``client.release`` card opens with RELEASES A HELD DELIVERY; a
 ``product.gumroad_publish`` card opens with PUTS A PRODUCT ON SALE and the price, shows the
 whole listing - the FULL description, the zip's file list, the secrets scan and any
 executables it ships - and carries the cover image as an attachment),
@@ -26,6 +31,15 @@ atomically (pending -> running) so it can never run twice, run as a job with the
 permission it was parked with, and settled approved / approved_failed. A ❌ goes
 through ``PionirApp.deny``. When the row settles, by whichever route, the
 message is edited to say what happened, so the channel is an honest log.
+
+Quote replies. The same poll also reads the owner's REPLIES to the quote cards
+(``quotes.card``) and turns each into a parked ``client.quote`` - see pionir/quotes.py. That
+is a REST read of the channel's messages (``GET /channels/<id>/messages?after=``): no
+gateway, no slash command (a slash command needs an interactions endpoint or a gateway
+socket, and this gate has neither). Reading a reply's text needs the bot's privileged
+Message Content intent, switched on in the Discord Developer Portal (Bot -> Privileged
+Gateway Intents -> Message Content Intent); a reply the bot cannot read is answered with
+exactly that. Only the owner's reply counts, and each reply is acted on once.
 
 Stdlib only, REST only (no gateway websocket), the same shape as Galatea's
 Discord bridge: a rejected token is configuration, not weather - the loop stops
@@ -65,12 +79,24 @@ from . import atomic
 from .adapters.clients import DELIVER as CLIENT_DELIVER
 from .adapters.clients import EMAIL as CLIENT_EMAIL
 from .adapters.clients import FIND_REPORT as CLIENT_FIND_REPORT
-from .adapters.clients import LINK_PLACEHOLDER
+from .adapters.clients import LINK_PLACEHOLDER, PAY_LINK_PLACEHOLDER
+from .adapters.clients import QUOTE as CLIENT_QUOTE
+from .adapters.clients import RELEASE as CLIENT_RELEASE
+from .adapters.clients import REMIND as CLIENT_REMIND
 from .adapters.content import PUBLISH, public_url
 from .adapters.devto import CROSSPOST as DEVTO_CROSSPOST
 from .adapters.instagram import POST as INSTAGRAM_POST
 from .adapters.products import PUBLISH as PRODUCT_PUBLISH
 from .adapters.products import price_text
+from .quotes import (
+    LINK_DAYS,
+    QuoteCardStore,
+    QuoteReplies,
+    days_text,
+    owner_reply,
+    parse_reply,
+    usd,
+)
 from .social.card import render_card
 from .social.post import full_caption
 
@@ -563,6 +589,14 @@ def _find_report_lines(payload: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+HOLD_LINE = ("\U0001f4b0 **HELD FOR THE BALANCE** - the client still owes half the price, so "
+             "the email below carries a link to PAY the balance, not the files. The zip is "
+             "stored with no link until the balance is paid; then a release card asks your "
+             "\u2705.")
+PAY_LINK_SHOWN = "<private pay link>"
+BALANCE_LINK_SHOWN = "<balance pay link>"
+
+
 def client_deliver_line(to: Any) -> str:
     """The first line of a client.deliver card: the zip goes out, to whom."""
     shown = f"`{_fence_safe(str(to))}`" if isinstance(to, str) and to else "(no address)"
@@ -613,14 +647,107 @@ def _client_deliver_lines(payload: Mapping[str, Any],
                    f"{int(preview.get('secret_values') or 0):,} secret values checked)")]
     body = payload.get("body_text")
     text = body if isinstance(body, str) else str(body)
-    text = text.replace(LINK_PLACEHOLDER, DOWNLOAD_LINK_SHOWN)
+    held = payload.get("hold_for_balance") is True
+    shown = BALANCE_LINK_SHOWN if held else DOWNLOAD_LINK_SHOWN
+    text = text.replace(LINK_PLACEHOLDER, shown)
     lines += [
         f"**Subject:** {_escape(str(payload.get('subject')))}",
         (f"**The email, in full, exactly as it will be sent - "
-         f"`{DOWNLOAD_LINK_SHOWN}` becomes the link to the zip:**"),
+         f"`{shown}` becomes " + ("the link to pay the balance:**" if held
+                                   else "the link to the zip:**")),
         _FENCE + "text", _fence_safe(text), _FENCE,
     ]
     return lines
+
+
+def _cents(value: Any) -> str:
+    return usd(value) if isinstance(value, int) and not isinstance(value, bool) else repr(value)
+
+
+def quote_line(to: Any) -> str:
+    """The first line of a client.quote card."""
+    shown = f"`{_fence_safe(str(to))}`" if isinstance(to, str) and to else "(no address)"
+    return ("\U0001f4b5 **SENDS A QUOTE** - on your \u2705 its pay link is created and the "
+            f"email below goes to {shown}. Nothing happens before that.")
+
+
+NOT_YOUR_REPLY = ("\u26d4 **NOT FROM YOUR REPLY** - no reply of yours on Discord is recorded "
+                  "for this quote. Deny it: a quote is only ever your own price.")
+
+
+def _quote_lines(payload: Mapping[str, Any],
+                 reply: Mapping[str, Any] | None = None) -> list[str]:
+    """The quote as the owner must see it before it goes: his reply AS THE GATE RECORDED IT
+    (never anything the payload says he wrote), the price, the deposit split, the delivery
+    time, what the pay link does, and the WHOLE email."""
+    total, deposit, days = (payload.get("total_cents"), payload.get("deposit_cents"),
+                            payload.get("days"))
+    lines = [f"**Order:** `{_fence_safe(str(payload.get('order_id')))}`"]
+    defaulted = False
+    if reply is None:
+        lines.append(NOT_YOUR_REPLY)
+    else:
+        text = str(reply.get("text"))
+        lines.append(f"**Your reply:** `{_fence_safe(text)}`")
+        try:
+            defaulted = parse_reply(text).days is None
+        except ValueError:
+            lines.append(NOT_YOUR_REPLY)
+    lines.append(f"**Price:** **{_cents(total)}** (USD)")
+    if isinstance(deposit, int) and not isinstance(deposit, bool) and deposit > 0 \
+            and isinstance(total, int):
+        lines.append(f"**Payment:** 50% deposit **{usd(deposit)}** before work starts, then "
+                     f"**{usd(total - deposit)}** on delivery - the files are held until the "
+                     "balance is paid")
+    else:
+        lines.append(f"**Payment:** in full, **{_cents(total)}**, up front")
+    shown_days = days_text(days) if isinstance(days, int) and not isinstance(days, bool) \
+        else repr(days)
+    lines.append(f"**Delivery:** {shown_days} from payment"
+                 + (" - **the default: your reply gave no days**" if defaulted else ""))
+    lines.append(f"**Pay link:** created only on your \u2705; valid {LINK_DAYS} days, then it "
+                 "says the quote expired and to reply. Unpaid on day 10: one reminder is "
+                 "drafted for your \u2705. A newer reply replaces this quote and stops its link.")
+    body = payload.get("body_text")
+    text = (body if isinstance(body, str) else str(body)).replace(PAY_LINK_PLACEHOLDER,
+                                                                  PAY_LINK_SHOWN)
+    lines += [
+        (f"**To:** `{_fence_safe(str(payload.get('to')))}` (Scrooge sends only to the "
+         "address stored on this order)"),
+        f"**Subject:** {_escape(str(payload.get('subject')))}",
+        (f"**The email, in full, exactly as it will be sent - `{PAY_LINK_SHOWN}` becomes the "
+         "pay link:**"),
+        _FENCE + "text", _fence_safe(text), _FENCE,
+    ]
+    return lines
+
+
+def reminder_line(to: Any) -> str:
+    shown = f"`{_fence_safe(str(to))}`" if isinstance(to, str) and to else "(no address)"
+    return ("\u23f0 **SENDS THE QUOTE REMINDER** - the one reminder this quote gets goes to "
+            f"{shown} if you approve.")
+
+
+def release_line(to: Any) -> str:
+    shown = f"`{_fence_safe(str(to))}`" if isinstance(to, str) and to else "(no address)"
+    return ("\U0001f4e6 **RELEASES A HELD DELIVERY** - the balance is paid; on your \u2705 "
+            f"the files get a private download link and the email below goes to {shown}.")
+
+
+def _release_lines(payload: Mapping[str, Any]) -> list[str]:
+    body = payload.get("body_text")
+    text = (body if isinstance(body, str) else str(body)).replace(LINK_PLACEHOLDER,
+                                                                  DOWNLOAD_LINK_SHOWN)
+    return [
+        f"**Order:** `{_fence_safe(str(payload.get('order_id')))}`",
+        f"**Delivery:** `{_fence_safe(str(payload.get('delivery_id')))}` (held until now)",
+        (f"**To:** `{_fence_safe(str(payload.get('to')))}` (Scrooge sends only to the "
+         "address stored on this order)"),
+        f"**Subject:** {_escape(str(payload.get('subject')))}",
+        (f"**The email, in full, exactly as it will be sent - `{DOWNLOAD_LINK_SHOWN}` becomes "
+         "the link to the zip:**"),
+        _FENCE + "text", _fence_safe(text), _FENCE,
+    ]
 
 
 def product_line(payload: Mapping[str, Any]) -> str:
@@ -780,7 +907,8 @@ def _instagram_lines(payload: Mapping[str, Any]) -> list[str]:
 
 def render_request(row: Mapping[str, Any], owner: str | None, *,
                    delivery: Mapping[str, Any] | None = None,
-                   product: Mapping[str, Any] | None = None) -> str:
+                   product: Mapping[str, Any] | None = None,
+                   quote_reply: Mapping[str, Any] | None = None) -> str:
     """The whole text of an approval message, before it is split to fit Discord.
     Nothing that says what the action does is ever cut; long text is split
     across messages instead. ``delivery`` is a client.deliver's zip as inspected on
@@ -795,7 +923,16 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
     delivers = row.get("capability") == CLIENT_DELIVER
     finds = row.get("capability") == CLIENT_FIND_REPORT
     sells = row.get("capability") == PRODUCT_PUBLISH
+    quotes = row.get("capability") == CLIENT_QUOTE
+    reminds = row.get("capability") == CLIENT_REMIND
+    releases = row.get("capability") == CLIENT_RELEASE
     lines: list[str] = []
+    if quotes:
+        lines.append(quote_line(payload.get("to")))
+    if reminds:
+        lines.append(reminder_line(payload.get("to")))
+    if releases:
+        lines.append(release_line(payload.get("to")))
     if sells:
         lines.append(product_line(payload))
         executables = _executables_line(payload, product)
@@ -803,6 +940,8 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
             lines.append(executables)
     if delivers:
         lines.append(client_deliver_line(payload.get("to")))
+        if payload.get("hold_for_balance") is True:
+            lines.append(HOLD_LINE)
     if emails:
         lines.append(client_email_line(payload.get("to")))
     if finds:
@@ -849,10 +988,22 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
         if isinstance(payload.get("body_md"), str):
             shown = {**payload, "body_md": f"(the full article above, "
                                            f"{len(payload['body_md']):,} characters)"}
-    if emails:
+    if emails or reminds:
         lines += _client_email_lines(payload)
+        if reminds:
+            lines.append(f"**Quote:** `{_fence_safe(str(payload.get('quote_id')))}`")
         if isinstance(payload.get("body_text"), str):
             shown = {**payload, "body_text": f"(the full message above, "
+                                             f"{len(payload['body_text']):,} characters)"}
+    if quotes:
+        lines += _quote_lines(payload, quote_reply)
+        if isinstance(payload.get("body_text"), str):
+            shown = {**payload, "body_text": f"(the full email above, "
+                                             f"{len(payload['body_text']):,} characters)"}
+    if releases:
+        lines += _release_lines(payload)
+        if isinstance(payload.get("body_text"), str):
+            shown = {**payload, "body_text": f"(the full email above, "
                                              f"{len(payload['body_text']):,} characters)"}
     if finds:
         lines += _find_report_lines(payload)
@@ -988,8 +1139,11 @@ class DiscordGate:
         sleep: Sleeper | None = None,
         inspect_delivery: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
         inspect_product: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
+        quotes: QuoteReplies | None = None,
     ) -> None:
         self.settings = settings
+        # The owner's replies to quote cards -> parked client.quote (pionir/quotes.py).
+        self._quotes = quotes
         self._approvals = approvals      # ApprovalQueue: pending() / get()
         self._approve = approve          # PionirApp.approve: claim, run as a job, settle
         self._deny = deny                # PionirApp.deny
@@ -1031,6 +1185,14 @@ class DiscordGate:
         product_preview = getattr(products, "product_preview", None)
         if callable(product_preview):
             kwargs.setdefault("inspect_product", product_preview)
+        order = getattr(client, "order", None)
+        if callable(order) and "quotes" not in kwargs:
+            # Replies are read only for cards in this record: with no quote card posted, the
+            # gate never reads the channel's messages nor asks Scrooge for an order.
+            kwargs["quotes"] = QuoteReplies(
+                QuoteCardStore.for_state_root(settings.state_root),
+                submit=lambda capability, payload: app.run_task(capability, payload, wait=0),
+                deny=app.deny, find_approvals=app.approvals.find, get_order=order)
         return cls(settings, approvals=app.approvals, approve=app.approve, deny=app.deny,
                    **kwargs)
 
@@ -1060,6 +1222,14 @@ class DiscordGate:
         return preview
 
     def _render(self, row: Mapping[str, Any], preview: Mapping[str, Any] | None) -> str:
+        if row.get("capability") == CLIENT_QUOTE:
+            payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
+            store = (self._quotes.store if self._quotes is not None
+                     else QuoteCardStore.for_state_root(self.settings.state_root))
+            reply = owner_reply(store, payload.get("order_id"), payload.get("quote_ref"))
+            if reply is not None and str(reply.get("by")) != str(self.settings.owner):
+                reply = None
+            return render_request(row, self.settings.owner, quote_reply=reply)
         if row.get("capability") == PRODUCT_PUBLISH:
             return render_request(row, self.settings.owner, product=preview)
         return render_request(row, self.settings.owner, delivery=preview)
@@ -1211,6 +1381,10 @@ class DiscordGate:
                   "configured" if self.settings.owner else "NOT configured - answers refused")
 
     def _tick(self) -> None:
+        if self._quotes is not None:
+            # First, so a quote card parked from a reply is posted in this same pass.
+            self._guard("quote-replies", lambda: self._quotes.tick(
+                self._call, self.settings.owner, str(self.settings.channel_id)))
         pending = self._approvals.pending()     # also auto-denies the expired
         fresh = set()
         for row in pending:

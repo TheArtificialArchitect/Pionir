@@ -163,6 +163,15 @@ class ApprovalQueue:
                 self._save(rows)
             return [r for r in rows if r["status"] == "pending"]
 
+    def find(self, capability: str, key: str, value: Any) -> list[dict[str, Any]]:
+        """Every row (any status, newest first) for ``capability`` whose payload[key] is
+        ``value``: how a producer finds the approval it already parked for one request
+        (a quote's quote_ref) instead of parking a second one."""
+        with self._lock:
+            return [dict(r) for r in reversed(self._load())
+                    if r.get("capability") == capability
+                    and isinstance(r.get("payload"), dict) and r["payload"].get(key) == value]
+
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
             return list(reversed(self._load()))[:limit]

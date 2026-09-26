@@ -31,7 +31,23 @@ around it. So:
   body, and the card lists each one by its domain above the whole report. It is sent
   through the same Scrooge call as ``client.email``, with the same answers.
 
-All five are ``routable=False``: reached only by name.
+- ``client.quote`` is PRIVILEGED with ``requires_approval=True``: the owner's price for a
+  custom order, from his Discord reply (pionir/quotes.py). The card shows the price, the
+  deposit split, the delivery time, the pay link's 14-day validity and the whole email; on
+  approval Scrooge creates the quote and its pay link and emails the client, with
+  ``{pay_link}`` replaced by the link. Checked here first: the split is this Pionir's rule
+  (``deposit_threshold_cents``) and the email states exactly the amounts and days charged.
+- ``client.quote_reminder`` is PRIVILEGED with ``requires_approval=True``: the ONE reminder a
+  quote gets, from day 10 while it is unpaid (Scrooge refuses a second, or an early one).
+- ``client.release`` is PRIVILEGED with ``requires_approval=True``: a delivery that was held
+  because half the price was still owed, released once the balance is paid - Scrooge gives it
+  a download link, the client is emailed it (``{link}``), and the order is marked delivered.
+- ``client.deliver`` with ``hold_for_balance: true``: the order still owes its balance, so
+  Scrooge stores the zip WITHOUT a link and mints a balance pay link, and ``{link}`` in the
+  email becomes that pay link. If Scrooge and the payload disagree about holding, nothing
+  is emailed.
+
+All eight are ``routable=False``: reached only by name.
 
 An email is checked here before anything is parked or sent - a bad one is refused by
 Pionir with ``AdapterProtocolError`` naming the field and why, in Scrooge's
@@ -94,6 +110,9 @@ EMAIL = "client.email"
 SET_STATUS = "client.set_status"
 DELIVER = "client.deliver"
 FIND_REPORT = "client.find_report"
+QUOTE = "client.quote"
+REMIND = "client.quote_reminder"
+RELEASE = "client.release"
 
 ORDER_STATUSES = ("awaiting_payment", "paid", "in_progress", "delivered", "declined",
                   "refunded", "quote_requested", "quoted")
@@ -103,12 +122,21 @@ SETTABLE_STATUSES = ("in_progress", "delivered", "declined", "refunded", "quoted
 EMAIL_FIELDS = frozenset({"order_id", "to", "subject", "body_text"})
 DELIVER_FIELDS = frozenset({"order_id", "to", "zip_name", "zip_sha256", "subject",
                             "body_text"})
+# client.deliver may also say the order owes its balance (the delivery is held).
+DELIVER_OPTIONAL = frozenset({"hold_for_balance"})
+QUOTE_FIELDS = frozenset({"order_id", "to", "quote_ref", "total_cents", "deposit_cents", "days",
+                          "subject", "body_text"})
+REMIND_FIELDS = frozenset({"order_id", "quote_id", "to", "subject", "body_text"})
+RELEASE_FIELDS = frozenset({"order_id", "to", "delivery_id", "subject", "body_text"})
 FIND_REPORT_FIELDS = frozenset({"order_id", "to", "subject", "body_text", "links"})
 # Where the download link goes in a delivery email: exactly once.
 LINK_PLACEHOLDER = "{link}"
 # The shape of the link, for checking the email before the upload (the real one is
 # Scrooge's https://api.dokaz.net/d/<64 hex>).
 SAMPLE_LINK = "https://api.dokaz.net/d/" + "0" * 64
+# A quote's pay link: {pay_link} in the quote email, Scrooge's https://api.dokaz.net/pay/<64 hex>.
+PAY_LINK_PLACEHOLDER = "{pay_link}"
+SAMPLE_PAY_LINK = "https://api.dokaz.net/pay/" + "0" * 64
 NOT_EMAILED = "the link exists but the client was NOT emailed"
 NOTHING_SHIPPED = "nothing was uploaded or emailed"
 
@@ -212,6 +240,8 @@ def check_email(payload: Mapping[str, Any]) -> dict[str, str]:
 
 
 _ZIP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.(?i:zip)")
+_RELEASE_ID = re.compile(r"dl_[0-9a-f]{24}")
+_PAY_URL = re.compile(r"https://[A-Za-z0-9.-]+/pay/[0-9a-f]{64}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _DELIVERY_ID = re.compile(r"[A-Za-z0-9_-]{1,100}")
 _DELIVERY_URL = re.compile(r"https://[A-Za-z0-9.-]+/d/[0-9a-f]{64}")
@@ -233,14 +263,17 @@ def check_zip_name(value: Any) -> str:
 def check_delivery(payload: Mapping[str, Any]) -> dict[str, str]:
     """The delivery exactly as it will be shipped, or ValueError("<field>: <why>"). The
     email is checked with a link in place of ``{link}``, by client.email's rules."""
-    unknown = sorted(set(payload) - DELIVER_FIELDS)
+    unknown = sorted(set(payload) - DELIVER_FIELDS - DELIVER_OPTIONAL)
     if unknown:
         raise ValueError(f"{unknown[0]}: not a delivery field (allowed: "
-                         f"{', '.join(sorted(DELIVER_FIELDS))})")
+                         f"{', '.join(sorted(DELIVER_FIELDS | DELIVER_OPTIONAL))})")
     missing = sorted(DELIVER_FIELDS - set(payload))
     if missing:
         raise ValueError(f"{missing[0]}: required")
     zip_name = check_zip_name(payload["zip_name"])
+    hold = payload.get("hold_for_balance", False)
+    if not isinstance(hold, bool):
+        raise ValueError("hold_for_balance: true or false")  # noqa: TRY004
     sha = payload["zip_sha256"]
     if not isinstance(sha, str) or not _SHA256.fullmatch(sha):
         raise ValueError("zip_sha256: the zip's SHA-256, 64 lowercase hex characters")
@@ -254,8 +287,108 @@ def check_delivery(payload: Mapping[str, Any]) -> dict[str, str]:
                          f"becomes the download link; found {found})")
     email = check_email({"order_id": payload["order_id"], "to": payload["to"],
                          "subject": payload["subject"],
+                         "body_text": body.replace(LINK_PLACEHOLDER,
+                                                   SAMPLE_PAY_LINK if hold else SAMPLE_LINK)})
+    return {**email, "body_text": body, "zip_name": zip_name, "zip_sha256": sha,
+            "hold_for_balance": hold}
+
+
+# ---- quotes -------------------------------------------------------------------------------
+_QUOTE_REF = re.compile(r"[A-Za-z0-9_-]{8,80}")
+_QUOTE_ID = re.compile(r"qt_[0-9a-f]{24}")
+
+
+def _whole(payload: Mapping[str, Any], key: str) -> int:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{key}: a whole number")  # noqa: TRY004
+    return value
+
+
+def check_quote(payload: Mapping[str, Any], threshold_cents: int) -> dict[str, Any]:
+    """The quote exactly as Scrooge will charge and send it, or ValueError("<field>: <why>").
+    Nothing here decides a price: it only checks that the numbers, the deposit rule and the
+    words of the email agree - so the card the owner approves is what the client gets."""
+    from pionir.quotes import MAX_CENTS, MAX_DAYS, MIN_CENTS, days_text, deposit_for, usd
+
+    unknown = sorted(set(payload) - QUOTE_FIELDS)
+    if unknown:
+        raise ValueError(f"{unknown[0]}: not a quote field (allowed: "
+                         f"{', '.join(sorted(QUOTE_FIELDS))})")
+    missing = sorted(QUOTE_FIELDS - set(payload))
+    if missing:
+        raise ValueError(f"{missing[0]}: required")
+    ref = payload["quote_ref"]
+    if not isinstance(ref, str) or not _QUOTE_REF.fullmatch(ref):
+        raise ValueError("quote_ref: 8-80 characters of A-Z a-z 0-9 _ -")
+    total, deposit, days = (_whole(payload, "total_cents"), _whole(payload, "deposit_cents"),
+                            _whole(payload, "days"))
+    if not MIN_CENTS <= total <= MAX_CENTS:
+        raise ValueError(f"total_cents: {MIN_CENTS}-{MAX_CENTS}")
+    if not 1 <= days <= MAX_DAYS:
+        raise ValueError(f"days: 1-{MAX_DAYS} business days")
+    want = deposit_for(total, threshold_cents)
+    if deposit != want:
+        raise ValueError(f"deposit_cents: the rule makes it {want} on {total} (threshold "
+                         f"{threshold_cents})")
+    body = payload["body_text"]
+    if not isinstance(body, str):
+        raise ValueError("body_text: required, a string")  # noqa: TRY004
+    found = body.count(PAY_LINK_PLACEHOLDER)
+    if found != 1:
+        raise ValueError(f"body_text: must contain {PAY_LINK_PLACEHOLDER} exactly once "
+                         f"(found {found})")
+    amounts = [usd(total)] + ([usd(deposit), usd(total - deposit)] if deposit else [])
+    for amount in amounts:
+        if not re.search(re.escape(amount) + r"(?![0-9]|[.,][0-9])", body):
+            raise ValueError(f"body_text: must state {amount}, as it will be charged")
+    if not re.search(r"(?<![0-9])" + re.escape(days_text(days)) + r"\b", body):
+        raise ValueError(f"body_text: must state the delivery time, {days_text(days)}")
+    email = check_email({"order_id": payload["order_id"], "to": payload["to"],
+                         "subject": payload["subject"],
+                         "body_text": body.replace(PAY_LINK_PLACEHOLDER, SAMPLE_PAY_LINK)})
+    return {**email, "body_text": body, "quote_ref": ref, "total_cents": total,
+            "deposit_cents": deposit, "days": days}
+
+
+def check_reminder(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """The day-10 reminder: a plain client email, plus the quote it is about."""
+    unknown = sorted(set(payload) - REMIND_FIELDS)
+    if unknown:
+        raise ValueError(f"{unknown[0]}: not a reminder field (allowed: "
+                         f"{', '.join(sorted(REMIND_FIELDS))})")
+    quote_id = payload.get("quote_id")
+    if not isinstance(quote_id, str) or not _QUOTE_ID.fullmatch(quote_id):
+        raise ValueError("quote_id: qt_ and 24 lowercase hex characters")
+    email = check_email({k: payload[k] for k in EMAIL_FIELDS if k in payload})
+    if PAY_LINK_PLACEHOLDER in email["body_text"]:
+        raise ValueError("body_text: a reminder carries no link")
+    return {**email, "quote_id": quote_id}
+
+
+def check_release(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """A held delivery's release: its id, and the email with {link} for the download link."""
+    unknown = sorted(set(payload) - RELEASE_FIELDS)
+    if unknown:
+        raise ValueError(f"{unknown[0]}: not a release field (allowed: "
+                         f"{', '.join(sorted(RELEASE_FIELDS))})")
+    missing = sorted(RELEASE_FIELDS - set(payload))
+    if missing:
+        raise ValueError(f"{missing[0]}: required")
+    delivery_id = payload["delivery_id"]
+    if not isinstance(delivery_id, str) or not _RELEASE_ID.fullmatch(delivery_id):
+        raise ValueError("delivery_id: dl_ and 24 lowercase hex characters")
+    body = payload["body_text"]
+    if not isinstance(body, str):
+        raise ValueError("body_text: required, a string")  # noqa: TRY004
+    found = body.count(LINK_PLACEHOLDER)
+    if found != 1:
+        raise ValueError(f"body_text: must contain {LINK_PLACEHOLDER} exactly once (it "
+                         f"becomes the download link; found {found})")
+    email = check_email({"order_id": payload["order_id"], "to": payload["to"],
+                         "subject": payload["subject"],
                          "body_text": body.replace(LINK_PLACEHOLDER, SAMPLE_LINK)})
-    return {**email, "body_text": body, "zip_name": zip_name, "zip_sha256": sha}
+    return {**email, "body_text": body, "delivery_id": delivery_id}
 
 
 # ---- the find report rules ----------------------------------------------------------------
@@ -483,6 +616,15 @@ class ClientSettings:
     secret_values: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     ssh_dir: Path | None = Path("~/.ssh")
     upload_timeout_seconds: int = 180
+    # client.quote: at or above this many cents, half up front and half on delivery. Must
+    # equal Scrooge's QUOTE_DEPOSIT_THRESHOLD_CENTS (Scrooge refuses, unsent, a mismatch).
+    deposit_threshold_cents: int = 50_000
+    # client.quote is accepted only as the owner's own Discord reply: the card record the gate
+    # keeps (quote-cards.json), his Discord user id, and the days used when a reply gives none.
+    # No record or no owner: every quote is refused.
+    quote_store: Path | None = None
+    owner_user_id: str | None = None
+    default_days: int = 7
 
     def __post_init__(self) -> None:
         parsed = urllib.parse.urlparse(self.base_url)
@@ -523,12 +665,21 @@ def client_settings(configured: Any) -> ClientSettings:
         ("the Daedalus token (PIONIR_DAEDALUS_TOKEN)", getattr(configured, "daedalus_token", None)),
         ("the Melete token (PIONIR_MELETE_TOKEN)", getattr(configured, "melete_token", None)),
     ) if token)
+    from pionir.discord_gate import DiscordGateSettings
+    from pionir.quotes import QuoteCardStore, QuoteSettings
+
+    quotes = QuoteSettings.from_environment()
     return ClientSettings(base_url=configured.content_url or DEFAULT_CONTENT_URL,
                           token_file=configured.ops_token_path,
                           deliveries_dir=configured.deliveries_path,
                           secrets_dir=configured.secrets_path,
                           secret_files=tuple(token_files),
-                          secret_values=values)
+                          secret_values=values,
+                          deposit_threshold_cents=quotes.deposit_threshold_cents,
+                          quote_store=QuoteCardStore.for_state_root(configured.state_root).path,
+                          owner_user_id=DiscordGateSettings.from_environment(
+                              configured.state_root).owner,
+                          default_days=quotes.default_days)
 
 
 def _refused(why: str, **extra: Any) -> dict[str, Any]:
@@ -593,6 +744,35 @@ class ClientAdapter:
                     requires_approval=True,
                     routable=False,
                 ),
+                Capability(
+                    name=QUOTE,
+                    description="Quote a custom order at the owner's price: create its pay "
+                                "link and email the client the quote (only after the owner "
+                                "approves the exact email)",
+                    risk=RiskLevel.PRIVILEGED,
+                    required_permissions=frozenset({QUOTE}),
+                    requires_approval=True,
+                    routable=False,
+                ),
+                Capability(
+                    name=REMIND,
+                    description="Send the one day-10 reminder of an unpaid quote (only "
+                                "after the owner approves it)",
+                    risk=RiskLevel.PRIVILEGED,
+                    required_permissions=frozenset({REMIND}),
+                    requires_approval=True,
+                    routable=False,
+                ),
+                Capability(
+                    name=RELEASE,
+                    description="Release a delivery held for the balance, once the balance "
+                                "is paid: email the client its download link (only after "
+                                "the owner approves it)",
+                    risk=RiskLevel.PRIVILEGED,
+                    required_permissions=frozenset({RELEASE}),
+                    requires_approval=True,
+                    routable=False,
+                ),
             ),
         )
 
@@ -622,15 +802,24 @@ class ClientAdapter:
                 raise AdapterProtocolError(f"{DELIVER} refused by Pionir - {error}") from error
         else:
             self._request(task)
-        if task.capability in (EMAIL, DELIVER, FIND_REPORT) \
+        if task.capability in (EMAIL, DELIVER, FIND_REPORT, QUOTE, REMIND, RELEASE) \
                 and read_token(self.settings.token_file) is None:
             # Asking the owner to approve an email that cannot be sent wastes his yes.
             raise AdapterUnavailable(self._not_configured())
 
-    @staticmethod
-    def _request(task: Task) -> tuple[str, str, dict[str, Any] | None]:
+    def _request(self, task: Task) -> tuple[str, str, dict[str, Any] | None]:
         """(method, path, JSON body) for this task, or AdapterProtocolError."""
         try:
+            if task.capability == QUOTE:
+                quote = check_quote(task.payload, self.settings.deposit_threshold_cents)
+                # ...and only as the owner's own reply: before it is parked AND when it runs
+                self._provenance(task.payload)
+                return "POST", "/dash/orders/quote", {k: quote[k] for k in sorted(QUOTE_FIELDS)}
+            if task.capability == REMIND:
+                return "POST", "/dash/orders/quote/remind", check_reminder(task.payload)
+            if task.capability == RELEASE:
+                check_release(task.payload)
+                return "POST", "/dash/orders/delivery/release", None
             if task.capability == ORDERS:
                 status = check_listing(task.payload)
                 query = f"?{urllib.parse.urlencode({'status': status})}" if status else ""
@@ -647,6 +836,12 @@ class ClientAdapter:
         except ValueError as error:
             raise AdapterProtocolError(f"{task.capability} refused by Pionir - {error}") from error
         raise AdapterProtocolError(f"client has no capability {task.capability!r}")
+
+    def _provenance(self, payload: Mapping[str, Any]) -> None:
+        from pionir.quotes import QuoteCardStore, check_provenance
+
+        store = QuoteCardStore(self.settings.quote_store) if self.settings.quote_store else None
+        check_provenance(payload, store, self.settings.owner_user_id, self.settings.default_days)
 
     @staticmethod
     def _delivery(task: Task) -> dict[str, str]:
@@ -680,6 +875,8 @@ class ClientAdapter:
     def execute(self, task: Task) -> TaskResult:
         if task.capability == DELIVER:
             return self._execute_delivery(task)
+        if task.capability == RELEASE:
+            return self._execute_release(task)
         method, path, body = self._request(task)
         token = read_token(self.settings.token_file)
         if token is None:
@@ -687,9 +884,10 @@ class ClientAdapter:
                                                    not_configured=True))
         status, document = self._http(method, path, body, token)
         output = self._answer(task.capability, status, document, token)
-        if task.capability in (EMAIL, FIND_REPORT):
+        if task.capability in (EMAIL, FIND_REPORT, QUOTE, REMIND):
             _log.info("client: %s for order %s: %s",
-                      "email" if task.capability == EMAIL else "find report",
+                      {EMAIL: "email", FIND_REPORT: "find report", QUOTE: "quote",
+                       REMIND: "quote reminder"}[task.capability],
                       body["order_id"] if body else "?",
                       "sent" if output.get("ok") is True else "not sent")
         # Belt and braces: whatever Scrooge echoed, the token does not leave in the result.
@@ -699,7 +897,7 @@ class ClientAdapter:
                 token: str) -> dict[str, Any]:
         doc = document if isinstance(document, Mapping) else {}
         said = self._scrub(str(doc.get("error") or ""), token)[:300]
-        emailing = capability in (EMAIL, FIND_REPORT)
+        emailing = capability in (EMAIL, FIND_REPORT, QUOTE, REMIND)
         if 200 <= status < 300:
             if doc.get("ok") is True:
                 return dict(doc)
@@ -764,6 +962,21 @@ class ClientAdapter:
         if uploaded.get("ok") is not True:
             _log.info("client: delivery for order %s: not uploaded", order_id)
             return uploaded, []
+        held = uploaded.get("held") is True
+        if held != bool(delivery.get("hold_for_balance")):
+            # The email says "pay the balance" and Scrooge gave a download link, or the
+            # reverse: sending either would give the client the wrong thing. Nothing goes.
+            if held:
+                why = ("Scrooge HELD the delivery: the order still owes its balance, and this "
+                       "email was written as a download - nothing was emailed; the delivery "
+                       "desk sends the balance request")
+                return _refused(why, delivery_id=uploaded["delivery_id"], held=True), []
+            revoked = self._revoke(uploaded["delivery_id"], token)
+            why = ("Scrooge did NOT hold the delivery (no balance is owed), and this email asks "
+                   "for a balance payment - " + ("the link was revoked" if revoked else
+                   f"revoke delivery {uploaded['delivery_id']} by hand")
+                   + "; nothing was emailed")
+            return _refused(why, delivery_id=uploaded["delivery_id"], revoked=revoked), []
         url = uploaded["url"]
         evidence = [f"client:delivery:{uploaded['delivery_id']}"]
         _log.info("client: delivery %s for order %s uploaded (link %s)",
@@ -796,9 +1009,18 @@ class ClientAdapter:
             return not_emailed(answer), evidence
         if answer.get("id"):
             evidence.append(f"client:message:{answer['id']}")
+        # Emailed: the client has the link. The approval and job records keep its tail only;
+        # the whole link is kept only when it was NOT emailed (the owner must hand it over).
         result: dict[str, Any] = {"ok": True, "delivery_id": uploaded["delivery_id"],
-                                  "url": url, "expires_at": uploaded["expires_at"],
-                                  "emailed": True}
+                                  "link_tail": link_tail(url),
+                                  "expires_at": uploaded["expires_at"], "emailed": True}
+        if held:
+            # The client was sent the balance pay link; Scrooge has already moved the order
+            # to balance_due. The files wait for the balance (client.release).
+            result.update(held=True, balance_cents=uploaded.get("balance_cents"))
+            _log.info("client: delivery %s for order %s: HELD, balance request emailed",
+                      uploaded["delivery_id"], order_id)
+            return result, evidence
         status, document = self._http("POST", "/dash/orders/status",
                                       {"order_id": order_id, "status": "delivered"}, token)
         moved = self._answer(SET_STATUS, status, document, token)
@@ -841,6 +1063,21 @@ class ClientAdapter:
                        f"the link could NOT be revoked: revoke delivery {delivery_id} by hand")
                     + "; nothing was emailed to the client",
                     delivery_id=delivery_id, revoked=revoked)
+            if doc.get("held") is True:
+                # Stored without a link: the order owes its balance. The link to send is the
+                # balance pay link Scrooge minted with it.
+                balance = doc.get("balance") if isinstance(doc.get("balance"), Mapping) else {}
+                pay = balance.get("url")
+                if not isinstance(pay, str) or not _PAY_URL.fullmatch(pay) \
+                        or _link_problem(pay) is not None:
+                    return _unavailable("Scrooge held the delivery but answered with no usable "
+                                        "balance link - nothing was emailed to the client",
+                                        status=status)
+                amount = balance.get("amount_cents")
+                return {"ok": True, "held": True, "delivery_id": delivery_id, "url": pay,
+                        "expires_at": balance.get("expires_at"), "sha256": stored,
+                        "size": inspection.size,
+                        "balance_cents": amount if isinstance(amount, int) else None}
             url = doc.get("url")
             if not isinstance(url, str) or not _DELIVERY_URL.fullmatch(url) \
                     or _link_problem(url) is not None:
@@ -880,6 +1117,92 @@ class ClientAdapter:
                    and document.get("ok") is True)
         _log.warning("client: delivery %s revoked: %s", delivery_id, revoked)
         return revoked
+
+    # ---- client.release: a held delivery gets its link, once the balance is paid -------
+    def _execute_release(self, task: Task) -> TaskResult:
+        try:
+            release = check_release(task.payload)
+        except ValueError as error:
+            raise AdapterProtocolError(f"{RELEASE} refused by Pionir - {error}") from error
+        token = read_token(self.settings.token_file)
+        if token is None:
+            return self._result(task, _unavailable(self._not_configured(), not_configured=True))
+        output, evidence = self._release(release, token)
+        return self._result(task, json.loads(self._scrub(json.dumps(output), token)),
+                            extra_evidence=evidence)
+
+    def _release(self, release: Mapping[str, str],
+                 token: str) -> tuple[dict[str, Any], list[str]]:
+        order_id = release["order_id"]
+        status, document = self._http("POST", "/dash/orders/delivery/release",
+                                      {"order_id": order_id,
+                                       "delivery_id": release["delivery_id"]}, token)
+        doc = document if isinstance(document, Mapping) else {}
+        if not (200 <= status < 300 and doc.get("ok") is True):
+            answer = self._answer(SET_STATUS, status, document, token)
+            why = f"{answer.get('error')} - nothing was released or emailed"
+            for key in ("refused", "unavailable", "error"):
+                if key in answer:
+                    answer[key] = why
+            return answer, []
+        url = doc.get("url")
+        if not isinstance(url, str) or not _DELIVERY_URL.fullmatch(url) \
+                or _link_problem(url) is not None:
+            return _unavailable("Scrooge released the delivery without a usable download link "
+                                "- nothing was emailed to the client", status=status), []
+        evidence = [f"client:delivery:{release['delivery_id']}"]
+        try:
+            email = check_email({"order_id": order_id, "to": release["to"],
+                                 "subject": release["subject"],
+                                 "body_text": release["body_text"].replace(LINK_PLACEHOLDER,
+                                                                           url)})
+        except ValueError as error:
+            return _refused(f"the email with the link failed Pionir's check ({error}); "
+                            f"{NOT_EMAILED}"), evidence
+        status, document = self._http("POST", "/dash/orders/email", email, token)
+        answer = self._answer(EMAIL, status, document, token)
+        if answer.get("ok") is not True:
+            why = f"{NOT_EMAILED} - " + str(answer.get("error")).replace(url, "<link>")
+            kind = "refused" if "refused" in answer else "unavailable"
+            return {"ok": False, kind: why, "error": why, "emailed": False,
+                    "released": True}, evidence
+        if answer.get("id"):
+            evidence.append(f"client:message:{answer['id']}")
+        # The download link went to the client; the approval and job records keep only the id.
+        result: dict[str, Any] = {"ok": True, "delivery_id": release["delivery_id"],
+                                  "link_tail": link_tail(url),
+                                  "expires_at": doc.get("expires_at"), "emailed": True}
+        status, document = self._http("POST", "/dash/orders/status",
+                                      {"order_id": order_id, "status": "delivered"}, token)
+        moved = self._answer(SET_STATUS, status, document, token)
+        if moved.get("ok") is True:
+            result["status"] = "delivered"
+        else:
+            result["status_error"] = ("the client was emailed the link, but the order was not "
+                                      "marked delivered - "
+                                      + str(moved.get("error")).replace(url, "<link>"))
+        _log.info("client: held delivery %s for order %s released (link %s)",
+                  release["delivery_id"], order_id, link_tail(url))
+        return result, evidence
+
+    # ---- one order, for the Discord gate's quote replies --------------------------------
+    def order(self, order_id: str) -> dict[str, Any] | None:
+        """The order as Scrooge has it now (name, address, status, its quote), or None when
+        Scrooge has no such order. AdapterUnavailable when it cannot be read."""
+        oid = check_order_id(order_id)
+        token = read_token(self.settings.token_file)
+        if token is None:
+            raise AdapterUnavailable(self._not_configured())
+        query = urllib.parse.urlencode({"id": oid})
+        status, document = self._http("GET", f"/dash/orders?{query}", None, token)
+        output = self._answer(ORDERS, status, document, token)
+        if output.get("ok") is not True:
+            raise AdapterUnavailable(self._scrub(str(output.get("error")), token))
+        orders = output.get("orders")
+        for o in orders if isinstance(orders, list) else []:
+            if isinstance(o, Mapping) and o.get("id") == oid:
+                return dict(o)
+        return None
 
     # ---- transport -----------------------------------------------------------------
     def _http(self, method: str, path: str, body: Mapping[str, Any] | None,
