@@ -375,6 +375,51 @@ class ReliabilityTests(_Case):
         self.assertEqual(row["attention"], "watch")          # not the model's "act"
 
 
+class HealthClaimTests(_Case):
+    """A report that misstates worker health goes through the same repair, then the
+    figures-only report - the runs table decides, not the model."""
+
+    def run_leader(self, *answers):
+        crew = self.crew({"alpha": [{"name": "ledger"},
+                                    {"name": "broken", "params": {"mode": "err"}}]})
+        crew.dispatcher.dispatch(wait=True)
+        ask = FakeAsk(script=[reply(summary=s) for s in answers])
+        return crew, ask, self.leader(crew, "alpha", ask).run()
+
+    def test_a_healthy_worker_called_failing_is_repaired(self) -> None:
+        crew, ask, result = self.run_leader(
+            "Revenue is $12.00, but alpha.ledger has not succeeded.",
+            "Revenue is $12.00; alpha.broken is failing.")
+        self.assertIsInstance(result, Ok, result)
+        self.assertIn("says 'has not succeeded' about alpha.ledger",
+                      ask.calls[1]["messages"][-1]["content"])
+        row = crew.store.reports(division="alpha")[0]
+        self.assertEqual(row["provenance"]["repaired"], "ungrounded")
+
+    def test_a_correct_failure_claim_is_accepted_at_once(self) -> None:
+        _crew, ask, result = self.run_leader(
+            "Revenue is $12.00. 1 worker failed: alpha.broken is failing.")
+        self.assertIsInstance(result, Ok, result)
+        self.assertEqual(len(ask.calls), 1)
+
+    def test_a_silent_worker_is_not_judged_healthy(self) -> None:
+        crew = self.crew({"alpha": [{"name": "ledger"},
+                                    {"name": "quiet", "params": {"mode": "silent"}}]})
+        crew.dispatcher.dispatch(wait=True)
+        ask = FakeAsk(reply(summary="Revenue is $12.00; alpha.quiet has stalled."))
+        self.assertIsInstance(self.leader(crew, "alpha", ask).run(), Ok)
+        self.assertEqual(len(ask.calls), 1)
+
+    def test_a_false_all_healthy_claim_ends_in_the_figures(self) -> None:
+        crew, ask, result = self.run_leader("Revenue is $12.00 and all workers are healthy.")
+        self.assertEqual(result.error.kind, "ungrounded")
+        self.assertEqual(len(ask.calls), 2)
+        row = crew.store.reports(division="alpha")[0]
+        self.assertEqual(row["provenance"]["composed"], FIGURES_ONLY)
+        self.assertIn("alpha.broken: NEVER SUCCEEDED", row["reason"])
+        self.assertNotIn("healthy", row["summary"])
+
+
 class EscalationTests(_Case):
     def test_the_daily_cap_holds_across_all_leaders(self) -> None:
         claude = FakeClaude()

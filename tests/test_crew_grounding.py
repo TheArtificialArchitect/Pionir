@@ -9,9 +9,13 @@ import unittest
 
 from pionir.crew.figures import Figure
 from pionir.crew.grounding import (
+    HEALTHY,
+    UNCLEAR,
+    UNHEALTHY,
     backs,
     check_report,
     claims_in,
+    health_claims,
     unbacked_claims,
     unbacked_figures,
     unknown_names,
@@ -119,6 +123,54 @@ class InventedNameTests(unittest.TestCase):
 
     def test_a_recorded_name_passes(self) -> None:
         self.assertEqual(unknown_names("Etsy sent two sales.", {"Etsy"}), [])
+
+
+OK = (HEALTHY, "ok, last success 1 min ago")
+NEVER = (UNHEALTHY, "NEVER SUCCEEDED in 3 attempts")
+SILENT = (UNCLEAR, "ok; succeeded 2 times in a row producing NOTHING")
+POSTING = {"posting.blog": OK, "posting.devto": OK, "posting.instagram": OK}
+CONTRACTS = {"contracts.orders": OK, "contracts.delivery": OK, "contracts.finder": NEVER}
+
+
+class HealthClaimTests(unittest.TestCase):
+    """A report may not call a worker failing that last ran ok, nor call all well while
+    one is failing - checked against the runs, conservatively."""
+
+    def test_the_live_posting_claim_is_caught(self) -> None:
+        live = "Posting.blog and posting.devto have not succeeded in any attempts."
+        (p,) = health_claims([live], POSTING)
+        self.assertIn("'have not succeeded'", p)
+        self.assertIn("posting.blog: ok, last success", p)
+        self.assertTrue(health_claims(["Posting.instagram has also not succeeded."], POSTING))
+        self.assertTrue(health_claims(["The workers have not succeeded."], POSTING))
+
+    def test_a_true_failure_claim_passes(self) -> None:
+        for text in ("1 worker failed: contracts.finder has never succeeded.",
+                     "The finder desk is failing; contracts.orders is fine.",
+                     "The workers have not all succeeded.",
+                     "Some workers are running normally."):     # no "all": not a claim
+            self.assertEqual(health_claims([text], CONTRACTS), [], text)
+
+    def test_a_false_all_healthy_claim_is_caught(self) -> None:
+        for text in ("All workers are healthy.", "All three desks report no issues.",
+                     "contracts.finder is healthy.",
+                     "Delivery and finder desks are operating normally."):
+            self.assertTrue(health_claims([text], CONTRACTS), text)
+        self.assertEqual(health_claims(["All workers are healthy."], POSTING), [])
+
+    def test_negations_and_counted_things_claim_nothing(self) -> None:
+        for text in ("posting.blog has 0 failures and has not failed.",
+                     "Two drafts failed the content check at posting.blog.",
+                     "At posting.blog 2 drafts failed.",
+                     "posting.devto reports 0 cross-posts failed to send.",
+                     "The workers report no failing products.",
+                     "Blog post generation failed twice."):
+            self.assertEqual(health_claims([text], POSTING, {"cross-posts failed", "drafts"}),
+                             [], text)
+
+    def test_an_unclear_worker_is_not_judged(self) -> None:
+        self.assertEqual(health_claims(["posting.blog has stalled."],
+                                       {"posting.blog": SILENT}), [])
 
 
 class ReportTests(unittest.TestCase):

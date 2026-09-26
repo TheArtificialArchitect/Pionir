@@ -26,10 +26,11 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 
 from .figures import Figure
-from .grounding import values_in_data, vocabulary_words
+from .grounding import HEALTHY, UNCLEAR, UNHEALTHY, values_in_data, vocabulary_words
 
 DEFAULT_QUOTA = 6
 TOTAL_LIMIT = 40
@@ -98,6 +99,28 @@ class Brief:
             if not o.derived:
                 names |= set(o.entities)
         return names
+
+    def health_states(self) -> dict:
+        """worker_id -> (verdict, the brief's words for it), for the health-claim check:
+        HEALTHY only when the last run was ok, fresh, with no failure since and something
+        written; UNHEALTHY when it last failed, never succeeded, is not wired or not
+        configured, or is stale; UNCLEAR otherwise (say, succeeding silently)."""
+        out = {}
+        for h in self.health:
+            if (h.worker_id in self.not_wired or h.not_configured or h.has_never_succeeded
+                    or h.last_outcome == "err" or h.is_stale):
+                verdict = UNHEALTHY
+            elif h.last_outcome == "ok" and not h.consecutive_failures and not h.silent_streak:
+                verdict = HEALTHY
+            else:
+                verdict = UNCLEAR
+            out[h.worker_id] = (verdict, worker_state(self, h))
+        return out
+
+    def counted_items(self) -> set:
+        """The words this brief's figures count ("drafts blocked" -> drafts, blocked)."""
+        return {w for o in self.outputs for f in o.figures
+                for w in re.split(r"[^a-z]+", f.measures.lower()) if len(w) > 2}
 
     def recorded_values(self) -> set:
         """Numbers real-source payloads hold outside their figures ("topics_left": 13).

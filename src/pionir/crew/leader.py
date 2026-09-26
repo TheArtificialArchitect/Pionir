@@ -44,7 +44,7 @@ from dataclasses import dataclass, field, replace
 
 from .brief import build_brief, figure_table, render, worker_state
 from .figures import Figure
-from .grounding import check_report
+from .grounding import check_report, health_claims
 from .log import log
 from .result import Err, Ok, Result
 from .worker import ErrorKind, WorkerError
@@ -400,10 +400,12 @@ class Leader:
         report, reasons = examine(raw, self.division, numbered)
         if report is None:
             return ErrorKind.MALFORMED, reasons, None
-        problems = check_report([report.headline, report.summary, *report.routine],
-                                report.figures, brief.recorded_figures(),
+        texts = [report.headline, report.summary, *report.routine]
+        problems = check_report(texts, report.figures, brief.recorded_figures(),
                                 brief.known_names(), brief.vocabulary(),
                                 brief.recorded_values())
+        # a claim about worker health the runs table contradicts is ungrounded too
+        problems += health_claims(texts, brief.health_states(), brief.counted_items())
         if problems:
             return ErrorKind.UNGROUNDED, problems, None
         return None, [], report

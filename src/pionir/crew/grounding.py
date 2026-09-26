@@ -386,3 +386,115 @@ def check_report(texts: Iterable[str], stated: Iterable[Figure], recorded: Itera
     for f in unbacked_figures(stated, recorded):
         problems.append(f"lists {f.display()}, which no worker recorded")
     return list(dict.fromkeys(problems))            # each reason once, in order
+
+
+# ---- health claims ----------------------------------------------------------------
+#
+# Numbers and names are not the only thing a report can get wrong. On the live crew's
+# copy a report passed every check above while saying "posting.blog and posting.devto have
+# not succeeded" - both had just run fine. Moss steers from these reports, so a report
+# may not call a worker failing that last ran ok, nor call things healthy while a worker
+# is failing. Conservative on purpose, because a false alarm here costs a report:
+#
+# - a claim is read per clause, and only when it has a SUBJECT: a worker named by its id
+#   ("posting.blog") or as "the <name> worker/desk", or the division as a whole ("the
+#   workers", "all desks", "the division"). "Blog post generation failed" has neither and
+#   is not judged;
+# - negation-aware: "0 failures", "no products are failing", "has not failed" claim
+#   nothing; a failure word tied to a counted thing ("2 drafts failed", "failed to send",
+#   "failing products") is about that thing, not a worker;
+# - a failure claim is false only against a worker that is clearly HEALTHY (last run ok,
+#   fresh, no failures since, not silent); a health claim is false only against one that
+#   is clearly UNHEALTHY (last run failed, never succeeded, not wired or configured,
+#   stale). Anything in between is not judged. A claim about named workers is judged
+#   against those workers; one about the division, against all of them.
+
+HEALTHY, UNHEALTHY, UNCLEAR = "healthy", "unhealthy", "unclear"
+
+_CLAUSE = re.compile(r"[.;!?](?:\s+|$)|,\s*|\n+|\s+(?:but|while|whereas|although|though|"
+                     r"however|yet)\s+")
+_NEGATORS = frozenset(words("no not 0 zero none without nothing never nor neither n't"))
+_AUX = frozenset(words("that which who have has had were was are is been be also all both"))
+_FAIL_PHRASE = re.compile(
+    r"\b(?:(?:has|have|had)\s+(?:\w+\s+)?not\s+(?:yet\s+|ever\s+|once\s+)?succeeded"
+    r"|(?:hasn't|haven't|hadn't)\s+(?:yet\s+|ever\s+|once\s+)?succeeded"
+    r"|(?:did|does|do)\s+not\s+succeed|(?:didn't|doesn't|don't)\s+succeed"
+    r"|never\s+(?:once\s+|yet\s+)?succeeded|not\s+(?:been\s+)?successful|unsuccessful"
+    r"|no\s+success(?:es|ful)?"
+    r"|not\s+(?:been\s+)?(?:working|running|functioning)"
+    r"|(?:is|are|was|were|has\s+been|have\s+been)\s+(?:down|offline|dead))\b")
+_FAIL_WORD = re.compile(r"\b(fail(?:s|ed|ing|ures?)?|stalled|stalling|stuck|broken|erroring|"
+                        r"crash(?:ed|es|ing)?)\b")
+_OK_PHRASE = re.compile(
+    r"\b(?:healthy|succeeded|succeeding|(?:operating|running|functioning|working)\s+normally"
+    r"|(?:is|are)\s+(?:ok|okay|fine|up\s+and\s+running|working|running)"
+    r"|no\s+(?:issues|problems|failures|errors))\b")
+_DIVISION = re.compile(r"\b(?:workers|desks|division|every\s+worker|each\s+worker)\b")
+_ALL = re.compile(r"\b(?:all|every|each|both|no\s+(?:issues|problems|failures|errors))\b")
+
+
+def _aliases(worker_id: str) -> re.Pattern:
+    short = worker_id.split(".", 1)[-1].lower()
+    names = sorted({re.escape(short), re.escape(singular(short))}, key=len, reverse=True)
+    return re.compile(rf"(?<![\w.]){re.escape(worker_id.lower())}(?!\w)"
+                      rf"|\b(?:{'|'.join(names)})\s+(?:workers?|desks?)\b")
+
+
+def _tokens_before(text: str, pos: int, n: int) -> list:
+    return re.findall(r"[a-z0-9']+", text[:pos].replace("n't", " n't"))[-n:]
+
+
+def _negated(clause: str, pos: int) -> bool:
+    return bool(set(_tokens_before(clause, pos, 3)) & _NEGATORS)
+
+
+def _item_bound(clause: str, m: re.Match, items: set) -> bool:
+    """A failure word about a counted thing ("2 drafts failed", "failed to send",
+    "failing products"), not about a worker."""
+    after = re.findall(r"[a-z0-9']+", clause[m.end():])[:1]
+    if after and (after[0] in ("the", "a", "an", "to", "its", "their")
+                  or singular(after[0]) in items):
+        return True
+    before = [t for t in _tokens_before(clause, m.start(), 4) if t not in _AUX]
+    return bool(before) and singular(before[-1]) in items
+
+
+def health_claims(texts: Iterable[str], states: dict, items: Iterable[str] = ()) -> list:
+    """The report's claims about worker health that the runs table contradicts, in words.
+
+    ``states``: worker_id -> (HEALTHY | UNHEALTHY | UNCLEAR, the brief's words for it).
+    ``items``: the nouns the division's figures count (drafts, deliveries...), which a
+    failure word may be about instead of a worker."""
+    items = {singular(i) for i in items} | {singular(n) for n in RESULT_NOUNS}
+    items -= {w.split(".", 1)[-1].lower() for w in states}
+    aliases = {w: _aliases(w) for w in states}
+    problems: list = []
+    for text in texts:
+        for clause in _CLAUSE.split(text or ""):
+            low = (clause or "").lower()
+            named = [w for w, rx in aliases.items() if rx.search(low)]
+            if not named and not _DIVISION.search(low):
+                continue
+            fails = [m.group(0) for m in _FAIL_PHRASE.finditer(low)]
+            masked = _FAIL_PHRASE.sub(lambda m: " " * len(m.group(0)), low)
+            fails += [m.group(0) for m in _FAIL_WORD.finditer(masked)
+                      if not _negated(masked, m.start()) and not _item_bound(masked, m, items)]
+            oks = []
+            for m in _OK_PHRASE.finditer(masked):
+                negated = _negated(masked, m.start()) and not m.group(0).startswith("no ")
+                (fails if negated else oks).append(m.group(0))
+            who = named or list(states)
+            if fails:
+                wrong = [w for w in who if states[w][0] == HEALTHY]
+                if wrong and (named or len(wrong) == len(states)):
+                    problems.append(_health_reason(fails[0], named, wrong, states))
+            elif oks and (named or _ALL.search(low)):
+                wrong = [w for w in who if states[w][0] == UNHEALTHY]
+                if wrong:
+                    problems.append(_health_reason(oks[0], named, wrong, states))
+    return list(dict.fromkeys(problems))
+
+
+def _health_reason(said: str, named: list, wrong: list, states: dict) -> str:
+    return (f"says {said!r} about {', '.join(named) or 'the workers'}, but the runs show "
+            + "; ".join(f"{w}: {states[w][1]}" for w in wrong))
