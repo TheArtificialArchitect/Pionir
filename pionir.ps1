@@ -88,14 +88,19 @@ function Stop-Bryo {
     $org = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -match '-m bryo(\s|$)' -and $_.CommandLine -notmatch 'viewer' }
     if (-not $org) { return }
+    # He reads KILL once per tick, and a quiet organism ticks as slowly as every
+    # 60 s (heartbeat.py clips the interval to 1..60), so wait out a whole tick.
+    # A 21 s wait once reported "stopped" while he kept running in the old window.
     $kill = Join-Path $terrariumDir "KILL"
     Set-Content -Path $kill -Value "pionir.ps1 -Stop" -Encoding UTF8
-    for ($i = 0; $i -lt 30; $i++) {
+    $gone = $false
+    for ($i = 0; $i -lt 130; $i++) {
         Start-Sleep -Milliseconds 700
-        if (-not (Get-Process -Id $org.ProcessId -ErrorAction SilentlyContinue)) { break }
+        if (-not (Get-Process -Id $org.ProcessId -ErrorAction SilentlyContinue)) { $gone = $true; break }
     }
     Remove-Item $kill -ErrorAction SilentlyContinue
-    Write-Host "  stopped Bryo (clean checkpoint + exit)."
+    if ($gone) { Write-Host "  stopped Bryo (clean checkpoint + exit)." }
+    else { Write-Host "  ! Bryo did not exit within 90 s; he is still running (KILL withdrawn)." -ForegroundColor Yellow }
 }
 
 # One pane = one process tree wt kills on close. The command sets the pane's
@@ -105,8 +110,37 @@ function Enc([string]$command) {
     return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
 }
 function Pane-Cmd([string]$title, [string]$dir, [string]$run, [string]$prelude) {
-    $body = "`$host.UI.RawUI.WindowTitle='$title'; Set-Location '$dir'; $prelude$run"
+    # PIONIR_PANE marks the shell as one of ours, so Close-EmptyPanes can find it.
+    $body = "`$env:PIONIR_PANE='1'; `$host.UI.RawUI.WindowTitle='$title'; Set-Location '$dir'; $prelude$run"
     return @("powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-EncodedCommand", (Enc $body))
+}
+
+function Close-EmptyPanes {
+    # A pane is a -NoExit shell, so stopping its bridge leaves the shell (and the
+    # window) behind: three restarts in one night left three windows of 17 empty
+    # shells. Close only Pionir's own pane shells - the PIONIR_PANE marker in the
+    # decoded command, or the older launcher's exact prelude - that no longer run
+    # anything. Never the shell running this script, or any of its ancestors.
+    $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    $mine = @{}
+    $cur = $PID
+    while ($cur -and -not $mine.ContainsKey($cur)) {
+        $mine[$cur] = $true
+        $cur = ($all | Where-Object { $_.ProcessId -eq $cur } | Select-Object -First 1).ParentProcessId
+    }
+    $closed = 0
+    foreach ($p in $all) {
+        if ($p.Name -ne 'powershell.exe' -or $mine.ContainsKey($p.ProcessId)) { continue }
+        if ($p.CommandLine -notmatch '-NoExit' -or $p.CommandLine -notmatch '-EncodedCommand\s+(\S+)') { continue }
+        try { $text = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1])) } catch { continue }
+        $ours = $text.StartsWith("`$env:PIONIR_PANE='1';") -or $text.StartsWith("`$host.UI.RawUI.WindowTitle='")
+        if (-not $ours) { continue }
+        $busy = @($all | Where-Object { $_.ParentProcessId -eq $p.ProcessId -and $_.Name -ne 'conhost.exe' })
+        if ($busy.Count -gt 0) { continue }
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+        $closed++
+    }
+    if ($closed) { Write-Host "  closed $closed empty pane(s) left by an earlier launch." }
 }
 
 if ($Stop) {
@@ -116,6 +150,7 @@ if ($Stop) {
     Stop-Port 8770 "Melete"
     Stop-Port 8782 "crew"
     Stop-Bryo
+    Close-EmptyPanes
     Write-Host "  stack stopped. (Closing the Pionir window does the same thing.)"
     exit 0
 }
@@ -231,6 +266,7 @@ if ($panes.Count -eq 0) {
     exit 0
 }
 
+Close-EmptyPanes
 $usedWt = $false
 if (Test-Path $wt) {
     # Assemble one window: first pane is a new-tab; the second splits it into two
