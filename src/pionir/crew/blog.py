@@ -20,7 +20,9 @@ One run:
 5. **The worker inserts the links itself**, each carrying the blog's UTM tags, and only
    THEN runs ``contentcheck.check`` - on the exact dict that would be submitted.
 6. **Blocked**: recorded with its reasons, loudly, and NOT submitted. One fresh draft is
-   allowed per run, with the reasons in the prompt. **Passed**: submitted as
+   allowed per run, with the reasons in the prompt; a topic blocked on an earlier day
+   starts its first draft with its last block's reasons (the model runs at temperature 0,
+   so without them it writes the same draft again). **Passed**: submitted as
    ``Job("content.publish", {draft_id, slug, title, description, body_md, tags})``; Pionir
    parks it for the owner, and it is recorded as PENDING APPROVAL - never as published.
    The record keeps that exact payload with the post (``payload``): once published it is
@@ -431,7 +433,10 @@ class DailyPoster(_Base):
             log.warning("%s: every topic has been used; nothing to draft until a goal or a "
                         "new seed topic is given", self.worker_id)
             return None
-        reasons: list = []
+        # The model runs at temperature 0: a topic blocked on an earlier day, drafted again
+        # with no reasons, comes back as the same draft and the same block. Its first draft
+        # today already knows why its last one was thrown away.
+        reasons: list = self._last_block_reasons(rec, topic)
         submitted = False
         for attempt in (1, 2):      # one fresh draft per run, at most, after a block
             got = ctx.words(self.purpose, self._system(),
@@ -463,6 +468,14 @@ class DailyPoster(_Base):
                 and topic.key not in rec["used_topics"]:
             rec["used_topics"].append(topic.key)
         return None
+
+    @staticmethod
+    def _last_block_reasons(rec: dict, topic: Topic) -> list:
+        """The reasons this topic's most recent blocked draft was thrown away, or none."""
+        for entry in reversed(rec.get("blocked") or []):
+            if isinstance(entry, dict) and entry.get("topic") == topic.key:
+                return [r for r in entry.get("reasons") or [] if isinstance(r, str)]
+        return []
 
     # ---- what a subclass says about its own kind of post ----------------------------------
     def _system(self) -> str:

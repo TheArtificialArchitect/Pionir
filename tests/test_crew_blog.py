@@ -313,6 +313,30 @@ class TopicAndSlugTests(_Case):
         self.assertIn("QR codes", brain.calls[0]["user"])
         self.assertIn("more search traffic", brain.calls[0]["user"])
 
+    def test_a_topic_blocked_yesterday_starts_today_knowing_why(self) -> None:
+        # temperature 0: without yesterday's reasons the first draft is yesterday's draft,
+        # blocked again, and the topic burns its MAX_TOPIC_BLOCKS days
+        brain = FakeBrain(bad(), bad(), good())
+        self.run_at(T0, brain)
+        self.assertNotIn("thrown away", brain.calls[0]["user"])     # a fresh topic: none
+        self.run_at(T0 + DAY, brain)
+        self.assertEqual(len(brain.calls), 3)
+        today = brain.calls[2]["user"]
+        self.assertIn(f"Topic: {SEEDS[0].subject}.", today)
+        self.assertIn("thrown away", today)
+        self.assertIn("'Jane Doe'", today)
+        (job,) = self.hands.jobs
+        self.assertEqual(self.record()["used_topics"], [SEEDS[0].key])
+
+    def test_another_topics_block_is_not_fed_to_this_one(self) -> None:
+        rec = self.worker.load(self.state)
+        rec["blocked"] = [{"draft_id": "x", "topic": SEEDS[1].key, "reasons": ["other topic"],
+                           "attempt": 1, "at": T0 - DAY}]
+        self.worker.save(self.state, rec)
+        brain = FakeBrain(good())
+        self.run_at(T0, brain)
+        self.assertNotIn("other topic", brain.calls[0]["user"])
+
     def test_a_goal_that_matches_no_seed_is_never_the_posts_subject(self) -> None:
         # live: Moss's instruction to the division would have become a post about itself,
         # linking to "/"; it only steers among the seeds, so the rotation goes on
