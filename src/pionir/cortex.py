@@ -37,6 +37,7 @@ from __future__ import annotations
 import array
 import functools
 import json
+import logging
 import urllib.error
 import urllib.request
 import math
@@ -47,7 +48,9 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Protocol, Sequence
+from typing import Any, Callable, Iterable, Protocol, Sequence
+
+_log = logging.getLogger(__name__)
 
 # Reciprocal-rank fusion constant. Fusion combines lexical and semantic recall by
 # rank, not by raw score, because a BM25 score and a cosine similarity live on
@@ -745,18 +748,55 @@ class OllamaEmbedder:
     Every failure path returns None rather than raising, because the Cortex
     embedding contract is fail-open: None means "fall back to lexical", not
     "the turn failed".
+
+    Fail-open must also fail FAST. When Ollama cannot answer (2026-09-26: its
+    scheduler wedged for 75 minutes waiting on an eviction that never finished),
+    every call waited out the full timeout - every Pionir task took 30 s, and Moss's
+    20 s business reads all failed. So a transport failure pauses the embedder:
+    calls go straight to lexical for a cooldown that doubles with each failure in a
+    row (60 s up to 15 min), and the first success clears it. The way back is
+    automatic - the first call after the cooldown tries Ollama again.
     """
+
+    BACKOFF_FIRST_SECONDS = 60.0
+    BACKOFF_MAX_SECONDS = 900.0
 
     def __init__(
         self,
         model: str = "nomic-embed-text",
         base_url: str = "http://127.0.0.1:11434",
         timeout_seconds: int = 30,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout_seconds
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self._clock = clock
+        self._pause_lock = threading.Lock()
+        self._paused_until = 0.0
+        self._backoff = 0.0
+
+    def paused_for(self) -> float:
+        """Seconds until the embedder is tried again (0 when it is live)."""
+        with self._pause_lock:
+            return max(0.0, self._paused_until - self._clock())
+
+    def _pause(self, error: BaseException) -> None:
+        with self._pause_lock:
+            self._backoff = min(self.BACKOFF_MAX_SECONDS,
+                                self._backoff * 2 or self.BACKOFF_FIRST_SECONDS)
+            self._paused_until = self._clock() + self._backoff
+            backoff = self._backoff
+        _log.warning("embedder %s unreachable (%s); lexical recall only for %.0f s",
+                     self._model, error, backoff)
+
+    def _clear(self) -> None:
+        with self._pause_lock:
+            if self._backoff:
+                _log.info("embedder %s answering again", self._model)
+            self._backoff = 0.0
+            self._paused_until = 0.0
 
     @property
     def model(self) -> str:
@@ -766,6 +806,8 @@ class OllamaEmbedder:
         items = [t for t in texts]
         if not items:
             return []
+        if self.paused_for() > 0:
+            return None
         body = json.dumps({"model": self._model, "input": items}).encode("utf-8")
         request = urllib.request.Request(
             f"{self._base_url}/api/embed",
@@ -775,8 +817,14 @@ class OllamaEmbedder:
         )
         try:
             with self._opener.open(request, timeout=self._timeout) as response:
-                document = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+                raw = response.read()
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            self._pause(error)
+            return None
+        self._clear()
+        try:
+            document = json.loads(raw.decode("utf-8"))
+        except ValueError:
             return None
         vectors = document.get("embeddings") if isinstance(document, dict) else None
         if not isinstance(vectors, list) or len(vectors) != len(items):
