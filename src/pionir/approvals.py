@@ -59,6 +59,8 @@ class Approval:
     expires_at: str | None = None  # a pending row past this is auto-denied ("expired")
     reason: str | None = None      # why it was denied, when it was
     task_id: str | None = None     # the job that ran it, once claimed
+    batch: bool = False            # waits for the owner's daily digest (pionir/batching.py)
+    digest_date: str | None = None # the digest it is (or will next be) listed in, local date
 
 
 class ApprovalQueue:
@@ -135,7 +137,12 @@ class ApprovalQueue:
         return changed
 
     def enqueue(self, capability: str, payload: dict[str, Any], permissions: list[str],
-                summary: str, requester: str = "moss") -> str:
+                summary: str, requester: str = "moss", *, batch: bool = False,
+                digest_date: str | None = None,
+                expires_after: timedelta | None = None) -> str:
+        """Park one action. ``batch`` rows are the same record - same checks, same claim,
+        same settle - that wait for the daily digest instead of their own card, with
+        their own (longer) ``expires_after``; nothing else about them differs."""
         with self._lock:
             rows = self._load()
             self._sweep(rows)
@@ -143,7 +150,9 @@ class ApprovalQueue:
             approval = Approval(
                 id=uuid.uuid4().hex[:12], created_at=now.isoformat(), capability=capability,
                 payload=dict(payload), permissions=list(permissions), summary=summary,
-                requester=requester, expires_at=(now + EXPIRES_AFTER).isoformat(),
+                requester=requester,
+                expires_at=(now + (expires_after or EXPIRES_AFTER)).isoformat(),
+                batch=bool(batch), digest_date=digest_date if batch else None,
             )
             rows.append(asdict(approval))
             self._save(rows)
@@ -162,6 +171,32 @@ class ApprovalQueue:
             if self._sweep(rows):
                 self._save(rows)
             return [r for r in rows if r["status"] == "pending"]
+
+    def note_digest(self, approval_ids: list[str], digest_date: str) -> int:
+        """Record that these still-pending batched rows are listed in the digest of
+        ``digest_date`` (a carried-over row moves to the new date). Touches nothing
+        else - never a status. Returns how many rows changed."""
+        wanted = set(approval_ids)
+        with self._lock:
+            rows = self._load()
+            changed = 0
+            for row in rows:
+                if row.get("id") in wanted and row.get("status") == "pending"                         and row.get("batch") and row.get("digest_date") != digest_date:
+                    row["digest_date"] = digest_date
+                    changed += 1
+            if changed:
+                self._save(rows)
+            return changed
+
+    def batched_expired(self) -> list[dict[str, Any]]:
+        """Batched rows that expired unanswered (denied, reason "expired"), oldest first:
+        what the next digest reports as "expired, not run"."""
+        with self._lock:
+            rows = self._load()
+            if self._sweep(rows):
+                self._save(rows)
+            return [dict(r) for r in rows if r.get("batch") and r.get("status") == "denied"
+                    and r.get("reason") == "expired"]
 
     def find(self, capability: str, key: str, value: Any) -> list[dict[str, Any]]:
         """Every row (any status, newest first) for ``capability`` whose payload[key] is

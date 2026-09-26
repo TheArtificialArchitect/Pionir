@@ -104,6 +104,16 @@ class Capability:
     around it. Such a capability must be PRIVILEGED (enforced below), PionirApp
     parks it on every call, and the intent router never classifies to it, so no
     routed request can run it either."""
+    batchable: bool = False
+    """This approval may wait for the owner's DAILY DIGEST instead of its own card at once.
+
+    The owner's decision, 2026-09-26: "Batch low-risk ones daily." Routine public items (a
+    blog post, a dev.to cross-post, an Instagram card, a product listing) arrive together
+    as one digest card he approves item by item; anything touching money or a client
+    stays its own card, instantly. Declared per capability and OFF by default, so a new
+    capability is never batched by accident (fail closed). A batchable capability must
+    need the owner's yes on every call and must never spend money (enforced below); the
+    server applies pionir.batching.batch_refusal on top, per call."""
 
     def __post_init__(self) -> None:
         if not self.name or any(char.isspace() for char in self.name):
@@ -120,6 +130,11 @@ class Capability:
             raise ValueError(
                 f"{self.name} requires the owner's approval on every call, so it must be "
                 "RiskLevel.PRIVILEGED"
+            )
+        if self.batchable and (self.spends_money or not self.requires_approval):
+            raise ValueError(
+                f"{self.name} cannot wait for the daily digest: only an every-call approval "
+                "that spends no money may be batched"
             )
         if any(not hint or any(char.isspace() for char in hint) for hint in self.routing_hints):
             raise ValueError("routing hints must be non-empty single words")

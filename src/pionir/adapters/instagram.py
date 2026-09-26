@@ -305,6 +305,9 @@ class InstagramAdapter:
                     risk=RiskLevel.PRIVILEGED,
                     required_permissions=frozenset({POST}),
                     requires_approval=True,
+                    # routine and public, no money, no client: waits for the
+                    # owner's daily digest (pionir/batching.py)
+                    batchable=True,
                     routable=False,
                 ),
                 Capability(

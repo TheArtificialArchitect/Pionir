@@ -31,6 +31,13 @@ from urllib.parse import parse_qs, urlparse
 
 from . import atomic
 from .approvals import ApprovalQueue
+from .batching import (
+    DigestSettings,
+    batch_refusal,
+    local_now,
+    read_request,
+    request_digest,
+)
 from .bootstrap import PionirRuntime
 from .cli import _capabilities, _doctor, _jsonable
 from .contracts import RiskLevel, Task, outcome_ok
@@ -293,6 +300,8 @@ class PionirApp:
         self.router = IntentRouter(runtime.executive)
         self.approvals = ApprovalQueue(runtime.settings.state_root / "approvals" / "queue.json")
         self.jobs = Jobs(runtime.settings.state_root / "tasks")
+        # When routine public approvals are batched into the owner's daily digest.
+        self.digest = DigestSettings.from_environment(runtime.settings.state_root)
 
     # ---- jobs: work that outlives the request ---------------------------
     def _submit(
@@ -725,16 +734,26 @@ class PionirApp:
         if self._needs_approval(capability, granted):
             _agent, cap = self._cap_and_agent(capability)
             summary = self._summarize(capability, payload)
+            # Routine public items wait for the owner's daily digest; money and clients
+            # never do (pionir/batching.py). Either way it is the same queue record.
+            batch = self.digest.enabled and batch_refusal(cap, payload) is None
+            digest_date = self.digest.next_digest(local_now()).date().isoformat()                 if batch else None
             approval_id = self.approvals.enqueue(
-                capability, payload, sorted(cap.required_permissions), summary=summary
+                capability, payload, sorted(cap.required_permissions), summary=summary,
+                batch=batch, digest_date=digest_date,
+                expires_after=self.digest.expires_after if batch else None,
             )
             response = {
                 "ok": False,
                 "status": "pending_approval",
                 "approval_id": approval_id,
                 "summary": summary,
-                "note": "held for Ian's approval - it has not run",
+                "note": (f"held for Ian's daily digest of {digest_date} - it has not run"
+                         if batch else "held for Ian's approval - it has not run"),
             }
+            if batch:
+                response["batched"] = True
+                response["digest_date"] = digest_date
             record = self.jobs.create("task", body)
             self.jobs.finish(record["task_id"], "pending_approval", result=response)
             return {**response, "task_id": record["task_id"]}
@@ -827,7 +846,31 @@ class PionirApp:
 
     # ---- approvals: Ian's yes/no on a parked privileged action ----------
     def approvals_view(self) -> dict[str, Any]:
-        return {"pending": self.approvals.pending(), "recent": self.approvals.recent(20)}
+        """The queue, as the dashboard shows it. A batched row is pending like any other,
+        with ``batch: true`` and its ``digest_date``."""
+        pending = self.approvals.pending()
+        request = self._digest_request()
+        return {"pending": pending, "recent": self.approvals.recent(20),
+                "digest": {"enabled": self.digest.enabled, "time": self.digest.time_text,
+                           "expire_days": self.digest.expire_days,
+                           "next": self.digest.next_digest(local_now()).isoformat(),
+                           "batched_pending": sum(1 for r in pending if r.get("batch")),
+                           "requested": bool(request and request.get("answered") is not True)}}
+
+    def _digest_request(self) -> dict[str, Any] | None:
+        return read_request(self.runtime.settings.state_root)
+
+    def request_digest(self) -> dict[str, Any]:
+        """The owner's urgent override: the Discord gate sends the digest on its next
+        poll instead of waiting for the daily time. Nothing is approved by asking."""
+        if not self.digest.enabled:
+            return {"ok": False, "error": {"type": "Disabled",
+                                           "message": "batching is off; every approval "
+                                                      "already has its own card"}}
+        request = request_digest(self.runtime.settings.state_root)
+        waiting = sum(1 for r in self.approvals.pending() if r.get("batch"))
+        return {"ok": True, "requested_at": request["requested_at"],
+                "request_id": request["id"], "batched_pending": waiting}
 
     def approve(self, approval_id: str, *, wait: float = 0.0) -> dict[str, Any]:
         """Claim first, then run as a job. The claim is an atomic pending->running
@@ -1061,6 +1104,8 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                         self._send({"error": "id required"}, 400)
                         return
                     self._send_job(app.approve(aid))
+                elif route.path == "/api/approvals/digest":
+                    self._send(app.request_digest())
                 elif route.path == "/api/approvals/deny":
                     aid = str(body.get("id", "")).strip()
                     if not aid:

@@ -32,6 +32,20 @@ permission it was parked with, and settled approved / approved_failed. A ❌ goe
 through ``PionirApp.deny``. When the row settles, by whichever route, the
 message is edited to say what happened, so the channel is an honest log.
 
+The daily digest. A row parked with ``batch: true`` (a routine public item - see
+pionir/batching.py; never money, never a client) is not posted at once: at the daily digest
+time (PIONIR_DIGEST_TIME, default 09:00 local), or when the owner asks for it early
+(POST /api/approvals/digest), each waiting item gets its full card posted as a quiet
+preview and ONE digest card lists them, numbered 1-10 (more cards past ten, or past what
+one message holds), each with a link to its preview. On the digest card a number approves
+that item and ✅ approves every item still waiting on it; ❌ on an item's preview rejects
+it (the previews are read first, so a reject always beats an approve-all in the same
+poll); the owner's ❌ on the digest card itself approves nothing from it. Approving goes
+through the same ``PionirApp.approve`` as any card. Undecided items carry over to the next
+digest (the older card is marked superseded and its reactions stop counting); an item left
+unanswered for PIONIR_DIGEST_EXPIRE_DAYS (default 7) is denied as expired, never run, and
+the next digest reports it.
+
 Quote replies. The same poll also reads the owner's REPLIES to the quote cards
 (``quotes.card``) and turns each into a parked ``client.quote`` - see pionir/quotes.py. That
 is a REST read of the channel's messages (``GET /channels/<id>/messages?after=``): no
@@ -88,6 +102,7 @@ from .adapters.devto import CROSSPOST as DEVTO_CROSSPOST
 from .adapters.instagram import POST as INSTAGRAM_POST
 from .adapters.products import PUBLISH as PRODUCT_PUBLISH
 from .adapters.products import price_text
+from .batching import DigestSettings, answer_request, local_now, read_request
 from .quotes import (
     LINK_DAYS,
     QuoteCardStore,
@@ -915,12 +930,15 @@ def _instagram_lines(payload: Mapping[str, Any]) -> list[str]:
 def render_request(row: Mapping[str, Any], owner: str | None, *,
                    delivery: Mapping[str, Any] | None = None,
                    product: Mapping[str, Any] | None = None,
-                   quote_reply: Mapping[str, Any] | None = None) -> str:
+                   quote_reply: Mapping[str, Any] | None = None,
+                   digest: bool = False) -> str:
     """The whole text of an approval message, before it is split to fit Discord.
     Nothing that says what the action does is ever cut; long text is split
     across messages instead. ``delivery`` is a client.deliver's zip as inspected on
     disk (ClientAdapter.delivery_preview), or None if it could not be; ``product`` is a
-    product.gumroad_publish's files as inspected (ProductAdapter.product_preview)."""
+    product.gumroad_publish's files as inspected (ProductAdapter.product_preview).
+    ``digest``: the row waits in the daily digest, so this is its full preview, answered
+    by its number on the digest card (or here)."""
 
     payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
     publishes = row.get("capability") == PUBLISH
@@ -972,7 +990,11 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
     expires = _stamp(row.get("expires_at"))
     if expires:
         lines.append(f"**Expires:** {expires} - unanswered, it is denied")
-    if owner:
+    if owner and digest:
+        lines.append(f"\U0001f4ec **Waits in the daily digest** - approve it with its number "
+                     f"on the digest card (or {APPROVE} here); react {DENY} here to reject it. "
+                     f"Only <@{owner}>'s reaction counts.")
+    elif owner:
         lines.append(f"React {APPROVE} to approve or {DENY} to deny. Only <@{owner}>'s "
                      "reaction counts.")
     else:
@@ -1035,6 +1057,134 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
     lines += ["**Full payload:**", _FENCE + "json",
               _fence_safe(json.dumps(shown, indent=2, ensure_ascii=False, default=str)),
               _FENCE]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- the daily digest
+# One keycap per item on a digest card: react the number to approve that item.
+NUMBERS = tuple(f"{n}️⃣" for n in range(1, 10)) + ("\U0001f51f",)
+DIGEST_MAX_ITEMS = len(NUMBERS)
+_DIGEST_KINDS = {PUBLISH: "Blog post", DEVTO_CROSSPOST: "dev.to cross-post",
+                 INSTAGRAM_POST: "Instagram post", PRODUCT_PUBLISH: "Gumroad listing"}
+_LONGEST_LINK = "https://discord.com/channels/" + "/".join(["9" * 20] * 3)
+
+
+def _emoji_key(name: Any) -> str:
+    """Discord may or may not keep the variation selector on a keycap's name."""
+    return str(name or "").replace("️", "")
+
+
+def digest_kind(row: Mapping[str, Any]) -> str:
+    capability = str(row.get("capability"))
+    return _DIGEST_KINDS.get(capability, capability)
+
+
+def digest_title(row: Mapping[str, Any]) -> str:
+    """Enough to recognise the item on the card; its full preview says everything."""
+    payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
+    capability = row.get("capability")
+    title: Any = None
+    if capability in (PUBLISH, DEVTO_CROSSPOST):
+        title = payload.get("title")
+    elif capability == INSTAGRAM_POST:
+        title = payload.get("headline")
+    elif capability == PRODUCT_PUBLISH:
+        name = payload.get("name")
+        if isinstance(name, str) and name.strip():
+            price = price_text(payload.get("price_cents"), payload.get("pay_what_you_want"))
+            title = f"{name.strip()} ({price})"
+    if not isinstance(title, str) or not title.strip():
+        title = row.get("summary") or row.get("id")
+    text = " ".join(str(title).split())
+    return text if len(text) <= 80 else text[:79] + "…"
+
+
+def digest_status(row: Mapping[str, Any] | None, carried_to: str | None = None) -> str:
+    """One item's standing, as its line on a digest card shows it."""
+    if row is None:
+        return "❔ gone from the queue"
+    status = row.get("status")
+    if status == "pending":
+        return f"↪️ carried over to {carried_to}" if carried_to else "⏳ waiting"
+    if status == "running":
+        return "▶️ approved, running"
+    if status == "approved":
+        return "✅ approved, ran OK"
+    if status == "approved_failed":
+        return "⚠️ approved, run FAILED"
+    if status == "denied" and row.get("reason") == "expired":
+        return "⌛ expired, not run"
+    if status == "denied" and row.get("reason") == "interrupted":
+        return "⚠️ interrupted"
+    if status == "denied":
+        return "❌ rejected, not run"
+    return f"❔ {_escape(str(status))}"
+
+
+def _parked(row: Mapping[str, Any] | None) -> str:
+    try:
+        created = datetime.fromisoformat(str((row or {}).get("created_at")))
+    except ValueError:
+        return ""
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=UTC)
+    local = created.astimezone()
+    return f"{local:%b} {local.day}"
+
+
+def superseded_line(day: str) -> str:
+    return (f"↪️ **Superseded by the digest of {day}** - every item still waiting is "
+            "listed there; reactions here no longer count.")
+
+
+DECIDED_LINE = "✔️ **Every item on this card is decided.**"
+
+
+def render_digest_card(day: str, index: int, total: int,
+                       items: list[tuple[Mapping[str, Any] | None, str | None, str]],
+                       owner: str | None, expire_days: int, *, requested: bool = False,
+                       closing: str | None = None) -> str:
+    """A digest card: one numbered line per item (its kind, title, when it was parked and
+    a link to its full preview) and how to answer. ``items`` is (row, preview link,
+    status) in card order; ``closing`` goes on top once the card is final."""
+
+    count = len(items)
+    head = (f"\U0001f4ec **Daily digest · {day}** · card {index} of {total} · "
+            f"{count} routine public item{'s' if count != 1 else ''}"
+            + (" · sent early, as you asked" if requested else ""))
+    lines = [closing, ""] if closing else []
+    lines += [head, ("Nothing here spends money or contacts a client - those always get "
+                     "their own card at once.")]
+    for number, (row, link, status) in zip(NUMBERS, items, strict=False):
+        kind = digest_kind(row) if row is not None else "?"
+        title = digest_title(row) if row is not None else "(no longer in the queue)"
+        line = f"{number} {status} · **{_escape(kind)}** — {_escape(title)}"
+        parked = _parked(row)
+        if parked:
+            line += f" · parked {parked}"
+        line += (f" · [full preview](<{link}>)" if link
+                 else " · (preview not posted: not approvable here)")
+        lines.append(line)
+    if owner:
+        lines.append(f"**Answer:** react a number to approve that item, or {APPROVE} to approve "
+                     f"every item still waiting here. To reject one, react {DENY} on its full "
+                     f"preview. Undecided items carry over to the next digest; unanswered for "
+                     f"{expire_days} days, an item expires and does not run. Only "
+                     f"<@{owner}>'s reactions count.")
+    else:
+        lines.append("⚠️ **This gate cannot accept answers: no owner user id is "
+                     "configured (PIONIR_DISCORD_USER_ID).** Approve or deny from the phone page.")
+    return "\n".join(lines)
+
+
+def render_expired(rows: list[Mapping[str, Any]], expire_days: int) -> str:
+    """The report of batched items that expired unanswered: denied, never run."""
+    lines = [(f"⌛ **Expired, not run** - unanswered for {expire_days} days in the daily "
+              "digest, so these were denied and did **not** run:")]
+    for row in rows:
+        lines.append(f"• **{_escape(digest_kind(row))}** — "
+                     f"{_escape(digest_title(row))} · parked {_parked(row) or '?'} "
+                     f"· id `{row.get('id')}`")
     return "\n".join(lines)
 
 
@@ -1130,6 +1280,25 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _fresh_digest_state() -> dict[str, Any]:
+    """The gate's own record of the daily digest (saved in gate.json with the cards)."""
+    return {"last_run_at": None, "handled_request": None, "run": None, "cards": {},
+            "reported_expired": []}
+
+
+def _parse_when(stamp: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(stamp))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _older_than(stamp: Any, cutoff: datetime) -> bool:
+    parsed = _parse_when(stamp) if stamp else None
+    return parsed is not None and parsed < cutoff
+
+
 # ---------------------------------------------------------------- the gate
 class DiscordGate:
     """Posts each pending approval to Discord and turns the owner's reaction
@@ -1147,8 +1316,16 @@ class DiscordGate:
         inspect_delivery: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
         inspect_product: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
         quotes: QuoteReplies | None = None,
+        digest: DigestSettings | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.settings = settings
+        # The daily digest of batched (routine public) approvals: when, and for how long
+        # an item may wait. ``clock`` is local, tz-aware wall time (tests fake it).
+        self._digest = digest or DigestSettings.from_environment(settings.state_root)
+        self._clock = clock or local_now
+        self._dstate: dict[str, Any] = _fresh_digest_state()
+        self._guild: str | None = None
         # The owner's replies to quote cards -> parked client.quote (pionir/quotes.py).
         self._quotes = quotes
         self._approvals = approvals      # ApprovalQueue: pending() / get()
@@ -1200,8 +1377,14 @@ class DiscordGate:
                 QuoteCardStore.for_state_root(settings.state_root),
                 submit=lambda capability, payload: app.run_task(capability, payload, wait=0),
                 deny=app.deny, find_approvals=app.approvals.find, get_order=order)
+        if isinstance(getattr(app, "digest", None), DigestSettings):
+            kwargs.setdefault("digest", app.digest)   # the same settings that batch at enqueue
         return cls(settings, approvals=app.approvals, approve=app.approve, deny=app.deny,
                    **kwargs)
+
+    def _batched(self, row: Mapping[str, Any]) -> bool:
+        """This row waits for the daily digest (and is not posted on its own)."""
+        return bool(row.get("batch")) and self._digest.enabled
 
     def _delivery_preview(self, row: Mapping[str, Any]) -> Mapping[str, Any] | None:
         """The zip of a parked client.deliver (or the files of a parked product) as it is
@@ -1229,6 +1412,7 @@ class DiscordGate:
         return preview
 
     def _render(self, row: Mapping[str, Any], preview: Mapping[str, Any] | None) -> str:
+        digest = self._batched(row)
         if row.get("capability") == CLIENT_QUOTE:
             payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
             store = (self._quotes.store if self._quotes is not None
@@ -1236,10 +1420,10 @@ class DiscordGate:
             reply = owner_reply(store, payload.get("order_id"), payload.get("quote_ref"))
             if reply is not None and str(reply.get("by")) != str(self.settings.owner):
                 reply = None
-            return render_request(row, self.settings.owner, quote_reply=reply)
+            return render_request(row, self.settings.owner, quote_reply=reply, digest=digest)
         if row.get("capability") == PRODUCT_PUBLISH:
-            return render_request(row, self.settings.owner, product=preview)
-        return render_request(row, self.settings.owner, delivery=preview)
+            return render_request(row, self.settings.owner, product=preview, digest=digest)
+        return render_request(row, self.settings.owner, delivery=preview, digest=digest)
 
     def __repr__(self) -> str:
         return (f"DiscordGate(channel={self.settings.channel_id!r}, "
@@ -1307,6 +1491,11 @@ class DiscordGate:
             "errors": self.errors,
             "tracked": len(entries),
             "open": sum(1 for e in entries.values() if not e.get("final")),
+            "digest": {"enabled": self._digest.enabled, "time": self._digest.time_text,
+                       "expire_days": self._digest.expire_days,
+                       "last_run_at": self._dstate.get("last_run_at"),
+                       "open_cards": sum(1 for c in self._dstate["cards"].values()
+                                         if not c.get("final"))},
         }
 
     def _loop(self) -> None:
@@ -1382,6 +1571,8 @@ class DiscordGate:
         me = self._call("GET", "/users/@me")
         channel = self._call("GET", f"/channels/{self.settings.channel_id}")
         self._bot = me if isinstance(me, dict) else {}
+        guild = channel.get("guild_id") if isinstance(channel, dict) else None
+        self._guild = str(guild) if guild else None    # for links to a digest item's preview
         _log.info("discord gate up as %s in channel %s; owner %s",
                   self._bot.get("username"),
                   channel.get("name") if isinstance(channel, dict) else self.settings.channel_id,
@@ -1396,12 +1587,17 @@ class DiscordGate:
         fresh = set()
         for row in pending:
             if row["id"] not in self._entries:
+                if self._batched(row):
+                    continue     # waits for the daily digest, which posts its preview
                 fresh.add(row["id"])
                 self._guard(row["id"], lambda row=row: self._post(row))
+        # Every card and digest preview first - so an owner's reject on a preview is
+        # always read before an approve-all on the digest card in the same pass.
         for approval_id, entry in list(self._entries.items()):
             if entry.get("final") or approval_id in fresh:
                 continue
             self._guard(approval_id, lambda a=approval_id, e=entry: self._follow(a, e))
+        self._guard("digest", self._digest_tick)
         self._prune()
 
     def _guard(self, approval_id: str, work: Callable[[], None]) -> None:
@@ -1423,7 +1619,9 @@ class DiscordGate:
         preview = self._delivery_preview(row)
         chunks = split_message(self._render(row, preview))
         owner = self.settings.owner
-        mentions: dict[str, Any] = {"parse": [], "users": [owner] if owner and not status else []}
+        # A digest item's preview never pings: the digest card itself is the one ping.
+        ping = bool(owner and not status and not self._batched(row))
+        mentions: dict[str, Any] = {"parse": [], "users": [owner] if ping else []}
         head = chunks[0]
         message = {"content": _compose(status, head), "allowed_mentions": mentions}
         attachment: Attachment | None = None
@@ -1610,6 +1808,274 @@ class DiscordGate:
             entry["final_at"] = _now().isoformat()
             self._save()
 
+    # ------------------------------------------------------------ the daily digest
+    # Batched rows are ordinary queue rows that wait: once a day (or when the owner asks)
+    # every one still pending gets its full preview posted - the very card it would have
+    # had, answerable with ✅/❌ like any card, but without a ping - and then one digest
+    # card per up-to-ten items lists them, numbered, each linking its preview. A number
+    # on the card approves that item, ✅ approves every item still waiting on the card;
+    # both go through the same _answer -> PionirApp.approve as any card, so an item runs
+    # exactly as its own card would and never twice. A newer digest supersedes the older
+    # cards (their reactions stop counting) and lists what they left undecided again.
+    #
+    # Restart-safe: a digest run is planned (items, pages) and saved before anything is
+    # posted, and every preview and card is saved the moment Discord has it; a restart
+    # finishes the planned run instead of starting another. The worst a crash can do is
+    # post one card twice (the untracked copy never counts) - never drop an item, and
+    # never run one twice (that is the queue's atomic claim).
+
+    def _digest_tick(self) -> None:
+        state = self._dstate
+        for key, card in list(state["cards"].items()):
+            if not card.get("final"):
+                self._guard(f"digest card {key}",
+                            lambda k=key, c=card: self._follow_card(k, c))
+        run = state.get("run")
+        if isinstance(run, dict) and not run.get("complete"):
+            self._continue_run(run)
+            return
+        if not self._digest.enabled:
+            return
+        reason, request = self._digest_due()
+        if reason is not None:
+            self._start_run(reason, request)
+
+    def _digest_due(self) -> tuple[str | None, dict[str, Any] | None]:
+        """("requested", request) when the owner asked for it and it is not yet answered;
+        ("scheduled", None) when today's digest time has passed since the last run."""
+        request = read_request(self.settings.state_root)
+        if request is not None and request.get("answered") is not True \
+                and request.get("id") != self._dstate.get("handled_request"):
+            return "requested", request
+        now = self._clock()
+        last = _parse_when(self._dstate.get("last_run_at"))
+        if last is None or last < self._digest.last_slot(now):
+            return "scheduled", None
+        return None, None
+
+    def _start_run(self, reason: str, request: Mapping[str, Any] | None) -> None:
+        now = self._clock()
+        day = now.date().isoformat()
+        items = [r["id"] for r in self._approvals.pending() if self._batched(r)]
+        reported = set(self._dstate["reported_expired"])
+        expired = [r["id"] for r in self._approvals.batched_expired() if r["id"] not in reported]
+        run = {"id": uuid4().hex[:12], "date": day, "reason": reason,
+               "request_id": (request or {}).get("id"), "started_at": now.isoformat(),
+               "items": items, "pages": self._pack(items, day, reason == "requested"),
+               "posted": {}, "expired": expired, "expired_posted": not expired,
+               "complete": False}
+        self._dstate["run"] = run
+        if request is not None:
+            self._dstate["handled_request"] = request.get("id")
+        self._save()                        # planned before anything is posted
+        _log.info("discord gate: digest of %s (%s): %d item(s), %d expired", day, reason,
+                  len(items), len(expired))
+        self._continue_run(run)
+
+    def _continue_run(self, run: dict[str, Any]) -> None:
+        day = run["date"]
+        cards = self._dstate["cards"]
+        # Older cards stop counting: what they left undecided is listed again below.
+        for card in list(cards.values()):
+            superseded = card.get("final") or card.get("superseded_by")
+            if card.get("run") != run["id"] and not superseded:
+                self._supersede(card, day)
+        if not run.get("expired_posted"):
+            rows = [r for r in (self._approvals.get(a) for a in run["expired"]) if r]
+            if rows:
+                for chunk in split_message(render_expired(rows, self._digest.expire_days),
+                                           MESSAGE_LIMIT):
+                    self._call("POST", f"/channels/{self.settings.channel_id}/messages",
+                               {"content": chunk, "allowed_mentions": {"parse": []}})
+            run["expired_posted"] = True
+            self._save()
+        pending = {r["id"]: r for r in self._approvals.pending()}
+        for approval_id in run["items"]:
+            row = pending.get(approval_id)
+            entry = self._entries.get(approval_id)
+            if row is not None and (entry is None or entry.get("final")):
+                # its full preview, saved the moment it is sent. One that cannot be posted
+                # does not hold up the rest: its line says so and it is not approvable
+                # from the card (never approved blind); the next digest tries again.
+                self._guard(approval_id, lambda row=row: self._post(row))
+        total = len(run["pages"])
+        for index, page in enumerate(run["pages"], start=1):
+            if str(index) not in run["posted"]:
+                self._post_card(run, index, total, page)
+        run["complete"] = True
+        self._dstate["last_run_at"] = run["started_at"]
+        self._dstate["reported_expired"] += [a for a in run["expired"]
+                                             if a not in self._dstate["reported_expired"]]
+        self._save()
+        if run.get("request_id"):
+            answer_request(self.settings.state_root, run["request_id"])
+
+    def _pack(self, items: list[str], day: str, requested: bool) -> list[list[str]]:
+        """Items into cards: at most ten each, and never more than one message can hold
+        (measured with the longest link, status and closing line a card can ever show)."""
+        rows = {a: self._approvals.get(a) for a in items}
+        worst = digest_status({"status": "pending"}, day)
+        pages: list[list[str]] = []
+        current: list[str] = []
+        for approval_id in items:
+            trial = [*current, approval_id]
+            text = render_digest_card(
+                day, 99, 99, [(rows[a], _LONGEST_LINK, worst) for a in trial],
+                self.settings.owner, self._digest.expire_days, requested=requested,
+                closing=superseded_line(day))
+            if current and (len(trial) > DIGEST_MAX_ITEMS or len(text) > MESSAGE_LIMIT):
+                pages.append(current)
+                current = [approval_id]
+            else:
+                current = trial
+        if current:
+            pages.append(current)
+        return pages
+
+    def _preview_link(self, approval_id: str) -> str | None:
+        entry = self._entries.get(approval_id)
+        if not entry or not entry.get("message_id"):
+            return None
+        return (f"https://discord.com/channels/{self._guild or '@me'}/"
+                f"{entry.get('channel_id')}/{entry['message_id']}")
+
+    def _card_text(self, card: Mapping[str, Any],
+                   rows: Mapping[str, Mapping[str, Any] | None]) -> str:
+        carried = card.get("superseded_by")
+        items = [(rows.get(a), self._preview_link(a), digest_status(rows.get(a), carried))
+                 for a in card["items"]]
+        closing = None
+        if carried:
+            closing = superseded_line(carried)
+        elif card.get("final"):
+            closing = DECIDED_LINE
+        text = render_digest_card(card["date"], card["index"], card["total"], items,
+                                  self.settings.owner, self._digest.expire_days,
+                                  requested=bool(card.get("requested")), closing=closing)
+        return text if len(text) <= MESSAGE_LIMIT else text[:MESSAGE_LIMIT - 1] + "…"
+
+    def _post_card(self, run: dict[str, Any], index: int, total: int, page: list[str]) -> None:
+        channel = self.settings.channel_id
+        key = f"{run['id']}-{index}"
+        card: dict[str, Any] = {
+            "run": run["id"], "date": run["date"], "index": index, "total": total,
+            "items": list(page), "requested": run.get("reason") == "requested",
+            "channel_id": channel, "final": False, "reactions_added": False,
+        }
+        rows = {a: self._approvals.get(a) for a in page}
+        text = self._card_text(card, rows)
+        owner = self.settings.owner
+        ping = [owner] if owner and index == 1 else []
+        sent = self._call("POST", f"/channels/{channel}/messages",
+                          {"content": text, "allowed_mentions": {"parse": [], "users": ping}})
+        card.update({"message_id": str(sent["id"]), "posted_at": _now().isoformat(),
+                     "shown": text})
+        self._dstate["cards"][key] = card
+        run["posted"][str(index)] = key
+        self._save()                        # saved at once: a restart never re-posts it
+        self._approvals.note_digest(page, run["date"])
+        self._add_card_reactions(card)
+
+    def _add_card_reactions(self, card: dict[str, Any]) -> None:
+        if not self.settings.owner:
+            return
+        base = f"/channels/{card['channel_id']}/messages/{card['message_id']}/reactions"
+        for emoji in (*NUMBERS[:len(card["items"])], APPROVE):
+            self._call("PUT", f"{base}/{urllib.parse.quote(emoji)}/@me")
+        card["reactions_added"] = True
+        self._save()
+
+    def _follow_card(self, key: str, card: dict[str, Any]) -> None:
+        rows = {a: self._approvals.get(a) for a in card["items"]}
+        waiting = [a for a in card["items"] if (rows[a] or {}).get("status") == "pending"]
+        # A superseded card still shows how its items ended, but its reactions no longer
+        # count: its numbers are not the numbers on the newer card.
+        if waiting and not card.get("superseded_by"):
+            path = f"/channels/{card['channel_id']}/messages/{card['message_id']}"
+            try:
+                message = self._call("GET", path)
+            except DiscordError as error:
+                if error.status != 404:
+                    raise
+                _log.warning("discord gate: digest card %s was deleted; re-posting", key)
+                sent = self._call("POST", f"/channels/{card['channel_id']}/messages",
+                                  {"content": self._card_text(card, rows),
+                                   "allowed_mentions": {"parse": []}})
+                card.update({"message_id": str(sent["id"]), "reactions_added": False,
+                             "shown": None})
+                self._save()
+                self._guard(key, lambda: self._add_card_reactions(card))
+                return
+            if not card.get("reactions_added"):
+                self._guard(key, lambda: self._add_card_reactions(card))
+            chosen, by = self._card_decision(card, message, waiting)
+            for approval_id in chosen:
+                # through the same _answer as a card's own ✅, which also marks its preview
+                self._answer(approval_id, self._entries[approval_id], "approve", by)
+            if chosen:
+                rows = {a: self._approvals.get(a) for a in card["items"]}
+        done = not any((rows[a] or {}).get("status") in ("pending", "running")
+                       for a in card["items"])
+        if done:
+            card["final"] = True
+            card["final_at"] = _now().isoformat()
+        self._edit(card, self._card_text(card, rows))
+        if done:
+            self._save()
+
+    def _card_decision(self, card: Mapping[str, Any], message: Any,
+                       waiting: list[str]) -> tuple[list[str], dict[str, Any]]:
+        """The items the owner approved on this card: a number is that item, ✅ is every
+        item still waiting. Only the owner's reactions count; with no owner configured,
+        or with the owner's ❌ on the card itself (ambiguous: "reject" is answered on an
+        item's preview, never here), nothing on this card is approved."""
+
+        owner = self.settings.owner
+        reactions = message.get("reactions") if isinstance(message, dict) else None
+        if owner is None or not isinstance(reactions, list):
+            return [], {}
+        # Never approved blind: an item whose full preview is not posted cannot be
+        # approved from the card (its line says so).
+        waiting = [a for a in waiting if self._preview_link(a)]
+        numbered = {_emoji_key(n): a for n, a in zip(NUMBERS, card["items"], strict=False)}
+        base = f"/channels/{card['channel_id']}/messages/{card['message_id']}/reactions"
+        chosen: set[str] = set()
+        by: dict[str, Any] = {}
+        refused = False
+        for reaction in reactions:
+            name = (reaction.get("emoji") or {}).get("name")
+            key = _emoji_key(name)
+            if key == _emoji_key(APPROVE):
+                targets = list(waiting)
+            elif key == _emoji_key(DENY):
+                targets = []
+            elif numbered.get(key) in waiting:
+                targets = [numbered[key]]
+            else:
+                continue
+            others = int(reaction.get("count") or 0) - (1 if reaction.get("me") else 0)
+            if others <= 0 or (not targets and key != _emoji_key(DENY)):
+                continue
+            users = self._call("GET", f"{base}/{urllib.parse.quote(str(name))}?limit=100")
+            for user in users if isinstance(users, list) else []:
+                if str(user.get("id")) == owner:          # only the owner counts
+                    if key == _emoji_key(DENY):
+                        refused = True
+                    else:
+                        chosen.update(targets)
+                        by = user
+        if refused:
+            return [], {}
+        return [a for a in card["items"] if a in chosen], by
+
+    def _supersede(self, card: dict[str, Any], day: str) -> None:
+        """A newer digest lists this card's undecided items: this card's reactions stop
+        counting. It is still followed - only to show how its items end."""
+        rows = {a: self._approvals.get(a) for a in card["items"]}
+        card["superseded_by"] = day
+        self._edit(card, self._card_text(card, rows))
+        self._save()
+
     # ------------------------------------------------------------ durability
     def _load(self) -> None:
         if self._loaded:
@@ -1635,13 +2101,24 @@ class DiscordGate:
                        "approvals will be re-posted", error, keep)
             return
         self._entries = {str(k): v for k, v in entries.items() if isinstance(v, dict)}
+        digest = data.get("digest")
+        if isinstance(digest, dict):
+            state = _fresh_digest_state()
+            state.update({k: v for k, v in digest.items() if k in state})
+            if not isinstance(state["cards"], dict):
+                state["cards"] = {}
+            if not isinstance(state["reported_expired"], list):
+                state["reported_expired"] = []
+            self._dstate = state
 
     def _save(self) -> None:
         path = self.settings.state_path
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"messages": self._entries}, ensure_ascii=False, indent=2),
-                       encoding="utf-8")
+        # One file, one atomic write: an item's preview and the digest card that lists it
+        # are never saved out of step with each other.
+        tmp.write_text(json.dumps({"messages": self._entries, "digest": self._dstate},
+                                  ensure_ascii=False, indent=2), encoding="utf-8")
         atomic.replace(tmp, path)
 
     def _prune(self) -> None:
@@ -1658,5 +2135,13 @@ class DiscordGate:
                 drop.append(approval_id)
         for approval_id in drop:
             del self._entries[approval_id]
-        if drop:
+        cards = self._dstate["cards"]
+        old_cards = [key for key, card in cards.items() if card.get("final")
+                     and _older_than(card.get("final_at"), cutoff)]
+        for key in old_cards:
+            del cards[key]
+        reported = self._dstate["reported_expired"]
+        if len(reported) > 500:        # the queue drops resolved rows after a week anyway
+            del reported[:-500]
+        if drop or old_cards:
             self._save()

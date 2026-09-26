@@ -281,6 +281,9 @@ class DevtoAdapter:
                     risk=RiskLevel.PRIVILEGED,
                     required_permissions=frozenset({CROSSPOST}),
                     requires_approval=True,
+                    # routine and public, no money, no client: waits for the
+                    # owner's daily digest (pionir/batching.py)
+                    batchable=True,
                     routable=False,
                 ),
             ),

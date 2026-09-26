@@ -143,6 +143,17 @@ class CsrfTests(unittest.TestCase):
             self.assertEqual(status, 400, path)
             self.assertEqual(out["error"], "id required")
 
+    def test_the_owner_can_ask_for_the_digest_now_but_a_foreign_page_cannot(self) -> None:
+        status, out = self._raw("POST", "/api/approvals/digest", "{}",
+                                self._json_headers(Origin="http://evil.example"))
+        self.assertEqual(status, 403)
+        self.assertEqual(out["error"], "forbidden")
+        self.assertFalse(self.app.approvals_view()["digest"]["requested"])
+        status, out = self._raw("POST", "/api/approvals/digest", "{}", self._json_headers())
+        self.assertEqual(status, 200)
+        self.assertTrue(out["ok"])
+        self.assertTrue(self.app.approvals_view()["digest"]["requested"])
+
     def test_get_is_untouched(self) -> None:
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
         conn.request("GET", "/api/state")
