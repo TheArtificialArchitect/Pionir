@@ -58,6 +58,7 @@ from .orders import (
     _NOT_SET_UP,
     _ORDER_ID,
     _URL,
+    FIND,
     PACKAGES,
     RETRY_UNDELIVERED,
     RETRY_UNREACHABLE,
@@ -382,8 +383,8 @@ class DeliveryDesk(_Base):
         root = Path(ctx.deliveries_dir)
         for order in sorted(orders, key=_oldest_first):
             oid, status = order["id"], order.get("status")
-            if status not in ("in_progress", "delivered"):
-                continue
+            if status not in ("in_progress", "delivered") or package_of(order) == FIND:
+                continue        # a "Find it for me" order is the finder's (finder.py): no zip
             last = self._last_delivered(rec, oid)
             if status == "delivered" and last is None:
                 continue        # delivered some other way: not this desk's to revise
@@ -540,7 +541,8 @@ class DeliveryDesk(_Base):
             return sum(1 for e in deliveries if e.get("status") in statuses
                        and (kind is None or e.get("kind") == kind))
 
-        in_progress = [o for o in orders if o.get("status") == "in_progress"]
+        in_progress = [o for o in orders if o.get("status") == "in_progress"
+                       and package_of(o) != FIND]
         delivered_ids = {e["order_id"] for e in deliveries if e.get("status") == "delivered"}
         late = []
         for o in in_progress:

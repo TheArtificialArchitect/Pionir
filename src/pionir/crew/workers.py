@@ -25,6 +25,9 @@ whole list, and a name not in it fails loudly at load time.
   approval. No words: no model can put a promise, a price or a date in a client's email.
 - ``delivery_desk`` - REAL (delivery.py). Ships each order's finished zip, dropped by the
   owner in its order's folder, as ``client.deliver`` by fixed template for his approval.
+- ``finder`` - REAL (finder.py). Researches each paid "Find it for me" order through Claude
+  on the owner's Max (web tools only, the daily Claude cap), checks the answer fail-closed,
+  and submits the report by fixed template as ``client.find_report`` for his approval.
 - ``product_shelf`` - REAL (products.py). Submits each product the owner stages in its own
   folder as ``product.gumroad_publish`` for his approval, and reads what the live ones sold
   (``product.gumroad_list``). No words: every word of a listing is the owner's.
@@ -327,6 +330,14 @@ def delivery_desk(spec, **params):
     return DeliveryDesk(spec, **params)
 
 
+def finder(spec, **params):
+    """REAL. ``contracts.finder`` (finder.py): each paid "Find it for me" order researched by
+    Claude with web tools only (``ctx.research``, the daily Claude cap), checked, and
+    reported by fixed template as ``client.find_report`` for the owner's approval."""
+    from .finder import Finder
+    return Finder(spec, **params)
+
+
 def product_shelf(spec, **params):
     """REAL. ``products.shelf`` (products.py): each staged product published on Gumroad, for
     the owner's approval, and the live products' sales as Gumroad reports them."""
@@ -346,5 +357,6 @@ IMPLS = {
     "devto_crossposter": devto_crossposter,
     "order_desk": order_desk,
     "delivery_desk": delivery_desk,
+    "finder": finder,
     "product_shelf": product_shelf,
 }
