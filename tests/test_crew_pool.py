@@ -37,6 +37,17 @@ class ConcurrencyTests(_Case):
         self.assertEqual(report.succeeded, 4)
         self.assertLess(took, 0.9)              # one at a time would take 1.2 s
 
+    def test_an_error_keeps_the_rows_its_other_source_gave_and_stays_an_error(self) -> None:
+        """Reverted: a worker whose one source is down loses what its other source said."""
+        crew = self.crew({"alpha": [{"name": "w", "params": {"mode": "partial"}}]})
+        report = crew.dispatcher.dispatch(wait=True)
+        self.assertEqual((report.succeeded, report.failed), (0, 1))
+        (run,) = crew.store.runs("alpha.w")
+        self.assertEqual((run["outcome"], run["error_kind"], run["yielded"]),
+                         ("err", "http_error", 1))
+        (row,) = crew.store.read_outputs(worker_id="alpha.w")
+        self.assertEqual(row.payload, {"from": "the other source"})
+
     def test_the_per_provider_interval_holds_under_concurrency(self) -> None:
         # Checks the slots the gate reserves, on a high-resolution clock - not wall-clock
         # wake-ups: on the Windows CI runner the coarse monotonic clock (~15.6 ms ticks) read

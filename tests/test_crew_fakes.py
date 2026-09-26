@@ -99,7 +99,7 @@ class FakeClaude:
 
 class ScriptedWorker:
     """A worker whose behaviour is a catalogue param: ``mode`` is one of
-    ok / silent / err / raise (decorated) / raw_raise (undecorated) / slow.
+    ok / silent / err / partial / raise (decorated) / raw_raise (undecorated) / slow.
     Records the monotonic time each run started."""
 
     live = True
@@ -137,6 +137,11 @@ class ScriptedWorker:
             return Err(WorkerError(self.worker_id, ErrorKind.HTTP_ERROR, "HTTP 500"))
         if self.mode == "silent":
             return Ok(())
+        if self.mode == "partial":          # one source failed, another answered
+            return Err(WorkerError(self.worker_id, ErrorKind.HTTP_ERROR, "HTTP 500", partial=(
+                make_output(self, valid_at=ctx.now, observed_at=ctx.now,
+                            payload={"from": "the other source"}, entities=self.entities,
+                            provenance={"source": "real"}),)))
         return Ok((make_output(self, valid_at=ctx.now + self.runs, observed_at=ctx.now,
                                payload={"run": self.runs},
                                figures=[{"value": self.value, "unit": self.unit,

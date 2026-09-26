@@ -43,7 +43,7 @@ from pionir.crew.blog import save_record
 from pionir.crew.hands import JobOutcome
 from pionir.crew.instagram import InstagramWorker
 from pionir.crew.registry import default_registry
-from pionir.crew.result import Ok
+from pionir.crew.result import Err, Ok
 from pionir.crew.worker import WorkContext
 from pionir.errors import AdapterProtocolError
 from pionir.server import PionirApp
@@ -610,6 +610,39 @@ class ResultsInsightsTests(_CrewCase):
         cache = json.loads(insights_module.cache_path(self.state, "posting.results")
                            .read_text(encoding="utf-8"))
         self.assertEqual(cache["media_ids"], {P1: M2})
+
+    def test_every_figure_names_its_own_source(self) -> None:
+        """Reverted: Instagram's figures in the summary are stamped as Scrooge's dash, and
+        on an empty site the summary loses its source altogether."""
+        self.instagram([ig_post(P1, M1, 1.0), ig_post(P2, M2, 2.0)])
+        for traffic in (TRAFFIC, EMPTY_TRAFFIC):
+            with self.subTest(views=traffic["views"]):
+                w = self.run_at(traffic=traffic)["traffic.working"]
+                sources = w.provenance["figure_sources"]
+                self.assertEqual(sources["instagram reach"], insights_module.SOURCE)
+                self.assertIn(insights_module.SOURCE, w.provenance["source_detail"])
+                self.assertIn("Scrooge", w.provenance["source_detail"])
+                for f in w.figures:                     # every figure has its source
+                    want = (insights_module.SOURCE if f.measures.startswith("instagram ")
+                            else w.provenance["source_detail"].split(";")[0])
+                    self.assertEqual(sources[f.measures], want)
+                if traffic is EMPTY_TRAFFIC:            # the empty-site row keeps both
+                    self.assertIn("Scrooge", w.payload["source"])
+                    self.assertEqual(w.payload["instagram_source"], insights_module.SOURCE)
+
+    def test_scrooge_down_still_records_the_instagram_row_and_is_still_an_error(self) -> None:
+        """Reverted: with the dash down, a fresh Instagram reading is thrown away."""
+        self.instagram([ig_post(P1, M1, 1.0), ig_post(P2, M2, 2.0)])
+        for dash in ({}, {DASH: (503, {"error": "down"})}, {DASH: (200, {"summary": {}})}):
+            with self.subTest(dash=dash):
+                result = self.worker.run(WorkContext(
+                    now=T0, http=FakeHttp(dash), secrets_dir=self.secrets,
+                    state_dir=self.state, job=self.hands.job))
+                self.assertIsInstance(result, Err, result)        # the dash error, as such
+                (ig,) = result.error.partial
+                self.assertEqual(ig.kind, "traffic.instagram")
+                self.assertEqual(self.figs(ig)[("instagram reach", P2)].value, 480)
+        self.assertEqual(len(self.hands.jobs), 1)                  # then the cache
 
     def test_a_post_not_in_the_reading_is_unknown_not_zero(self) -> None:
         self.instagram([ig_post(P1, M1, 1.0), ig_post(P2, M3, 2.0)])

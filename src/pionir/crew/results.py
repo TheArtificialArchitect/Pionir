@@ -15,7 +15,8 @@ Honest numbers only, the ledger's rule:
   never given a figure), and a sum over it is a lower bound and says so in what it
   measures ("at least").
 - Every figure is typed (``count`` / ``usd_cents``), names its window (``last30``), and
-  the row it sits in names its source (the ``traffic`` field it came from).
+  the row it sits in names its source (the ``traffic`` field it came from); a row that also
+  carries Instagram's figures names each figure's source (``figure_sources``).
 
 How a campaign is matched to a post: the blog worker tags every link in a post with
 ``utm_source=blog&utm_medium=referral&utm_campaign=<utm_campaign(draft_id)>``, and Scrooge
@@ -30,13 +31,15 @@ The rows, per run: ``traffic.site`` (site-wide and per-channel figures), ``traff
 (each published post's figures), ``traffic.sales`` (sales and net revenue per campaign,
 where Scrooge attributed any), ``traffic.instagram`` (each published Instagram post's
 lifetime reach, likes, comments, saves, shares, interactions and views, from Instagram's own
-Media Insights - read through Pionir at most once per 6 h; insights.py), and
+Media Insights - read through Pionir at most once per 6 h; insights.py - and recorded even
+when the dash fails, with the failed attempt), and
 ``traffic.working`` - the plain "what's working" summary the posting leader reads first,
 built only from the figures above (including the best Instagram post by reach).
 """
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 
 from . import insights
 from .blog import _Unreadable, published_posts, read_record
@@ -155,25 +158,35 @@ class TrafficWorker(DashReader):
 
     @never_raises()
     def run(self, ctx: WorkContext) -> Result:
+        # Instagram's numbers are their own source: gathered whether or not Scrooge
+        # answers, so a dash that is down does not hide a fresh Instagram reading
+        ig = self._instagram(ctx)
         got = self._read_dash(ctx)
         if isinstance(got, Err):
-            return got
+            return self._keeping(got, ctx, ig)
         doc, resp = got.value
         if "traffic" not in doc or doc["traffic"] is None:
-            return self._err(ErrorKind.NOT_CONFIGURED,
-                             "the dash has no traffic report (a Scrooge from before it "
-                             "counted page views); traffic is UNKNOWN, not zero. Deploy "
-                             "Scrooge with worker/src/traffic.ts", retryable=False)
+            return self._keeping(self._err(
+                ErrorKind.NOT_CONFIGURED, "the dash has no traffic report (a Scrooge from "
+                "before it counted page views); traffic is UNKNOWN, not zero. Deploy "
+                "Scrooge with worker/src/traffic.ts", retryable=False), ctx, ig)
         traffic = doc["traffic"]
         posts, record_note = self._posts(ctx)
         try:
             if not isinstance(traffic, dict):
                 raise _Malformed("traffic is not an object")
-            ig = self._instagram(ctx)
             outputs = self._outputs(ctx, traffic, posts, record_note, resp, ig)
         except (TypeError, ValueError, KeyError) as exc:
-            return self._err(ErrorKind.MALFORMED, f"{type(exc).__name__}: {exc}")
+            return self._keeping(self._err(ErrorKind.MALFORMED, f"{type(exc).__name__}: {exc}"),
+                                 ctx, ig)
         return Ok(tuple(outputs))
+
+    def _keeping(self, err: Err, ctx: WorkContext, ig: insights.Insights | None) -> Err:
+        """The dash's error, still an error, carrying the ``traffic.instagram`` row: that
+        source answered, and its row is recorded with the failed attempt."""
+        if ig is None:
+            return err
+        return Err(replace(err.error, partial=(insights.row(self, ctx, ig),)))
 
     def _instagram(self, ctx: WorkContext) -> insights.Insights | None:
         """The Instagram posts' insights. A fault there is said in words and never sinks
@@ -216,13 +229,24 @@ class TrafficWorker(DashReader):
         source = f"Scrooge /dash/api.json traffic, last 30 days since {since}"
         prov = {**self._provenance(resp), "window": WINDOW, "since": since}
 
-        def out(kind: str, payload: dict, figures: list, *, sourced: bool = True):
+        def out(kind: str, payload: dict, figures: list, *, sourced: bool = True,
+                ig_figs: list = ()):
             # the source travels in provenance always, and in the details a leader reads
-            # except on the summary row, whose every number is already a sourced figure
+            # except on the summary row, whose every number is already a sourced figure.
+            # Instagram's figures come from Instagram, not Scrooge: a row carrying any
+            # names each figure's source (``figure_sources``, by what it measures).
+            prov_row = {**prov, "source_detail": source}
+            if ig_figs:
+                prov_row["source_detail"] = f"{source}; the instagram figures: {insights.SOURCE}"
+                prov_row["figure_sources"] = {
+                    f.measures: insights.SOURCE if any(f is g for g in ig_figs) else source
+                    for f in figures}
+                if sourced:
+                    payload = {**payload, "instagram_source": insights.SOURCE}
             return make_output(self, kind=kind, valid_at=ctx.now, observed_at=ctx.now,
                                payload={"source": source, **payload} if sourced else payload,
                                figures=figures, entities=self.entities,
-                               provenance={**prov, "source_detail": source})
+                               provenance=prov_row)
 
         ig_rows = [insights.row(self, ctx, ig)] if ig is not None else []
         ig_line, ig_figs = insights.working_line(ig)
@@ -231,7 +255,7 @@ class TrafficWorker(DashReader):
             summary = NO_DATA + (f"; {ig_line}" if ig_line else "")
             return ig_rows + [out("traffic.working", {"summary": summary, "posts": record_note
                                                       or f"{len(posts)} published blog posts"},
-                                  ig_figs, sourced=not ig_figs)]
+                                  ig_figs, ig_figs=ig_figs)]
 
         path_views = {p: c["n"] for p, c in paths}
         paths_capped = _capped(paths)
@@ -376,4 +400,5 @@ class TrafficWorker(DashReader):
             "summary": "; ".join(parts),
             "top_by_views": [s["slug"] for s in by_views],
             "top_by_clicks": [s["slug"] for s in by_clicks],
-            "visitors_from": [k for k, _n in sent]}, figures, sourced=False)
+            "visitors_from": [k for k, _n in sent]}, figures, sourced=False,
+            ig_figs=ig_figs or [])

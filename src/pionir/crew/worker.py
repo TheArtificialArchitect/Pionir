@@ -66,6 +66,10 @@ class WorkerError:
     kind: ErrorKind
     message: str
     retryable: bool = True
+    # Rows the worker still has from a source the error is not about (the results worker's
+    # Instagram reading when Scrooge is down): recorded with the failed attempt, which
+    # stays a failure.
+    partial: tuple = field(default=(), compare=False, repr=False)
 
     def __str__(self) -> str:
         return f"[{self.worker_id}/{self.kind}] {self.message}"

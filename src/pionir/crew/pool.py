@@ -185,18 +185,19 @@ class Dispatcher:
             result = worker.run(self._context(worker))
             if isinstance(result, Err):
                 error = result.error
+                value = getattr(error, "partial", ())
             elif isinstance(result, Ok):
                 value = result.value
                 if not isinstance(value, (tuple, list)):
                     raise TypeError(f"{worker.worker_id} returned Ok({type(value).__name__}); "
                                     "a single Output is not a one-element tuple")
-                for o in value:
-                    if not isinstance(o, Output) or o.worker_id != worker.worker_id:
-                        raise TypeError(f"{worker.worker_id} returned {o!r}, not its own Output")
-                outputs = list(value)
             else:
                 raise TypeError(f"{worker.worker_id} returned {type(result).__name__}, "
                                 "not Ok or Err")
+            for o in value:
+                if not isinstance(o, Output) or o.worker_id != worker.worker_id:
+                    raise TypeError(f"{worker.worker_id} returned {o!r}, not its own Output")
+            outputs = list(value)
         except Exception as exc:  # noqa: BLE001 - recorded as the run's error, below
             error = WorkerError(worker.worker_id, ErrorKind.UNAVAILABLE,
                                 f"escaped the contract: {type(exc).__name__}: {exc}")
