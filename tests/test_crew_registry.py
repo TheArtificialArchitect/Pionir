@@ -16,20 +16,22 @@ class DefaultCatalogueTests(unittest.TestCase):
     def test_the_initial_catalogue(self) -> None:
         reg = default_registry()
         self.assertEqual(reg.division_ids(),
-                         ("treasury", "watch", "posting", "contracts", "products", "builds"))
+                         ("treasury", "watch", "posting", "contracts", "products", "fiverr",
+                          "builds"))
         self.assertEqual(reg.ids(), ("builds.daedalus", "contracts.delivery",
-                                     "contracts.finder", "contracts.orders", "posting.blog",
+                                     "contracts.finder", "contracts.orders", "fiverr.desk",
+                                     "fiverr.gigs", "posting.blog",
                                      "posting.devto",
                                      "posting.instagram", "posting.results",
                                      "products.api_builder", "products.shelf",
-                                     "treasury.ledger", "watch.health"))
+                                     "treasury.fiverr", "treasury.ledger", "watch.health"))
         live = sorted(w.worker_id for w in reg.all() if w.live)
         self.assertEqual(live, ["contracts.delivery", "contracts.finder", "contracts.orders",
-                                "posting.blog",
+                                "fiverr.desk", "fiverr.gigs", "posting.blog",
                                 "posting.devto",
                                 "posting.instagram",
-                                "posting.results", "products.shelf", "treasury.ledger",
-                                "watch.health"])
+                                "posting.results", "products.shelf", "treasury.fiverr",
+                                "treasury.ledger", "watch.health"])
 
     def test_adding_a_worker_is_adding_an_entry(self) -> None:
         cat = load_catalogue()

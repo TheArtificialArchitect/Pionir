@@ -37,7 +37,14 @@ from .api import CrewApi
 from .brain import Brain, Post, http_post_json
 from .clock import WallClock
 from .direction import Allocation, Direction
-from .escalation import Escalator, Runner, claude_cli_runner, claude_research_runner
+from .escalation import (
+    Escalator,
+    Runner,
+    claude_cli_runner,
+    claude_research_runner,
+    claude_review_runner,
+    claude_site_runner,
+)
 from .gpu import CardWatch
 from .hands import Hands, Job, JobOutcome, PionirClient
 from .leader import Leader, parse_json_object
@@ -59,6 +66,8 @@ class Crew:
                  client=None, card: CardWatch | None = None,
                  claude_runner: Runner | None = claude_cli_runner,
                  research_runner: Runner | None = claude_research_runner,
+                 site_runner: Runner | None = claude_site_runner,
+                 review_runner: Runner | None = claude_review_runner,
                  clock: WallClock | None = None,
                  monotonic: Callable[[], float] = time.monotonic,
                  now: Callable[[], float] = time.time) -> None:
@@ -88,7 +97,11 @@ class Crew:
                                    daily_cap=cfg.claude_daily_cap,
                                    timeout=cfg.escalation_timeout_seconds, clock=now,
                                    research_runner=(research_runner
-                                                    if cfg.claude_daily_cap > 0 else None))
+                                                    if cfg.claude_daily_cap > 0 else None),
+                                   site_runner=(site_runner
+                                                if cfg.claude_daily_cap > 0 else None),
+                                   review_runner=(review_runner
+                                                  if cfg.claude_daily_cap > 0 else None))
         self.leaders = {d: Leader(d, registry, self.store, ask=self.brain.ask,
                                   escalator=self.escalator, model=cfg.model, clock=now)
                         for d in registry.division_ids()}
@@ -120,7 +133,10 @@ class Crew:
                            deliveries_dir=getattr(self.cfg, "deliveries_dir", None),
                            products_dir=getattr(self.cfg, "products_dir", None),
                            research=partial(self.escalator.research, worker.division),
-                           affiliates=tuple(getattr(self.cfg, "affiliates", ()) or ()))
+                           affiliates=tuple(getattr(self.cfg, "affiliates", ()) or ()),
+                           build_site=partial(self.escalator.build_site, worker.division),
+                           review=partial(self.escalator.review, worker.division),
+                           fiverr_dir=getattr(self.cfg, "fiverr_dir", None))
 
     def _words(self, worker, purpose: str, system: str, user: str, schema: dict) -> Result:
         """The ONLY way a worker reaches a model: the shared brain, JSON-schema output,

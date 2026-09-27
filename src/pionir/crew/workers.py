@@ -28,6 +28,8 @@ whole list, and a name not in it fails loudly at load time.
 - ``finder`` - REAL (finder.py). Researches each paid "Find it for me" order through Claude
   on the owner's Max (web tools only, the daily Claude cap), checks the answer fail-closed,
   and submits the report by fixed template as ``client.find_report`` for his approval.
+- ``fiverr_gigs``, ``fiverr_desk``, ``fiverr_earnings`` - REAL (fiverr/). The Fiverr division:
+  listings and order deliveries PREPARED for the owner, who does every Fiverr step himself.
 - ``product_shelf`` - REAL (products.py). Submits each product the owner stages in its own
   folder as ``product.gumroad_publish`` for his approval, and reads what the live ones sold
   (``product.gumroad_list``). No words: every word of a listing is the owner's.
@@ -345,6 +347,26 @@ def product_shelf(spec, **params):
     return ProductShelf(spec, **params)
 
 
+def fiverr_gigs(spec, **params):
+    """REAL. ``fiverr.gigs`` (fiverr/gigs.py): one checked Fiverr listing per service, handed to
+    the owner on Discord to paste into Fiverr himself; redrafted only when he asks."""
+    from .fiverr.gigs import GigDrafter
+    return GigDrafter(spec, **params)
+
+
+def fiverr_desk(spec, **params):
+    """REAL. ``fiverr.desk`` (fiverr/desk.py): each Fiverr order, from Scrooge's events to a
+    READY card with the files and a drafted reply the owner delivers on Fiverr himself."""
+    from .fiverr.desk import FiverrDesk
+    return FiverrDesk(spec, **params)
+
+
+def fiverr_earnings(spec, **params):
+    """REAL. ``treasury.fiverr``: the Fiverr-reported gross, read from the desk's record."""
+    from .fiverr.desk import FiverrEarnings
+    return FiverrEarnings(spec, **params)
+
+
 # The whole list of worker implementations. A catalogue ``impl`` not named here is an
 # error at load time, never a worker that silently does not exist.
 IMPLS = {
@@ -359,4 +381,7 @@ IMPLS = {
     "delivery_desk": delivery_desk,
     "finder": finder,
     "product_shelf": product_shelf,
+    "fiverr_gigs": fiverr_gigs,
+    "fiverr_desk": fiverr_desk,
+    "fiverr_earnings": fiverr_earnings,
 }

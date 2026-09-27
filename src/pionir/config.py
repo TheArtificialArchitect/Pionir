@@ -184,6 +184,19 @@ class PionirSettings:
     # unregistered), off in a bare PionirSettings so a test runtime never reaches the real
     # bot. Registered only when content_url is on (the replies become client.quote).
     quote_cards: bool = False
+    # The Fiverr desk (adapters/fiverr.py, crew/fiverr): fiverr.card posts the desk's cards in
+    # the Discord gate's channel and fiverr.inbox serves the owner's replies to them; nothing
+    # touches Fiverr. Off unless PIONIR_FIVERR_DESK=1, and off in a bare PionirSettings, so a
+    # test runtime is never wired to the real bot (the owner_notify rule).
+    fiverr_desk: bool = False
+    # fiverr.events / fiverr.ack read and acknowledge the order events Scrooge takes from
+    # Fiverr's emails (GET /dash/fiverr/events). Off (they answer "unavailable") until
+    # Scrooge serves the route: PIONIR_FIVERR_EVENTS=1 turns them on.
+    fiverr_events: bool = False
+    # The Fiverr desk's folder (gigs/, orders/<n>/input and out); the crew writes it, and
+    # fiverr.card attaches files only from inside it. None means ~/.pionir/fiverr;
+    # PIONIR_FIVERR_DIR points elsewhere (the crew reads the same variable).
+    fiverr_dir: Path | None = None
     # Scrooge's publish endpoint for the content.* capabilities. content.publish parks
     # for the owner's yes on every call; the token is read from content_token_file
     # (None means ~/.pionir/secrets/scrooge-publish-token.txt) at call time, so no
@@ -367,6 +380,16 @@ class PionirSettings:
         return home / ".pionir" / "products"
 
     @property
+    def fiverr_path(self) -> Path:
+        if self.fiverr_dir is not None:
+            return self.fiverr_dir
+        try:
+            home = Path.home()
+        except RuntimeError:
+            return self.state_root / "fiverr"
+        return home / ".pionir" / "fiverr"
+
+    @property
     def devto_ledger_path(self) -> Path:
         return self.state_root / "devto" / "posts.json"
 
@@ -472,6 +495,15 @@ class PionirSettings:
                          not in {"0", "off", "false", "no"}),
             owner_notify=(os.environ.get("PIONIR_OWNER_NOTIFY", "1").strip().lower()
                           not in {"0", "off", "false", "no"}),
+            fiverr_desk=(os.environ.get("PIONIR_FIVERR_DESK", "0").strip().lower()
+                         in {"1", "on", "true", "yes"}),
+            fiverr_events=(os.environ.get("PIONIR_FIVERR_EVENTS", "0").strip().lower()
+                           in {"1", "on", "true", "yes"}),
+            fiverr_dir=(
+                Path(os.environ["PIONIR_FIVERR_DIR"]).expanduser()
+                if (os.environ.get("PIONIR_FIVERR_DIR") or "").strip()
+                else None
+            ),
             content_url=_optional_url("PIONIR_CONTENT_URL", _declared("content_url")),
             content_token_file=(
                 Path(os.environ["PIONIR_CONTENT_TOKEN_FILE"]).expanduser()

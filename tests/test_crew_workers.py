@@ -158,7 +158,9 @@ class LedgerTests(unittest.TestCase):
             try:
                 crew.dispatcher.dispatch(only=["treasury.ledger"], wait=True)
                 self.assertEqual(crew.store.count_outputs("treasury"), 0)
-                h = crew.store.health(crew.registry.cadences("treasury"), time.time())[0]
+                h = next(x for x in crew.store.health(crew.registry.cadences("treasury"),
+                                                      time.time())
+                         if x.worker_id == "treasury.ledger")
                 self.assertTrue(h.not_configured)
                 self.assertTrue(h.has_never_succeeded)
             finally:

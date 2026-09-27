@@ -177,6 +177,7 @@ def make_crew(root, *, cat: dict | None = None, http=None, post=None, claude=Non
     cfg.setdefault("secrets_dir", __import__("pathlib").Path(root) / "secrets")
     cfg.setdefault("deliveries_dir", __import__("pathlib").Path(root) / "deliveries")
     cfg.setdefault("products_dir", __import__("pathlib").Path(root) / "products")
+    cfg.setdefault("fiverr_dir", __import__("pathlib").Path(root) / "fiverr")
     s = settings(root, **cfg)
     reg = registry or build_registry(cat or catalogue(), TEST_IMPLS)
     return Crew(s, reg, http=http or FakeHttp(), post=post or FakeOllama(),
@@ -184,4 +185,6 @@ def make_crew(root, *, cat: dict | None = None, http=None, post=None, claude=Non
                 card=CardWatch(s.gpu_lock_path, probe=lambda: None, poll_seconds=0.01),
                 claude_runner=claude if claude is not None else FakeClaude(),
                 # never the real claude_research_runner from a test
-                research_runner=research if research is not None else FakeClaude(), now=now)
+                research_runner=research if research is not None else FakeClaude(),
+                # nor the real website build or review
+                site_runner=FakeClaude(), review_runner=FakeClaude(), now=now)

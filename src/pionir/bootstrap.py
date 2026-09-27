@@ -230,6 +230,14 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
 
             runtime.register(QuoteCardAdapter(QuoteCardSettings.from_gate(
                 DiscordGateSettings.from_environment(configured.state_root))))
+    if configured.fiverr_desk:
+        # The Fiverr desk's cards (in the Discord gate's channel, with its bot token, read
+        # when a card is posted) and the owner's replies to them; the order events from
+        # Scrooge with the ops token (off until PIONIR_FIVERR_EVENTS=1). Nothing touches
+        # Fiverr. No network at boot.
+        from .adapters.fiverr import FiverrAdapter, fiverr_settings
+
+        runtime.register(FiverrAdapter(fiverr_settings(configured)))
     if configured.content_url is not None and configured.instagram_graph_url is not None:
         # Needs Scrooge to host the card image. No boot-time call: both token files are
         # read when a post runs. social.instagram_post always parks for approval.

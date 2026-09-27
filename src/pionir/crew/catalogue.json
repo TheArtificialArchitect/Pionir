@@ -24,8 +24,13 @@
             "url": "https://api.dokaz.net/dash/api.json",
             "token_file": "scrooge-read-token.txt"
           }
-        }
-      ]
+        },
+        {"name": "fiverr", "impl": "fiverr_earnings", "kind": "fiverr", "cadence_seconds": 3600,
+         "provider": "none", "entities": ["Fiverr"],
+         "note": "the Fiverr-reported gross (from Fiverr's order emails, via the Fiverr desk's record); not our revenue records",
+         "params": {"desk_worker": "fiverr.desk"}}
+      ],
+      "leader_notes": "treasury.ledger is Scrooge's ledger: our revenue. treasury.fiverr is different: fiverr.earnings holds the Fiverr-reported gross - the prices Fiverr's order emails state, before Fiverr's fee - for orders not cancelled and for completed orders. Always call it Fiverr-reported gross, report it separately, and never add it to our revenue or call it revenue: Fiverr keeps its fee and pays out on its own schedule, and Scrooge's ledger never sees it. Orders whose price was not a plain US dollar amount are counted, never valued. When treasury.fiverr has not run or cannot read the desk's record, Fiverr earnings are UNKNOWN, never zero."
     },
     {
       "id": "watch",
@@ -120,6 +125,33 @@
          "note": "each product staged in its own folder published on Gumroad, for the owner's approval, and the live products' sales as Gumroad reports them; no model"},
         {"name": "api_builder", "impl": "placeholder", "kind": "product", "cadence_seconds": 21600,
          "provider": "none", "entities": [], "note": "building new paid API products"}
+      ]
+    },
+    {
+      "id": "fiverr",
+      "title": "Fiverr",
+      "leader_cadence_seconds": 3600,
+      "entities": ["Fiverr", "Discord"],
+      "leader_notes": "Two workers: fiverr.gigs drafts one listing per service (research, data, website, uptime) for the owner to paste into Fiverr himself, and fiverr.desk prepares each Fiverr order for him to deliver. Nothing in the crew or Pionir logs into, posts to or messages on Fiverr: the owner does every Fiverr step himself. A READY card (fiverr.ready, fiverr.order_ready) means the files and a drafted reply are waiting for the OWNER to upload and send on Fiverr - never say the buyer has anything, or that anything was delivered or sent, until fiverr.order_delivered says Fiverr marked the order completed. Report NEW ORDERS (fiverr.order_new) first, with their order numbers and service. A fiverr.problem row is URGENT: nothing was prepared for that order (a check failed, the research or the website failed twice, or the brief names no site) - give the order number and the reasons; the order waits for the owner. Orders waiting for the buyer's files or for Claude's budget are waiting, not failed. fiverr.tally holds the counts: orders by state (new, brief received, working, ready, delivered, cancelled), orders stopped for the owner, orders waiting, READY cards posted, revisions asked, buyer messages with a drafted reply, events applied, unknown events, events not yet acknowledged, the median time from brief to ready, and the Fiverr-reported gross. The gross is what Fiverr's emails state, before Fiverr's fee: always call it Fiverr-reported gross, never revenue or earnings of ours. fiverr.gig_tally holds the gigs drafted, blocked, and the packages waiting for the owner's price: a package with no price is waiting for HIM - the crew only proposes, and never state a proposed price as a gig's price. A fiverr.cards_unposted row means cards for the owner have not reached Discord for over an hour (they are retried every run): say so plainly. When the desk could not read the events, the orders are UNKNOWN, never zero.",
+      "brief_quota": {"fiverr.tally": 3, "fiverr.gig_tally": 2, "fiverr.order_new": 6,
+                      "fiverr.ready": 5, "fiverr.problem": 5, "fiverr.order_ready": 4,
+                      "fiverr.order_delivered": 4, "fiverr.order_cancelled": 4,
+                      "fiverr.order_brief_received": 3, "fiverr.order_working": 3,
+                      "fiverr.message_drafted": 4, "fiverr.review": 3,
+                      "fiverr.waiting_for_claude": 2, "fiverr.gig_drafted": 4,
+                      "fiverr.gig_blocked": 4, "fiverr.gig_not_posted": 2,
+                      "fiverr.gig_priced_by_owner": 2, "fiverr.gig_redraft_asked": 2,
+                      "fiverr.retry_asked": 2, "fiverr.checks_unavailable": 2,
+                      "fiverr.cards_unposted": 2},
+      "workers": [
+        {"name": "gigs", "impl": "fiverr_gigs", "kind": "fiverr", "cadence_seconds": 3600,
+         "provider": "none", "entities": ["Fiverr"],
+         "note": "one checked Fiverr listing per service, handed to the owner on Discord to paste into Fiverr himself; redrafted only when he replies redraft or sets prices",
+         "params": {"source_root": "C:/src", "ssh_dir": "~/.ssh"}},
+        {"name": "desk", "impl": "fiverr_desk", "kind": "fiverr", "cadence_seconds": 300,
+         "provider": "claude", "entities": ["Fiverr", "Claude"],
+         "note": "each Fiverr order from Scrooge's events to a READY card (files and a drafted reply) that the owner delivers on Fiverr himself; research and websites by Claude on the daily cap",
+         "params": {"ssh_dir": "~/.ssh"}}
       ]
     },
     {

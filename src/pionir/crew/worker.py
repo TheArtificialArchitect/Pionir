@@ -146,6 +146,15 @@ class WorkContext:
     # the owner's affiliate programs (affiliate.Program, config.CrewSettings.affiliates):
     # the finder tags the shop links they cover. Empty: no link is ever rewritten.
     affiliates: tuple = ()
+    # (prompt, timeout) -> Result[str, escalation.ClaudeRefusal]: one website build by Claude
+    # (the Write tool only, in an empty temporary directory; escalation.claude_site_runner),
+    # and one review by Claude with no tools at all - both on the daily Claude cap, charged
+    # to the worker's division. None: no Claude.
+    build_site: Callable[..., Result] | None = None
+    review: Callable[..., Result] | None = None
+    # where the Fiverr desk keeps each gig's listing and each order's files
+    # (config.CrewSettings.fiverr_dir); None: the Fiverr workers cannot run
+    fiverr_dir: Path | None = None
 
 
 @runtime_checkable

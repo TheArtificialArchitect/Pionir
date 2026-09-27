@@ -89,6 +89,11 @@ class CrewSettings:
     # The owner's affiliate programs (affiliate.py), from PIONIR_AFFILIATE_*: the finder puts
     # his tag on the shop links they cover, and discloses it. Empty: nothing is rewritten.
     affiliates: tuple = ()
+    # The Fiverr desk's folder (crew/fiverr): each gig's listing and image
+    # (``gigs/<service>/``), each order's inputs the owner drops (``orders/<n>/input/``) and the
+    # files prepared for him to upload on Fiverr (``orders/<n>/out/``). Pionir's fiverr.card
+    # reads the same folder. None -> ~/.pionir/fiverr
+    fiverr_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if self.tick_seconds <= 0:
@@ -118,6 +123,8 @@ class CrewSettings:
             object.__setattr__(self, "deliveries_dir", Path.home() / ".pionir" / "deliveries")
         if self.products_dir is None:
             object.__setattr__(self, "products_dir", Path.home() / ".pionir" / "products")
+        if self.fiverr_dir is None:
+            object.__setattr__(self, "fiverr_dir", Path.home() / ".pionir" / "fiverr")
 
     @classmethod
     def from_pionir(cls, settings: PionirSettings, **overrides) -> CrewSettings:
@@ -149,6 +156,7 @@ class CrewSettings:
             ("PIONIR_CREW_CATALOGUE", "catalogue_path", Path),
             ("PIONIR_CREW_DELIVERIES_DIR", "deliveries_dir", Path),
             ("PIONIR_CREW_PRODUCTS_DIR", "products_dir", Path),
+            ("PIONIR_FIVERR_DIR", "fiverr_dir", Path),
             ("PIONIR_CREW_PIONIR_URL", "pionir_url", str),
             ("PIONIR_CREW_JOB_FOLLOW_SECONDS", "job_follow_seconds", float),
         ):
@@ -171,6 +179,7 @@ class CrewSettings:
         d["secrets_dir"] = str(self.secrets_dir)
         d["deliveries_dir"] = str(self.deliveries_dir)
         d["products_dir"] = str(self.products_dir)
+        d["fiverr_dir"] = str(self.fiverr_dir)
         d["catalogue_path"] = str(self.catalogue_path) if self.catalogue_path else None
         d["affiliates"] = [p.public() for p in self.affiliates]
         return d
