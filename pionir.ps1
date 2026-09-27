@@ -116,14 +116,23 @@ function Stop-Bryo {
 function Enc([string]$command) {
     return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
 }
+# A pane closes itself when its bridge was stopped on purpose (-Stop drops the stop
+# marker first), and stays open showing the error when a bridge dies on its own.
+# Before this, panes were -NoExit shells that -Stop had to kill, and Windows Terminal
+# keeps a pane whose process ended with an error code - every restart left a whole
+# window of dead panes behind (seven of them by one evening).
+$stopMarker = Join-Path $env:LOCALAPPDATA "Pionir\stopping"
 function Pane-Cmd([string]$title, [string]$dir, [string]$run, [string]$prelude) {
     # PIONIR_PANE marks the shell as one of ours, so Close-EmptyPanes can find it.
-    $body = "`$env:PIONIR_PANE='1'; `$host.UI.RawUI.WindowTitle='$title'; Set-Location '$dir'; $prelude$run"
-    return @("powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-EncodedCommand", (Enc $body))
+    $body = "`$env:PIONIR_PANE='1'; `$host.UI.RawUI.WindowTitle='$title'; Set-Location '$dir'; $prelude$run; " +
+            "`$code = `$LASTEXITCODE; if (Test-Path '$stopMarker') { exit 0 }; " +
+            "Write-Host ''; Write-Host ('  $title stopped on its own (exit ' + `$code + '). Read the error above; press Enter to close this pane.') -ForegroundColor Yellow; " +
+            "[void](Read-Host); exit 0"
+    return @("powershell", "-ExecutionPolicy", "Bypass", "-EncodedCommand", (Enc $body))
 }
 
 function Close-EmptyPanes {
-    # A pane is a -NoExit shell, so stopping its bridge leaves the shell (and the
+    # An older launcher's pane was a -NoExit shell, so stopping its bridge left the shell (and the
     # window) behind: three restarts in one night left three windows of 17 empty
     # shells. Close only Pionir's own pane shells - the PIONIR_PANE marker in the
     # decoded command, or the older launcher's exact prelude - that no longer run
@@ -138,7 +147,7 @@ function Close-EmptyPanes {
     $closed = 0
     foreach ($p in $all) {
         if ($p.Name -ne 'powershell.exe' -or $mine.ContainsKey($p.ProcessId)) { continue }
-        if ($p.CommandLine -notmatch '-NoExit' -or $p.CommandLine -notmatch '-EncodedCommand\s+(\S+)') { continue }
+        if ($p.CommandLine -notmatch '-EncodedCommand\s+(\S+)') { continue }
         try { $text = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1])) } catch { continue }
         $ours = $text.StartsWith("`$env:PIONIR_PANE='1';") -or $text.StartsWith("`$host.UI.RawUI.WindowTitle='")
         if (-not $ours) { continue }
@@ -151,6 +160,8 @@ function Close-EmptyPanes {
 }
 
 if ($Stop) {
+    New-Item -ItemType Directory -Force (Split-Path $stopMarker) | Out-Null
+    Set-Content -Path $stopMarker -Value (Get-Date -Format o) -Encoding UTF8
     Stop-Port $Port "dashboard"
     Stop-Port 8799 "Galatea"
     Stop-Port 8771 "Daedalus"
@@ -291,13 +302,18 @@ if ($panes.Count -eq 0) {
 }
 
 Close-EmptyPanes
+# A new launch is not a stop: panes started from here on report a crash instead of
+# closing silently. (Cleared only now, after any wait for Bryo above.)
+Remove-Item $stopMarker -ErrorAction SilentlyContinue
 $usedWt = $false
 if (Test-Path $wt) {
     # Assemble one window: first pane is a new-tab; the second splits it into two
     # columns; the rest fill down, alternating columns. Four panes -> a 2x2; five
     # or more keep tiling without any fixed-size table. -w new forces a dedicated
     # window rather than a tab grafted onto an existing one.
-    $wtArgs = @("-w", "new", "new-tab") + $panes[0]
+    # One named window: every launch lands in the same "pionir" window (a new tab there,
+    # the previous tab's panes having closed themselves), never a fresh window each time.
+    $wtArgs = @("-w", "pionir", "new-tab") + $panes[0]
     for ($i = 1; $i -lt $panes.Count; $i++) {
         if ($i -eq 1) {
             $wtArgs += @(";", "split-pane", "-V") + $panes[$i]      # two columns
@@ -315,7 +331,7 @@ if (Test-Path $wt) {
     # Fallback: no Windows Terminal on this machine, so one window per bridge.
     Write-Host "  ! wt.exe not found; falling back to one window per bridge." -ForegroundColor Yellow
     foreach ($pane in $panes) {
-        # $pane is a full command line ("powershell" -NoExit ... -EncodedCommand b64);
+        # $pane is a full command line ("powershell" ... -EncodedCommand b64);
         # element 0 is the exe, the rest are its arguments.
         Start-Process $pane[0] -ArgumentList $pane[1..($pane.Count - 1)]
     }
