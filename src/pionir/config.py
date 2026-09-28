@@ -210,6 +210,11 @@ class PionirSettings:
     # tools/setup-ops-token.ps1), read at call time: no network at boot. Registered only
     # when content_url is on; PIONIR_OPS_TOKEN_FILE points at another token file.
     ops_token_file: Path | None = None
+    # Where the per-client bearer tokens for Pionir's own HTTP API live
+    # (pionir-client-<client>.token, made on first start; see pionir/auth.py). None means
+    # <state_root>/secrets - ~/.pionir/secrets on the live box, a temp dir in a test.
+    # PIONIR_CLIENT_TOKEN_DIR points elsewhere (the clients honour the same variable).
+    client_token_dir: Path | None = None
     # Where the owner drops each order's finished zip for client.deliver:
     # <deliveries_dir>/<order_id>/<name>.zip. None means ~/.pionir/deliveries;
     # PIONIR_DELIVERIES_DIR points elsewhere.
@@ -308,6 +313,11 @@ class PionirSettings:
         except RuntimeError:
             return self.state_root / "secrets" / "scrooge-publish-token.txt"
         return home / ".pionir" / "secrets" / "scrooge-publish-token.txt"
+
+    @property
+    def client_token_path(self) -> Path:
+        """The directory holding pionir-client-<client>.token (pionir/auth.py)."""
+        return self.client_token_dir or self.state_root / "secrets"
 
     @property
     def ops_token_path(self) -> Path:
@@ -513,6 +523,11 @@ class PionirSettings:
             ops_token_file=(
                 Path(os.environ["PIONIR_OPS_TOKEN_FILE"]).expanduser()
                 if (os.environ.get("PIONIR_OPS_TOKEN_FILE") or "").strip()
+                else None
+            ),
+            client_token_dir=(
+                Path(os.environ["PIONIR_CLIENT_TOKEN_DIR"]).expanduser()
+                if (os.environ.get("PIONIR_CLIENT_TOKEN_DIR") or "").strip()
                 else None
             ),
             deliveries_dir=(

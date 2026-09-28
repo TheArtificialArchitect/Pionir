@@ -21,6 +21,7 @@ from test_crew_fakes import catalogue, make_crew
 
 from pionir.adapters._http import HttpStatusError
 from pionir.adapters.crew import NOT_RUNNING, CrewAdapter, CrewAdapterSettings
+from pionir.auth import token_path
 from pionir.bootstrap import build_runtime
 from pionir.config import PionirSettings
 from pionir.contracts import RiskLevel, Task, outcome_kind
@@ -252,6 +253,9 @@ class ThroughPionirTests(unittest.TestCase):
         self.app = PionirApp(_runtime(self.pionir_tmp.name,
                                       f"http://127.0.0.1:{self.crew.api.port}"))
         self.addCleanup(self.app.runtime.cortex.close)
+        # the crew checks writes against its token, the one Pionir made (and sends)
+        self.crew.api.token_file = token_path(Path(self.pionir_tmp.name) / "secrets", "crew")
+        self.crew.api.compat = False
 
     def ledger(self) -> list:
         return self.app.runtime.executive.audit_sink.recent(200)

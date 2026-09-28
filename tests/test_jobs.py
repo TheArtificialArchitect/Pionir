@@ -239,11 +239,15 @@ class HttpJobTests(unittest.TestCase):
         self.assertTrue(self.app.jobs.wait(out["task_id"], 30))
 
     def test_approve_over_http_is_immediate(self) -> None:
-        _, parked = self._post("/api/task", {"capability": "test.slow_privileged", "payload": {}})
-        status, out = self._post("/api/approvals/approve", {"id": parked["approval_id"]})
+        crew = {"Authorization": f"Bearer {self.app.auth.tokens['crew']}"}
+        phone = {"Authorization": f"Bearer {self.app.auth.tokens['phone']}"}
+        _, parked = self._post("/api/task", {"capability": "test.slow_privileged", "payload": {}},
+                               crew)
+        status, out = self._post("/api/approvals/approve", {"id": parked["approval_id"]}, phone)
         self.assertEqual(status, 202)
         self.assertEqual(out["status"], "running")
-        status, again = self._post("/api/approvals/approve", {"id": parked["approval_id"]})
+        status, again = self._post("/api/approvals/approve", {"id": parked["approval_id"]},
+                                   phone)
         self.assertEqual(status, 200)
         self.assertEqual(again["error"]["type"], "AlreadyResolved")
         self.assertTrue(self.app.jobs.wait(out["task_id"], 30))

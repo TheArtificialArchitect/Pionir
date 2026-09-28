@@ -76,6 +76,10 @@ class CrewSettings:
     api_port: int | None = 8782
     # Where workers find the secrets they read (the Scrooge read token). None -> ~/.pionir/secrets
     secrets_dir: Path | None = None
+    # The crew's own client token for Pionir's API (pionir/auth.py): sent as a bearer on
+    # every call to Pionir, and required of every write to the crew API. Set from Pionir's
+    # client token dir by from_pionir; None (a bare settings, a test) sends none.
+    pionir_token_file: Path | None = None
     # The catalogue of divisions and workers. None -> the packaged catalogue.json
     catalogue_path: Path | None = None
     # Where the owner drops each paid order's finished work, one folder per order
@@ -132,6 +136,8 @@ class CrewSettings:
         and the very lock file the scheduler takes."""
         overrides.setdefault("state_dir", settings.state_root / "crew")
         overrides.setdefault("gpu_lock_path", settings.gpu_lock_path)
+        from ..auth import token_path
+        overrides.setdefault("pionir_token_file", token_path(settings.client_token_path, "crew"))
         return cls(**overrides)
 
     @classmethod
@@ -180,6 +186,7 @@ class CrewSettings:
         d["deliveries_dir"] = str(self.deliveries_dir)
         d["products_dir"] = str(self.products_dir)
         d["fiverr_dir"] = str(self.fiverr_dir)
+        d["pionir_token_file"] = str(self.pionir_token_file) if self.pionir_token_file else None
         d["catalogue_path"] = str(self.catalogue_path) if self.catalogue_path else None
         d["affiliates"] = [p.public() for p in self.affiliates]
         return d

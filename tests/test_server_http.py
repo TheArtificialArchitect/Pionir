@@ -137,9 +137,13 @@ class CsrfTests(unittest.TestCase):
                                 self._json_headers(**{"Content-Length": "2000000"}))
         self.assertEqual(status, 400)
 
+    def _as(self, client: str, **extra: str) -> dict:
+        return self._json_headers(Authorization=f"Bearer {self.app.auth.tokens[client]}",
+                                  **extra)
+
     def test_missing_approval_id_is_400(self) -> None:
         for path in ("/api/approvals/approve", "/api/approvals/deny"):
-            status, out = self._raw("POST", path, "{}", self._json_headers())
+            status, out = self._raw("POST", path, "{}", self._as("phone"))
             self.assertEqual(status, 400, path)
             self.assertEqual(out["error"], "id required")
 
@@ -150,6 +154,9 @@ class CsrfTests(unittest.TestCase):
         self.assertEqual(out["error"], "forbidden")
         self.assertFalse(self.app.approvals_view()["digest"]["requested"])
         status, out = self._raw("POST", "/api/approvals/digest", "{}", self._json_headers())
+        self.assertEqual(status, 401)                 # asking for it is the owner's, too
+        self.assertFalse(self.app.approvals_view()["digest"]["requested"])
+        status, out = self._raw("POST", "/api/approvals/digest", "{}", self._as("phone"))
         self.assertEqual(status, 200)
         self.assertTrue(out["ok"])
         self.assertTrue(self.app.approvals_view()["digest"]["requested"])

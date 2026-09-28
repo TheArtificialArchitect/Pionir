@@ -61,6 +61,22 @@ $terrariumDir = if ($env:PIONIR_TERRARIUM_DIR) { $env:PIONIR_TERRARIUM_DIR } els
 $srcDir      = Join-Path $root "src"
 $wt          = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\wt.exe"
 
+# The dashboard, opened signed in: /?key=<the dashboard's client token> becomes an
+# HttpOnly session cookie and leaves the address bar at once (src/pionir/auth.py).
+# Without the token file (Pionir not started yet) it is the plain, read-only page.
+function Dashboard-Url([int]$p) {
+    $dir = Join-Path $HOME ".pionir\secrets"
+    if ($env:PIONIR_STATE_ROOT) { $dir = Join-Path $env:PIONIR_STATE_ROOT "secrets" }
+    if ($env:PIONIR_CLIENT_TOKEN_DIR) { $dir = $env:PIONIR_CLIENT_TOKEN_DIR }
+    $file = Join-Path $dir "pionir-client-dashboard.token"
+    $url = "http://127.0.0.1:$p/"
+    if (Test-Path $file) {
+        $key = (Get-Content $file -Raw -ErrorAction SilentlyContinue)
+        if ($key) { $url += "?key=" + $key.Trim() }
+    }
+    return $url
+}
+
 function Test-Port([int]$p) {
     # Dispose the client either way: a connected socket left open holds the
     # port's accept queue slot until the GC gets to it.
@@ -297,7 +313,7 @@ if (-not $NoBryo) {
 
 if ($panes.Count -eq 0) {
     Write-Host "  everything is already up; nothing to start." -ForegroundColor DarkCyan
-    if (-not $NoBrowser -and (Test-Port $Port)) { Start-Process "http://127.0.0.1:$Port/" }
+    if (-not $NoBrowser -and (Test-Port $Port)) { Start-Process (Dashboard-Url $Port) }
     exit 0
 }
 
@@ -366,6 +382,6 @@ if ($bryoStarted) {
     if ($alive) { Write-Host "  up   :Bryo (organism alive)" -ForegroundColor Green }
     else { Write-Host "  DOWN :Bryo - organism did not come up" -ForegroundColor Red }
 }
-if (-not $NoBrowser -and (Test-Port $Port)) { Start-Process "http://127.0.0.1:$Port/" }
+if (-not $NoBrowser -and (Test-Port $Port)) { Start-Process (Dashboard-Url $Port) }
 Write-Host "  ready." -ForegroundColor DarkCyan
 exit 0

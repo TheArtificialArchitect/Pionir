@@ -9,6 +9,13 @@ The endpoint logic lives in ``PionirApp`` as plain dict-returning methods so it
 is testable without a socket; the HTTP handler is a thin shell over it. The
 server binds loopback only - it is an admin surface for the person at the
 machine, the same trust boundary as the specialists it front-ends.
+
+Loopback is not an identity, though: any local process can reach the port. So every POST
+that runs, parks or decides something names its caller with a per-client bearer token
+(or, for the owner's own page, the dashboard session cookie), a request's own
+``permissions`` are never trusted, and only the owner's surfaces approve - see
+``pionir/auth.py``. Read-only GETs stay open on loopback for the owner's browser and
+Pionir Desktop, behind the same DNS-rebinding Host check.
 """
 
 from __future__ import annotations
@@ -31,6 +38,17 @@ from urllib.parse import parse_qs, urlparse
 
 from . import atomic
 from .approvals import ApprovalQueue
+from .auth import (
+    ANONYMOUS,
+    APPROVE,
+    APPROVERS,
+    INTENT,
+    ROUTE,
+    SESSION_COOKIE,
+    TASK,
+    ClientAuth,
+    Unauthenticated,
+)
 from .batching import (
     BATCHED_GRANT,
     NEW_ONLY_GRANT,
@@ -304,6 +322,9 @@ class PionirApp:
         self.jobs = Jobs(runtime.settings.state_root / "tasks")
         # When routine public approvals are batched into the owner's daily digest.
         self.digest = DigestSettings.from_environment(runtime.settings.state_root)
+        # Who is calling over HTTP, and what each client may do (pionir/auth.py). Makes
+        # any missing client token file on first start.
+        self.auth = ClientAuth.for_settings(runtime.settings)
 
     # ---- jobs: work that outlives the request ---------------------------
     def _submit(
@@ -488,6 +509,7 @@ class PionirApp:
         *,
         permissions: list[str] | None = None,
         execute: bool = True,
+        client: str | None = None,
     ) -> dict[str, Any]:
         """Classify a request, and unless told otherwise run it.
 
@@ -496,8 +518,13 @@ class PionirApp:
         it true, an ambiguous request comes back as a question rather than a
         guess, and any specialist or gate error is returned as data - the
         dashboard shows the failure, it does not crash on it.
+
+        ``client`` is the authenticated HTTP caller: its permissions are its grant's,
+        never the request's (``permissions`` is for in-process callers only).
         """
 
+        if client is not None and permissions is not None:
+            raise ValueError("an HTTP client's permissions come from its grant, never the request")
         decision = self.router.classify(request)
         if not execute:
             self._record_routed(decision, note="executed=false")
@@ -508,6 +535,16 @@ class PionirApp:
                 "decision": _decision_json(decision),
                 "question": decision.question(),
             }
+        if client is not None:
+            grant = self.auth.grant(client)
+            if client == ANONYMOUS and self._privileged(decision.capability):
+                raise Unauthenticated(
+                    f"{decision.capability} is privileged; send your client token")
+            if not grant.allows_capability(decision.capability or ""):
+                return {"executed": False, "decision": _decision_json(decision),
+                        "error": {"type": "NotGranted",
+                                  "message": f"{client} may not call {decision.capability}"}}
+            permissions = sorted(grant.permissions)
         try:
             _, result = self.router.route(
                 request, granted_permissions=permissions or ()
@@ -532,7 +569,8 @@ class PionirApp:
             "evidence": list(result.evidence),
         }
 
-    def intent(self, request: str, *, wait: float = DEFAULT_WAIT_SECONDS) -> dict[str, Any]:
+    def intent(self, request: str, *, wait: float = DEFAULT_WAIT_SECONDS,
+               client: str | None = None) -> dict[str, Any]:
         """The voice's one seam for getting something done - and it reaches only
         Atani, never a doer. Runs as a job (see ``_submit``): answered in full if
         it finishes within ``wait`` seconds, else ``status: running`` + task_id.
@@ -561,6 +599,10 @@ class PionirApp:
             return {**response, "task_id": record["task_id"]}
 
         def run(capability: str, permissions: frozenset[str]) -> dict[str, Any]:
+            # These permissions are the voice seam's own, chosen here - never a caller's.
+            # An unauthenticated caller (the compatibility window) gets none of them.
+            if client == ANONYMOUS and (permissions or self._privileged(capability)):
+                raise Unauthenticated(f"{capability} is privileged; send your client token")
             return self._submit(
                 "intent", body,
                 lambda: self._run_intent(capability, {"content": request}, permissions, decision),
@@ -592,6 +634,12 @@ class PionirApp:
         # actually happened. manager.atani_manage holds no GPU lease of its own,
         # so the doer's task can take the single lease.
         return run("manager.atani_manage", frozenset({"atani.manage"}))
+
+    def _privileged(self, name: str | None) -> bool:
+        """Privileged, public, client or money: anything the owner must be asked about."""
+        _agent, cap = self._cap_and_agent(name) if name else (None, None)
+        return cap is not None and (cap.risk is RiskLevel.PRIVILEGED
+                                    or cap.requires_approval or cap.spends_money)
 
     def _capability_risk(self, name: str) -> RiskLevel | None:
         for manifest in self.runtime.executive.registry.manifests():
@@ -728,6 +776,7 @@ class PionirApp:
         permissions: list[str] | None = None,
         deferrable: bool = False,
         wait: float = DEFAULT_WAIT_SECONDS,
+        client: str | None = None,
     ) -> dict[str, Any]:
         """Invoke one named capability directly. A privileged action without its
         permission is parked in the approval queue and does NOT run - it waits for
@@ -736,11 +785,33 @@ class PionirApp:
 
         ``deferrable`` lets a background caller say its work can wait: if Bryo is
         alive and stressed, GPU work is held back and returned as a BodyDeferred
-        error rather than run. Default False - nothing interactive is ever held."""
+        error rather than run. Default False - nothing interactive is ever held.
 
-        granted = list(permissions or ())
+        ``client`` is the authenticated HTTP caller (pionir/auth.py). Its permissions are
+        its grant's and nothing else: a request never names its own. ``permissions`` is
+        for in-process callers only, and the two are never combined."""
+
+        grant = None
+        if client is not None:
+            if permissions is not None:
+                raise ValueError("an HTTP client's permissions come from its grant, "
+                                 "never the request")
+            grant = self.auth.grant(client)
+            if client == ANONYMOUS and self._privileged(capability):
+                raise Unauthenticated(f"{capability} is privileged; send your client token")
+            granted = sorted(grant.permissions)
+        else:
+            granted = list(permissions or ())
         body = {"capability": capability, "payload": payload, "permissions": granted,
                 "deferrable": deferrable}
+        if grant is not None:
+            body["client"] = client
+            if not grant.allows_capability(capability):
+                response = {"ok": False, "status": "error", "error": {
+                    "type": "NotGranted", "message": f"{client} may not call {capability}"}}
+                record = self.jobs.create("task", body)
+                self.jobs.finish(record["task_id"], "error", result=response)
+                return {**response, "task_id": record["task_id"]}
         # Validate the action's arguments BEFORE anything is parked for approval.
         # Argument validation used to live only in the adapter's execute(), which
         # runs after Ian approves - so he could be asked to approve a request that
@@ -762,6 +833,8 @@ class PionirApp:
                     if batch else None
             approval_id = self.approvals.enqueue(
                 capability, payload, sorted(cap.required_permissions), summary=summary,
+                # who parked it: that client may never approve it (approve())
+                **({"requester": client} if client is not None else {}),
                 batch=batch, digest_date=digest_date,
                 expires_after=self.digest.expires_after if batch else None,
                 context=context,
@@ -895,13 +968,22 @@ class PionirApp:
         return {"ok": True, "requested_at": request["requested_at"],
                 "request_id": request["id"], "batched_pending": waiting}
 
-    def approve(self, approval_id: str, *, wait: float = 0.0) -> dict[str, Any]:
+    def approve(self, approval_id: str, *, wait: float = 0.0,
+                approver: str | None = None) -> dict[str, Any]:
         """Claim first, then run as a job. The claim is an atomic pending->running
         move in the queue, so two taps (or a proxy retry after its own timeout)
         can never run the action twice: the second gets AlreadyResolved. The
         response comes back at once with the job's task_id; when the job ends the
-        approval record is marked approved (or approved_failed) with the result."""
+        approval record is marked approved (or approved_failed) with the result.
 
+        ``approver`` is the authenticated HTTP client saying yes (None in-process: the
+        Discord gate's reaction). Only the owner's surfaces approve, and no client ever
+        approves an item it parked itself."""
+
+        if approver is not None:
+            refused = self._approver_refusal(approval_id, approver)
+            if refused is not None:
+                return refused
         task_id = uuid.uuid4().hex
         record = self.approvals.claim(approval_id, task_id=task_id)
         if record is None:
@@ -941,7 +1023,21 @@ class PionirApp:
         return {"ok": True, "status": self.approvals.get(approval_id)["status"],
                 "approval_id": approval_id, "task_id": task_id, "result": response}
 
-    def deny(self, approval_id: str) -> dict[str, Any]:
+    def _approver_refusal(self, approval_id: str, approver: str) -> dict[str, Any] | None:
+        if approver not in APPROVERS:
+            return {"ok": False, "error": {"type": "Forbidden",
+                                           "message": f"{approver} does not approve"}}
+        current = self.approvals.get(approval_id)
+        if current is not None and current.get("requester") == approver:
+            return {"ok": False, "error": {"type": "SelfApproval",
+                                           "message": f"{approver} parked this item, so it "
+                                                      "cannot approve it"}}
+        return None
+
+    def deny(self, approval_id: str, *, approver: str | None = None) -> dict[str, Any]:
+        if approver is not None and approver not in APPROVERS:
+            return {"ok": False, "error": {"type": "Forbidden",
+                                           "message": f"{approver} does not deny"}}
         if self.approvals.resolve(approval_id, "denied"):
             return {"ok": True, "status": "denied", "approval_id": approval_id}
         return {"ok": False, "error": {"type": "AlreadyResolved", "message": "not pending"}}
@@ -964,6 +1060,32 @@ def _hostname(header: str | None) -> str | None:
         return None
 
 
+def _error_type(result: Mapping[str, Any]) -> str | None:
+    error = result.get("error")
+    return str(error.get("type")) if isinstance(error, Mapping) else None
+
+
+def _host_allowed(headers: Any, bind_host: str) -> str | None:
+    """None if the Host names this machine, else why not. Every request is checked, GETs
+    too: a page on another site that rebinds its DNS name to 127.0.0.1 still sends its
+    own name as Host, so it can neither read the state nor drive the API."""
+    host = _hostname(headers.get("Host"))
+    if host is None or host not in (_LOCAL_HOSTS | {bind_host}):
+        return "host is not local"
+    return None
+
+
+# POST paths -> the route a client's grant must name (pionir/auth.py).
+_POST_ROUTES = {
+    "/api/route": ROUTE,
+    "/api/intent": INTENT,
+    "/api/task": TASK,
+    "/api/approvals/approve": APPROVE,
+    "/api/approvals/deny": APPROVE,
+    "/api/approvals/digest": APPROVE,
+}
+
+
 def _post_allowed(headers: Any, bind_host: str) -> str | None:
     """None if the POST may proceed, else why it may not.
 
@@ -978,9 +1100,9 @@ def _post_allowed(headers: Any, bind_host: str) -> str | None:
     if content_type != "application/json":
         return "content-type must be application/json"
     host_header = headers.get("Host")
-    host = _hostname(host_header)
-    if host is None or host not in (_LOCAL_HOSTS | {bind_host}):
-        return "host is not local"
+    refused = _host_allowed(headers, bind_host)
+    if refused is not None:
+        return refused
     origin = headers.get("Origin")
     if origin is not None and origin.strip().lower() != f"http://{host_header.strip()}".lower():
         return "origin does not match host"
@@ -1043,8 +1165,33 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                 return None
             return document if isinstance(document, dict) else None
 
+        def _sign_in(self, key: str) -> None:
+            """``/?key=<dashboard token>`` (the link the launcher opens): the owner's
+            browser gets the dashboard token as an HttpOnly, SameSite=Strict session
+            cookie and a clean URL. Any other key is refused."""
+            if app.auth.identify(key) != "dashboard":
+                self._send({"error": "unauthorized",
+                            "reason": "that is not the dashboard's key - open the "
+                                      "dashboard from the launcher"}, 401)
+                return
+            self.send_response(303)
+            self.send_header("Set-Cookie", f"{SESSION_COOKIE}={key}; HttpOnly; "
+                                           "SameSite=Strict; Path=/")
+            self.send_header("Location", "/")
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+
         def do_GET(self) -> None:
             route = urlparse(self.path)
+            refused = _host_allowed(self.headers, bind_host)
+            if refused is not None:
+                self._send({"error": "forbidden", "reason": refused}, 403)
+                return
+            key = parse_qs(route.query).get("key")
+            if route.path in ("/", "/index.html") and key:
+                self._sign_in(key[0])
+                return
             if route.path in ("/", "/index.html"):
                 body = _ui_bytes()
                 self.send_response(200)
@@ -1085,6 +1232,23 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
             except Exception as error:  # noqa: BLE001
                 self._send({"error": type(error).__name__, "message": str(error)}, 500)
 
+        def _caller(self, path: str) -> tuple[str | None, int, str]:
+            """Who is POSTing, or (None, status, why) to refuse it. A credential that is
+            present must be right; none at all is ``anonymous``, served only in the
+            compatibility window and never for the approval routes."""
+            client, refused = app.auth.from_headers(self.headers.get("Authorization"),
+                                                    self.headers.get("Cookie"))
+            if refused is not None:
+                return None, 401, refused
+            needed = _POST_ROUTES[path]
+            if client is None:
+                if needed == APPROVE or not app.auth.compat:
+                    return None, 401, "a client token is required"
+                return ANONYMOUS, 0, ""
+            if needed not in app.auth.grant(client).routes:
+                return None, 403, f"{client} may not use {path}"
+            return client, 0, ""
+
         def do_POST(self) -> None:
             route = urlparse(self.path)
             refused = _post_allowed(self.headers, bind_host)
@@ -1092,60 +1256,74 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                 self._drain()
                 self._send({"error": "forbidden", "reason": refused}, 403)
                 return
+            if route.path not in _POST_ROUTES:
+                self._drain()
+                self._send({"error": "not found"}, 404)
+                return
+            client, status, why = self._caller(route.path)
+            if client is None:
+                self._drain()
+                self._send({"error": "unauthorized" if status == 401 else "forbidden",
+                            "reason": why}, status)
+                return
             body = self._body()
             if body is None:
                 self._send({"error": "bad json"}, 400)
                 return
+            if client == ANONYMOUS:
+                app.auth.warn_anonymous(route.path, str(body.get("capability") or ""))
+            # A request never names its own permissions: any "permissions" field in the
+            # body is ignored. They come from the client's grant (pionir/auth.py) or,
+            # for an approved item, from the approval record.
             try:
                 if route.path == "/api/route":
                     request = str(body.get("request", "")).strip()
                     if not request:
                         self._send({"error": "request is required"}, 400)
                         return
-                    self._send(
-                        app.route(
-                            request,
-                            permissions=[str(p) for p in body.get("permissions", [])],
-                            execute=bool(body.get("execute", True)),
-                        )
-                    )
+                    self._send(app.route(request, execute=bool(body.get("execute", True)),
+                                         client=client))
                 elif route.path == "/api/intent":
                     request = str(body.get("request", "") or body.get("intent", "")).strip()
                     if not request:
                         self._send({"error": "intent is required"}, 400)
                         return
-                    self._send_job(app.intent(request, wait=_clamp_wait(body.get("wait"))))
+                    self._send_job(app.intent(request, wait=_clamp_wait(body.get("wait")),
+                                              client=client))
                 elif route.path == "/api/task":
                     capability = str(body.get("capability", "")).strip()
                     if not capability:
                         self._send({"error": "capability is required"}, 400)
                         return
                     payload = body.get("payload")
-                    self._send_job(
-                        app.run_task(
-                            capability,
-                            payload if isinstance(payload, dict) else {},
-                            permissions=[str(p) for p in body.get("permissions", [])],
-                            deferrable=body.get("deferrable") is True,
-                            wait=_clamp_wait(body.get("wait")),
-                        )
+                    result = app.run_task(
+                        capability,
+                        payload if isinstance(payload, dict) else {},
+                        deferrable=body.get("deferrable") is True,
+                        wait=_clamp_wait(body.get("wait")),
+                        client=client,
                     )
-                elif route.path == "/api/approvals/approve":
-                    aid = str(body.get("id", "")).strip()
-                    if not aid:
-                        self._send({"error": "id required"}, 400)
-                        return
-                    self._send_job(app.approve(aid))
+                    if _error_type(result) == "NotGranted":
+                        self._send(result, 403)
+                    else:
+                        self._send_job(result)
                 elif route.path == "/api/approvals/digest":
                     self._send(app.request_digest())
-                elif route.path == "/api/approvals/deny":
+                else:
                     aid = str(body.get("id", "")).strip()
                     if not aid:
                         self._send({"error": "id required"}, 400)
                         return
-                    self._send(app.deny(aid))
-                else:
-                    self._send({"error": "not found"}, 404)
+                    if route.path == "/api/approvals/approve":
+                        result = app.approve(aid, approver=client)
+                    else:
+                        result = app.deny(aid, approver=client)
+                    if _error_type(result) in ("Forbidden", "SelfApproval"):
+                        self._send(result, 403)
+                    else:
+                        self._send_job(result)
+            except Unauthenticated as error:
+                self._send({"error": "unauthorized", "reason": str(error)}, 401)
             except Exception as error:  # noqa: BLE001
                 self._send({"error": type(error).__name__, "message": str(error)}, 500)
 
@@ -1253,7 +1431,10 @@ def serve(
               "the phone still approves.")
     print("  awake while this window is open; Ctrl+C stops it.")
     if open_browser:
-        threading.Thread(target=lambda: webbrowser.open(url), daemon=True).start()
+        # Opened signed in: the key becomes an HttpOnly session cookie and leaves the URL
+        # at once (see _sign_in). The launcher opens the same link (pionir.ps1).
+        signed_in = f"{url}?key={app.auth.tokens['dashboard']}"
+        threading.Thread(target=lambda: webbrowser.open(signed_in), daemon=True).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

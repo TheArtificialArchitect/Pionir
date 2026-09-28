@@ -21,6 +21,12 @@ Loopback only, three ways: the socket binds 127.0.0.1, a non-loopback peer is re
 anyway, and a request naming a non-local Host (DNS rebinding) is refused. A POST must be
 declared JSON and carry at most ``MAX_BODY_BYTES``; a browser Origin must be local.
 
+A write (``POST``) must also carry the crew's client token as ``Authorization: Bearer``
+(``pionir-client-crew.token``, made by Pionir; Pionir's crew adapter sends it), because
+loopback alone lets any local process in. A wrong token is always refused (401). No token
+at all is served, with a warning, only while ``PIONIR_AUTH_COMPAT`` is on (the rollout
+window, pionir/auth.py). Reads stay open on loopback.
+
 The validators (``parse_*``) are shared with Pionir's adapter so both sides refuse the
 same malformed request with the same words.
 
@@ -29,15 +35,18 @@ it in ``Crew.stop``.
 """
 from __future__ import annotations
 
+import hmac
 import ipaddress
 import json
 import socket
 import threading
 from collections.abc import Callable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from ..auth import compat_from_environment, parse_bearer, read_token
 from .direction import DIGEST_CHARS, MAX_GOAL_CHARS, _check_resource
 from .log import lesion, log
 
@@ -152,10 +161,14 @@ class CrewApi:
     socket and the socket cannot add rules of its own."""
 
     def __init__(self, direction, *, health: Callable[[], dict],
-                 port: int = DEFAULT_PORT, host: str = BIND_HOST) -> None:
+                 port: int = DEFAULT_PORT, host: str = BIND_HOST,
+                 token_file: Path | None = None, compat: bool | None = None) -> None:
         if not is_loopback(host):
             raise ValueError("the crew API binds loopback only")
         self.direction = direction
+        # The token a write must carry, read per request (Pionir may re-make it).
+        self.token_file = token_file
+        self.compat = compat_from_environment() if compat is None else compat
         self._health = health
         self._host = host
         self._port = port
@@ -223,6 +236,10 @@ class CrewApi:
             if route.path in POST_ROUTES:
                 if method != "POST":
                     return 405, _err(f"{route.path} is written with POST")
+                refused = self._authorize(headers, route.path)
+                if refused is not None:
+                    _discard(headers, read_body)   # a reply over unread bytes is a reset
+                    return refused
                 body = _read_json(headers, read_body)
                 if isinstance(body, tuple):
                     return body
@@ -234,6 +251,21 @@ class CrewApi:
             lesion("crew.api", exc)
             return 500, _err(f"the crew failed internally ({type(exc).__name__}); "
                              "see crew.log")
+
+    def _authorize(self, headers: Mapping[str, str], path: str) -> Reply | None:
+        """None if this write may proceed, else the 401 that refuses it."""
+        present, token = parse_bearer(headers.get("Authorization"))
+        if present:
+            expected = read_token(self.token_file)
+            if token and expected and hmac.compare_digest(token.encode("utf-8"),
+                                                          expected.encode("utf-8")):
+                return None
+            return 401, _err("invalid bearer token")
+        if self.compat:
+            log.warning("UNAUTHENTICATED write to the crew API %s served under "
+                        "PIONIR_AUTH_COMPAT=on; the caller sent no token", path)
+            return None
+        return 401, _err("a write needs the crew's client token as a bearer")
 
     def _get(self, path: str, query: dict) -> Reply:
         if path == "/api/health":
@@ -263,6 +295,15 @@ class CrewApi:
 
 def _err(message: str) -> dict:
     return {"ok": False, "error": message}
+
+
+def _discard(headers: Mapping[str, str], read_body: Callable[[int], bytes] | None) -> None:
+    try:
+        length = int(headers.get("Content-Length") or 0)
+    except ValueError:
+        return
+    if read_body is not None and 0 < length <= MAX_BODY_BYTES:
+        read_body(length)
 
 
 def _read_json(headers: Mapping[str, str], read_body: Callable[[int], bytes] | None):

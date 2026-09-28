@@ -201,7 +201,12 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
     if configured.crew_url is not None:
         # No boot-time call: the crew is reached only when a crew.* task runs (or
         # doctor asks), so a runtime without a running crew builds exactly the same.
-        runtime.register(CrewAdapter(CrewAdapterSettings(base_url=configured.crew_url)))
+        # The crew API's writes (a goal, an allocation) are authenticated with the crew's
+        # client token, which Pionir holds because it made it (pionir/auth.py).
+        from .auth import ensure_tokens
+        crew_token = ensure_tokens(configured.client_token_path, ("crew",))["crew"]
+        runtime.register(CrewAdapter(CrewAdapterSettings(base_url=configured.crew_url,
+                                                         token=crew_token)))
     if configured.owner_notify:
         # Moss's brief/alert to the owner, in the Discord gate's channel with its bot
         # token. No boot-time call: the token is read when a note is sent, and a gate

@@ -214,7 +214,7 @@ class GateCase(unittest.TestCase):
 
         self.app._execute_task = execute  # type: ignore[method-assign]
         self.token_file = self.root / "secrets" / "discord-bot-token.txt"
-        self.token_file.parent.mkdir(parents=True)
+        self.token_file.parent.mkdir(parents=True, exist_ok=True)   # Pionir's client tokens
         self.token_file.write_text(TOKEN + "\n", encoding="utf-8")
         self.fake = FakeDiscord()
         self.sleeps: list[float] = []

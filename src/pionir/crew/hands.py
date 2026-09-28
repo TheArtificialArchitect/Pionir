@@ -35,8 +35,10 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import quote, urlparse
 
+from ..auth import read_token
 from .grounding import values_in_data
 from .log import lesion, log
 
@@ -56,7 +58,7 @@ class Job:
     capability: str                 # a Pionir capability name, e.g. "reasoning.atani_answer"
     payload: dict = field(default_factory=dict)
     what: str = ""                  # in words: "send the follow-ups"
-    permissions: tuple = ()         # anything privileged without these is parked for the owner
+    permissions: tuple = ()         # never sent: Pionir parks anything privileged for the owner
     wait: float = 30.0              # seconds Pionir may hold the call before handing back an id
 
     def __post_init__(self) -> None:
@@ -156,18 +158,30 @@ def outcome_of(capability: str, doc) -> JobOutcome:
 class PionirClient:
     """Loopback only: the crew talks to the local Pionir and nothing else."""
 
-    def __init__(self, url: str = "http://127.0.0.1:8780", *, timeout: float = 60.0) -> None:
+    def __init__(self, url: str = "http://127.0.0.1:8780", *, timeout: float = 60.0,
+                 token_file: Path | None = None) -> None:
         parsed = urlparse(url)
         if parsed.scheme != "http" or parsed.hostname not in LOOPBACK:
             raise ValueError(f"the crew reaches Pionir over loopback only, not {url!r}")
         self.url = url.rstrip("/")
         self.timeout = timeout
+        # The crew's client token (pionir/auth.py), read on every call so a token Pionir
+        # re-made is picked up without a restart. No file: no header, and Pionir serves
+        # only non-privileged work, and only while its compatibility window is open.
+        self.token_file = token_file
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def _headers(self) -> dict:
+        headers = {"Content-Type": "application/json"}
+        token = read_token(self.token_file)
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
 
     def _call(self, method: str, path: str, body: dict | None, timeout: float) -> dict:
         data = json.dumps(body).encode("utf-8") if body is not None else None
         request = urllib.request.Request(self.url + path, data=data, method=method,
-                                         headers={"Content-Type": "application/json"})
+                                         headers=self._headers())
         try:
             with self._opener.open(request, timeout=timeout) as response:
                 raw = response.read(_MAX_BYTES)
@@ -193,8 +207,10 @@ class PionirClient:
 
     def run_task(self, capability: str, payload: dict, *, permissions: tuple = (),
                  wait: float = 30.0) -> dict:
-        body = {"capability": capability, "payload": payload,
-                "permissions": list(permissions), "wait": wait}
+        # ``permissions`` is not sent: Pionir never takes them from a request (it uses
+        # the crew's grant), so asking for one would only mislead a reader.
+        del permissions
+        body = {"capability": capability, "payload": payload, "wait": wait}
         return self._call("POST", "/api/task", body, self.timeout + wait)
 
     def task(self, task_id: str, *, wait: float = 0.0) -> dict:

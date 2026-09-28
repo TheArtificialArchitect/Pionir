@@ -387,18 +387,14 @@ function showOrgan(agent){
 }
 
 // ---- advanced direct invoke (debug) ----
-function neededPerm(cap){
-  if(cap.indexOf("atani_")>=0 && cap.indexOf("executive")>=0) return "atani.executive";
-  if(cap.indexOf("atani")>=0) return "atani.chat";
-  if(cap.indexOf("daedalus")>=0) return "daedalus.solve";
-  if(cap.indexOf("melete")>=0) return "melete.invoke";
-  return null;
-}
+// No permissions are sent: Pionir never takes them from a request. Anything privileged
+// parks for the owner's yes (Discord or the phone) like every other caller's. This page
+// posts as the dashboard, signed in by the link the launcher opens (a session cookie).
 $id("adv-run").onclick=async()=>{
   const cap=$id("adv-cap").value; let payload={};
   try{ payload=JSON.parse($id("adv-payload").value||"{}"); }catch(e){ $id("adv-out").innerHTML='<pre>payload is not valid JSON</pre>'; return; }
-  const p=neededPerm(cap); const perms=p?[p]:[];
-  const res=await jpost("/api/task",{capability:cap,payload,permissions:perms});
+  const res=await jpost("/api/task",{capability:cap,payload});
+  if(res && res.error==="unauthorized") res.hint="this tab is not signed in: open the dashboard from the launcher (pionir.ps1), which signs it in";
   const pre=document.createElement("pre"); pre.textContent=JSON.stringify(res,null,2);
   $id("adv-out").innerHTML=""; $id("adv-out").appendChild(pre);
 };

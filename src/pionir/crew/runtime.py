@@ -87,7 +87,8 @@ class Crew:
         self.direction = Direction(self.store, registry, self.allocation, clock=now)
         self.brain = Brain(cfg, self, card=card, post=post, now=now, allocation=self.allocation)
         self.hands = Hands(cfg, self, client if client is not None
-                           else PionirClient(cfg.pionir_url), now=monotonic)
+                           else PionirClient(cfg.pionir_url,
+                                             token_file=cfg.pionir_token_file), now=monotonic)
         self.http = http if http is not None else UrllibHttp()
         self.gate = ProviderGate(registry.providers)
         self.dispatcher = Dispatcher(registry, self.store, context=self.context_for,
@@ -119,7 +120,8 @@ class Crew:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="pionir-crew-loop", daemon=True)
         # Built here, served from start(): building a crew opens no socket.
-        self.api = (CrewApi(self.direction, health=self.api_health, port=cfg.api_port)
+        self.api = (CrewApi(self.direction, health=self.api_health, port=cfg.api_port,
+                            token_file=cfg.pionir_token_file)
                     if cfg.api_port is not None else None)
         self._restore()
 
