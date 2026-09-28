@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
+from .bridge_auth import read_token
 from .scheduler import ResourceBudget
 
 
@@ -497,9 +498,11 @@ class PionirSettings:
             galatea_model_id=(os.environ.get("PIONIR_GALATEA_MODEL_ID") or "").strip()
             or None,
             daedalus_url=_optional_url("PIONIR_DAEDALUS_URL", _declared("daedalus_url")),
-            daedalus_token=(os.environ.get("PIONIR_DAEDALUS_TOKEN") or "").strip() or None,
+            daedalus_token=((os.environ.get("PIONIR_DAEDALUS_TOKEN") or "").strip()
+                            or read_token("daedalus-token.txt")),
             melete_url=_optional_url("PIONIR_MELETE_URL", _declared("melete_url")),
-            melete_token=(os.environ.get("PIONIR_MELETE_TOKEN") or "").strip() or None,
+            melete_token=((os.environ.get("PIONIR_MELETE_TOKEN") or "").strip()
+                          or read_token("melete-token.txt")),
             crew_url=_optional_url("PIONIR_CREW_URL", _declared("crew_url")),
             quote_cards=(os.environ.get("PIONIR_QUOTE_CARDS", "1").strip().lower()
                          not in {"0", "off", "false", "no"}),

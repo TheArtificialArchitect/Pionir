@@ -196,6 +196,22 @@ if (-not (Test-Port 11434)) {
 }
 $env:PIONIR_GALATEA_URL = "http://127.0.0.1:8799"
 
+# Bridge tokens. Daedalus (:8771, every repo under C:\src, policy "full") and Melete
+# (:8770) take a job from ANY local process unless started with a token: Daedalus reads
+# DAEDALUS_TOKEN, Melete MELETE_TOKEN, and then each wants "Authorization: Bearer" on every
+# job call. Make ~/.pionir/secrets/daedalus-token.txt and melete-token.txt if missing (32
+# random bytes, owner-only file; never overwritten), start each bridge with its token, and
+# hand Pionir both. If they cannot be made the bridges are NOT started - an open bridge is
+# worse than a missing one.
+$savedPythonPath = $env:PYTHONPATH
+$env:PYTHONPATH = $srcDir
+& python -m pionir bridge-tokens
+$bridgeTokensOk = ($LASTEXITCODE -eq 0)
+$env:PYTHONPATH = $savedPythonPath
+if (-not $bridgeTokensOk) {
+    Write-Host "  ! could not make the bridge tokens in ~/.pionir/secrets; Daedalus and Melete will not be started." -ForegroundColor Yellow
+}
+
 # Decide which bridges this launch brings up: skip any already listening (do not
 # double-start and collide on the port), and honour the flags.
 $browserFlag = ""
@@ -214,7 +230,7 @@ if ($NoBrowser) { $browserFlag = " --no-browser" }
 # the voice to Moss" seam. Moss is the personality Ian talks to; Atani is the
 # background reasoner/router, so it answers plainly. Reversible, no state change,
 # and the answer/cycle_id contract is untouched (affect audit, 2026-09-14).
-$pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://127.0.0.1:8799'; `$env:ATANI_PIONIR_URL='http://127.0.0.1:$Port'; `$env:ATANI_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_DELIBERATE_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_TEACHER_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_VOICE_RENDERER='0'; "
+$pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://127.0.0.1:8799'; `$env:ATANI_PIONIR_URL='http://127.0.0.1:$Port'; `$env:ATANI_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_DELIBERATE_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_TEACHER_MODEL='qwen3:4b-instruct-2507-q4_K_M'; `$env:ATANI_VOICE_RENDERER='0'; `$env:PIONIR_DAEDALUS_TOKEN=(Get-Content -Raw (Join-Path `$HOME '.pionir\secrets\daedalus-token.txt')).Trim(); `$env:PIONIR_MELETE_TOKEN=(Get-Content -Raw (Join-Path `$HOME '.pionir\secrets\melete-token.txt')).Trim(); "
 
 $panes = @()   # ordered: dashboard, voice, then the doers
 $ports = @()   # the ports this launch is responsible for verifying
@@ -234,7 +250,8 @@ if (-not $NoVoice) {
 }
 
 if (-not $NoSpecialists) {
-    if (Test-Port 8771) { Write-Host "  Daedalus already up on 8771." -ForegroundColor DarkCyan }
+    if (-not $bridgeTokensOk) { }
+    elseif (Test-Port 8771) { Write-Host "  Daedalus already up on 8771 (pionir doctor says whether it wants a token)." -ForegroundColor DarkCyan }
     elseif (Test-Path $daedalusDir) {
         # Daedalus runs qwen3-coder:30b - a code-specialist MoE (~3B active),
         # a far stronger coder than a GPU 7B. It is NOT 0 VRAM: measured
@@ -250,13 +267,15 @@ if (-not $NoSpecialists) {
         #   THINK 1        - only sent to a model that reports "thinking"; qwen3-coder
         #                    does not (think=true is a 400), so it is inert until the
         #                    model changes. /health brain.thinking_active is the truth.
-        $daedalusEnv = "`$env:DAEDALUS_MODEL='qwen3-coder:30b'; `$env:DAEDALUS_NUM_CTX='32768'; `$env:DAEDALUS_MAX_STEPS='32'; `$env:DAEDALUS_REPAIRS='4'; `$env:DAEDALUS_TEMPERATURE='0.35'; `$env:DAEDALUS_THINK='1'; "
+        $daedalusEnv = "`$env:DAEDALUS_MODEL='qwen3-coder:30b'; `$env:DAEDALUS_NUM_CTX='32768'; `$env:DAEDALUS_MAX_STEPS='32'; `$env:DAEDALUS_REPAIRS='4'; `$env:DAEDALUS_TEMPERATURE='0.35'; `$env:DAEDALUS_THINK='1'; `$env:DAEDALUS_TOKEN=(Get-Content -Raw (Join-Path `$HOME '.pionir\secrets\daedalus-token.txt')).Trim(); "
         $panes += ,(Pane-Cmd "Daedalus :8771" $daedalusDir "python -m daedalus.server" $daedalusEnv)
         $ports += 8771
     } else { Write-Host "  ! Daedalus not found at $daedalusDir; skipping." -ForegroundColor Yellow }
-    if (Test-Port 8770) { Write-Host "  Melete already up on 8770." -ForegroundColor DarkCyan }
+    if (-not $bridgeTokensOk) { }
+    elseif (Test-Port 8770) { Write-Host "  Melete already up on 8770 (it has a token only if this launcher started it)." -ForegroundColor DarkCyan }
     elseif (Test-Path $meleteDir) {
-        $panes += ,(Pane-Cmd "Melete :8770" $meleteDir "python -m melete.server" "")
+        $meleteEnv = "`$env:MELETE_TOKEN=(Get-Content -Raw (Join-Path `$HOME '.pionir\secrets\melete-token.txt')).Trim(); "
+        $panes += ,(Pane-Cmd "Melete :8770" $meleteDir "python -m melete.server" $meleteEnv)
         $ports += 8770
     } else { Write-Host "  ! Melete not found at $meleteDir; skipping." -ForegroundColor Yellow }
 }

@@ -69,6 +69,31 @@ class HermeticSuiteTests(unittest.TestCase):
                                         "(or leave owner_notify off)")
 
 
+    def test_no_test_probes_the_live_bridges(self) -> None:
+        # Doctor POSTs to Daedalus without a token to see whether it is locked. A test
+        # that ran it at the default URL would hand the owner's live :8771 a job call, so
+        # every probe gets a fake opener, and every _doctor(...) runs with both bridges
+        # switched off (daedalus_url=None, melete_url=None) or bridge_report patched.
+        offenders = []
+        for path, tree in _sources():
+            for fn in ast.walk(tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                for name in ("bridge_report", "daedalus_open"):
+                    offenders += [f"{path.name}:{c.lineno} {name}() without opener="
+                                  for c in _calls(fn, name) if "opener" not in _keywords(c)]
+                if not _calls(fn, "_doctor"):
+                    continue
+                off = {k.arg for c in _calls(fn, "PionirSettings") for k in c.keywords
+                       if k.arg in ("daedalus_url", "melete_url")
+                       and isinstance(k.value, ast.Constant) and k.value.value is None}
+                patched = any(isinstance(n, ast.Constant) and n.value == "bridge_report"
+                              for n in ast.walk(fn))
+                if off != {"daedalus_url", "melete_url"} and not patched:
+                    offenders.append(f"{path.name}:{fn.lineno} {fn.name}() runs _doctor")
+        self.assertEqual(offenders, [])
+
+
 def _runtime_settings():
     """(path, function, PionirSettings call) for every runtime-shaped settings in the
     tests: built straight into build_runtime(...), assigned to a name that is then passed

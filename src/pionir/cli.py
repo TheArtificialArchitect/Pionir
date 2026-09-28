@@ -11,7 +11,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from . import benchmark, bryofeed, recallcheck, routecheck
+from . import benchmark, bridge_auth, bryofeed, recallcheck, routecheck
 from .batching import DigestSettings, approval_level, batch_condition
 from .bootstrap import PionirRuntime, build_runtime
 from .config import PionirSettings
@@ -57,6 +57,10 @@ def _parser() -> argparse.ArgumentParser:
         "--no-browser", action="store_true", help="do not open the dashboard in a browser"
     )
     commands.add_parser("doctor", help="check state integrity and specialist reachability")
+    commands.add_parser(
+        "bridge-tokens",
+        help="make the Daedalus and Melete tokens in ~/.pionir/secrets if missing (owner-only)",
+    )
     commands.add_parser("capabilities", help="show registered specialist contracts")
     commands.add_parser("audit-verify", help="verify the durable audit hash chain")
 
@@ -327,6 +331,8 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
     return {
         "runtime": "ok",
         "state_root": str(runtime.settings.state_root),
+        # A bridge that takes jobs without a token is a door any local process can use.
+        "bridge_auth": bridge_auth.bridge_report(runtime.settings),
         "audit": {
             "status": "verified",
             "events": sequence,
@@ -440,7 +446,9 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
             item["status"] == "unavailable"
             for item in report["specialists"].values()
         )
-        return int(unavailable or report["routing_aim"]["status"] == "failing")
+        open_bridge = any("warning" in item for item in report["bridge_auth"].values())
+        return int(unavailable or open_bridge
+                   or report["routing_aim"]["status"] == "failing")
     if args.command == "capabilities":
         _print(_capabilities(runtime))
         return 0
@@ -777,6 +785,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print({"status": "error", "error_type": type(error).__name__,
                     "message": str(error)})
             return 1
+    if args.command == "bridge-tokens":
+        # Run by pionir.ps1 before any pane starts; needs no runtime.
+        try:
+            made = bridge_auth.ensure_tokens()
+        except OSError as error:
+            _print({"status": "error", "error_type": type(error).__name__,
+                    "message": str(error)})
+            return 1
+        _print({"status": "ok", "directory": str(bridge_auth.secrets_dir()), "tokens": made})
+        return 0
     if args.command == "bryo-feed":
         # A standalone poller: it reads the running server over HTTP and needs no
         # runtime of its own (no Cortex, no GPU lock), so it short-circuits here.
