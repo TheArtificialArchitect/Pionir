@@ -127,13 +127,19 @@ class PionirSettings:
     # blocking). Needs bryo_status_command. Turn off with PIONIR_BRYO_PRESSURE=off.
     bryo_pressure: bool = True
     # Nyx (offensive) and Voodoo (defensive), Pionir's read-only security organs.
-    # Wired in by default: `nyx status` is an installed console script; Voodoo's
-    # editable install isn't importable, so `python -m voodoo status` runs from
-    # its src tree. Each shows unavailable in doctor if its tree/CLI is gone, and
-    # either is turned off with PIONIR_NYX/VOODOO_STATUS_COMMAND_JSON set to "off".
-    nyx_status_command: tuple[str, ...] | None = ("nyx", "status")
+    # Both live under C:\src\Nyx.Voodoo now and run as modules from their own src
+    # trees: the `nyx` console script's editable install still points at the
+    # deleted C:\src\Nyx (so bare `nyx` fails), and Voodoo's editable install
+    # isn't importable. So each runs `python -m <package> ...` with its src tree as
+    # the working directory - the status and every run action alike. Nyx's data
+    # root is its own default (C:\src\NyxData), untouched here. Each shows
+    # unavailable in doctor if its tree is gone; either is turned off with
+    # PIONIR_NYX/VOODOO_STATUS_COMMAND_JSON set to "off", and
+    # PIONIR_NYX/VOODOO_STATUS_CWD point at another tree.
+    nyx_status_command: tuple[str, ...] | None = ("python", "-m", "nyx", "status")
+    nyx_status_cwd: str = r"C:\src\Nyx.Voodoo\Nyx\src"
     voodoo_status_command: tuple[str, ...] | None = ("python", "-m", "voodoo", "status")
-    voodoo_status_cwd: str = r"C:\src\voodoo\src"
+    voodoo_status_cwd: str = r"C:\src\Nyx.Voodoo\Voodoo\src"
     # Taskable actions: Atani may invoke one of these (privileged, so it lands in
     # the approval queue and never fires on the voice's own initiative). The
     # action is an allowlisted subcommand (one token, or the explicit two-token
@@ -142,7 +148,7 @@ class PionirSettings:
     # offensive commands are research/crawl/fingerprint/cert (`scan` is `nyx
     # improve scan`, `specialists` needs list|run); Voodoo's `hunt` is `defend
     # hunt`, and bare `defend` errors, so each defend posture is spelled out.
-    nyx_run_prefix: tuple[str, ...] = ("nyx",)
+    nyx_run_prefix: tuple[str, ...] = ("python", "-m", "nyx")
     nyx_run_actions: tuple[str, ...] = ("research", "crawl", "fingerprint", "cert")
     voodoo_run_prefix: tuple[str, ...] = ("python", "-m", "voodoo")
     voodoo_run_actions: tuple[str, ...] = field(default=(
@@ -490,6 +496,9 @@ class PionirSettings:
                 else _command_from_json(
                     "PIONIR_VOODOO_STATUS_COMMAND_JSON", _declared("voodoo_status_command")
                 )
+            ),
+            nyx_status_cwd=(
+                os.environ.get("PIONIR_NYX_STATUS_CWD") or _declared("nyx_status_cwd")
             ),
             voodoo_status_cwd=(
                 os.environ.get("PIONIR_VOODOO_STATUS_CWD") or _declared("voodoo_status_cwd")

@@ -165,6 +165,9 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
                 command=configured.nyx_status_command,
                 run_prefix=configured.nyx_run_prefix,
                 run_actions=configured.nyx_run_actions,
+                # `python -m nyx` resolves only from its src tree: the status and
+                # every run action execute there.
+                cwd=configured.nyx_status_cwd,
             ))
         )
     if configured.voodoo_status_command is not None:
