@@ -304,7 +304,9 @@ class GateOverHttp(unittest.TestCase):
     # ---- 6. the owner's dashboard session --------------------------------------------
     def test_the_dashboard_link_sets_a_strict_http_only_session(self) -> None:
         key = self.app.auth.tokens["dashboard"]
-        status, _doc, response = self._raw("GET", f"/?key={key}")
+        code = self.app.signin_codes.mint()
+        self.assertNotIn(key, code)
+        status, _doc, response = self._raw("GET", f"/?code={code}")
         self.assertEqual(status, 303)
         self.assertEqual(response.getheader("Location"), "/")
         cookie = response.getheader("Set-Cookie")
@@ -315,12 +317,66 @@ class GateOverHttp(unittest.TestCase):
         session = f"{auth.SESSION_COOKIE}={key}"
         status, out = self.post("/api/approvals/approve", {"id": aid}, Cookie=session)
         self.assertIn(status, (200, 202), out)
-
-    def test_a_wrong_key_or_another_clients_token_is_no_session(self) -> None:
-        status, _doc, response = self._raw("GET", f"/?key={WRONG}")
+        # used once
+        status, _doc, response = self._raw("GET", f"/?code={code}")
         self.assertEqual(status, 401)
         self.assertIsNone(response.getheader("Set-Cookie"))
-        status, _doc, _ = self._raw("GET", f"/?key={self.app.auth.tokens['crew']}")
+
+    def test_a_stale_code_is_no_session(self) -> None:
+        from pionir.signin import CODE_TTL, SigninCodes
+        codes = SigninCodes(clock=lambda: 1000.0)
+        code = codes.mint()
+        codes._clock = lambda: 1000.0 + CODE_TTL + 1
+        self.assertFalse(codes.redeem(code))
+        self.assertLessEqual(CODE_TTL, 60)
+
+    def test_no_long_lived_key_signs_in_from_a_url(self) -> None:
+        # the dashboard token itself in the address bar is no sign-in any more
+        for q in (f"key={self.app.auth.tokens['dashboard']}", f"code={self.app.auth.tokens['dashboard']}"):
+            _status, _doc, response = self._raw("GET", f"/?{q}")
+            self.assertIsNone(response.getheader("Set-Cookie"), q[:4])
+
+    def _ask_code(self, key: str | None = None, *, nonce: str | None = None, ts: float | None = None,
+                  port: int | None = None, **headers: str):
+        import secrets as _s
+        import time as _t
+        from pionir.signin import sign
+        nonce = nonce or _s.token_hex(16)
+        ts = int(_t.time() if ts is None else ts)
+        sig = sign(key or self.app.auth.tokens["dashboard"], "signin", nonce, ts, port or self.port)
+        status, out = self.post("/api/signin_code", {"nonce": nonce, "ts": ts},
+                                **{"X-Pionir-Sign": sig, **headers})
+        return status, out, nonce
+
+    def test_a_launcher_signed_with_the_dashboard_token_gets_a_code_and_the_proof(self) -> None:
+        from pionir.signin import same, sign
+        status, out, nonce = self._ask_code()
+        self.assertEqual(status, 200, out)
+        self.assertTrue(same(out["proof"], sign(self.app.auth.tokens["dashboard"], "signin-reply",
+                                                nonce, out["code"], self.port)))
+        self.assertNotIn(self.app.auth.tokens["dashboard"], json.dumps(out))
+        status, _doc, response = self._raw("GET", f"/?code={out['code']}")
+        self.assertEqual(status, 303)
+        self.assertIn("HttpOnly", response.getheader("Set-Cookie"))
+
+    def test_every_other_ask_for_a_code_is_refused(self) -> None:
+        import time as _t
+        status, _out, nonce = self._ask_code()
+        self.assertEqual(status, 200)
+        self.assertEqual(self._ask_code(nonce=nonce)[0], 403)                     # replay
+        for c in ("crew", "galatea", "phone", "desktop"):
+            self.assertEqual(self._ask_code(self.app.auth.tokens[c])[0], 403, c)  # another client's
+        self.assertEqual(self._ask_code(ts=_t.time() - 120)[0], 403)              # stale
+        self.assertEqual(self._ask_code(port=self.port + 1)[0], 403)              # another port
+        self.assertEqual(self._ask_code(Origin=f"http://127.0.0.1:{self.port}")[0], 403)  # a page
+        status, _ = self.post("/api/signin_code", {"nonce": "n" * 32, "ts": int(_t.time())})
+        self.assertEqual(status, 403)
+
+    def test_a_wrong_key_or_another_clients_token_is_no_session(self) -> None:
+        status, _doc, response = self._raw("GET", f"/?code={WRONG}")
+        self.assertEqual(status, 401)
+        self.assertIsNone(response.getheader("Set-Cookie"))
+        status, _doc, _ = self._raw("GET", f"/?code={self.app.auth.tokens['crew']}")
         self.assertEqual(status, 401)
         aid = self._parked()
         for value in (WRONG, self.app.auth.tokens["crew"], self.app.auth.tokens["phone"]):
@@ -332,7 +388,7 @@ class GateOverHttp(unittest.TestCase):
     # ---- 7. DNS rebinding and cross-site pages ---------------------------------------
     def test_a_rebound_host_can_neither_read_nor_write(self) -> None:
         for path in ("/", "/api/state", "/api/approvals", "/api/audit",
-                     f"/?key={self.app.auth.tokens['dashboard']}"):
+                     f"/?code={self.app.signin_codes.mint()}"):
             status, out, response = self._raw("GET", path, headers={"Host": "evil.example"})
             self.assertEqual(status, 403, path)
             self.assertIsNone(response.getheader("Set-Cookie"))
@@ -358,17 +414,66 @@ class GateOverHttp(unittest.TestCase):
         (folder / "galatea-glass-token.txt").write_text(key, encoding="utf-8")
         return key
 
-    def test_the_owners_session_gets_her_glass_with_its_key(self) -> None:
+    def _her(self, key: str, *, honest: bool = True) -> str:
+        """A stand-in for her /api/ticket on a free port: signs as she does, or - a
+        squatter - answers without knowing her key. Points the runtime at it."""
+        import dataclasses
+        from http.server import BaseHTTPRequestHandler
+        from pionir.signin import same, sign
+        seen = self.her_asks = []
+
+        class Her(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                return
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                seen.append({"headers": dict(self.headers), "body": body})
+                port = self.server.server_address[1]
+                ok = same(self.headers.get("X-Galatea-Sign"),
+                          sign(key, "ticket", body["nonce"], body["ts"], port))
+                ticket = "t" * 32
+                proof = sign(key if honest else "not-her-key" * 4, "ticket-reply", body["nonce"], ticket, port)
+                data = json.dumps({"ticket": ticket, "proof": proof} if ok or not honest else {"error": "no"}).encode()
+                self.send_response(200 if ok or not honest else 403)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Her)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        url = f"http://127.0.0.1:{httpd.server_address[1]}"
+        saved = self.app.runtime.settings
+        self.app.runtime.settings = dataclasses.replace(saved, galatea_url=url)
+        self.addCleanup(setattr, self.app.runtime, "settings", saved)
+        return url
+
+    def test_the_owners_session_gets_her_glass_with_a_one_time_ticket(self) -> None:
         key = self._glass()
+        url = self._her(key)
         session = f"{auth.SESSION_COOKIE}={self.app.auth.tokens['dashboard']}"
         status, out, response = self._raw("GET", "/api/voice_link", headers={"Cookie": session})
         self.assertEqual(status, 200, out)
-        base = str(self.app.runtime.settings.galatea_url).rstrip("/")
-        self.assertEqual(out["url"], f"{base}/?token={key}")
+        self.assertEqual(out["url"], f"{url}/?ticket={'t' * 32}")
         self.assertEqual(response.getheader("Cache-Control"), "no-store")
+        # her key never left: not in the ask, not in the answer
+        self.assertNotIn(key, json.dumps(self.her_asks))
+        self.assertNotIn(key, json.dumps(out))
+
+    def test_a_squatter_on_her_port_is_handed_nothing(self) -> None:
+        key = self._glass()
+        self._her(key, honest=False)
+        session = f"{auth.SESSION_COOKIE}={self.app.auth.tokens['dashboard']}"
+        status, out, _ = self._raw("GET", "/api/voice_link", headers={"Cookie": session})
+        self.assertEqual(status, 502, out)
+        self.assertNotIn("url", out)
+        self.assertNotIn(key, json.dumps(self.her_asks))
 
     def test_no_one_else_gets_her_glass(self) -> None:
         key = self._glass()
+        self._her(key)
         tries = [{}, {"Cookie": f"{auth.SESSION_COOKIE}={WRONG}"},
                  {"Origin": f"http://127.0.0.1:{self.port}", "X-Forwarded-For": "100.101.102.103",
                   "Tailscale-User-Login": "ian@example.com"}]
@@ -378,7 +483,7 @@ class GateOverHttp(unittest.TestCase):
         for headers in tries:
             status, out, _ = self._raw("GET", "/api/voice_link", headers=headers)
             self.assertEqual(status, 401, headers)
-            self.assertNotIn(key, json.dumps(out))
+            self.assertNotIn("ticket", json.dumps(out))
         # nor a rebound name, even carrying the session
         session = f"{auth.SESSION_COOKIE}={self.app.auth.tokens['dashboard']}"
         status, out, _ = self._raw("GET", "/api/voice_link",
@@ -395,6 +500,53 @@ class GateOverHttp(unittest.TestCase):
         status, out, _ = self._raw("GET", "/api/voice_link", headers={"Cookie": session})
         self.assertEqual(status, 503, out)
         self.assertIn("galatea-glass-token.txt", out["reason"])
+
+    # ---- 9. the launcher's sign-in link (pionir.ps1, PowerShell 5.1) ------------------
+    def _dashboard_url(self, port: int) -> str:
+        import subprocess
+        text = (Path(__file__).resolve().parent.parent / "pionir.ps1").read_text(encoding="utf-8-sig")
+        start, end = text.index("function Hex-Hmac"), text.index("function Test-Port")
+        env = {**os.environ,
+               "PIONIR_CLIENT_TOKEN_DIR": str(self.app.runtime.settings.client_token_path)}
+        env.pop("PIONIR_STATE_ROOT", None)
+        done = subprocess.run(["powershell", "-NoProfile", "-Command",
+                               text[start:end] + f"\nDashboard-Url {port}"],
+                              env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return done.stdout.strip()
+
+    @unittest.skipUnless(os.name == "nt", "runs the launcher's PowerShell")
+    def test_the_launcher_opens_a_one_time_code_never_the_token(self) -> None:
+        url = self._dashboard_url(self.port)
+        self.assertTrue(url.startswith(f"http://127.0.0.1:{self.port}/?code="), url[:40])
+        self.assertNotIn(self.app.auth.tokens["dashboard"], url)
+        status, _doc, response = self._raw("GET", url.split(str(self.port), 1)[1])
+        self.assertEqual(status, 303)
+        self.assertIn("HttpOnly", response.getheader("Set-Cookie"))
+
+    @unittest.skipUnless(os.name == "nt", "runs the launcher's PowerShell")
+    def test_the_launcher_opens_nothing_signed_in_on_a_squatter(self) -> None:
+        from http.server import BaseHTTPRequestHandler
+
+        class Squatter(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                return
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                data = json.dumps({"code": "c" * 32, "proof": "0" * 64}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Squatter)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        port = httpd.server_address[1]
+        self.assertEqual(self._dashboard_url(port), f"http://127.0.0.1:{port}/")
 
     def test_reads_stay_open_on_loopback(self) -> None:
         for path in ("/api/state", "/api/approvals", "/api/capabilities"):

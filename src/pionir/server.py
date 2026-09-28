@@ -60,6 +60,7 @@ from .batching import (
     request_digest,
 )
 from .adapters.galatea import GLASS_KEY_FILE, read_key
+from .signin import NotGalatea, SigninCodes, galatea_ticket
 from .bootstrap import PionirRuntime
 from .cli import _capabilities, _doctor, _jsonable
 from .contracts import RiskLevel, Task, outcome_ok
@@ -327,6 +328,9 @@ class PionirApp:
         # Who is calling over HTTP, and what each client may do (pionir/auth.py). Makes
         # any missing client token file on first start.
         self.auth = ClientAuth.for_settings(runtime.settings)
+        # One-time sign-in codes for the owner's browser (pionir/signin.py): no launcher
+        # puts the dashboard token itself in a URL.
+        self.signin_codes = SigninCodes()
 
     # ---- jobs: work that outlives the request ---------------------------
     def _submit(
@@ -467,11 +471,12 @@ class PionirApp:
 
     def voice_link(self, authorization: str | None, cookie: str | None
                    ) -> tuple[int, dict[str, Any]]:
-        """The Voice view's signed-in address of her glass: her URL with her GLASS key
-        (Galatea's galatea/keys.py). Only for the owner's own dashboard - its session
-        cookie or its token - because that key lets the browser do on her page all
-        he can, his approvals included; none of it goes out on the open /api/state.
-        Her page keeps the key and drops it from its address bar."""
+        """The Voice view's signed-in address of her glass: her URL with a one-time
+        sign-in ticket (60 s, used once), asked of her with an HMAC of her glass key and
+        taken only with her proof (pionir/signin.py) - so a squatter on her port is
+        handed nothing and cannot pass for her. Only for the owner's own dashboard -
+        its session cookie or its token; none of it goes out on the open /api/state.
+        No key is ever in the URL; her page trades the ticket for its session cookie."""
         client, refused = self.auth.from_headers(authorization, cookie)
         if client != "dashboard":
             return 401, {"error": "unauthorized",
@@ -484,7 +489,11 @@ class PionirApp:
         if key is None:
             return 503, {"error": "no key",
                          "reason": f"no {GLASS_KEY_FILE} yet: she makes it when she wakes"}
-        return 200, {"url": f"{str(base).rstrip('/')}/?{urlencode({'token': key})}"}
+        try:
+            ticket = galatea_ticket(str(base), key)
+        except NotGalatea as why:
+            return 502, {"error": "not her", "reason": str(why)}
+        return 200, {"url": f"{str(base).rstrip('/')}/?{urlencode({'ticket': ticket})}"}
 
     def body(self) -> dict[str, Any] | None:
         reading = self.runtime.executive.body_reading()
@@ -1184,18 +1193,21 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                 return None
             return document if isinstance(document, dict) else None
 
-        def _sign_in(self, key: str) -> None:
-            """``/?key=<dashboard token>`` (the link the launcher opens): the owner's
-            browser gets the dashboard token as an HttpOnly, SameSite=Strict session
-            cookie and a clean URL. Any other key is refused."""
-            if app.auth.identify(key) != "dashboard":
+        def _sign_in(self, code: str) -> None:
+            """``/?code=<one-time code>`` (the link a launcher opens, pionir/signin.py):
+            a live code gets the owner's browser the dashboard session as an HttpOnly,
+            SameSite=Strict cookie and a clean URL. Any other code is refused. No
+            long-lived key is ever taken from a URL."""
+            if not app.signin_codes.redeem(code):
                 self._send({"error": "unauthorized",
-                            "reason": "that is not the dashboard's key - open the "
-                                      "dashboard from the launcher"}, 401)
+                            "reason": "that sign-in link is used or stale - open the "
+                                      "dashboard from the launcher again"}, 401)
                 return
+            key = app.auth.tokens["dashboard"]
             self.send_response(303)
             self.send_header("Set-Cookie", f"{SESSION_COOKIE}={key}; HttpOnly; "
                                            "SameSite=Strict; Path=/")
+            self.send_header("Referrer-Policy", "no-referrer")
             self.send_header("Location", "/")
             self.send_header("Content-Length", "0")
             self.send_header("Cache-Control", "no-store")
@@ -1207,9 +1219,9 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
             if refused is not None:
                 self._send({"error": "forbidden", "reason": refused}, 403)
                 return
-            key = parse_qs(route.query).get("key")
-            if route.path in ("/", "/index.html") and key:
-                self._sign_in(key[0])
+            code = parse_qs(route.query).get("code")
+            if route.path in ("/", "/index.html") and code:
+                self._sign_in(code[0])
                 return
             if route.path in ("/", "/index.html"):
                 body = _ui_bytes()
@@ -1278,6 +1290,17 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
             if refused is not None:
                 self._drain()
                 self._send({"error": "forbidden", "reason": refused}, 403)
+                return
+            if route.path == "/api/signin_code":
+                # a launcher, signed with the dashboard token (never sent): its signature
+                # is its authentication, and the proof in the answer is ours
+                body = self._body()
+                out = None
+                if isinstance(body, dict) and not self.headers.get("Origin"):
+                    out = app.signin_codes.signed_mint(
+                        app.auth.tokens.get("dashboard"), body.get("nonce"), body.get("ts"),
+                        self.headers.get("X-Pionir-Sign"), self.server.server_address[1])
+                self._send(out if out else {"error": "refused"}, 200 if out else 403)
                 return
             if route.path not in _POST_ROUTES:
                 self._drain()
@@ -1454,9 +1477,10 @@ def serve(
               "the phone still approves.")
     print("  awake while this window is open; Ctrl+C stops it.")
     if open_browser:
-        # Opened signed in: the key becomes an HttpOnly session cookie and leaves the URL
-        # at once (see _sign_in). The launcher opens the same link (pionir.ps1).
-        signed_in = f"{url}?key={app.auth.tokens['dashboard']}"
+        # Opened signed in with a one-time code (60 s, used once) that becomes the HttpOnly
+        # session cookie and leaves the URL at once (see _sign_in) - never the token itself.
+        # The other launchers ask for a code the same way, signed (pionir.ps1, Desktop).
+        signed_in = f"{url}?code={app.signin_codes.mint()}"
         threading.Thread(target=lambda: webbrowser.open(signed_in), daemon=True).start()
     try:
         httpd.serve_forever()

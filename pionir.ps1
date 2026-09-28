@@ -61,19 +61,53 @@ $terrariumDir = if ($env:PIONIR_TERRARIUM_DIR) { $env:PIONIR_TERRARIUM_DIR } els
 $srcDir      = Join-Path $root "src"
 $wt          = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\wt.exe"
 
-# The dashboard, opened signed in: /?key=<the dashboard's client token> becomes an
-# HttpOnly session cookie and leaves the address bar at once (src/pionir/auth.py).
-# Without the token file (Pionir not started yet) it is the plain, read-only page.
+# The dashboard, opened signed in: /?code=<one-time code> (60 s, used once) becomes an
+# HttpOnly session cookie and leaves the address bar at once (src/pionir/signin.py).
+# The code is asked of the running Pionir with an HMAC of the dashboard's client token
+# - never the token itself, which stays out of every URL and command line - and taken
+# only with Pionir's proof, so a squatter on the port gets nothing and is opened
+# nothing. Without the token file, or no proof, it is the plain, read-only page.
+function Hex-Hmac([byte[]]$key, [string]$text) {
+    $h = New-Object System.Security.Cryptography.HMACSHA256 (,$key)
+    try { $b = $h.ComputeHash([Text.Encoding]::UTF8.GetBytes($text)) } finally { $h.Dispose() }
+    return (($b | ForEach-Object { $_.ToString("x2") }) -join "")
+}
 function Dashboard-Url([int]$p) {
     $dir = Join-Path $HOME ".pionir\secrets"
     if ($env:PIONIR_STATE_ROOT) { $dir = Join-Path $env:PIONIR_STATE_ROOT "secrets" }
     if ($env:PIONIR_CLIENT_TOKEN_DIR) { $dir = $env:PIONIR_CLIENT_TOKEN_DIR }
     $file = Join-Path $dir "pionir-client-dashboard.token"
     $url = "http://127.0.0.1:$p/"
-    if (Test-Path $file) {
-        $key = (Get-Content $file -Raw -ErrorAction SilentlyContinue)
-        if ($key) { $url += "?key=" + $key.Trim() }
-    }
+    if (-not (Test-Path $file)) { return $url }
+    $raw = Get-Content $file -Raw -ErrorAction SilentlyContinue
+    if (-not $raw) { return $url }
+    $key = [Text.Encoding]::UTF8.GetBytes($raw.Trim())
+    try {
+        $rand = New-Object byte[] 16
+        $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+        try { $rng.GetBytes($rand) } finally { $rng.Dispose() }
+        $nonce = ($rand | ForEach-Object { $_.ToString("x2") }) -join ""
+        $ts = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $body = [Text.Encoding]::UTF8.GetBytes('{"nonce":"' + $nonce + '","ts":' + $ts + '}')
+        $req = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$p/api/signin_code")
+        $req.Method = "POST"
+        $req.ContentType = "application/json"
+        $req.Proxy = $null
+        $req.Timeout = 5000
+        $req.Headers.Add("X-Pionir-Sign", (Hex-Hmac $key "signin|$nonce|$ts|$p"))
+        $req.ContentLength = $body.Length
+        $out = $req.GetRequestStream()
+        try { $out.Write($body, 0, $body.Length) } finally { $out.Close() }
+        $resp = $req.GetResponse()
+        try {
+            $reader = New-Object IO.StreamReader($resp.GetResponseStream())
+            $answer = $reader.ReadToEnd() | ConvertFrom-Json
+        } finally { $resp.Close() }
+        $code = [string]$answer.code
+        if ($code -and ([string]$answer.proof -eq (Hex-Hmac $key "signin-reply|$nonce|$code|$p"))) {
+            return $url + "?code=" + [Uri]::EscapeDataString($code)
+        }
+    } catch { }
     return $url
 }
 
