@@ -469,6 +469,11 @@ class PionirApp:
             "generated_at": datetime.now(UTC).isoformat(),
         }
 
+    def signin_url(self, base: str) -> str:
+        """The dashboard's address with a fresh one-time sign-in code - what Pionir opens
+        in the browser on start. Never the token itself."""
+        return f"{base.rstrip('/')}/?code={self.signin_codes.mint()}"
+
     def voice_link(self, authorization: str | None, cookie: str | None
                    ) -> tuple[int, dict[str, Any]]:
         """The Voice view's signed-in address of her glass: her URL with a one-time
@@ -1480,7 +1485,7 @@ def serve(
         # Opened signed in with a one-time code (60 s, used once) that becomes the HttpOnly
         # session cookie and leaves the URL at once (see _sign_in) - never the token itself.
         # The other launchers ask for a code the same way, signed (pionir.ps1, Desktop).
-        signed_in = f"{url}?code={app.signin_codes.mint()}"
+        signed_in = app.signin_url(url)
         threading.Thread(target=lambda: webbrowser.open(signed_in), daemon=True).start()
     try:
         httpd.serve_forever()

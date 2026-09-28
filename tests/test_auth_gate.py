@@ -322,6 +322,15 @@ class GateOverHttp(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertIsNone(response.getheader("Set-Cookie"))
 
+    def test_pionir_opens_its_browser_with_a_one_time_code(self) -> None:
+        url = self.app.signin_url(f"http://127.0.0.1:{self.port}/")
+        self.assertTrue(url.startswith(f"http://127.0.0.1:{self.port}/?code="), url[:30])
+        for token in self.app.auth.tokens.values():
+            self.assertNotIn(token, url)
+        status, _doc, response = self._raw("GET", url.split(str(self.port), 1)[1])
+        self.assertEqual(status, 303)
+        self.assertIn("HttpOnly", response.getheader("Set-Cookie"))
+
     def test_a_stale_code_is_no_session(self) -> None:
         from pionir.signin import CODE_TTL, SigninCodes
         codes = SigninCodes(clock=lambda: 1000.0)
