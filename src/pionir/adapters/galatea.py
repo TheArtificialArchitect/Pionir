@@ -30,11 +30,15 @@ open or carry. She is not loopback-only: she runs with ``--phone`` bound on
 0.0.0.0 so her phone page can reach her. Pionir only ever dials 127.0.0.1, and
 refuses any non-loopback base url so it can never be pointed at her over the LAN.
 Loopback is not an identity, though - any local process reaches that port - so
-every call carries her LOCAL key (``X-Galatea-Token``, from
-``galatea-local-token.txt`` in the owner's secrets folder, which she makes on
-wake; Galatea's ``galatea/keys.py``). That key reads her state, messages and
-settings and sends a line; it cannot approve, change her, or get her phone link.
-It is read on every call, so a key she re-made is picked up without a restart.
+every call is SIGNED with her LOCAL key (``galatea-local-token.txt`` in the owner's
+secrets folder, which she makes on wake; Galatea's ``galatea/keys.py``):
+``X-Galatea-Ts``, ``X-Galatea-Nonce`` and ``X-Galatea-Sig`` = HMAC-SHA256(key,
+method \\n path+query \\n ts \\n nonce \\n sha256(body)). The key itself never crosses
+the wire, so a squatter on her port while she is down captures nothing it can use,
+and she refuses a request that is stale, replayed or altered. The key reads her
+state, messages and settings and sends a line; it cannot approve, change her, or
+get her phone link. It is read on every call, so a key she re-made is picked up
+without a restart.
 
 Action authorisation stays with Pionir. This capability is conversation only:
 Galatea speaks, and any doing she wants done is a separate intent handed to the
@@ -43,8 +47,11 @@ Manager through Pionir's gates, which is not this change.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import re
+import secrets
 import time
 import urllib.error
 import urllib.request
@@ -52,7 +59,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urlparse, urlsplit
 
 from pionir.contracts import AgentManifest, Capability, ModelRequirement, Task, TaskResult
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
@@ -69,8 +76,26 @@ MAX_CONTENT_CHARS = 4_000
 # view is handed by /api/voice_link.
 LOCAL_KEY_FILE = "galatea-local-token.txt"
 GLASS_KEY_FILE = "galatea-glass-token.txt"
-KEY_HEADER = "X-Galatea-Token"
+
 _KEY_SHAPE = re.compile(r"[A-Za-z0-9_-]{32,256}")
+
+
+def request_sig(key: str, method: str, target: str, ts: object, nonce: str, body: bytes = b"") -> str:
+    """HMAC-SHA256(key, method \\n path+query \\n ts \\n nonce \\n sha256(body)), as hex -
+    exactly as Galatea's galatea/keys.py checks it."""
+    message = "\n".join([method.upper(), target, str(ts), nonce,
+                         hashlib.sha256(body or b"").hexdigest()])
+    return hmac.new(key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def signed_headers(key: str, method: str, url: str, body: bytes = b"") -> dict[str, str]:
+    """The headers that sign one request to her with the local key - never the key."""
+    parts = urlsplit(url)
+    target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    ts = int(time.time())
+    nonce = secrets.token_hex(16)
+    return {"X-Galatea-Ts": str(ts), "X-Galatea-Nonce": nonce,
+            "X-Galatea-Sig": request_sig(key, method, target, ts, nonce, body)}
 
 
 def read_key(directory: Path | None, name: str = LOCAL_KEY_FILE) -> str | None:
@@ -194,20 +219,21 @@ class LoopbackTransport:
             raise AdapterProtocolError("Galatea returned a non-object response")
         return document
 
-    def _key(self) -> dict[str, str]:
+    def _signed(self, method: str, url: str, body: bytes = b"") -> dict[str, str]:
         key = read_key(self._key_dir)
-        return {KEY_HEADER: key} if key else {}
+        return signed_headers(key, method, url, body) if key else {}
 
     def get(self, path: str) -> Mapping[str, Any]:
-        return self._open(urllib.request.Request(
-            f"{self._base_url}{path}", headers=self._key(), method="GET"))
+        url = f"{self._base_url}{path}"
+        return self._open(urllib.request.Request(url, headers=self._signed("GET", url), method="GET"))
 
     def post(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         body = json.dumps(dict(payload)).encode("utf-8")
+        url = f"{self._base_url}{path}"
         request = urllib.request.Request(
-            f"{self._base_url}{path}",
+            url,
             data=body,
-            headers={"Content-Type": "application/json", **self._key()},
+            headers={"Content-Type": "application/json", **self._signed("POST", url, body)},
             method="POST",
         )
         return self._open(request)

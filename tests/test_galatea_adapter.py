@@ -9,6 +9,7 @@ answer, rather than that a reply merely comes back.
 import json
 import secrets
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -142,40 +143,96 @@ class _Opener:
 
 
 class LocalKeyTests(unittest.TestCase):
-    """Loopback is not an identity: her server takes nothing without a key, so every
-    call carries her LOCAL key - never the glass key, which is the owner's."""
+    """Loopback is not an identity: her server takes nothing unauthenticated, so every
+    call is SIGNED with her LOCAL key - which never crosses the wire (a squatter on
+    her port while she is down would capture it) - and never uses the glass key."""
 
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp(prefix="pionir-galatea-key-"))
         self.key = secrets.token_urlsafe(32)
+        self.glass = secrets.token_urlsafe(32)
         (self.dir / "galatea-local-token.txt").write_text(self.key + "\n", encoding="utf-8")
-        (self.dir / "galatea-glass-token.txt").write_text(secrets.token_urlsafe(32), encoding="utf-8")
+        (self.dir / "galatea-glass-token.txt").write_text(self.glass, encoding="utf-8")
         self.transport = galatea_module.LoopbackTransport(GalateaSettings(key_dir=self.dir))
         self.opener = _Opener()
         self.transport._opener = self.opener
 
-    def test_every_call_carries_the_local_key(self) -> None:
+    def _check(self, request, key: str) -> None:
+        method = request.get_method()
+        ts, nonce, sig = (request.get_header(h) for h in ("X-galatea-ts", "X-galatea-nonce", "X-galatea-sig"))
+        self.assertTrue(ts and nonce and sig, request.header_items())
+        self.assertLessEqual(abs(int(ts) - time.time()), 5)
+        want = galatea_module.request_sig(key, method, request.selector, ts, nonce, request.data or b"")
+        self.assertEqual(sig, want)
+        wire = json.dumps(request.header_items()) + request.full_url + (request.data or b"").decode()
+        self.assertNotIn(key, wire)
+        self.assertNotIn(self.glass, wire)
+        self.assertIsNone(request.get_header("X-galatea-token"))
+
+    def test_every_call_is_signed_and_never_carries_a_key(self) -> None:
         self.transport.get("/api/state")
-        self.transport.get("/api/messages?after=0")
+        self.transport.get("/api/messages?after=7")
         self.transport.post("/api/send", {"text": "hi"})
         self.assertEqual(len(self.opener.requests), 3)
         for request in self.opener.requests:
-            self.assertEqual(request.get_header("X-galatea-token"), self.key)
+            self._check(request, self.key)
+        self.assertEqual(self.opener.requests[1].selector, "/api/messages?after=7")
         self.assertEqual(self.opener.requests[2].get_header("Content-type"), "application/json")
+        nonces = {r.get_header("X-galatea-nonce") for r in self.opener.requests}
+        self.assertEqual(len(nonces), 3)                               # a fresh nonce every time
 
     def test_a_key_she_remade_is_picked_up_without_a_restart(self) -> None:
         fresh = secrets.token_urlsafe(32)
         (self.dir / "galatea-local-token.txt").write_text(fresh, encoding="utf-8")
         self.transport.get("/api/state")
-        self.assertEqual(self.opener.requests[0].get_header("X-galatea-token"), fresh)
+        self._check(self.opener.requests[0], fresh)
 
-    def test_no_key_file_or_a_malformed_one_sends_no_key(self) -> None:
+    def test_no_key_file_or_a_malformed_one_signs_nothing(self) -> None:
         (self.dir / "galatea-local-token.txt").write_text("short", encoding="utf-8")
         self.transport.get("/api/state")
         (self.dir / "galatea-local-token.txt").unlink()
         self.transport.get("/api/state")
         for request in self.opener.requests:
-            self.assertIsNone(request.get_header("X-galatea-token"))
+            self.assertIsNone(request.get_header("X-galatea-sig"))
+
+    def test_a_squatter_on_her_port_never_sees_the_key(self) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        seen: list[bytes] = []
+
+        class Squatter(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                return
+
+            def _record(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                seen.append(self.requestline.encode() + bytes(self.headers) + self.rfile.read(n))
+                data = json.dumps({"ok": True, "id": 1, "messages": [], "typing": False}).encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            do_GET = do_POST = _record
+
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), Squatter)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        try:
+            transport = galatea_module.LoopbackTransport(GalateaSettings(
+                base_url=f"http://127.0.0.1:{httpd.server_address[1]}", key_dir=self.dir))
+            transport.get("/api/state")
+            transport.get("/api/messages?after=0")
+            transport.post("/api/send", {"text": "hello"})
+            galatea_module.resolve_served_model(GalateaSettings(
+                base_url=f"http://127.0.0.1:{httpd.server_address[1]}", key_dir=self.dir))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertEqual(len(seen), 4)
+        for got in seen:
+            self.assertIn(b"X-Galatea-Sig", got)
+            self.assertNotIn(self.key.encode(), got)
+            self.assertNotIn(self.glass.encode(), got)
 
     def test_the_runtime_points_her_adapter_at_the_owners_secrets(self) -> None:
         from pionir.bootstrap import _galatea_settings
