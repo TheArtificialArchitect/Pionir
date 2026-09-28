@@ -190,6 +190,8 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
                     base_url=configured.daedalus_url,
                     token=configured.daedalus_token or "",
                     sandbox_root=configured.daedalus_sandbox_root,
+                    # every job in flight, so a restart cancels what the last run left
+                    state_file=str(configured.state_root / "daedalus" / "jobs.json"),
                 )
             )
         )

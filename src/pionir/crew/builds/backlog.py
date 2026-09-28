@@ -367,38 +367,54 @@ def backlog_path(builds_dir) -> Path:
     return Path(builds_dir) / BACKLOG_FILE
 
 
-def load(builds_dir) -> dict:
-    """``{"products": [entries...], "malformed": [{"slug", "reasons"}]}``. Seeded with
-    ``SEED`` when there is no file yet; an unreadable file raises ``BacklogUnreadable``
-    (never silently replaced - the owner's additions are in it)."""
-    path = backlog_path(builds_dir)
-    if not path.exists():
-        doc = {"products": [dict(e) for e in SEED]}
-        save(builds_dir, doc)
-    else:
-        try:
-            doc = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise BacklogUnreadable(f"{path}: {exc}") from exc
-    if not isinstance(doc, dict) or not isinstance(doc.get("products"), list):
-        raise BacklogUnreadable(f"{path} has no product list")
+def view(raw: dict) -> dict:
+    """The backlog as the worker uses it, from the file's document ``raw`` (kept as it is):
+    ``{"raw", "products": [usable entries], "malformed": [{"slug", "reasons"}]}``."""
     good, bad, seen = [], [], set()
-    for entry in doc["products"][:MAX_ENTRIES]:
+    for entry in raw["products"]:
         reasons = entry_problems(entry)
         slug = entry.get("slug") if isinstance(entry, dict) else None
         if not reasons and slug in seen:
             reasons = ["listed twice"]
+        if not reasons and len(good) >= MAX_ENTRIES:
+            reasons = [f"beyond the first {MAX_ENTRIES} products"]
         if reasons:
             bad.append({"slug": _clip(slug or "?", 40), "reasons": reasons[:4]})
             continue
         seen.add(slug)
         good.append(entry)
-    return {"products": good, "malformed": bad}
+    return {"raw": raw, "products": good, "malformed": bad}
+
+
+def load(builds_dir) -> dict:
+    """The backlog (``view``). Seeded with ``SEED`` when there is no file yet; an unreadable
+    file raises ``BacklogUnreadable`` (never silently replaced - the owner's additions are in
+    it)."""
+    path = backlog_path(builds_dir)
+    if not path.exists():
+        raw = {"products": [dict(e) for e in SEED]}
+        save(builds_dir, {"raw": raw})
+    else:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise BacklogUnreadable(f"{path}: {exc}") from exc
+    if not isinstance(raw, dict) or not isinstance(raw.get("products"), list):
+        raise BacklogUnreadable(f"{path} has no product list")
+    return view(raw)
 
 
 def save(builds_dir, doc: dict) -> None:
-    from ..blog import save_record
-    save_record(backlog_path(builds_dir), {"products": list(doc["products"])})
+    """Write back exactly the document that was read (``doc["raw"]``): every entry it held -
+    ones this worker cannot use, fields it does not know, keys beside ``products`` - kept
+    verbatim; only what a reply targeted has changed."""
+    from pionir import atomic
+    path = backlog_path(builds_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(doc["raw"], indent=2, ensure_ascii=False) + "\n",
+                   encoding="utf-8")
+    atomic.replace(tmp, path)
 
 
 def fingerprint(entries) -> str:
@@ -488,30 +504,38 @@ def apply_reply(doc: dict, text: str, taken: set) -> tuple:
     words = first.split()
     verb = words[0].lower() if words else ""
     slug = words[1].lower() if len(words) > 1 else ""
-    products = doc["products"]
-    known = {e["slug"] for e in products}
+    raw = doc["raw"]["products"]
+
+    def slug_of(e):
+        return e.get("slug") if isinstance(e, dict) else None
+
+    known = {slug_of(e) for e in raw}
     if verb == "remove" and slug:
         if slug not in known:
             return False, f"remove {slug}: it is not in the backlog"
-        doc["products"] = [e for e in products if e["slug"] != slug]
+        # only entries of exactly this slug go; everything else stays as it was written
+        doc["raw"]["products"] = [e for e in raw if slug_of(e) != slug]
+        doc.update(view(doc["raw"]))
         return True, f"removed {slug}"
     if verb == "top" and slug:
-        if slug not in known:
-            return False, f"top {slug}: it is not in the backlog"
+        if slug not in {e["slug"] for e in doc["products"]}:
+            return False, f"top {slug}: it is not a usable product in the backlog"
         if slug in taken:
             return False, f"top {slug}: it was already built or is being built"
-        doc["products"] = ([e for e in products if e["slug"] == slug]
-                           + [e for e in products if e["slug"] != slug])
+        i = next(i for i, e in enumerate(raw) if slug_of(e) == slug)
+        doc["raw"]["products"] = [raw[i], *raw[:i], *raw[i + 1:]]
+        doc.update(view(doc["raw"]))
         return True, f"{slug} is next"
     if verb == "add" and slug:
         if slug in known or slug in taken:
             return False, f"add {slug}: that slug is already used"
-        if len(products) >= MAX_ENTRIES:
+        if len(doc["products"]) >= MAX_ENTRIES:
             return False, f"add {slug}: the backlog is full ({MAX_ENTRIES} products)"
         entry, reasons = parse_add(slug, rest)
         if reasons:
             return False, f"add {slug} was NOT added: " + "; ".join(reasons[:4])
-        doc["products"] = [*products, entry]
+        doc["raw"]["products"] = [*raw, entry]
+        doc.update(view(doc["raw"]))
         return True, f"added {slug} ({entry['name']}, ${entry['price_cents'] / 100:.2f})"
     return False, ("not understood - reply with 'add <slug>' and its fields, "
                    "'remove <slug>' or 'top <slug>'")

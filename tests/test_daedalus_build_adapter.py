@@ -12,6 +12,7 @@ temporary folders.
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import tempfile
@@ -80,6 +81,31 @@ class Clock:
         return self.t
 
 
+class FakeLauncher:
+    """The build Daedalus's launcher: records starts and stops; ``fail`` makes it not come
+    up. The job client is the FakeDaedalus the test hands in."""
+
+    base_url = "http://127.0.0.1:8772"
+
+    def __init__(self, *, fail: str | None = None) -> None:
+        self.fail = fail
+        self.starts: list = []
+        self.stops = 0
+        self.running = False
+        self.stopped_while_polled = None
+
+    def start(self, *, not_after):
+        self.starts.append(not_after)
+        if self.fail:
+            raise RuntimeError(self.fail)
+        self.running = True
+        return "per-launch-token"
+
+    def stop(self) -> None:
+        self.stops += 1
+        self.running = False
+
+
 class _Case(unittest.TestCase):
     def setUp(self) -> None:
         self._t = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -94,16 +120,29 @@ class _Case(unittest.TestCase):
         sandbox.create(self.root, entry(slug), year=2026, created_at=T0)
         return self.root / slug
 
-    def adapter(self, client, *, clock=None, wall=T0, **settings) -> DaedalusAdapter:
+    def adapter(self, client, *, clock=None, wall=T0, launcher=None, configured=True,
+                sleep=None, **settings) -> DaedalusAdapter:
         clock = clock or Clock()
+        self.launcher = launcher or FakeLauncher()
+        self.tokens: list = []
+
+        def build_client(base, token):
+            self.tokens.append((base, token))
+            return client
+
         return DaedalusAdapter(DaedalusSettings(sandbox_root=str(self.root),
                                                 poll_interval_seconds=1.0, **settings),
-                               client=client, sleep=lambda _s: None, monotonic=clock.mono,
-                               clock=lambda: wall)
+                               client=client, sleep=sleep or (lambda _s: None),
+                               monotonic=clock.mono, clock=lambda: wall,
+                               setup=lambda: (object(), None) if configured else (
+                                   None, r"not configured: run tools\setup-build-sandbox.ps1"),
+                               launcher=lambda _setup: self.launcher,
+                               build_client=build_client)
 
     def build(self, repo, **over) -> Task:
         payload = {"intent": "build the product in BRIEF.md", "repo": str(repo),
-                   "budget_seconds": 2700, "not_after": T0 + 2700}
+                   "budget_seconds": 2700, "not_after": T0 + 2700,
+                   "build_id": "cron-explain-1-abcd1234"}
         payload.update(over)
         return Task(BUILD, payload, frozenset({BUILD_PERMISSION}))
 
@@ -218,6 +257,16 @@ class SandboxRuleTests(_Case):
                        capture_output=True)
         self.assertIn("no .git folder", sandbox_repo_problem(str(wt), str(self.root)))
 
+    def test_a_marker_for_another_repo_is_refused(self) -> None:
+        repo = self.make_sandbox()
+        (repo / ".git" / SANDBOX_MARKER).write_text('{"slug": "csv-to-ics"}', encoding="utf-8")
+        self.assertIn("does not name this repo", sandbox_repo_problem(str(repo), str(self.root)))
+
+    def test_a_repo_sharing_another_repos_objects_is_refused(self) -> None:
+        repo = self.make_sandbox()
+        (repo / ".git" / "commondir").write_text(r"C:\src\Pionir\.git", encoding="utf-8")
+        self.assertIn("linked worktree", sandbox_repo_problem(str(repo), str(self.root)))
+
     def test_a_name_that_is_not_a_slug_is_refused(self) -> None:
         self.assertIn("not a sandbox repo's name",
                       sandbox_repo_problem(str(self.root / "Has Spaces"), str(self.root)))
@@ -296,9 +345,12 @@ class BuildCapabilityTests(_Case):
         client.forever = False
         client.running_polls = 10 ** 6
         adapter = self.adapter(client, clock=Clock(step=100.0))
-        with self.assertRaises(AdapterTimeout) as caught:
+        with self.assertRaises(AdapterTimeout):
             adapter.execute(self.build(repo, budget_seconds=120))
-        self.assertIn("stopped: cancelled", str(caught.exception))
+        calls = [(c[0], c[1]) for c in client.calls]
+        cancel = calls.index(("POST", "/jobs/job-7/cancel"))
+        self.assertEqual(calls[cancel + 1], ("GET", "/jobs/job-7"))   # waited for the stop
+        self.assertEqual(self.launcher.stops, 1)                      # then killed it
 
     def test_a_build_whose_window_closed_before_it_started_is_not_sent(self) -> None:
         repo = self.make_sandbox()
@@ -349,6 +401,220 @@ class BuildCapabilityTests(_Case):
 
         with self.assertRaises(AdapterUnavailable):
             self.adapter(Old()).execute(self.build(repo))
+
+
+class Flaky(FakeDaedalus):
+    """Polls that fail ``failures`` times (Daedalus restarting, a dropped socket), or raise
+    something unexpected once (``boom``), before the job finishes."""
+
+    def __init__(self, *, failures=0, boom=False, on_poll=None, **kw) -> None:
+        super().__init__(**kw)
+        self.failures = failures
+        self.boom = boom
+        self.on_poll = on_poll
+
+    def get(self, path, *, timeout_seconds=None):
+        if self.on_poll is not None:
+            self.on_poll()
+        if self.boom and not self.cancelled:
+            self.boom = False
+            raise RuntimeError("something unexpected")
+        if self.failures > 0 and not self.cancelled:
+            self.failures -= 1
+            self.calls.append(("GET", path, None, timeout_seconds))
+            raise AdapterUnavailable("connection refused")
+        return super().get(path, timeout_seconds=timeout_seconds)
+
+
+class ContainmentTests(_Case):
+    """The build runs on its OWN Daedalus, started as the sandbox user and killed after."""
+
+    def test_without_the_sandbox_user_nothing_is_started(self) -> None:
+        repo = self.make_sandbox()
+        client = FakeDaedalus()
+        out = self.adapter(client, configured=False).execute(self.build(repo)).output
+        self.assertIs(out["ok"], False)
+        self.assertTrue(out["not_configured"])
+        self.assertIn("setup-build-sandbox", out["refused"])
+        self.assertEqual(self.launcher.starts, [])
+        self.assertEqual(client.calls, [])
+
+    def test_the_build_uses_its_own_daedalus_and_token_then_kills_it(self) -> None:
+        repo = self.make_sandbox()
+        solve_side = FakeDaedalus()
+        build_side = FakeDaedalus({"state": "done", "result": {"ok": True}})
+        adapter = self.adapter(solve_side)
+        adapter._build_client = lambda base, token: (self.tokens.append((base, token))
+                                                     or build_side)
+        adapter.execute(self.build(repo))
+        self.assertEqual(solve_side.calls, [])              # the owner's Daedalus: untouched
+        self.assertEqual(self.tokens, [("http://127.0.0.1:8772", "per-launch-token")])
+        self.assertEqual(self.launcher.starts, [T0 + 2700])  # killed at the window's end
+        self.assertEqual(self.launcher.stops, 1)
+        self.assertFalse(self.launcher.running)
+
+    def test_a_daedalus_that_will_not_start_is_waiting_and_killed(self) -> None:
+        repo = self.make_sandbox()
+        adapter = self.adapter(FakeDaedalus(), launcher=FakeLauncher(fail="port taken"))
+        with self.assertRaises(AdapterUnavailable):
+            adapter.execute(self.build(repo))
+        self.assertEqual(self.launcher.stops, 1)
+
+    def test_the_repos_git_config_is_rewritten_before_the_job(self) -> None:
+        from pionir import sandbox_git
+        repo = self.make_sandbox()
+        (repo / ".git" / "config").write_text(
+            "[core]\n\tfsmonitor = calc.exe\n[include]\n\tpath = ../evil\n", encoding="utf-8")
+        (repo / ".git" / "hooks" / "post-commit").write_text("#!/bin/sh\n", encoding="utf-8")
+        adapter = self.adapter(FakeDaedalus())
+        adapter._sanitize = sandbox_git.sanitize
+        adapter.execute(self.build(repo))
+        self.assertEqual((repo / ".git" / "config").read_text(encoding="utf-8"),
+                         sandbox_git.CANONICAL)
+        self.assertEqual(list((repo / ".git" / "hooks").iterdir()), [])
+
+    def test_a_repo_that_cannot_be_made_canonical_is_refused(self) -> None:
+        repo = self.make_sandbox()
+        adapter = self.adapter(FakeDaedalus())
+
+        def refuse(_repo):
+            raise RuntimeError("git reads config from 'file:C:/evil'")
+
+        adapter._sanitize = refuse
+        with self.assertRaises(AdapterProtocolError):
+            adapter.execute(self.build(repo))
+        self.assertEqual(self.launcher.starts, [])
+
+    def test_a_few_failed_polls_are_tolerated(self) -> None:
+        repo = self.make_sandbox()
+        client = Flaky(failures=3, detail={"state": "done", "result": {"ok": True}})
+        out = self.adapter(client).execute(self.build(repo)).output
+        self.assertIs(out["ok"], True)
+        self.assertFalse(client.cancelled)
+
+    def test_daedalus_gone_for_good_is_cancelled_waited_on_and_killed(self) -> None:
+        repo = self.make_sandbox()
+        client = Flaky(failures=100)
+        with self.assertRaises(AdapterUnavailable):
+            self.adapter(client).execute(self.build(repo))
+        self.assertTrue(client.cancelled)
+        self.assertEqual(self.launcher.stops, 1)
+
+    def test_any_error_while_waiting_cancels_and_kills(self) -> None:
+        repo = self.make_sandbox()
+        client = Flaky(boom=True, running_polls=5)
+        with self.assertRaises(RuntimeError):
+            self.adapter(client).execute(self.build(repo))
+        self.assertTrue(client.cancelled)
+        self.assertEqual(self.launcher.stops, 1)
+
+    def test_the_lease_is_never_released_before_the_daedalus_is_killed(self) -> None:
+        # execute() holds the lease; the kill must have happened before it returns
+        repo = self.make_sandbox()
+        adapter = self.adapter(FakeDaedalus(forever=True), clock=Clock(step=100.0))
+        with self.assertRaises(AdapterTimeout):
+            adapter.execute(self.build(repo, budget_seconds=120))
+        self.assertEqual(self.launcher.stops, 1)
+        self.assertFalse(self.launcher.running)
+
+    def test_the_job_in_flight_is_on_disk_and_a_restart_cancels_a_solve_it_left(self) -> None:
+        repo = self.make_sandbox()
+        ledger = self.tmp / "jobs.json"
+        seen = []
+        client = Flaky(on_poll=lambda: seen.append(json.loads(ledger.read_text())["jobs"]),
+                       detail={"state": "done", "result": {"ok": True}})
+        adapter = self.adapter(client, state_file=str(ledger))
+        adapter.execute(self.build(repo))
+        self.assertEqual(seen[0]["build:cron-explain-1-abcd1234"]["job_id"], "job-7")
+        self.assertEqual(json.loads(ledger.read_text())["jobs"], {})
+        # a previous Pionir died with a solve in flight: the next start cancels it first
+        ledger.write_text(json.dumps({"jobs": {"solve:old-9": {"kind": "solve",
+                                                                "job_id": "old-9"}},
+                                      "cancelled": []}))
+        owner = FakeDaedalus()
+        fresh = self.adapter(owner, state_file=str(ledger))
+        fresh.execute(self.build(repo, build_id="cron-explain-2-abcd1234"))
+        self.assertIn(("POST", "/jobs/old-9/cancel"), [(c[0], c[1]) for c in owner.calls])
+        self.assertEqual(json.loads(ledger.read_text())["jobs"], {})
+
+    def test_a_cancelled_build_never_starts(self) -> None:
+        from pionir.adapters.daedalus import CANCEL
+        repo = self.make_sandbox()
+        client = FakeDaedalus()
+        adapter = self.adapter(client)
+        adapter.execute(Task(CANCEL, {"build_id": "cron-explain-1-abcd1234"}))
+        out = adapter.execute(self.build(repo)).output
+        self.assertIs(out["started"], False)
+        self.assertEqual(self.launcher.starts, [])
+        self.assertEqual(client.calls, [])
+
+    def test_a_running_build_is_cancelled_and_killed(self) -> None:
+        from pionir.adapters.daedalus import CANCEL
+        repo = self.make_sandbox()
+        holder = {}
+
+        def cancel_from_outside():
+            if not holder.get("done"):
+                holder["done"] = True
+                holder["adapter"].execute(Task(CANCEL, {"build_id": "cron-explain-1-abcd1234"}))
+
+        client = Flaky(on_poll=cancel_from_outside, running_polls=3)
+        holder["adapter"] = self.adapter(client)
+        holder["adapter"].execute(self.build(repo))
+        self.assertTrue(client.cancelled)
+        self.assertGreaterEqual(self.launcher.stops, 1)
+
+    def test_a_build_without_its_window_or_id_is_refused(self) -> None:
+        repo = self.make_sandbox()
+        adapter = self.adapter(FakeDaedalus())
+        for over in ({"not_after": None}, {"build_id": None}, {"build_id": "BAD ID"}):
+            payload = {k: v for k, v in self.build(repo, **over).payload.items()
+                       if v is not None}
+            with self.assertRaises(AdapterProtocolError, msg=str(over)):
+                adapter.validate(Task(BUILD, payload))
+
+
+class CrewGrantTests(unittest.TestCase):
+    """Pionir itself: the crew's grant runs a sandbox build unparked, and nothing else."""
+
+    def test_only_the_crew_and_only_the_build_skip_parking(self) -> None:
+        from pionir.bootstrap import build_runtime
+        from pionir.config import PionirSettings
+        from pionir.server import PionirApp
+        from standins import down_url
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp) / "daedalus-work"
+            root.mkdir()
+            sandbox.create(root, entry(), year=2026, created_at=T0)
+            runtime = build_runtime(PionirSettings(
+                state_root=Path(tmp), atani_command=("pionir-test-no-such-binary",),
+                galatea_url=None, embed_model=None, daedalus_url=down_url(),
+                melete_url=None, crew_url=None, bryo_status_command=None,
+                nyx_status_command=None, voodoo_status_command=None, evict_to_fit=False,
+                daedalus_sandbox_root=str(root)))
+            # never the real sandbox user from a test, whatever this machine has set up
+            runtime.adapters["daedalus"]._setup = lambda: (None, "not configured (test)")
+            app = PionirApp(runtime)
+            try:
+                payload = {"intent": "build it", "repo": str(root / "cron-explain"),
+                           "budget_seconds": 2700, "not_after": 4_000_000_000.0,
+                           "build_id": "cron-explain-1-abcd1234"}
+                # the crew's grant unlocks the build (it would run, not park) - checked
+                # without running it: a run would take the real GPU lease
+                crew = sorted(app.auth.grant("crew").permissions_for(BUILD))
+                self.assertEqual(crew, [BUILD_PERMISSION])
+                self.assertFalse(app._needs_approval(BUILD, crew))
+                self.assertEqual(sorted(app.auth.grant("crew").permissions_for(
+                    "coding.daedalus_solve")), [])
+                for client in ("galatea", "atani", "dashboard"):
+                    parked = app.run_task(BUILD, payload, client=client, wait=30)
+                    self.assertEqual(parked["status"], "pending_approval", client)
+                solve = app.run_task("coding.daedalus_solve",
+                                     {"content": "x", "repo": str(root / "cron-explain")},
+                                     client="crew", wait=30)
+                self.assertEqual(solve["status"], "pending_approval")
+            finally:
+                runtime.cortex.close()
 
 
 if __name__ == "__main__":

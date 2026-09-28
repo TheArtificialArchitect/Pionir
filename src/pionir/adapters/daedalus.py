@@ -2,55 +2,38 @@
 
 Daedalus opens an isolated git worktree, edits, runs tests and lands (or
 refuses) a local commit, all bounded by an uneditable germline it may never
-touch. Until now it was reachable only through Theo's `execute_task`, outside
-Pionir's permission gates and outside its audit ledger; routing it here is what
-puts a coding action under the same gate and ledger as everything else.
+touch. Routing it here puts a coding action under Pionir's gate and ledger.
 
-Two capabilities, both PRIVILEGED (they write code and land commits):
+Three capabilities:
 
-- ``coding.daedalus_solve`` - any coding job in any repo Daedalus reaches. It
-  needs ``daedalus.solve``, which nothing holds, so every call is parked for the
-  owner's approval (unchanged). Its commits are local and reversible (its own
-  ``/revert``, and ``dry_run`` plans without landing).
-- ``coding.daedalus_build`` - the crew's Builds division building one product in
-  a SANDBOX repo: a fresh repository the Builds worker created directly under
-  the sandbox workspace (``sandbox_root``, ``C:\\src\\daedalus-work``). It needs
-  ``daedalus.build_sandbox`` - the narrowest grant there is, because the
-  capability itself can reach nothing else: every call's repo must pass
-  ``sandbox_repo_problem`` (exactly ``<sandbox_root>\\<slug>``, resolved with
-  every link and junction followed and compared case-insensitively on Windows;
-  no ``..``, no UNC path, no other drive; a real ``.git`` folder carrying the
-  Builds worker's marker and no remote - so a clone of a live repo, a linked
-  worktree or a link into one is refused). Holding the permission buys a write
-  inside the sandbox and nothing more. Not routable: by name only.
+- ``coding.daedalus_solve`` (PRIVILEGED, ``daedalus.solve``, which no client holds: every
+  call parks for the owner) - any coding job, on the owner's Daedalus (:8771).
+- ``coding.daedalus_build`` (PRIVILEGED, ``daedalus.build_sandbox`` - granted to the crew
+  client only, for this capability only: pionir/auth.py) - the Builds division building one
+  product. It never touches the owner's Daedalus. For each build it starts a SECOND Daedalus
+  as the contained ``pionir-builds`` user (pionir/build_sandbox.py: :8772, a fresh bearer
+  token, roots = the sandbox only, state and worktrees inside the sandbox, in a kill-on-close
+  job object) and kills it when the build ends - so it exists only while a build runs,
+  inside the overnight window. The repo must pass ``sandbox_repo_problem`` (exactly a marked
+  repo the Builds worker made directly inside the sandbox), and before the job its
+  ``.git/config`` is REWRITTEN to canonical content and ``.git/hooks`` emptied
+  (pionir/sandbox_git.py). Without the sandbox user set up it runs nothing and says
+  ``not configured: run tools\\setup-build-sandbox.ps1``.
+- ``coding.daedalus_build_cancel`` (REVERSIBLE_WRITE) - cancel a build by its ``build_id``:
+  the running one is cancelled and its Daedalus killed, and one not started yet never will.
 
-**An empty repo is refused, always, by both.** Daedalus falls back to its OWN
-repository when no repo is named, and that repository is protected.
+**An empty repo is refused, always.** Daedalus falls back to its OWN protected repository.
 
-The call is asynchronous on purpose. ``POST /solve`` blocks for the whole job
-with no way to cancel, and the ledger showed what that costs: at exactly the
-client timeout Pionir recorded AdapterUnavailable while Daedalus kept working
-and landed a commit nobody was told about, because the ``daedalus:commit:<sha>``
-evidence was only ever emitted on the success path. So this submits to
-``POST /jobs``, polls ``GET /jobs/{id}`` until the job finishes or the deadline
-passes, and on the deadline asks ``POST /jobs/{id}/cancel`` and raises
-``AdapterTimeout`` naming the job id - so the outcome can be found afterwards at
-``GET /jobs/{id}`` rather than vanishing. ``/solve`` remains only as the fallback
-for an older Daedalus that answers 404 to ``/jobs`` (never for a build: a
-blocking call could not be cancelled at the window's end).
+Jobs are asynchronous: ``POST /jobs``, poll ``GET /jobs/{id}``; on the deadline ``POST
+/jobs/{id}/cancel`` and ``AdapterTimeout`` naming the job. A solve's deadline is
+``timeout_seconds``; a build's is its own budget, never past ``not_after`` (the window's
+end). A few failed polls in a row are tolerated; any way out of the wait that is not a
+finished job cancels the job and waits for it to stop - and for a build, kills its Daedalus -
+BEFORE returning, so the GPU lease is never released under a Daedalus still working. The job
+id of every job in flight is kept on disk; a job left by a restart is cancelled first thing.
 
-A solve's deadline is ``timeout_seconds`` (600). A build's is its own
-``budget_seconds`` (real jobs take 5-20 minutes, so a build is given its budget,
-not 600 s), capped by ``max_build_seconds`` and by ``not_after`` - the wall-clock
-end of the overnight window the crew allows GPU work in. A build that could not
-even start before ``not_after`` (the lease came too late) is refused without
-calling Daedalus. On a build's deadline the adapter cancels and then waits up to
-``cancel_grace_seconds`` for Daedalus to stop, so the GPU lease still covers the
-wind-down.
-
-The output always surfaces what the owner and the crew need from a finished job:
-``branch``, ``commit``, ``files``, the ``gate`` and, from it, ``passed``,
-``landed``, ``stage_failed`` and ``gate_reason``.
+The output surfaces ``branch``, ``commit``, ``files``, the ``gate`` and ``passed``,
+``landed``, ``stage_failed``, ``gate_reason``.
 """
 
 from __future__ import annotations
@@ -58,12 +41,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pionir import atomic
 from pionir.adapters._http import (
     HttpStatusError,
     LoopbackHttpSettings,
@@ -82,6 +67,7 @@ from pionir.errors import AdapterProtocolError, AdapterUnavailable
 
 SOLVE = "coding.daedalus_solve"
 BUILD = "coding.daedalus_build"
+CANCEL = "coding.daedalus_build_cancel"
 SOLVE_PERMISSION = "daedalus.solve"
 BUILD_PERMISSION = "daedalus.build_sandbox"
 DEFAULT_SANDBOX_ROOT = r"C:\src\daedalus-work"
@@ -89,7 +75,10 @@ DEFAULT_SANDBOX_ROOT = r"C:\src\daedalus-work"
 # without it was not made by the worker and is never built in.
 SANDBOX_MARKER = "pionir-sandbox.json"
 SANDBOX_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{2,39}")
-BUILD_FIELDS = frozenset({"intent", "repo", "verify", "context", "budget_seconds", "not_after"})
+BUILD_FIELDS = frozenset({"intent", "repo", "verify", "context", "budget_seconds", "not_after",
+                          "build_id"})
+BUILD_ID = re.compile(r"[a-z0-9][a-z0-9-]{7,63}")
+POLL_FAILURES_ALLOWED = 5
 MIN_BUILD_SECONDS = 60
 MAX_VERIFY_CHARS = 2_000
 
@@ -197,28 +186,26 @@ def sandbox_repo_problem(repo: Any, root: str | os.PathLike) -> str | None:
 @dataclass(frozen=True, slots=True)
 class DaedalusSettings(LoopbackHttpSettings):
     base_url: str = "http://127.0.0.1:8771"
-    # The whole-job deadline. A real coding job - worktree, edits, a test run,
-    # repairs - is minutes, not seconds. Generous against that tail rather than
-    # tuned to a median.
+    # The whole-job deadline of a solve. A real coding job is minutes, not seconds.
     timeout_seconds: int = 600
-    # One HTTP call: submit, a poll, a cancel. Short, because the job's own
-    # length is carried by the deadline above, not by any single request.
+    # One HTTP call: submit, a poll, a cancel.
     request_timeout_seconds: int = 30
     poll_interval_seconds: float = 3.0
-    # Observability only; resolved live from /health at boot. Daedalus runs
-    # qwen3-coder:30b - a code-specialist MoE. It is NOT a CPU tenant: measured
-    # 2026-09-13, Ollama loads it at ~18-19 GB with ~10 GB on the card, and the
-    # load evicted gemma3:12b. So a coding job takes the GPU lease (see the
-    # capability's ModelRequirement below).
+    # Observability only; resolved live from /health at boot. qwen3-coder:30b fills the
+    # card (measured 2026-09-13: ~10 GB on it, the rest in RAM), so a job takes the lease.
     model_id: str = "qwen3-coder:30b"
     # The Builds division's sandbox workspace: coding.daedalus_build reaches only repos
-    # directly inside it (sandbox_repo_problem).
+    # directly inside it (sandbox_repo_problem), through the build Daedalus on build_port.
     sandbox_root: str = DEFAULT_SANDBOX_ROOT
+    build_port: int = 8772
     # The longest budget a build may ask for; its real deadline is its own budget.
     max_build_seconds: int = 3 * 3600
-    # After a build's deadline cancel, how long to wait for Daedalus to actually stop
-    # (it stops at its next step boundary) while the lease is still held.
+    # After a cancel, how long to wait for Daedalus to actually stop (at its next step
+    # boundary) while the lease is still held. A build's Daedalus is killed after it.
     cancel_grace_seconds: float = 120.0
+    # Where the id of every job in flight is kept, so a restart can cancel what it left.
+    # "" keeps none (tests); bootstrap passes <state_root>/daedalus/jobs.json.
+    state_file: str = ""
 
     def __post_init__(self) -> None:
         # Explicit rather than zero-argument super(): a slots=True dataclass is
@@ -234,6 +221,21 @@ class DaedalusSettings(LoopbackHttpSettings):
             raise ValueError("Daedalus's cancel grace cannot be negative")
 
 
+def _default_setup(settings: DaedalusSettings):
+    from pionir.build_sandbox import load_setup
+    return load_setup(settings.sandbox_root)
+
+
+def _default_launcher(setup, settings: DaedalusSettings):
+    from pionir.build_sandbox import BuildDaedalus
+    return BuildDaedalus(setup, port=settings.build_port, model=settings.model_id)
+
+
+def _default_sanitize(repo: str) -> None:
+    from pionir.sandbox_git import sanitize
+    sanitize(repo)
+
+
 class DaedalusAdapter:
     """Daedalus as a gated, audited Pionir coding specialist."""
 
@@ -245,38 +247,33 @@ class DaedalusAdapter:
         sleep: Any = time.sleep,
         monotonic: Any = time.monotonic,
         clock: Any = time.time,
+        setup: Callable[[], tuple] | None = None,
+        launcher: Callable[..., Any] | None = None,
+        build_client: Callable[[str, str], Any] | None = None,
+        sanitize: Callable[[str], None] | None = None,
     ) -> None:
         self.settings = settings or DaedalusSettings()
         self._client = client or LoopbackJsonClient("Daedalus", self.settings)
         self._sleep = sleep
         self._monotonic = monotonic
         self._clock = clock
+        self._setup = setup or (lambda: _default_setup(self.settings))
+        self._launcher = launcher or (lambda s: _default_launcher(s, self.settings))
+        self._build_client = build_client or (lambda base, token: LoopbackJsonClient(
+            "Build Daedalus", LoopbackHttpSettings(base_url=base, token=token)))
+        self._sanitize = sanitize or _default_sanitize
+        self._lock = threading.RLock()
+        self._running: dict[str, dict[str, Any]] = {}     # build_id -> {client, job, launcher}
+        self._leftovers_checked = False
         model = ModelRequirement(
             model_id=self.settings.model_id,
-            # Measured 2026-09-13 (pionir.ps1, commit 484a6c0): Ollama
-            # loads qwen3-coder:30b at ~18-19 GB, ~10 GB of it on the
-            # card and the rest in system RAM, and the load evicted
-            # gemma3:12b. The old 0 / requires_gpu=False claimed a CPU
-            # tenant; it was false, and it meant a coding job took no
-            # lease while it filled the card.
-            #
-            # 10_000 is the measured on-card share, and it admits: the
-            # budget allows 12_288 - 1_830 = 10_458 MB, and an emptied
-            # card shows ~10_450 free. Ollama spills the rest to RAM
-            # rather than refusing, so declaring the whole 18-19 GB
-            # would be unadmittable for a model that does run here.
-            # Context is 0 on purpose: raising DAEDALUS_NUM_CTX to
-            # 32768 measured +0.83 GB system RAM per +16K and VRAM
-            # unchanged. Fitting means sidelining the voice's model -
-            # allowed only under the lease, while she has stood down,
-            # and put back when the lease ends (scheduler handback).
+            # Measured 2026-09-13: Ollama loads qwen3-coder:30b at ~18-19 GB, ~10 GB on the
+            # card, evicting gemma3:12b. 10_000 is the on-card share, and it admits (the
+            # budget allows 12_288 - 1_830 = 10_458 MB). Fitting means sidelining the
+            # voice's model - only under the lease, put back when the lease ends.
             estimated_vram_mb=10_000,
             context_vram_mb=0,
             requires_gpu=True,
-            # The 30B coder fills the card; making room for it may
-            # evict even the protected voice model, but only once the
-            # shared lease is held (she has stood down) and the lease's
-            # release re-warms hers. No other tenant declares this.
             exclusive_card=True,
         )
         self._manifest = AgentManifest(
@@ -296,11 +293,17 @@ class DaedalusAdapter:
                 ),
                 Capability(
                     name=BUILD,
-                    description="Daedalus building one product in a fresh sandbox repo under "
-                                "the Builds workspace (the crew's overnight builds only)",
+                    description="A contained Daedalus (the pionir-builds user) building one "
+                                "product in a fresh sandbox repo (the crew's overnight builds)",
                     risk=RiskLevel.PRIVILEGED,
                     required_permissions=frozenset({BUILD_PERMISSION}),
                     model=model,
+                    routable=False,
+                ),
+                Capability(
+                    name=CANCEL,
+                    description="Cancel a sandbox build by its id (it stops, or never starts)",
+                    risk=RiskLevel.REVERSIBLE_WRITE,
                     routable=False,
                 ),
             ),
@@ -319,11 +322,66 @@ class DaedalusAdapter:
     def resolve_model(self) -> str | None:
         return health_model(self._client)
 
+    # ---- the job ledger on disk ---------------------------------------------------------------
+    def _ledger(self) -> dict:
+        blank = {"jobs": {}, "cancelled": []}
+        path = self.settings.state_file
+        if not path:
+            return getattr(self, "_memory_ledger", blank)
+        try:
+            doc = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return blank
+        if not isinstance(doc, dict):
+            return blank
+        doc.setdefault("jobs", {})
+        doc.setdefault("cancelled", [])
+        return doc
+
+    def _write_ledger(self, doc: dict) -> None:
+        doc["cancelled"] = list(doc.get("cancelled") or [])[-200:]
+        path = self.settings.state_file
+        if not path:
+            self._memory_ledger = doc
+            return
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_suffix(".tmp")
+        tmp.write_text(json.dumps(doc, indent=1), encoding="utf-8")
+        atomic.replace(tmp, target)
+
+    def _remember(self, key: str, entry: dict | None) -> None:
+        with self._lock:
+            doc = self._ledger()
+            if entry is None:
+                doc["jobs"].pop(key, None)
+            else:
+                doc["jobs"][key] = entry
+            self._write_ledger(doc)
+
+    def _cancelled(self, build_id: str) -> bool:
+        with self._lock:
+            return build_id in self._ledger()["cancelled"]
+
+    def _cancel_leftovers(self) -> None:
+        """Jobs a previous Pionir left in flight: a solve's is cancelled on the owner's
+        Daedalus; a build's Daedalus died with that Pionir (kill-on-close), so there is
+        nothing left of it to stop. Once per process, before any new job."""
+        with self._lock:
+            if self._leftovers_checked:
+                return
+            self._leftovers_checked = True
+            doc = self._ledger()
+            left = dict(doc["jobs"])
+            doc["jobs"] = {}
+            self._write_ledger(doc)
+        for entry in left.values():
+            if entry.get("kind") == "solve" and _JOB_ID.match(str(entry.get("job_id") or "")):
+                self._cancel(self._client, str(entry["job_id"]))
+
     # ---- the checks, before anything is parked or sent ------------------------------------
     @staticmethod
     def _intent(payload: Mapping[str, Any]) -> str:
-        # The router passes the request as "content"; a structured caller may
-        # send "intent" plus repo/verify/dry_run. Accept both.
         intent = str(payload.get("intent") or payload.get("content") or "").strip()
         if not intent:
             raise AdapterProtocolError("Daedalus needs a coding intent")
@@ -338,24 +396,37 @@ class DaedalusAdapter:
         solve for approval, so the owner is never asked to approve one that cannot run."""
 
         payload = task.payload
+        if task.capability == CANCEL:
+            self._build_id(payload, only=True)
+            return
         if task.capability == BUILD:
             self._intent(payload)
             self._build_budget(payload)
             return
-        # A solve's intent is checked when it runs, as it always was; only the repo rule is
-        # new, and it is checked before parking so the owner is never asked about one.
+        # A solve's intent is checked when it runs, as it always was; the repo rule is
+        # checked before parking so the owner is never asked about one without a repo.
         if not str(payload.get("repo") or "").strip():
             raise AdapterProtocolError(
                 "Daedalus needs a repo: with none it falls back to its own repository, "
                 "which is never worked on through Pionir"
             )
 
-    def _build_budget(self, payload: Mapping[str, Any]) -> tuple[int, float | None]:
-        """A build's checked arguments: its budget in seconds and its not_after (or None)."""
+    @staticmethod
+    def _build_id(payload: Mapping[str, Any], *, only: bool = False) -> str:
+        if only and set(payload) != {"build_id"}:
+            raise AdapterProtocolError(f"{CANCEL}: the payload is {{build_id}}")
+        build_id = payload.get("build_id")
+        if not isinstance(build_id, str) or not BUILD_ID.fullmatch(build_id):
+            raise AdapterProtocolError("build_id must be 8 to 64 of a-z, 0-9 and -")
+        return build_id
+
+    def _build_budget(self, payload: Mapping[str, Any]) -> tuple[int, float]:
+        """A build's checked arguments: its budget in seconds and its not_after."""
 
         extra = sorted(set(payload) - BUILD_FIELDS)
         if extra:
             raise AdapterProtocolError(f"{BUILD}: {extra[0]!r} is not a build field")
+        self._build_id(payload)
         problem = sandbox_repo_problem(payload.get("repo"), self.settings.sandbox_root)
         if problem:
             raise AdapterProtocolError(f"{BUILD}: refused - {problem}")
@@ -367,10 +438,10 @@ class DaedalusAdapter:
                 f"{self.settings.max_build_seconds}"
             )
         not_after = payload.get("not_after")
-        if not_after is not None and (isinstance(not_after, bool)
-                                      or not isinstance(not_after, (int, float))
-                                      or not_after <= 0):
-            raise AdapterProtocolError(f"{BUILD}: not_after must be a wall-clock time")
+        if isinstance(not_after, bool) or not isinstance(not_after, (int, float)) \
+                or not_after <= 0:
+            raise AdapterProtocolError(f"{BUILD}: not_after (the window's end, wall clock) "
+                                       "is required")
         verify = payload.get("verify")
         if verify is not None and (not isinstance(verify, str) or len(verify) > MAX_VERIFY_CHARS):
             raise AdapterProtocolError(f"{BUILD}: verify must be a command of at most "
@@ -378,11 +449,14 @@ class DaedalusAdapter:
         context = payload.get("context")
         if context is not None and not isinstance(context, dict):
             raise AdapterProtocolError(f"{BUILD}: context must be an object")
-        return budget, (float(not_after) if not_after is not None else None)
+        return budget, float(not_after)
 
     # ---- running a job -------------------------------------------------------------------------
     def execute(self, task: Task) -> TaskResult:
         self.validate(task)
+        if task.capability == CANCEL:
+            return self._cancel_build(task)
+        self._cancel_leftovers()
         if task.capability == BUILD:
             return self._build(task)
         payload = task.payload
@@ -407,49 +481,106 @@ class DaedalusAdapter:
             )
             return self._result(task, document, job_id=None)
         job_id = self._job_id(started)
-        return self._result(
-            task, self._await_job(job_id, self.settings.timeout_seconds), job_id=job_id
-        )
+        key = f"solve:{job_id}"
+        self._remember(key, {"kind": "solve", "job_id": job_id, "at": self._clock()})
+        try:
+            detail = self._await_job(self._client, job_id, self.settings.timeout_seconds,
+                                     grace=self.settings.cancel_grace_seconds)
+        finally:
+            self._remember(key, None)
+        return self._result(task, detail, job_id=job_id)
+
+    def _refused(self, task: Task, why: str, **extra: Any) -> TaskResult:
+        return TaskResult(task_id=task.task_id, agent_id=self.manifest.agent_id,
+                          output={"ok": False, "refused": why, "started": False, **extra},
+                          evidence=("daedalus:build", "daedalus:build:not-started"))
 
     def _build(self, task: Task) -> TaskResult:
-        """One sandbox build: its own budget as the deadline, never past not_after."""
+        """One sandbox build on its own contained Daedalus; never past not_after."""
 
         payload = task.payload
         budget, not_after = self._build_budget(payload)
-        deadline = float(budget)
-        if not_after is not None:
-            left = not_after - float(self._clock())
-            if left <= 0:
-                # The lease came too late: the window closed before the job could start.
-                return TaskResult(
-                    task_id=task.task_id, agent_id=self.manifest.agent_id,
-                    output={"ok": False, "refused": "the build window closed before the job "
-                            "could start; nothing was sent to Daedalus", "started": False},
-                    evidence=("daedalus:build", "daedalus:build:not-started"),
-                )
-            deadline = min(deadline, left)
-        request: dict[str, Any] = {
-            "intent": self._intent(payload),
-            "repo": os.path.abspath(str(payload["repo"]).strip()),
-            "dry_run": False,
-        }
+        build_id = self._build_id(payload)
+        if self._cancelled(build_id):
+            return self._refused(task, f"build {build_id} was cancelled; nothing was started")
+        left = not_after - float(self._clock())
+        if left <= 0:
+            # The lease came too late: the window closed before the job could start.
+            return self._refused(task, "the build window closed before the job could start; "
+                                       "nothing was sent to Daedalus")
+        setup, why = self._setup()
+        if setup is None:
+            return self._refused(task, why or "not configured", not_configured=True)
+        repo = os.path.abspath(str(payload["repo"]).strip())
+        try:
+            self._sanitize(repo)
+        except Exception as error:  # noqa: BLE001 - never build in a repo we could not clean
+            raise AdapterProtocolError(f"{BUILD}: refused - its git config could not be made "
+                                       f"canonical ({error})") from error
+        problem = sandbox_repo_problem(repo, self.settings.sandbox_root)
+        if problem:
+            raise AdapterProtocolError(f"{BUILD}: refused - {problem}")
+        request: dict[str, Any] = {"intent": self._intent(payload), "repo": repo,
+                                   "dry_run": False,
+                                   "context": {**(payload.get("context") or {}),
+                                               "deadline": not_after, "build_id": build_id}}
         if payload.get("verify"):
             request["verify"] = str(payload["verify"])
-        if payload.get("context") is not None:
-            request["context"] = payload["context"]
+        launcher = self._launcher(setup)
+        key = f"build:{build_id}"
         try:
-            started = self._client.post(
-                "/jobs", request, timeout_seconds=self.settings.request_timeout_seconds
-            )
-        except HttpStatusError as error:
-            if error.status != 404:
-                raise
-            raise AdapterUnavailable(
-                "Daedalus does not serve /jobs; a build needs a cancellable job"
-            ) from error
-        job_id = self._job_id(started)
-        detail = self._await_job(job_id, deadline, grace=self.settings.cancel_grace_seconds)
-        return self._result(task, detail, job_id=job_id)
+            try:
+                token = launcher.start(not_after=not_after)
+            except Exception as error:  # noqa: BLE001 - a Daedalus that did not come up
+                raise AdapterUnavailable(f"the build Daedalus could not start: {error}") \
+                    from error
+            client = self._build_client(launcher.base_url, token)
+            self._remember(key, {"kind": "build", "build_id": build_id,
+                                 "port": self.settings.build_port, "at": self._clock()})
+            with self._lock:
+                self._running[build_id] = {"client": client, "job": None, "launcher": launcher}
+            try:
+                started = client.post("/jobs", request,
+                                      timeout_seconds=self.settings.request_timeout_seconds)
+            except HttpStatusError as error:
+                if error.status != 404:
+                    raise
+                raise AdapterUnavailable("the build Daedalus does not serve /jobs; a build "
+                                         "needs a cancellable job") from error
+            job_id = self._job_id(started)
+            with self._lock:
+                self._running[build_id]["job"] = job_id
+            self._remember(key, {"kind": "build", "build_id": build_id, "job_id": job_id,
+                                 "port": self.settings.build_port, "at": self._clock()})
+            if self._cancelled(build_id):
+                self._cancel(client, job_id)
+                raise AdapterUnavailable(f"build {build_id} was cancelled")
+            detail = self._await_job(client, job_id, min(float(budget), left),
+                                     grace=self.settings.cancel_grace_seconds)
+            return self._result(task, detail, job_id=job_id)
+        finally:
+            with self._lock:
+                self._running.pop(build_id, None)
+            self._remember(key, None)
+            # the whole tree dies BEFORE the lease is released (we are still inside it)
+            launcher.stop()
+
+    def _cancel_build(self, task: Task) -> TaskResult:
+        build_id = self._build_id(task.payload, only=True)
+        with self._lock:
+            doc = self._ledger()
+            if build_id not in doc["cancelled"]:
+                doc["cancelled"].append(build_id)
+            self._write_ledger(doc)
+            entry = self._running.get(build_id)
+        if entry is not None:
+            if entry.get("job"):
+                self._cancel(entry["client"], entry["job"])
+            entry["launcher"].stop()
+        return TaskResult(task_id=task.task_id, agent_id=self.manifest.agent_id,
+                          output={"ok": True, "build_id": build_id,
+                                  "was_running": entry is not None},
+                          evidence=("daedalus:build-cancel",))
 
     @staticmethod
     def _job_id(started: Mapping[str, Any]) -> str:
@@ -459,61 +590,72 @@ class DaedalusAdapter:
             raise AdapterProtocolError("Daedalus accepted the job but returned no usable job id")
         return job_id
 
-    def _poll(self, job_id: str) -> dict[str, Any]:
-        try:
-            detail = self._client.get(
-                f"/jobs/{job_id}", timeout_seconds=self.settings.request_timeout_seconds
-            )
-        except AdapterUnavailable as error:
-            raise AdapterUnavailable(
-                f"Daedalus became unreachable while running job {job_id}: {error}"
-            ) from error
+    def _poll(self, client, job_id: str) -> dict[str, Any]:
+        detail = client.get(
+            f"/jobs/{job_id}", timeout_seconds=self.settings.request_timeout_seconds
+        )
         job = detail.get("job")
         if not isinstance(job, dict):
             raise AdapterProtocolError(f"Daedalus's detail for job {job_id} is malformed")
         return job
 
-    def _await_job(self, job_id: str, timeout: float, *, grace: float = 0.0) -> Mapping[str, Any]:
-        """Poll the job until it finishes; on the deadline, cancel it and say which."""
+    def _await_job(self, client, job_id: str, timeout: float, *,
+                   grace: float = 0.0) -> Mapping[str, Any]:
+        """Poll the job until it finishes. A few failed polls in a row are tolerated. Any
+        other way out - the deadline, Daedalus gone for good, an error, an interrupt -
+        cancels the job and waits for it to stop before this returns or raises."""
 
         deadline = self._monotonic() + timeout
-        while True:
-            job = self._poll(job_id)
-            if str(job.get("state") or "") in FINISHED_STATES:
-                return job
-            if self._monotonic() >= deadline:
-                self._cancel(job_id)
-                stopped = self._wind_down(job_id, grace) if grace > 0 else None
-                state = f" (it has {stopped})" if stopped else (
-                    " (it stops at its next step boundary)")
-                raise AdapterTimeout(
-                    f"Daedalus job {job_id} did not finish within {timeout:.0f} seconds; "
-                    f"cancellation requested{state} - the outcome is at GET /jobs/{job_id}",
-                    job_id=job_id,
-                )
-            self._sleep(self.settings.poll_interval_seconds)
+        failures = 0
+        finished = False
+        try:
+            while True:
+                try:
+                    job = self._poll(client, job_id)
+                    failures = 0
+                except AdapterUnavailable as error:
+                    failures += 1
+                    if failures > POLL_FAILURES_ALLOWED:
+                        raise AdapterUnavailable(
+                            f"Daedalus became unreachable while running job {job_id}: {error}"
+                        ) from error
+                    job = None
+                if job is not None and str(job.get("state") or "") in FINISHED_STATES:
+                    finished = True
+                    return job
+                if self._monotonic() >= deadline:
+                    raise AdapterTimeout(
+                        f"Daedalus job {job_id} did not finish within {timeout:.0f} seconds; "
+                        f"it was cancelled - the outcome is at GET /jobs/{job_id}",
+                        job_id=job_id,
+                    )
+                self._sleep(self.settings.poll_interval_seconds)
+        finally:
+            if not finished:
+                self._cancel(client, job_id)
+                if grace > 0:
+                    self._wind_down(client, job_id, grace)
 
-    def _wind_down(self, job_id: str, grace: float) -> str | None:
-        """After a cancel, wait up to ``grace`` seconds for the job to stop - still under the
-        lease, so the voice's model is not re-warmed onto a card Daedalus still fills. The
-        state it reached, or None if it had not stopped."""
+    def _wind_down(self, client, job_id: str, grace: float) -> str | None:
+        """After a cancel, wait up to ``grace`` seconds for the job to stop - still under
+        the lease. The state it reached, or None if it had not stopped."""
 
         until = self._monotonic() + grace
         while self._monotonic() < until:
             self._sleep(self.settings.poll_interval_seconds)
             try:
-                state = str(self._poll(job_id).get("state") or "")
+                state = str(self._poll(client, job_id).get("state") or "")
             except (AdapterUnavailable, AdapterProtocolError):
-                return None
+                continue
             if state in FINISHED_STATES:
                 return f"stopped: {state}"
         return None
 
-    def _cancel(self, job_id: str) -> None:
+    def _cancel(self, client, job_id: str) -> None:
         """Best effort: the deadline is the news; a failed cancel must not hide it."""
 
         try:
-            self._client.post(
+            client.post(
                 f"/jobs/{job_id}/cancel", {}, timeout_seconds=self.settings.request_timeout_seconds
             )
         except (AdapterUnavailable, AdapterProtocolError):
@@ -522,16 +664,9 @@ class DaedalusAdapter:
     def _result(
         self, task: Task, document: Mapping[str, Any], *, job_id: str | None
     ) -> TaskResult:
-        """Shape a finished job (or a /solve answer) into Pionir's result.
-
-        A job detail carries the dispatcher's outcome under ``result`` (the same
-        object /solve returns) - or none at all when the worker raised, in
-        which case ``error`` says why. A refused or failed solve is a real
-        outcome (ok=false with a gate/error), not an adapter failure: return it
-        so the ledger and the caller see the verdict rather than "unavailable".
-        The branch, commit, files and the gate's verdict are always surfaced at the
-        top level, from the result or from the job's own summary.
-        """
+        """Shape a finished job (or a /solve answer) into Pionir's result. A refused or
+        failed solve is a real outcome (ok=false with a gate/error), not an adapter
+        failure. The branch, commit, files and the gate's verdict are always surfaced."""
 
         if job_id is None:
             output: dict[str, Any] = dict(document)
@@ -558,6 +693,8 @@ class DaedalusAdapter:
             for key in _SUMMARY_FIELDS:
                 if output.get(key) is None and document.get(key) is not None:
                     output[key] = document[key]
+        if task.capability == BUILD:
+            output.pop("steps", None)           # large, and nothing downstream reads them
         commit = str(output.get("commit") or "").strip()
         evidence: list[str] = ["daedalus:build" if task.capability == BUILD else "daedalus:solve"]
         if job_id is not None:

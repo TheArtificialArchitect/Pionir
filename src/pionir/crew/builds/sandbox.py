@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pionir.adapters.daedalus import SANDBOX_MARKER, sandbox_repo_problem
+from pionir.sandbox_git import GitError, run_git, sanitize
 
 from .backlog import listing
 
@@ -40,19 +41,13 @@ class SandboxError(RuntimeError):
 
 def git(args: list, cwd, *, run=subprocess.run, timeout: float = GIT_TIMEOUT,
         text: bool = True):
-    """One git command in ``cwd``; its stdout, or SandboxError. Never a shell."""
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}
+    """One git command in ``cwd``; its stdout, or SandboxError. Never a shell, always the
+    safe way (pionir/sandbox_git.py: no hooks, no fsmonitor, no system or global config,
+    a minimal environment): the repo is written by generated code."""
     try:
-        done = run(["git", *args], cwd=str(cwd), capture_output=True, timeout=timeout,
-                   env=env, check=False, **({"text": True, "encoding": "utf-8",
-                                             "errors": "replace"} if text else {}))
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise SandboxError(f"git {args[0]} could not run ({type(exc).__name__})") from exc
-    if done.returncode != 0:
-        err = done.stderr if isinstance(done.stderr, str) else (done.stderr or b"").decode(
-            "utf-8", "replace")
-        raise SandboxError(f"git {args[0]} failed: {' '.join(err.split())[:200]}")
-    return done.stdout
+        return run_git(args, cwd, run=run, timeout=timeout, text=text)
+    except GitError as exc:
+        raise SandboxError(str(exc)) from exc
 
 
 def short_name(entry: dict) -> str:
@@ -197,12 +192,22 @@ def create(root, entry: dict, *, year: int, created_at: float, run=subprocess.ru
     Refuses a folder that already exists (it was not made for this product) and checks the
     result with the very rule Pionir's adapter enforces."""
     root = Path(root)
-    root.mkdir(parents=True, exist_ok=True)
+    # the root first, before anything is made: it exists (the setup made it, with its
+    # ACL), it is a real folder and not a link or junction to somewhere else
+    if root.is_symlink() or _is_junction(root) or not root.is_dir():
+        raise SandboxError(f"the sandbox workspace {root} is missing or is a link; run "
+                           r"tools\setup-build-sandbox.ps1")
+    if os.path.normcase(os.path.realpath(root)) != os.path.normcase(os.path.abspath(root)):
+        raise SandboxError(f"the sandbox workspace {root} resolves somewhere else")
     repo = root / entry["slug"]
     if repo.exists() or repo.is_symlink():
         raise SandboxError(f"{repo} already exists; a sandbox repo is always fresh")
     repo.mkdir()
     git(["init", "-q", "-b", "main"], repo, run=run)
+    try:
+        sanitize(repo, run=run)             # canonical config, no hooks, from the start
+    except GitError as exc:
+        raise SandboxError(str(exc)) from exc
     for rel, text in seed_files(entry, year).items():
         path = repo / rel
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -243,11 +248,27 @@ class Tree:
     problems: list = field(default_factory=list)
 
 
+_RESERVED = re.compile(r"(?i)^(?:con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|"
+                       r"lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)(?:\..*)?$")
+
+
+def _is_junction(path: Path) -> bool:
+    try:
+        return path.is_junction()
+    except (AttributeError, OSError):
+        return False
+
+
 def _path_problem(rel: str) -> str | None:
     parts = rel.split("/")
     if rel.startswith("/") or "\\" in rel or ":" in rel or any(
             p in ("", ".", "..") or not _SAFE_PART.fullmatch(p) for p in parts):
         return f"{rel[:80]!r} is not a plain relative path"
+    for part in parts:
+        if part != part.rstrip(". "):
+            return f"{rel[:80]!r} has a name ending in a dot or a space (Windows drops it)"
+        if _RESERVED.match(part):
+            return f"{rel[:80]!r} uses a name Windows reserves for a device ({part!r})"
     return None
 
 
@@ -257,6 +278,7 @@ def export(repo, *, run=subprocess.run) -> Tree:
     tree = Tree()
     raw = git(["ls-tree", "-r", "-z", "--full-tree", "HEAD"], repo, run=run, text=False)
     total = 0
+    folded: dict = {}
     for item in bytes(raw).split(b"\x00"):
         if not item:
             continue
@@ -277,6 +299,12 @@ def export(repo, *, run=subprocess.run) -> Tree:
         if why:
             tree.problems.append(why)
             continue
+        key = rel.casefold()
+        if key in folded:
+            # one file on Windows, two in git: which one lands is an accident
+            tree.problems.append(f"{rel[:80]!r} and {folded[key][:80]!r} differ only in case")
+            continue
+        folded[key] = rel
         if len(tree.files) >= MAX_FILES:
             tree.problems.append(f"more than {MAX_FILES} files are committed")
             break

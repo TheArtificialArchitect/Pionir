@@ -6,9 +6,10 @@ the product backlog (backlog.py) into staged products, one at a time:
 1. **Pick** (by day, from the backlog; Moss's division goal can put a product first) and,
    inside the overnight window only (window.py, default 01:00-07:00), create the product's
    OWN fresh sandbox repo (sandbox.py, ``<builds_sandbox>\\<slug>``) and ask Pionir to run
-   ``coding.daedalus_build`` in it - Job(permissions=("daedalus.build_sandbox",)), the
-   narrowest grant: Pionir's adapter refuses any repo that is not a sandbox repo this
-   worker made. Pionir takes its exclusive GPU lease for the job (Moss's model steps aside),
+   ``coding.daedalus_build`` in it - unparked only through the crew client's one grant
+   (``daedalus.build_sandbox``, scoped in pionir/auth.py to that capability): Pionir's
+   adapter refuses any repo that is not a sandbox repo this worker made, rewrites its git
+   config first, and runs the job on a contained Daedalus of its own. Pionir takes its exclusive GPU lease for the job (Moss's model steps aside),
    so: at most ONE job at a time, never one that cannot finish before the window ends
    (``budget_minutes``, default 45; its ``not_after`` is the window's end at the latest, and
    Pionir cancels it there), at most one NEW product per night. The job is submitted with
@@ -32,16 +33,24 @@ the product backlog (backlog.py) into staged products, one at a time:
    for each staged or shelved product, and the backlog card, which - like the nightly
    report - takes his replies (``add``/``remove``/``top``; only his count).
 
+**Contained** (pionir/build_sandbox.py): nothing here runs as the owner. Daedalus builds on a
+second instance Pionir starts as the ``pionir-builds`` user for each job; our own test run of
+the generated code runs as that user too, with its firewalled interpreter, in a job object.
+Until ``tools\\setup-build-sandbox.ps1`` has been run the worker says "not configured" and
+runs nothing at all.
+
 Everything the worker does is in its record (``builds.daedalus.json``) and reported to the
 Builds leader as rows (``build.*``). No model of the crew's writes anything here.
 """
 from __future__ import annotations
 
-import json
+import os
 import re
+import secrets
 from datetime import datetime
 from pathlib import Path
 
+from pionir import build_sandbox
 from pionir.adapters.deliveries import DeliveryProblem
 
 from ..blog import _clip, _Unreadable, read_record, record_path, save_record
@@ -59,6 +68,7 @@ from . import package, review, sandbox
 from .window import Window, can_start, not_after
 
 BUILD = "coding.daedalus_build"
+CANCEL = "coding.daedalus_build_cancel"
 PERMISSION = "daedalus.build_sandbox"
 CARD = "builds.card"
 INBOX = "builds.inbox"
@@ -73,7 +83,6 @@ LOST_AFTER = 1200.0                  # past not_after with no outcome: the job i
 MAX_UNPOSTED = 20
 KEEP_NIGHTS = 30
 KEEP_REPLIES = 500
-DEFAULT_HEALTH_URL = "http://127.0.0.1:8771/health"
 
 
 def _hm(t: float) -> str:
@@ -86,8 +95,7 @@ class BuildsWorker(_Base):
     record_what = "the Builds worker's own record of every product it built"
 
     def __init__(self, spec, *, window: str = "01:00-07:00", budget_minutes: int = 45,
-                 max_attempts: int = 2, health_url: str = DEFAULT_HEALTH_URL,
-                 ssh_dir: str | None = "~/.ssh", test_timeout_seconds: float = review.TEST_TIMEOUT,
+                 max_attempts: int = 2, ssh_dir: str | None = "~/.ssh", test_timeout_seconds: float = review.TEST_TIMEOUT,
                  review_timeout_seconds: float = REVIEW_TIMEOUT) -> None:
         super().__init__(spec)
         self.window = Window.parse(window)
@@ -97,17 +105,26 @@ class BuildsWorker(_Base):
         if not 1 <= int(max_attempts) <= 3:
             raise ValueError("max_attempts must be 1 to 3 (a build and its repairs)")
         self.max_attempts = int(max_attempts)
-        self.health_url = health_url
         self.ssh_dir = ssh_dir
         self.test_timeout = float(test_timeout_seconds)
         self.review_timeout = float(review_timeout_seconds)
         # the outside world, injected (tests replace these)
         self.run_tests = review.run_tests
         self.git_run = None                 # None: subprocess.run
+        # the contained sandbox user, as the setup script left it (None: not configured)
+        self.load_sandbox = lambda root: build_sandbox.load_setup(root)
+        self._setup = None
         self.load_guard = lambda secrets_dir: checks.load_guard(
             secrets_dir, self.ssh_dir, checks.owner_markers())
         self._log_lines: list = []          # this run's lines for the night's report
         self._tried: set = set()            # the card keys tried this run
+
+    def readiness(self, secrets_dir) -> str | None:
+        """Why the worker cannot build yet: the contained sandbox user is not set up."""
+        root = os.environ.get("PIONIR_DAEDALUS_SANDBOX", "").strip() or \
+            build_sandbox.default_sandbox_root()
+        _setup, why = self.load_sandbox(root)
+        return why
 
     # ---- the record --------------------------------------------------------------------
     @staticmethod
@@ -142,6 +159,13 @@ class BuildsWorker(_Base):
         if ctx.job is None:
             return self._err(ErrorKind.NOT_CONFIGURED, "no hands: builds run only through "
                              "Pionir", retryable=False)
+        setup, why = self.load_sandbox(ctx.builds_sandbox)
+        if setup is None:
+            # the owner's rule: without the contained user, NOTHING runs - no repo is made,
+            # no job is asked for, no generated code is run
+            return self._err(ErrorKind.NOT_CONFIGURED, why or build_sandbox.SETUP_HINT,
+                             retryable=False)
+        self._setup = setup
         try:
             rec = self.load(ctx.state_dir)
         except _Unreadable as exc:
@@ -162,6 +186,7 @@ class BuildsWorker(_Base):
                                                  "reported": False})
         if doc is not None:
             self._replies(ctx, rec, doc, events)
+        self._recover_orphans(ctx, rec, events)
         self._follow(ctx, rec, events)
         self._review_one(ctx, rec, events)
         self._maybe_start(ctx, rec, doc, events)
@@ -208,6 +233,9 @@ class BuildsWorker(_Base):
         if p is None:
             rec["active"] = None
             return
+        if not act.get("task_id"):
+            self._orphan(ctx, rec, p, act, events)
+            return
         if ctx.task is None:
             return
         out = ctx.task(BUILD, act["task_id"])
@@ -230,7 +258,10 @@ class BuildsWorker(_Base):
         a["finished_at"] = ctx.now
         a["pionir_status"] = out.status
         output = out.result if isinstance(out.result, dict) else {}
-        if out.status == "done" and output.get("refused") and output.get("started") is False:
+        if out.status == "done" and output.get("not_configured"):
+            self._not_started(ctx, p, a, str(output.get("refused") or build_sandbox.SETUP_HINT),
+                              events, retry=True)
+        elif out.status == "done" and output.get("refused") and output.get("started") is False:
             self._not_started(ctx, p, a, "the window closed before the GPU was free; nothing "
                               "was started", events)
         elif out.status == "done" and output.get("ok") is True \
@@ -253,6 +284,8 @@ class BuildsWorker(_Base):
             # lost touch WHILE Daedalus ran it: it may still be running and commit, so wait
             # out its deadline before sending the job again (a commit is found meanwhile)
             running = "while running job" in (out.error or "")
+            if not rec.get("daedalus_down_since"):
+                rec["daedalus_down_since"] = ctx.now
             self._not_started(ctx, p, a, f"Daedalus or the GPU was not available "
                               f"({_clip(out.error, 160)})", events, retry=True,
                               hold=(float(a["not_after"]) - ctx.now + 300.0) if running
@@ -274,8 +307,12 @@ class BuildsWorker(_Base):
                        "refused anyway once its window has passed) and check that Pionir "
                        "runs this version of the Daedalus adapter.")
         elif out.status == "unreachable":
-            self._not_started(ctx, p, a, "Pionir did not answer; the job may not have run",
-                              events, retry=True, hold=self.budget)
+            # we do not know that it did not start: it is cancelled by its id before anything
+            # else is sent (``_orphan``), and until then it is still the one job in flight
+            rec["active"] = {"slug": p["slug"], "task_id": None, "build_id": a.get("build_id"),
+                             "attempt": a["n"], "not_after": a["not_after"]}
+            a.pop("finished_at", None)
+            self._orphan(ctx, rec, p, rec["active"], events)
         else:
             a.update(outcome="failed", why=_clip(out.error, 300))
             self._failed_attempt(ctx, rec, p, f"the job failed ({_clip(out.error, 240)})",
@@ -369,26 +406,36 @@ class BuildsWorker(_Base):
             events.append(self._event(ctx, "build.checks_unavailable",
                                       {"slug": p["slug"], "why": _clip(exc, 160)}))
             return
-        suite = self.run_tests(tree.files, entry["language"], timeout=self.test_timeout)
         year = datetime.fromtimestamp(float(p.get("created_at") or ctx.now)).year
-        reasons = review.deterministic(entry, tree.files, tree.problems, guard, suite, year=year)
+        # every check that needs nothing run comes FIRST: code that fails them never runs
+        reasons = review.static_problems(entry, tree.files, tree.problems, guard, year=year)
+        if reasons:
+            p["reviews"].append({"at": ctx.now, "head": p["head"], "tests_ran": None,
+                                 "tests_passed": None, "by": "our checks", "approved": False,
+                                 "reasons": [_clip(r, 300) for r in reasons[:12]]})
+            self._rejected(ctx, rec, p, reasons, events, by="our checks")
+            return
+        # then the product's tests, contained: as pionir-builds, in a job object
+        suite = self.run_tests(tree.files, entry["language"], setup=self._setup,
+                               timeout=self.test_timeout)
         base = {"at": ctx.now, "head": p["head"], "tests_ran": suite.ran,
                 "tests_passed": suite.passed}
+        reasons = review.suite_problems(suite)
         if reasons:
             p["reviews"].append({**base, "by": "our checks", "approved": False,
                                  "reasons": [_clip(r, 300) for r in reasons[:12]]})
             self._rejected(ctx, rec, p, reasons, events, by="our checks")
             return
-        prompt = review.review_prompt(entry, tree.files, suite, self._changed(p))
+        prompt, why = review.review_prompt(entry, tree.files, suite, self._changed(p))
         if prompt is None:
-            reasons = [f"the product is larger than one review can read "
-                       f"({review.MAX_REVIEW_CHARS:,} characters); keep it smaller"]
+            reasons = [why]
             p["reviews"].append({**base, "by": "our checks", "approved": False,
                                  "reasons": reasons})
             self._rejected(ctx, rec, p, reasons, events, by="our checks")
             return
         last = (p.get("reviews") or [None])[-1]
-        if last and last.get("by") == "Claude" and last.get("approved") is True                 and last.get("head") == p["head"]:
+        if last and last.get("by") == "Claude" and last.get("approved") is True \
+                and last.get("head") == p["head"]:
             # Claude already approved exactly this commit (staging was interrupted)
             self._stage(ctx, rec, p, tree.files, guard, events)
             return
@@ -525,34 +572,50 @@ class BuildsWorker(_Base):
             entry = bl.choose(doc["products"], set(products), ctx.goal)
             if entry is None:
                 return
-            if not self._daedalus_up(ctx, rec):
-                return
             p = self._new_product(ctx, rec, entry, night, events)
             if p is None:
                 return
-        elif not self._daedalus_up(ctx, rec):
-            p["waiting"] = "Daedalus is not answering; tried again later in the window"
-            return
         if self._landed_meanwhile(ctx, rec, p, events):
             return
         self._submit(ctx, rec, p, night, events)
 
-    def _daedalus_up(self, ctx: WorkContext, rec: dict) -> bool:
-        """A read of Daedalus's health before the GPU is taken: a job for a Daedalus that is
-        down would evict Moss's model for nothing. Down is WAITING, never a failure."""
-        from ..net import HttpUnreachable
-        try:
-            resp = ctx.http.get(self.health_url, timeout=5.0)
-            up = resp.status == 200 and json.loads(resp.body.decode("utf-8")).get("ok") is True
-        except (HttpUnreachable, ValueError, UnicodeDecodeError, AttributeError):
-            up = False
-        if not up:
-            if not rec.get("daedalus_down_since"):
-                rec["daedalus_down_since"] = ctx.now
-                self._night_log(ctx, "Daedalus is not answering; waiting")
-        else:
-            rec["daedalus_down_since"] = None
-        return up
+    def _recover_orphans(self, ctx, rec, events) -> None:
+        """A product left ``building`` with no job in flight (a crash between two saves, an
+        old record) is never left stuck: its last attempt becomes the job in flight again if
+        it has an id, else it is followed as an orphan until it is cancelled or lost."""
+        act = rec.get("active")
+        for p in rec["products"].values():
+            if p.get("state") != "building" or (act and act.get("slug") == p["slug"]):
+                continue
+            a = (p.get("attempts") or [{}])[-1]
+            rec["active"] = act = {"slug": p["slug"], "task_id": a.get("task_id"),
+                                   "build_id": a.get("build_id"), "attempt": a.get("n"),
+                                   "not_after": float(a.get("not_after") or ctx.now)}
+            log.warning("%s: %s was left building with no job in flight; following it",
+                        self.worker_id, p["slug"])
+            break
+
+    def _orphan(self, ctx, rec, p, act, events) -> None:
+        """A job Pionir may have started but never told us about: cancel it by its build id
+        (it stops if it runs; it never starts if it waits for the GPU) before anything else
+        is sent. Until that is confirmed it stays the one job in flight; past its deadline
+        with no confirmation it is lost (a commit it landed is still found and reviewed)."""
+        build_id = act.get("build_id")
+        if build_id:
+            out = ctx.job(Job(CANCEL, {"build_id": build_id},
+                              what=f"cancel the unconfirmed build of {p['slug']}"))
+            if out.status == "done":
+                rec["active"] = None
+                a = p["attempts"][-1]
+                a.update(finished_at=ctx.now, outcome="not_started",
+                         why="its start was never confirmed; it was cancelled")
+                self._not_started(ctx, p, a, "its start was never confirmed; it was cancelled",
+                                  events, retry=True)
+                self._save(ctx, rec)
+                return
+        if ctx.now > float(act.get("not_after") or 0) + LOST_AFTER:
+            self._lost(ctx, rec, p, events, "its start was never confirmed and it could not "
+                                             "be cancelled")
 
     def _new_product(self, ctx, rec, entry: dict, night, events: list) -> dict | None:
         slug = entry["slug"]
@@ -626,24 +689,30 @@ class BuildsWorker(_Base):
     def _submit(self, ctx: WorkContext, rec: dict, p: dict, night, events: list) -> None:
         kind = "repair" if p.get("state") == "repair" else "build"
         deadline = not_after(night, ctx.now, self.budget)
+        n = len(p["attempts"]) + 1
+        build_id = f"{p['slug']}-{n}-{secrets.token_hex(4)}"
         payload = {"intent": self._intent(p, kind), "repo": p["repo"],
                    "verify": self._verify(p["entry"]), "budget_seconds": self.budget,
-                   "not_after": deadline}
-        n = len(p["attempts"]) + 1
+                   "not_after": deadline, "build_id": build_id}
         a = {"n": n, "kind": kind, "submitted_at": ctx.now, "not_after": deadline,
-             "night": night.key}
+             "night": night.key, "build_id": build_id}
         p["attempts"].append(a)
         # one product a night: a repair of an earlier night's product counts as tonight's
-        rec["nights"][night.key]["started"] = rec["nights"][night.key].get("started")             or p["slug"]
+        rec["nights"][night.key]["started"] = rec["nights"][night.key].get("started") \
+            or p["slug"]
         p.update(state="building", waiting=None)
-        self._save(ctx, rec)                    # recorded BEFORE the job can start
+        # the latch, saved BEFORE the job can start: whatever happens next, this job is the
+        # one in flight until it is settled, cancelled or lost - never a second one
+        rec["active"] = {"slug": p["slug"], "task_id": None, "build_id": build_id,
+                         "attempt": n, "not_after": deadline}
+        self._save(ctx, rec)
         out = ctx.job(Job(BUILD, payload, what=f"build {p['slug']} with Daedalus in its "
                                               f"sandbox ({kind})",
                           permissions=(PERMISSION,), wait=5.0, follow=0))
         a["task_id"] = out.task_id
         if out.status == "running" and out.task_id:
-            rec["active"] = {"slug": p["slug"], "task_id": out.task_id, "attempt": n,
-                             "not_after": deadline}
+            rec["active"]["task_id"] = out.task_id
+            rec["daedalus_down_since"] = None
             self._night_log(ctx, f"{p['slug']}: {kind} started at {_hm(ctx.now)}, must end by "
                                  f"{_hm(deadline)}")
             events.append(self._event(ctx, "build.started", {
@@ -653,6 +722,7 @@ class BuildsWorker(_Base):
             return
         if out.status == "failed" and (out.error_type == "CapabilityNotFound"
                                        or _NOT_SET_UP.search(out.error or "")):
+            rec["active"] = None
             p["attempts"].pop()
             p.update(state=kind if kind == "repair" else "queued",
                      waiting=f"{BUILD} is not set up in Pionir "
