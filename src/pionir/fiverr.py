@@ -73,14 +73,19 @@ def owner_replies(store: QuoteCardStore, owner: str | None, kind: str | None = N
 
 class FiverrReplies:
     """Records the owner's replies to the Fiverr cards that take one. Driven by the Discord
-    gate's poll (``tick``) with the gate's own client."""
+    gate's poll (``tick``) with the gate's own client. The Builds division's cards use the
+    same recorder over their own record (``label`` names it in the log; ``recorded`` is the
+    answer the owner gets)."""
 
     def __init__(self, store: QuoteCardStore, *, every: float = 10.0,
-                 clock: Callable[[], float] = time.monotonic) -> None:
+                 clock: Callable[[], float] = time.monotonic, recorded: str = RECORDED,
+                 label: str = "fiverr") -> None:
         self.store = store
         self.every = every
         self._clock = clock
         self._last = -float("inf")
+        self.recorded = recorded
+        self.label = label
 
     def tick(self, call: Call, owner: str | None, channel: str) -> None:
         if owner is None:
@@ -126,7 +131,7 @@ class FiverrReplies:
         author = str((message.get("author") or {}).get("id"))
         if author != str(owner):
             # only the owner answers the desk; anyone else's reply is not read at all
-            _log.info("fiverr: a reply to card %s from someone else was ignored", key)
+            _log.info("%s: a reply to card %s from someone else was ignored", self.label, key)
             return
         reply_id = str(message["id"])
         card = doc["cards"][key]
@@ -141,7 +146,7 @@ class FiverrReplies:
                 "text": text[:MAX_REPLY]}
 
         self.store.update(record)       # recorded BEFORE it is answered: never twice
-        answer = RECORDED if text else INTENT_HINT.replace("the quote card", "the card")
+        answer = self.recorded if text else INTENT_HINT.replace("the quote card", "the card")
         call("POST", f"/channels/{channel}/messages", {
             "content": answer[:1900],
             "allowed_mentions": {"parse": [], "replied_user": False},

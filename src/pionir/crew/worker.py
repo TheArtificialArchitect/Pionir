@@ -155,6 +155,13 @@ class WorkContext:
     # where the Fiverr desk keeps each gig's listing and each order's files
     # (config.CrewSettings.fiverr_dir); None: the Fiverr workers cannot run
     fiverr_dir: Path | None = None
+    # (capability, task_id) -> hands.JobOutcome: what became of a job Pionir is still running
+    # (one submitted with ``Job.follow=0``). A read: it starts nothing. None: not available.
+    task: Callable[..., Any] | None = None
+    # the Builds division's folder (config.CrewSettings.builds_dir: its backlog.json) and its
+    # sandbox workspace, where each product gets a fresh repo (CrewSettings.builds_sandbox)
+    builds_dir: Path | None = None
+    builds_sandbox: Path | None = None
 
 
 @runtime_checkable

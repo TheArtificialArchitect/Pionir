@@ -245,8 +245,10 @@ class GateCase(unittest.TestCase):
                                    sleep=self.sleeps.append)
 
     def park(self, payload: dict[str, Any] | None = None) -> str:
-        out = self.app.run_task("coding.daedalus_solve",
-                                payload or {"content": "refactor the parser"})
+        # a solve names its repo: Daedalus refuses one without (it would fall back to its own)
+        payload = {"repo": "C:/src/thing",
+                   **(payload or {"content": "refactor the parser"})}
+        out = self.app.run_task("coding.daedalus_solve", payload)
         self.assertEqual(out["status"], "pending_approval")
         return out["approval_id"]
 
@@ -380,7 +382,7 @@ class OwnerOnlyTests(GateCase):
         # it ran through PionirApp.approve: claimed as a job, exact permission
         self.assertEqual(self.app.jobs.get(row["task_id"])["kind"], "approval")
         self.assertEqual(self.runs, [("coding.daedalus_solve",
-                                      {"content": "refactor the parser"}, ["daedalus.solve"])])
+                                      {"content": "refactor the parser", "repo": "C:/src/thing"}, ["daedalus.solve"])])
         for _ in range(3):
             gate.run_once()
         self.assertEqual(len(self.runs), 1)

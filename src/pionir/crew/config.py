@@ -20,6 +20,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from ..adapters.daedalus import DEFAULT_SANDBOX_ROOT
 from ..config import PionirSettings
 from .affiliate import programs_from_environment
 
@@ -98,6 +99,13 @@ class CrewSettings:
     # files prepared for him to upload on Fiverr (``orders/<n>/out/``). Pionir's fiverr.card
     # reads the same folder. None -> ~/.pionir/fiverr
     fiverr_dir: Path | None = None
+    # The Builds division (crew/builds): its folder (``backlog.json``, the product ideas it
+    # builds from; the owner edits it by replying to its cards) and its sandbox workspace,
+    # where each product gets a fresh git repo that Daedalus builds in overnight - the only
+    # place Pionir's coding.daedalus_build reaches (PIONIR_DAEDALUS_SANDBOX, read by Pionir
+    # too). None -> ~/.pionir/builds and C:\src\daedalus-work.
+    builds_dir: Path | None = None
+    builds_sandbox: Path | None = None
 
     def __post_init__(self) -> None:
         if self.tick_seconds <= 0:
@@ -129,6 +137,10 @@ class CrewSettings:
             object.__setattr__(self, "products_dir", Path.home() / ".pionir" / "products")
         if self.fiverr_dir is None:
             object.__setattr__(self, "fiverr_dir", Path.home() / ".pionir" / "fiverr")
+        if self.builds_dir is None:
+            object.__setattr__(self, "builds_dir", Path.home() / ".pionir" / "builds")
+        if self.builds_sandbox is None:
+            object.__setattr__(self, "builds_sandbox", Path(DEFAULT_SANDBOX_ROOT))
 
     @classmethod
     def from_pionir(cls, settings: PionirSettings, **overrides) -> CrewSettings:
@@ -163,6 +175,8 @@ class CrewSettings:
             ("PIONIR_CREW_DELIVERIES_DIR", "deliveries_dir", Path),
             ("PIONIR_CREW_PRODUCTS_DIR", "products_dir", Path),
             ("PIONIR_FIVERR_DIR", "fiverr_dir", Path),
+            ("PIONIR_CREW_BUILDS_DIR", "builds_dir", Path),
+            ("PIONIR_DAEDALUS_SANDBOX", "builds_sandbox", Path),
             ("PIONIR_CREW_PIONIR_URL", "pionir_url", str),
             ("PIONIR_CREW_JOB_FOLLOW_SECONDS", "job_follow_seconds", float),
         ):
@@ -187,6 +201,8 @@ class CrewSettings:
         d["products_dir"] = str(self.products_dir)
         d["fiverr_dir"] = str(self.fiverr_dir)
         d["pionir_token_file"] = str(self.pionir_token_file) if self.pionir_token_file else None
+        d["builds_dir"] = str(self.builds_dir)
+        d["builds_sandbox"] = str(self.builds_sandbox)
         d["catalogue_path"] = str(self.catalogue_path) if self.catalogue_path else None
         d["affiliates"] = [p.public() for p in self.affiliates]
         return d

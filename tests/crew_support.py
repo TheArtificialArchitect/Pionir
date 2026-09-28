@@ -26,6 +26,9 @@ def settings(root: str | Path, **overrides) -> CrewSettings:
     # Never the real port: 8782 is where a running crew listens, so a test crew binding it
     # collides with the owner's live one. 0 = any free port.
     overrides.setdefault("api_port", 0)
+    # The Builds worker seeds its backlog and creates sandbox repos: never in the real ones.
+    overrides.setdefault("builds_dir", root / "builds")
+    overrides.setdefault("builds_sandbox", root / "daedalus-work")
     calls = overrides.pop("calls_per_hour", None)
     if calls is not None:
         overrides["budget"] = CrewBudget(calls_per_hour=calls)

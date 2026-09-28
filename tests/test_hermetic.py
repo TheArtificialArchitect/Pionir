@@ -53,11 +53,12 @@ class HermeticSuiteTests(unittest.TestCase):
         # PionirSettings whose owner_notify is anything but the literal False must sit in
         # a function that patches the Discord client - a patch(...) naming DiscordRest.
         # quotes.card (quote_cards) is wired to the same bot and channel: the same rule, and
-        # so is fiverr.card (fiverr_desk).
+        # so is fiverr.card (fiverr_desk), and so is builds.card (builds_cards).
         offenders = []
         for path, fn, call in _runtime_settings():
             values = [k.value for k in call.keywords
-                      if k.arg in ("owner_notify", "quote_cards", "fiverr_desk")]
+                      if k.arg in ("owner_notify", "quote_cards", "fiverr_desk",
+                                   "builds_cards")]
             if all(isinstance(v, ast.Constant) and v.value is False for v in values):
                 continue
             fakes = [c for name in ("patch", "object") for c in _calls(fn, name)

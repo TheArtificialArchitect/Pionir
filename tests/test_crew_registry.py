@@ -26,7 +26,8 @@ class DefaultCatalogueTests(unittest.TestCase):
                                      "products.api_builder", "products.shelf",
                                      "treasury.fiverr", "treasury.ledger", "watch.health"))
         live = sorted(w.worker_id for w in reg.all() if w.live)
-        self.assertEqual(live, ["contracts.delivery", "contracts.finder", "contracts.orders",
+        self.assertEqual(live, ["builds.daedalus",
+                                "contracts.delivery", "contracts.finder", "contracts.orders",
                                 "fiverr.desk", "fiverr.gigs", "posting.blog",
                                 "posting.devto",
                                 "posting.instagram",

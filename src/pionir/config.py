@@ -170,6 +170,11 @@ class PionirSettings:
     # set to "off". Tokens are read only if those services were started with one.
     daedalus_url: str | None = "http://127.0.0.1:8771"
     daedalus_token: str | None = field(default=None, repr=False)
+    # The Builds division's sandbox workspace: coding.daedalus_build reaches ONLY a repo
+    # the crew's Builds worker created directly inside it (adapters/daedalus.py,
+    # sandbox_repo_problem). PIONIR_DAEDALUS_SANDBOX points elsewhere (the crew reads the
+    # same variable, so the worker creates its repos where the adapter allows them).
+    daedalus_sandbox_root: str = r"C:\src\daedalus-work"
     melete_url: str | None = "http://127.0.0.1:8770"
     melete_token: str | None = field(default=None, repr=False)
     # The crew (`python -m pionir.crew`, its own foreground process) serves its
@@ -196,6 +201,12 @@ class PionirSettings:
     # touches Fiverr. Off unless PIONIR_FIVERR_DESK=1, and off in a bare PionirSettings, so a
     # test runtime is never wired to the real bot (the owner_notify rule).
     fiverr_desk: bool = False
+    # builds.card / builds.inbox: the crew's Builds division's cards (a nightly report, the
+    # product backlog, a staged or shelved product) in the Discord gate's channel, and the
+    # owner's replies to them (adding to or removing from the backlog). Same wiring and the
+    # same rule as owner_notify: on in from_environment (PIONIR_BUILDS_CARDS=0 leaves it
+    # unregistered), off in a bare PionirSettings so a test runtime never reaches the bot.
+    builds_cards: bool = False
     # fiverr.events / fiverr.ack read and acknowledge the order events Scrooge takes from
     # Fiverr's emails (GET /dash/fiverr/events). Off (they answer "unavailable") until
     # Scrooge serves the route: PIONIR_FIVERR_EVENTS=1 turns them on.
@@ -509,6 +520,8 @@ class PionirSettings:
             daedalus_url=_optional_url("PIONIR_DAEDALUS_URL", _declared("daedalus_url")),
             daedalus_token=((os.environ.get("PIONIR_DAEDALUS_TOKEN") or "").strip()
                             or read_token("daedalus-token.txt")),
+            daedalus_sandbox_root=(os.environ.get("PIONIR_DAEDALUS_SANDBOX") or "").strip()
+            or _declared("daedalus_sandbox_root"),
             melete_url=_optional_url("PIONIR_MELETE_URL", _declared("melete_url")),
             melete_token=((os.environ.get("PIONIR_MELETE_TOKEN") or "").strip()
                           or read_token("melete-token.txt")),
@@ -519,6 +532,8 @@ class PionirSettings:
                           not in {"0", "off", "false", "no"}),
             fiverr_desk=(os.environ.get("PIONIR_FIVERR_DESK", "0").strip().lower()
                          in {"1", "on", "true", "yes"}),
+            builds_cards=(os.environ.get("PIONIR_BUILDS_CARDS", "1").strip().lower()
+                          not in {"0", "off", "false", "no"}),
             fiverr_events=(os.environ.get("PIONIR_FIVERR_EVENTS", "0").strip().lower()
                            in {"1", "on", "true", "yes"}),
             fiverr_dir=(

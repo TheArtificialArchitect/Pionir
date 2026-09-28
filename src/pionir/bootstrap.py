@@ -189,6 +189,7 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
                 DaedalusSettings(
                     base_url=configured.daedalus_url,
                     token=configured.daedalus_token or "",
+                    sandbox_root=configured.daedalus_sandbox_root,
                 )
             )
         )
@@ -246,6 +247,12 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         from .adapters.fiverr import FiverrAdapter, fiverr_settings
 
         runtime.register(FiverrAdapter(fiverr_settings(configured)))
+    if configured.builds_cards:
+        # The Builds division's cards and the owner's replies to them, in the Discord gate's
+        # channel with its bot token (read when a card is posted: no network at boot).
+        from .adapters.builds import BuildCardAdapter, build_card_settings
+
+        runtime.register(BuildCardAdapter(build_card_settings(configured)))
     if configured.content_url is not None and configured.instagram_graph_url is not None:
         # Needs Scrooge to host the card image. No boot-time call: both token files are
         # read when a post runs. social.instagram_post always parks for approval.

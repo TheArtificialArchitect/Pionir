@@ -55,6 +55,7 @@ class AsyncFakeClient:
 
 
 def _daedalus_task(content="add a null check", **payload):
+    payload.setdefault("repo", "C:/src/thing")
     return Task("coding.daedalus_solve", {"content": content, **payload}, frozenset({"daedalus.solve"}))
 
 

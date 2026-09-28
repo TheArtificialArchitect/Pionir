@@ -33,6 +33,9 @@ whole list, and a name not in it fails loudly at load time.
 - ``product_shelf`` - REAL (products.py). Submits each product the owner stages in its own
   folder as ``product.gumroad_publish`` for his approval, and reads what the live ones sold
   (``product.gumroad_list``). No words: every word of a listing is the owner's.
+- ``daedalus_builds`` - REAL (builds/). One small developer tool a night, built by Daedalus in
+  a fresh sandbox repo inside the overnight GPU window, reviewed by Claude (and by our own
+  checks), and staged for products.shelf - which still submits it for the owner's approval.
 """
 from __future__ import annotations
 
@@ -361,6 +364,13 @@ def fiverr_desk(spec, **params):
     return FiverrDesk(spec, **params)
 
 
+def daedalus_builds(spec, **params):
+    """REAL. ``builds.daedalus`` (builds/worker.py): one product a night built by Daedalus in its
+    own sandbox repo, overnight only, reviewed by Claude, and staged for the product shelf."""
+    from .builds.worker import BuildsWorker
+    return BuildsWorker(spec, **params)
+
+
 def fiverr_earnings(spec, **params):
     """REAL. ``treasury.fiverr``: the Fiverr-reported gross, read from the desk's record."""
     from .fiverr.desk import FiverrEarnings
@@ -384,4 +394,5 @@ IMPLS = {
     "fiverr_gigs": fiverr_gigs,
     "fiverr_desk": fiverr_desk,
     "fiverr_earnings": fiverr_earnings,
+    "daedalus_builds": daedalus_builds,
 }
