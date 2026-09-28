@@ -6,7 +6,11 @@ for the right bubbles and refuses to mistake a rumination or a fragment for the
 answer, rather than that a reply merely comes back.
 """
 
+import json
+import secrets
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from pionir.adapters import galatea as galatea_module
@@ -112,10 +116,73 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             GalateaSettings(base_url="http://192.168.1.50:8799")
 
-    def test_needs_no_token_on_loopback(self) -> None:
-        # Her server authorises 127.0.0.1 outright, so unlike Theo's bridge this
-        # carries no credential at all - and construction must not demand one.
-        GalateaSettings()
+    def test_construction_does_not_demand_a_key(self) -> None:
+        # the key is read per call from her file; with no folder she simply refuses
+        self.assertIsNone(GalateaSettings().key_dir)
+
+
+class _Opener:
+    def __init__(self) -> None:
+        self.requests = []
+
+    def open(self, request, timeout=None):
+        self.requests.append(request)
+
+        class _Resp:
+            def __enter__(s):
+                return s
+
+            def __exit__(s, *a):
+                return False
+
+            def read(s, n=-1):
+                return json.dumps({"ok": True, "id": 7, "messages": []}).encode()
+
+        return _Resp()
+
+
+class LocalKeyTests(unittest.TestCase):
+    """Loopback is not an identity: her server takes nothing without a key, so every
+    call carries her LOCAL key - never the glass key, which is the owner's."""
+
+    def setUp(self) -> None:
+        self.dir = Path(tempfile.mkdtemp(prefix="pionir-galatea-key-"))
+        self.key = secrets.token_urlsafe(32)
+        (self.dir / "galatea-local-token.txt").write_text(self.key + "\n", encoding="utf-8")
+        (self.dir / "galatea-glass-token.txt").write_text(secrets.token_urlsafe(32), encoding="utf-8")
+        self.transport = galatea_module.LoopbackTransport(GalateaSettings(key_dir=self.dir))
+        self.opener = _Opener()
+        self.transport._opener = self.opener
+
+    def test_every_call_carries_the_local_key(self) -> None:
+        self.transport.get("/api/state")
+        self.transport.get("/api/messages?after=0")
+        self.transport.post("/api/send", {"text": "hi"})
+        self.assertEqual(len(self.opener.requests), 3)
+        for request in self.opener.requests:
+            self.assertEqual(request.get_header("X-galatea-token"), self.key)
+        self.assertEqual(self.opener.requests[2].get_header("Content-type"), "application/json")
+
+    def test_a_key_she_remade_is_picked_up_without_a_restart(self) -> None:
+        fresh = secrets.token_urlsafe(32)
+        (self.dir / "galatea-local-token.txt").write_text(fresh, encoding="utf-8")
+        self.transport.get("/api/state")
+        self.assertEqual(self.opener.requests[0].get_header("X-galatea-token"), fresh)
+
+    def test_no_key_file_or_a_malformed_one_sends_no_key(self) -> None:
+        (self.dir / "galatea-local-token.txt").write_text("short", encoding="utf-8")
+        self.transport.get("/api/state")
+        (self.dir / "galatea-local-token.txt").unlink()
+        self.transport.get("/api/state")
+        for request in self.opener.requests:
+            self.assertIsNone(request.get_header("X-galatea-token"))
+
+    def test_the_runtime_points_her_adapter_at_the_owners_secrets(self) -> None:
+        from pionir.bootstrap import _galatea_settings
+        from pionir.config import PionirSettings
+        configured = PionirSettings(state_root=self.dir, galatea_url="http://127.0.0.1:1",
+                                    galatea_model_id="stub", embed_model=None)
+        self.assertEqual(_galatea_settings(configured).key_dir, configured.client_token_path)
 
 
 class SendAndReadTests(unittest.TestCase):

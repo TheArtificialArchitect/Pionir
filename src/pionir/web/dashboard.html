@@ -257,8 +257,14 @@ function setView(v){
   document.querySelectorAll(".tab").forEach(t=>t.classList.toggle("active", t.dataset.view===v));
   if(v==="voice"){
     const f=$id("voice-frame");
-    if(VOICE_URL){ if(f.getAttribute("src")!==VOICE_URL) f.setAttribute("src",VOICE_URL); }
-    else { $id("view-voice").innerHTML='<div class="voice-empty">No voice is wired in. Set PIONIR_GALATEA_URL and wake her.</div>'; }
+    if(!VOICE_URL){ $id("view-voice").innerHTML='<div class="voice-empty">No voice is wired in. Set PIONIR_GALATEA_URL and wake her.</div>'; }
+    else if(f && !f.getAttribute("src")){
+      // her glass needs her key; only this signed-in page is handed it (never /api/state)
+      const say=(t)=>{ const d=document.createElement("div"); d.className="voice-empty"; d.textContent=t; $id("view-voice").replaceChildren(d); };
+      fetch("/api/voice_link",{cache:"no-store"})
+        .then(async r=>{ const j=await r.json().catch(()=>({})); if(r.ok&&j.url) f.setAttribute("src",j.url); else say(j.reason||j.error||("HTTP "+r.status)); })
+        .catch(()=>say("Pionir is not answering."));
+    }
   }
 }
 document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>setView(t.dataset.view));

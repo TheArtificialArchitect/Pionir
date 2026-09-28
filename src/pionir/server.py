@@ -34,7 +34,7 @@ from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from . import atomic
 from .approvals import ApprovalQueue
@@ -59,6 +59,7 @@ from .batching import (
     read_request,
     request_digest,
 )
+from .adapters.galatea import GLASS_KEY_FILE, read_key
 from .bootstrap import PionirRuntime
 from .cli import _capabilities, _doctor, _jsonable
 from .contracts import RiskLevel, Task, outcome_ok
@@ -463,6 +464,27 @@ class PionirApp:
             "bryo": self.body(),
             "generated_at": datetime.now(UTC).isoformat(),
         }
+
+    def voice_link(self, authorization: str | None, cookie: str | None
+                   ) -> tuple[int, dict[str, Any]]:
+        """The Voice view's signed-in address of her glass: her URL with her GLASS key
+        (Galatea's galatea/keys.py). Only for the owner's own dashboard - its session
+        cookie or its token - because that key lets the browser do on her page all
+        he can, his approvals included; none of it goes out on the open /api/state.
+        Her page keeps the key and drops it from its address bar."""
+        client, refused = self.auth.from_headers(authorization, cookie)
+        if client != "dashboard":
+            return 401, {"error": "unauthorized",
+                         "reason": refused or "her glass opens only in the signed-in dashboard: "
+                                              "open the dashboard from the launcher"}
+        base = self.runtime.settings.galatea_url
+        if not base:
+            return 404, {"error": "not found", "reason": "no voice is wired in"}
+        key = read_key(self.runtime.settings.client_token_path, GLASS_KEY_FILE)
+        if key is None:
+            return 503, {"error": "no key",
+                         "reason": f"no {GLASS_KEY_FILE} yet: she makes it when she wakes"}
+        return 200, {"url": f"{str(base).rstrip('/')}/?{urlencode({'token': key})}"}
 
     def body(self) -> dict[str, Any] | None:
         reading = self.runtime.executive.body_reading()
@@ -1210,6 +1232,10 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                     self._send(app.audit(min(max(n, 1), 500)))
                 elif route.path == "/api/approvals":
                     self._send(app.approvals_view())
+                elif route.path == "/api/voice_link":
+                    status, document = app.voice_link(self.headers.get("Authorization"),
+                                                      self.headers.get("Cookie"))
+                    self._send(document, status)
                 elif route.path == "/api/tasks":
                     n = int(parse_qs(route.query).get("n", ["20"])[0] or 20)
                     self._send(app.jobs_view(min(max(n, 1), JOBS_KEEP)))

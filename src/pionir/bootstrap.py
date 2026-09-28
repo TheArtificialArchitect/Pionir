@@ -73,7 +73,8 @@ def _galatea_settings(configured: PionirSettings) -> GalateaSettings:
     declaration against what she reports either way.
     """
 
-    settings = GalateaSettings(base_url=str(configured.galatea_url))
+    settings = GalateaSettings(base_url=str(configured.galatea_url),
+                               key_dir=configured.client_token_path)
     if configured.galatea_model_id:
         return replace(settings, model_id=configured.galatea_model_id)
     served = resolve_served_model(settings)

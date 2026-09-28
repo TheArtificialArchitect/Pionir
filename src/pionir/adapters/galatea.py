@@ -27,10 +27,14 @@ design:
 Continuity needs no conversation id. Galatea is one persistent being with one
 ongoing relationship in one SQLite store; unlike Theo there are no threads to
 open or carry. She is not loopback-only: she runs with ``--phone`` bound on
-0.0.0.0 so her phone page can reach her. Pionir, though, only ever dials
-127.0.0.1, which her server authorises without a token, so - unlike Theo's
-bridge - this adapter carries no credential, and it refuses any non-loopback
-base url so it can never be pointed at her over the LAN.
+0.0.0.0 so her phone page can reach her. Pionir only ever dials 127.0.0.1, and
+refuses any non-loopback base url so it can never be pointed at her over the LAN.
+Loopback is not an identity, though - any local process reaches that port - so
+every call carries her LOCAL key (``X-Galatea-Token``, from
+``galatea-local-token.txt`` in the owner's secrets folder, which she makes on
+wake; Galatea's ``galatea/keys.py``). That key reads her state, messages and
+settings and sends a line; it cannot approve, change her, or get her phone link.
+It is read on every call, so a key she re-made is picked up without a restart.
 
 Action authorisation stays with Pionir. This capability is conversation only:
 Galatea speaks, and any doing she wants done is a separate intent handed to the
@@ -40,11 +44,13 @@ Manager through Pionir's gates, which is not this change.
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
 
@@ -57,6 +63,25 @@ MAX_RESPONSE_BYTES = 4_000_000
 # Checked here so an over-long request fails with Pionir's own error rather than
 # being silently truncated on the far side into a different question.
 MAX_CONTENT_CHARS = 4_000
+
+# Her keys' files, in the owner's secrets folder (Galatea's galatea/keys.py): the LOCAL
+# key this adapter sends, and the GLASS key (the owner's browser) the dashboard's Voice
+# view is handed by /api/voice_link.
+LOCAL_KEY_FILE = "galatea-local-token.txt"
+GLASS_KEY_FILE = "galatea-glass-token.txt"
+KEY_HEADER = "X-Galatea-Token"
+_KEY_SHAPE = re.compile(r"[A-Za-z0-9_-]{32,256}")
+
+
+def read_key(directory: Path | None, name: str = LOCAL_KEY_FILE) -> str | None:
+    """One of her keys, or None (no folder given, no file, or not a key)."""
+    if directory is None:
+        return None
+    try:
+        text = (Path(directory) / name).read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        return None
+    return text if _KEY_SHAPE.fullmatch(text) else None
 
 
 class JsonTransport(Protocol):
@@ -96,6 +121,9 @@ class GalateaSettings:
     # this id never drives an admission decision - it only lets doctor name the
     # brain she is on. She has been seen on gemma3:12b as well as this.
     model_id: str = "qwen2.5:7b-instruct"
+    # The folder holding her local key (the owner's secrets folder). None sends no
+    # key, and she refuses every call.
+    key_dir: Path | None = None
 
     def __post_init__(self) -> None:
         parsed = urlparse(self.base_url)
@@ -122,6 +150,7 @@ class LoopbackTransport:
 
     def __init__(self, settings: GalateaSettings) -> None:
         self._base_url = settings.base_url.rstrip("/")
+        self._key_dir = settings.key_dir
         # Per request, not per turn: the turn's deadline lives in the poll loop.
         self._timeout = settings.request_timeout_seconds
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -165,15 +194,20 @@ class LoopbackTransport:
             raise AdapterProtocolError("Galatea returned a non-object response")
         return document
 
+    def _key(self) -> dict[str, str]:
+        key = read_key(self._key_dir)
+        return {KEY_HEADER: key} if key else {}
+
     def get(self, path: str) -> Mapping[str, Any]:
-        return self._open(urllib.request.Request(f"{self._base_url}{path}", method="GET"))
+        return self._open(urllib.request.Request(
+            f"{self._base_url}{path}", headers=self._key(), method="GET"))
 
     def post(self, path: str, payload: Mapping[str, Any]) -> Mapping[str, Any]:
         body = json.dumps(dict(payload)).encode("utf-8")
         request = urllib.request.Request(
             f"{self._base_url}{path}",
             data=body,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **self._key()},
             method="POST",
         )
         return self._open(request)

@@ -350,6 +350,52 @@ class GateOverHttp(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(self.app.approvals.get(aid)["status"], "pending")
 
+    # ---- 8. her glass: the Voice view's key goes to the owner's session only ----------
+    def _glass(self) -> str:
+        key = "g" * 43
+        folder = self.app.runtime.settings.client_token_path
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "galatea-glass-token.txt").write_text(key, encoding="utf-8")
+        return key
+
+    def test_the_owners_session_gets_her_glass_with_its_key(self) -> None:
+        key = self._glass()
+        session = f"{auth.SESSION_COOKIE}={self.app.auth.tokens['dashboard']}"
+        status, out, response = self._raw("GET", "/api/voice_link", headers={"Cookie": session})
+        self.assertEqual(status, 200, out)
+        base = str(self.app.runtime.settings.galatea_url).rstrip("/")
+        self.assertEqual(out["url"], f"{base}/?token={key}")
+        self.assertEqual(response.getheader("Cache-Control"), "no-store")
+
+    def test_no_one_else_gets_her_glass(self) -> None:
+        key = self._glass()
+        tries = [{}, {"Cookie": f"{auth.SESSION_COOKIE}={WRONG}"},
+                 {"Origin": f"http://127.0.0.1:{self.port}", "X-Forwarded-For": "100.101.102.103",
+                  "Tailscale-User-Login": "ian@example.com"}]
+        tries += [{"Authorization": f"Bearer {self.app.auth.tokens[c]}"}
+                  for c in ("crew", "galatea", "atani", "desktop", "phone")]
+        tries += [{"Cookie": f"{auth.SESSION_COOKIE}={self.app.auth.tokens['phone']}"}]
+        for headers in tries:
+            status, out, _ = self._raw("GET", "/api/voice_link", headers=headers)
+            self.assertEqual(status, 401, headers)
+            self.assertNotIn(key, json.dumps(out))
+        # nor a rebound name, even carrying the session
+        session = f"{auth.SESSION_COOKIE}={self.app.auth.tokens['dashboard']}"
+        status, out, _ = self._raw("GET", "/api/voice_link",
+                                   headers={"Cookie": session, "Host": "evil.example"})
+        self.assertEqual(status, 403)
+        self.assertNotIn(key, json.dumps(out))
+        # and the open state names her address, never her key
+        status, out, _ = self._raw("GET", "/api/state")
+        self.assertEqual(status, 200)
+        self.assertNotIn(key, json.dumps(out))
+
+    def test_no_glass_key_yet_is_said_plainly(self) -> None:
+        session = f"{auth.SESSION_COOKIE}={self.app.auth.tokens['dashboard']}"
+        status, out, _ = self._raw("GET", "/api/voice_link", headers={"Cookie": session})
+        self.assertEqual(status, 503, out)
+        self.assertIn("galatea-glass-token.txt", out["reason"])
+
     def test_reads_stay_open_on_loopback(self) -> None:
         for path in ("/api/state", "/api/approvals", "/api/capabilities"):
             status, _doc, _ = self._raw("GET", path)
