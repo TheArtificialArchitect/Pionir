@@ -95,11 +95,16 @@ class FakeSetup:
         self.python = Path(sys.executable)
         self.python_dir = self.python.parent
         self.runs_dir = self.sandbox_root / ".runs"
+        self.sid = None
         self.logons = 0
+        self.reaps = 0
 
     def logon(self):
         self.logons += 1
         return None
+
+    def reap(self):
+        self.reaps += 1
 
 
 def commit(repo: Path, files: dict, message="Daedalus: build") -> str:
@@ -621,6 +626,18 @@ class ReviewTests(_Case):
                 self.assertEqual(self.prompts, [])
                 self.assertFalse((self.shelf / "exif-strip").exists())
 
+    def test_a_third_party_import_is_rejected_before_its_tests_run(self) -> None:
+        self.run_at(at(1, 1, 30))
+        repo = Path(self.pionir.builds()[0].payload["repo"])
+        head = commit(repo, product(self.entry(),
+                                    extra={"src/exif_strip/img.py": "import requests\n"}))
+        self.pionir.finish("t-build-0", commit=head)
+        self.answers.append(approve())
+        self.run_at(at(1, 1, 50))
+        self.assertEqual(self.test_runs, 0)
+        last = self.product_state("exif-strip")["reviews"][-1]
+        self.assertIn("not in the standard library", " ".join(last["reasons"]))
+
     def test_a_changed_licence_is_rejected(self) -> None:
         self.run_at(at(1, 1, 30))
         repo = Path(self.pionir.builds()[0].payload["repo"])
@@ -1045,6 +1062,31 @@ class HardeningTests(unittest.TestCase):
                 sandbox.create(self.root / "junction", e, year=2026, created_at=0.0)
             self.assertEqual(list(real.iterdir()), [])
 
+    def test_too_few_tests_is_a_rejection(self) -> None:
+        few = review.suite_problems(SuiteRun(True, review.MIN_TESTS - 1, "python", "OK"))
+        self.assertIn(f"at least {review.MIN_TESTS}", " ".join(few))
+        self.assertEqual(review.suite_problems(SuiteRun(True, review.MIN_TESTS, "python", "OK")),
+                         [])
+
+    def test_a_submodule_is_refused_on_export(self) -> None:
+        e = dict(backlog.SEED[0])
+        base = sandbox.create(self.root, e, year=2026, created_at=0.0)
+        repo = self.root / e["slug"]
+        subprocess.run(["git", "update-index", "--add", "--cacheinfo", f"160000,{base},vendored"],
+                       cwd=repo, check=True)
+        subprocess.run(["git", "-c", "user.name=d", "-c", "user.email=d@example.invalid",
+                        "commit", "-q", "-m", "a submodule"], cwd=repo, check=True)
+        tree = sandbox.export(repo)
+        self.assertIn("submodule", " ".join(tree.problems))
+        self.assertNotIn("vendored", tree.files)
+
+    def test_a_slug_already_built_cannot_be_added_again(self) -> None:
+        doc = backlog.view({"products": []})
+        body = ("add exif-strip\nname: EXIF Strip Again\nprice: 12\nsummary: " + "x" * 30)
+        changed, note = backlog.apply_reply(doc, body, {"exif-strip"})
+        self.assertFalse(changed)
+        self.assertIn("already used", note)
+
     def test_names_windows_cannot_hold_are_refused_on_export(self) -> None:
         e = dict(backlog.SEED[0])
         sandbox.create(self.root, e, year=2026, created_at=0.0)
@@ -1105,6 +1147,128 @@ class HardeningTests(unittest.TestCase):
         backlog.save(builds, view)
         after = json.loads((builds / "backlog.json").read_text(encoding="utf-8"))
         self.assertEqual(after["products"], [dict(backlog.SEED[1]), odd])
+
+
+class OwnerSideGitTests(_Case):
+    """The owner's side never checks out or merges a build repo, and never lets its config run."""
+
+    def test_a_smudge_filter_in_the_build_repo_never_runs_as_the_owner(self) -> None:
+        self.run_at(at(1, 1, 30))
+        repo = Path(self.pionir.builds()[0].payload["repo"])
+        flag = self.root / "PWNED"
+        git = ["git", "-c", "user.name=d", "-c", "user.email=d@example.invalid"]
+        # Daedalus found the tree dirty and left its work on a branch of its own ...
+        subprocess.run([*git, "checkout", "-q", "-b", "daedalus/work"], cwd=repo, check=True)
+        files = product(self.entry(), extra={".gitattributes": "* filter=evil\n"})
+        head = commit(repo, files)
+        subprocess.run([*git, "checkout", "-q", "main"], cwd=repo, check=True)
+        # ... and the repo's config now runs a program on every checkout of those files
+        cmd = f'"{sys.executable}" -c "open(r\'{flag}\', \'w\').write(\'x\')"'
+        cmd = cmd.replace(chr(92), chr(92) * 2)
+        (repo / ".git" / "config").write_text(
+            f"[core]\n\tfsmonitor = {cmd}\n[filter \"evil\"]\n\tsmudge = {cmd}\n"
+            f"\tclean = {cmd}\n\trequired = true\n", encoding="utf-8")
+        (repo / ".git" / "hooks").mkdir(exist_ok=True)
+        (repo / ".git" / "hooks" / "post-checkout").write_text(f"#!/bin/sh\n{cmd}\n")
+        self.pionir.finish("t-build-0", commit=head, branch="daedalus/work")
+        self.answers.append(approve())
+        self.run_at(at(1, 1, 50))
+        self.assertFalse(flag.exists(), "a program from the build repo ran as the owner")
+        p = self.product_state("exif-strip")
+        self.assertEqual(p["head"], head)
+        self.assertEqual(p["state"], "staged")
+        # the branch's work was read by id, never merged into the checked-out branch
+        main = subprocess.run(["git", "-c", "core.hooksPath=NUL", "rev-parse", "main"],
+                              cwd=repo, capture_output=True, text=True).stdout.strip()
+        self.assertNotEqual(main, head)
+
+    def test_every_owner_side_git_call_rewrites_the_repo_config_first(self) -> None:
+        from pionir import sandbox_git
+        e = dict(backlog.SEED[0])
+        sandbox.create(self.sandbox, e, year=2026, created_at=0.0)
+        repo = self.sandbox / e["slug"]
+        for call in (lambda: sandbox.head(repo), lambda: sandbox.export(repo),
+                     lambda: sandbox.changed_files(repo, sandbox.head(repo))):
+            (repo / ".git" / "config").write_text("[core]\n\tsshCommand = calc.exe\n"
+                                                  "[alias]\n\tx = !calc.exe\n",
+                                                  encoding="utf-8")
+            (repo / ".git" / "hooks" / "pre-commit").write_text("#!/bin/sh\n")
+            (repo / ".git" / "objects" / "info").mkdir(parents=True, exist_ok=True)
+            (repo / ".git" / "objects" / "info" / "alternates").write_text("C:/src/Pionir/.git/objects")
+            call()
+            self.assertEqual((repo / ".git" / "config").read_text(encoding="utf-8"),
+                             sandbox_git.CANONICAL)
+            self.assertEqual(list((repo / ".git" / "hooks").iterdir()), [])
+            self.assertFalse((repo / ".git" / "objects" / "info" / "alternates").exists())
+
+    def test_a_commit_that_does_not_descend_from_the_seed_is_refused(self) -> None:
+        self.run_at(at(1, 1, 30))
+        repo = Path(self.pionir.builds()[0].payload["repo"])
+        git = ["git", "-c", "user.name=d", "-c", "user.email=d@example.invalid"]
+        subprocess.run([*git, "checkout", "-q", "--orphan", "stray"], cwd=repo, check=True)
+        subprocess.run(["git", "rm", "-rq", "--cached", "."], cwd=repo, check=True)
+        orphan = commit(repo, {"x.txt": "unrelated"})
+        subprocess.run([*git, "checkout", "-q", "-f", "main"], cwd=repo, check=True)
+        self.pionir.finish("t-build-0", commit=orphan)
+        self.run_at(at(1, 1, 50))
+        p = self.product_state("exif-strip")
+        self.assertNotEqual(p.get("head"), orphan)
+        self.assertIn("seed", p["attempts"][0]["why"])
+
+    def test_a_git_folder_that_is_a_junction_is_never_used(self) -> None:
+        if sys.platform != "win32":
+            self.skipTest("junctions are Windows")
+        import _winapi
+        repo = self.sandbox / "exif-strip"
+        repo.mkdir()
+        elsewhere = self.root / "elsewhere"
+        subprocess.run(["git", "init", "-q", str(elsewhere)], check=True)
+        commit(elsewhere, {"a.txt": "a live repo"})              # a HEAD that would answer
+        config = (elsewhere / ".git" / "config").read_text(encoding="utf-8")
+        _winapi.CreateJunction(str(elsewhere / ".git"), str(repo / ".git"))
+        with self.assertRaises(sandbox.SandboxError):
+            sandbox.head(repo)
+        # and nothing was rewritten in the repo it points at
+        self.assertEqual((elsewhere / ".git" / "config").read_text(encoding="utf-8"), config)
+        with self.assertRaises(sandbox.SandboxError):
+            sandbox.export(repo)
+
+
+class StdlibOnlyTests(unittest.TestCase):
+    def test_a_third_party_import_is_refused_before_anything_runs(self) -> None:
+        e = dict(backlog.SEED[0])
+        files = as_bytes(product(e, extra={"src/exif_strip/img.py": "import PIL.Image\n",
+                                           "tests/test_y.py": "import pytest\n"}))
+        reasons = review.stdlib_problems(files)
+        self.assertIn("src/exif_strip/img.py imports 'PIL'", " ".join(reasons))
+        self.assertIn("tests/test_y.py imports 'pytest'", " ".join(reasons))
+        self.assertEqual(review.stdlib_problems(as_bytes(product(e))), [])
+
+    def test_the_suite_runs_isolated_without_site_packages(self) -> None:
+        argv = review.suite_argv("python", r"C:\py\python.exe")
+        self.assertEqual(argv[:3], [r"C:\py\python.exe", "-I", "-S"])
+        with self.assertRaises(ValueError):
+            review.suite_argv("javascript", "x")
+
+    @unittest.skipUnless(sys.platform == "win32", "job objects are Windows")
+    def test_an_installed_package_is_not_importable_in_our_run(self) -> None:
+        # pip itself is in this interpreter's site-packages: a product may not reach it
+        e = dict(backlog.SEED[0])
+        probe = {"tests/test_site.py": "import importlib.util, unittest\n\n\n"
+                                       "class S(unittest.TestCase):\n"
+                                       "    def test_no_site(self):\n"
+                                       "        self.assertIsNone(importlib.util.find_spec('pip'))\n"}
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        setup = FakeSetup(Path(tmp.name))
+        run = review.run_tests(as_bytes(product(e, extra=probe)), "python", setup=setup,
+                               timeout=120)
+        self.assertTrue(run.passed, run.tail)
+        self.assertEqual(setup.reaps, 2)                # before and after
+
+    def test_javascript_is_not_in_the_backlog_until_node_is_set_up(self) -> None:
+        entry = dict(backlog.SEED[0], language="javascript")
+        self.assertIn("language", " ".join(backlog.entry_problems(entry)))
 
 
 if __name__ == "__main__":

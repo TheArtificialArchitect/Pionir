@@ -78,8 +78,6 @@ JS_NET = re.compile(r"""(?x)
   | \bfetch\s*\( | \bXMLHttpRequest\b | \bWebSocket\b | \bsendBeacon\b""")
 _INTERNAL = re.compile(r"(?i)(?<![a-z0-9])(" + "|".join(INTERNAL_NAMES) + r")(?![a-z0-9])")
 _RAN = re.compile(r"(?m)^Ran (\d+) tests? in ")
-_JS_PASS = re.compile(r"(?m)^(?:#|ℹ)\s*pass\s+(\d+)")
-_JS_FAIL = re.compile(r"(?m)^(?:#|ℹ)\s*fail\s+(\d+)")
 
 
 def is_text(rel: str) -> bool:
@@ -109,10 +107,20 @@ class SuiteRun:
     timed_out: bool = False
 
 
+# ``python -I -S``: isolated (no PYTHON* variables, no user site, no current folder on the
+# path) and no site-packages - so "standard library only" is what actually runs, whatever the
+# interpreter has installed. Only the product's own src/ is put on the path.
+SUITE_RUNNER = ("import sys, unittest; sys.path.insert(0, 'src'); "
+                "p = unittest.main(module=None, argv=['unittest', 'discover', '-s', 'tests'], "
+                "exit=False); sys.exit(0 if p.result.wasSuccessful() else 1)")
+
+
 def suite_argv(language: str, python: str) -> list:
-    if language == "python":
-        return [python, "-m", "unittest", "discover", "-s", "tests"]
-    return ["node", "--test"]
+    if language != "python":
+        # JavaScript products are not built until node.exe is set up for the sandbox user
+        # (its absolute path, its firewall rule): backlog.LANGUAGES is Python only
+        raise ValueError(f"no contained test runner for {language!r}")
+    return [python, "-I", "-S", "-c", SUITE_RUNNER]
 
 
 def run_tests(files: dict, language: str, *, setup, timeout: float = TEST_TIMEOUT,
@@ -126,22 +134,28 @@ def run_tests(files: dict, language: str, *, setup, timeout: float = TEST_TIMEOU
     from pionir import build_sandbox as bs
 
     argv = suite_argv(language, str(setup.python))
-    shown = " ".join(["python" if a == str(setup.python) else a for a in argv])
+    shown = "python -I -S -m unittest discover -s tests (no site-packages)"
     work = Path(setup.runs_dir) / f"run-{secrets.token_hex(6)}"
     try:
         work.mkdir(parents=True)
         product = work / "product"
         write_tree(files, product)
         system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
-        env = bs.minimal_env(work=work / "env", path_dirs=[setup.python_dir, system32],
-                             extra={"PYTHONPATH": "src"})
+        env = bs.minimal_env(work=work / "env", path_dirs=[setup.python_dir, system32])
         limits = bs.JobLimits(active_processes=8, job_memory_mb=2048,
                               cpu_seconds=max(30.0, timeout))
         try:
+            setup.reap()                    # nothing of the sandbox user's runs before
             done = bs.run(argv, cwd=product, env=env, out_dir=work / "out", timeout=timeout,
-                          limits=limits, logon=setup.logon(), spawner=spawner)
+                          limits=limits, logon=setup.logon(), spawner=spawner,
+                          sid=getattr(setup, "sid", None))
         except (bs.SandboxError, OSError) as exc:
             return SuiteRun(False, 0, shown, f"the tests could not start contained ({exc})")
+        finally:
+            try:
+                setup.reap()                # ... and nothing it started survives it
+            except (bs.SandboxError, OSError):
+                pass                        # the next start refuses while any survives
     finally:
         shutil.rmtree(work, ignore_errors=True)
     if done.timed_out:
@@ -149,14 +163,9 @@ def run_tests(files: dict, language: str, *, setup, timeout: float = TEST_TIMEOU
                                          "(every process they started was killed)",
                         timed_out=True)
     out = f"{done.stdout}\n{done.stderr}"
-    if language == "python":
-        m = _RAN.search(out)
-        ran = int(m.group(1)) if m else 0
-        ok = done.returncode == 0 and bool(re.search(r"(?m)^OK\b", out))
-    else:
-        m, f = _JS_PASS.search(out), _JS_FAIL.search(out)
-        ran = int(m.group(1)) if m else 0
-        ok = done.returncode == 0 and (f is None or int(f.group(1)) == 0)
+    m = _RAN.search(out)
+    ran = int(m.group(1)) if m else 0
+    ok = done.returncode == 0 and bool(re.search(r"(?m)^OK\b", out))
     return SuiteRun(ok, ran, shown, out.strip()[-1500:])
 
 
@@ -191,6 +200,45 @@ def _py_network(rel: str, text: str) -> list:
                 and NET_STRINGS.search(node.value):
             found.add(f"a command-line network tool ({NET_STRINGS.search(node.value).group(0)})")
     return [f"{rel} reaches the network: {what}" for what in sorted(found)]
+
+
+def _own_modules(files: dict) -> set:
+    """The product's own top-level modules and packages (src/..., tests/..., the root)."""
+    own = {"tests", "src"}
+    for rel in files:
+        parts = rel.split("/")
+        if parts[0] == "src" and len(parts) > 1:
+            own.add(parts[1].removesuffix(".py"))
+        elif parts[0] in ("tests", "test") and len(parts) > 1:
+            own.add(parts[1].removesuffix(".py"))
+        elif len(parts) == 1 and rel.endswith(".py"):
+            own.add(rel.removesuffix(".py"))
+    return own
+
+
+def stdlib_problems(files: dict) -> list:
+    """Every import in the product that is neither the standard library nor its own code -
+    it could only come from something installed, which the product may not rely on."""
+    import sys
+    std = set(sys.stdlib_module_names) | {"__future__"}
+    own = _own_modules(files)
+    reasons = []
+    for rel, data in sorted(files.items()):
+        if not rel.endswith(".py"):
+            continue
+        try:
+            tree = ast.parse(data.decode("utf-8", "replace"), filename=rel)
+        except SyntaxError:
+            continue                        # reported by network_problems
+        found = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                found.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+                found.add(node.module.split(".")[0])
+        for name in sorted(found - std - own):
+            reasons.append(f"{rel} imports {name!r}, which is not in the standard library")
+    return reasons
 
 
 def network_problems(files: dict) -> list:
@@ -249,6 +297,8 @@ def static_problems(entry: dict, files: dict, tree_problems: list, guard, *,
         reasons.append(f"there are no tests in {suite_dir}")
     # every file that is RUN counts, not only what ships (a test or a dotfile runs too)
     reasons += network_problems(files)
+    if entry["language"] == "python":
+        reasons += stdlib_problems(files)
     reasons += leak_problems(files, guard)
     return reasons
 

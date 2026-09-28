@@ -53,17 +53,22 @@ class SetupRecordTests(_Case):
         src = self.root / "daedalus"
         (src / "daedalus").mkdir(parents=True, exist_ok=True)
         (src / "daedalus" / "server.py").write_text("", encoding="utf-8")
-        doc = {"user": bs.USER, "sid": SID, "python": sys.executable,
+        python = self.root / "python" / "python.exe"      # the copy in the install folder
+        python.parent.mkdir(exist_ok=True)
+        python.write_bytes(b"MZ")
+        doc = {"version": 2, "user": bs.USER, "sid": SID, "python": str(python),
                "sandbox_root": str(sandbox), "daedalus_src": str(src),
                "credential": str(self.root / "c.cred")}
         doc.update(over)
-        path = self.root / f"setup-{time.monotonic_ns()}.json"     # one record per case
+        self.n = getattr(self, "n", 0) + 1
+        path = self.root / f"setup-{self.n}.json"                   # one record per case
         path.write_text(json.dumps(doc), encoding="utf-8")
         return path
 
-    def load(self, record, *, sid=SID, read=lambda _p: "x" * 20, root=None):
+    def load(self, record, *, sid=SID, read=lambda _p: "x" * 20, root=None, low=None):
         return bs.load_setup(root or self.root / "daedalus-work", record=record,
-                             lookup=lambda _name: sid, read=read)
+                             lookup=lambda _name: sid, read=read,
+                             low=low or (lambda _path: True))
 
     def test_a_complete_setup_is_ready(self) -> None:
         setup, why = self.load(self.record())
@@ -84,6 +89,14 @@ class SetupRecordTests(_Case):
             "no daedalus": dict(record=self.record(daedalus_src=str(self.root / "x"))),
             "bad credential": dict(record=self.record(), read=bad_cred),
             "not our user": dict(record=self.record(user="someone")),
+            "an older setup": dict(record=self.record(version=1)),
+            "interpreter outside the install": dict(record=self.record(python=sys.executable)),
+            "daedalus left in C:\\src": dict(
+                record=self.record(daedalus_src=r"C:\src\Tech-Support\daedalus")),
+            "interpreter not Low": dict(record=self.record(),
+                                        low=lambda path: "python" not in str(path)),
+            "sandbox not Low": dict(record=self.record(),
+                                    low=lambda path: "daedalus-work" not in str(path)),
         }
         for name, kw in cases.items():
             setup, why = self.load(**kw)
@@ -92,6 +105,8 @@ class SetupRecordTests(_Case):
         # and each case fails for ITS reason, not another's
         self.assertIn("account", self.load(record=self.record(), sid=None)[1])
         self.assertIn("credential", self.load(record=self.record(), read=bad_cred)[1])
+        self.assertIn("Low", self.load(record=self.record(),
+                                        low=lambda path: "python" not in str(path))[1])
 
     def test_the_credential_is_dpapi_for_this_account(self) -> None:
         cred = self.root / "c.cred"
@@ -166,6 +181,15 @@ class JobObjectTests(_Case):
         time.sleep(0.5)
         self.assertFalse(pid_alive(proc.pid))
 
+    def test_close_kills_the_tree_before_it_returns(self) -> None:
+        proc = bs.spawn([sys.executable, "-c", "import time; time.sleep(120)"], cwd=self.root,
+                        env=self.env(), stdout=self.root / "o3.txt",
+                        stderr=self.root / "e3.txt", limits=bs.JobLimits(), logon=None)
+        started = time.monotonic()
+        proc.close()
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertFalse(pid_alive(proc.pid))
+
     def test_letting_go_of_the_job_alone_kills_everything_in_it(self) -> None:
         # kill-on-close: if Pionir dies (its handles close), nothing it started survives
         proc = bs.spawn([sys.executable, "-c", "import time; time.sleep(120)"], cwd=self.root,
@@ -204,6 +228,21 @@ class FakeProc:
         self.closed = True
 
 
+class FakeGate:
+    url = "http://127.0.0.1:8773"
+
+    def __init__(self) -> None:
+        self.running = False
+        self.starts = 0
+
+    def start(self) -> None:
+        self.running = True
+        self.starts += 1
+
+    def stop(self) -> None:
+        self.running = False
+
+
 class FakeResponse(io.BytesIO):
     def __enter__(self):
         return self
@@ -215,16 +254,27 @@ class FakeResponse(io.BytesIO):
 class BuildDaedalusTests(_Case):
     def setup(self):
         sandbox = self.root / "daedalus-work"
+        sid = SID
         sandbox.mkdir(exist_ok=True)
         python = Path(sys.executable)
-        return SimpleNamespace(user=bs.USER, sandbox_root=sandbox, python=python,
+        return SimpleNamespace(user=bs.USER, sid=sid, sandbox_root=sandbox, python=python,
                                python_dir=python.parent, daedalus_src=self.root / "daedalus",
                                state_dir=sandbox / bs.STATE_DIR_NAME,
                                runs_dir=sandbox / bs.RUNS_DIR_NAME,
                                logon=lambda: ("pionir-builds", ".", "pw"))
 
-    def launcher(self, *, health=None, before=False, accepts_wrong=False, wrong_ok=False):
+    def launcher(self, *, health=None, before=False, accepts_wrong=False, wrong_ok=False,
+                 strays=None):
         setup = self.setup()
+        self.reaps = []
+
+        def reap():
+            self.reaps.append(time.monotonic())
+            if strays:
+                raise bs.SandboxError(f"processes of pionir-builds survived ({strays})")
+
+        setup.reap = reap
+        self.gate = FakeGate()
         state = {"up": before}
         spawned: list = []
         health = health or {"ok": True, "policy": "full",
@@ -249,7 +299,8 @@ class BuildDaedalusTests(_Case):
             return FakeProc()
 
         launcher = bs.BuildDaedalus(setup, spawner=spawner, opener=opener,
-                                    sleep=lambda _s: None, git_dir=Path(r"C:\Git\cmd"))
+                                    sleep=lambda _s: None, git_dir=Path(r"C:\Git\cmd"),
+                                    gate=self.gate)
         return launcher, spawned
 
     def test_it_runs_as_the_sandbox_user_confined_to_the_sandbox(self) -> None:
@@ -281,6 +332,26 @@ class BuildDaedalusTests(_Case):
         finally:
             launcher.stop()
         self.assertIsNone(launcher.proc)
+
+    def test_it_reaches_ollama_only_through_the_gate_and_reaps_around_itself(self) -> None:
+        launcher, spawned = self.launcher()
+        launcher.start(not_after=time.time() + 3600)
+        env = spawned[0]["env"]
+        self.assertEqual(env["OLLAMA_HOST"], "http://127.0.0.1:8773")
+        self.assertTrue(self.gate.running)
+        self.assertEqual(len(self.reaps), 1)                  # before it started
+        self.assertEqual(spawned[0]["sid"], launcher.setup.sid)
+        self.assertEqual(env["GIT_CEILING_DIRECTORIES"], str(launcher.setup.sandbox_root))
+        launcher.stop()
+        self.assertFalse(self.gate.running)
+        self.assertEqual(len(self.reaps), 2)                  # and after it was killed
+
+    def test_nothing_starts_while_a_stray_survives(self) -> None:
+        launcher, spawned = self.launcher(strays="evil.exe")
+        with self.assertRaises(bs.SandboxError):
+            launcher.start(not_after=time.time() + 3600)
+        self.assertEqual(spawned, [])
+        self.assertFalse(self.gate.running)
 
     def test_it_is_killed_when_its_window_ends_whatever_happens(self) -> None:
         launcher, spawned = self.launcher()
@@ -354,6 +425,16 @@ class SandboxGitTests(_Case):
         with self.assertRaises(sandbox_git.GitError):
             sandbox_git.verify(repo)
 
+    def test_verification_names_config_read_from_anywhere_else(self) -> None:
+        repo = self.repo()
+        (repo / ".git" / "other").write_text("[user]\n\tname = x\n", encoding="utf-8")
+        sandbox_git.prepare(repo)
+        with (repo / ".git" / "config").open("a", encoding="utf-8") as f:
+            f.write("[include]\n\tpath = other\n")
+        with self.assertRaises(sandbox_git.GitError) as caught:
+            sandbox_git.verify(repo)
+        self.assertIn("reads config from", str(caught.exception))
+
     def test_our_git_never_runs_the_repos_fsmonitor_or_hooks(self) -> None:
         repo = self.repo()
         flag = self.root / "RAN"
@@ -373,10 +454,161 @@ class SandboxGitTests(_Case):
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         sandbox_git.run_git(["status"], self.root, run=run)
-        self.assertEqual(seen["argv"][1:5], list(sandbox_git.SAFE_ARGS))
+        self.assertEqual(seen["argv"][1:1 + len(sandbox_git.SAFE_ARGS)], list(sandbox_git.SAFE_ARGS))
+        self.assertIn(f"core.attributesFile={os.devnull}", seen["argv"])
         self.assertEqual(seen["env"]["GIT_CONFIG_NOSYSTEM"], "1")
         self.assertEqual(seen["env"]["GIT_CONFIG_GLOBAL"], os.devnull)
         self.assertNotIn("USERPROFILE", seen["env"])
+
+
+@unittest.skipUnless(WINDOWS, "desktops are Windows")
+class DesktopTests(_Case):
+    def test_every_process_gets_every_ui_restriction_and_a_private_desktop(self) -> None:
+        env = bs.minimal_env(work=self.root / "env",
+                             path_dirs=[Path(sys.executable).parent, r"C:\Windows\System32"])
+        proc = bs.spawn([sys.executable, "-c", "import time; time.sleep(5)"], cwd=self.root,
+                        env=env, stdout=self.root / "o.txt", stderr=self.root / "e.txt",
+                        limits=bs.JobLimits(), logon=None)
+        try:
+            self.assertEqual(bs.job_ui_restrictions(proc), bs.JOB_OBJECT_UILIMIT_ALL)
+            self.assertIn("PionirBuilds-", proc._desktop.path)
+            self.assertFalse(proc._desktop.path.lower().endswith("\\default"))
+        finally:
+            proc.close()
+
+    def test_the_process_really_runs_on_the_private_desktop(self) -> None:
+        env = bs.minimal_env(work=self.root / "env",
+                             path_dirs=[Path(sys.executable).parent, r"C:\Windows\System32"])
+        code = ("import ctypes\nfrom ctypes import wintypes as w\n"
+                "u = ctypes.WinDLL('user32'); k = ctypes.WinDLL('kernel32')\n"
+                "u.GetThreadDesktop.restype = w.HANDLE\n"
+                "u.GetUserObjectInformationW.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p,"
+                " w.DWORD, ctypes.POINTER(w.DWORD)]\n"
+                "d = u.GetThreadDesktop(k.GetCurrentThreadId())\n"
+                "buf = ctypes.create_unicode_buffer(256); n = w.DWORD()\n"
+                "u.GetUserObjectInformationW(d, 2, buf, 512, ctypes.byref(n))\n"
+                "print('DESKTOP', buf.value)\n")
+        out = bs.run([sys.executable, "-c", code], cwd=self.root, env=env,
+                     out_dir=self.root / "desk", timeout=30, limits=bs.JobLimits(), logon=None)
+        name = out.stdout.split("DESKTOP", 1)[1].strip()
+        self.assertTrue(name.startswith("PionirBuilds-"), name)
+
+    def test_a_relative_program_is_refused(self) -> None:
+        with self.assertRaises(bs.SandboxError):
+            bs.spawn(["python", "-c", "1"], cwd=self.root, env={}, stdout=self.root / "o",
+                     stderr=self.root / "e", limits=bs.JobLimits(), logon=None)
+
+
+class ReapTests(_Case):
+    def setup(self, *, listing: str, code: int = 0):
+        calls = []
+
+        def runner(argv, **kw):
+            calls.append((argv, kw))
+            if argv[0].endswith("tasklist.exe"):
+                return bs.RunResult(code, False, listing, "")
+            return bs.RunResult(0, False, "", "")
+
+        setup = SimpleNamespace(user=bs.USER, sid=SID, runs_dir=self.root / ".runs",
+                                logon=lambda: ("pionir-builds", ".", "pw"))
+        return setup, runner, calls
+
+    def test_everything_of_the_user_is_killed_as_that_user(self) -> None:
+        setup, runner, calls = self.setup(
+            listing='"tasklist.exe","42","Console","2","8,000 K"\n'
+                    '"conhost.exe","43","Console","2","6,000 K"\n')
+        self.assertEqual(bs.reap(setup, runner=runner), [])
+        kill, listed = calls
+        self.assertTrue(kill[0][0].lower().endswith("taskkill.exe"))
+        self.assertIn("USERNAME eq pionir-builds", kill[0])
+        self.assertIn("/F", kill[0])
+        self.assertEqual(kill[1]["logon"], ("pionir-builds", ".", "pw"))
+        self.assertEqual(listed[1]["logon"], ("pionir-builds", ".", "pw"))
+
+    def test_a_survivor_is_reported_and_stops_everything(self) -> None:
+        for listing, left in (
+                ('"evil.exe","7","Console","2","1 K"\n"tasklist.exe","8","C","2","1 K"', ["evil.exe"]),
+                ('"conhost.exe","7","C","2","1 K"\n"conhost.exe","9","C","2","1 K"', ["conhost.exe"]),
+                ('"taskkill.exe","7","C","2","1 K"', ["taskkill.exe"])):
+            setup, runner, _calls = self.setup(listing=listing)
+            self.assertEqual(bs.reap(setup, runner=runner), left)
+            with self.assertRaises(bs.SandboxError):
+                bs.ensure_no_strays(setup, runner=runner)
+
+    def test_a_check_that_fails_is_not_clean(self) -> None:
+        setup, runner, _calls = self.setup(listing="", code=1)
+        self.assertTrue(bs.reap(setup, runner=runner))
+
+
+class OllamaGateTests(_Case):
+    """The gate in front of Ollama: only the build model's chat and the model listing."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        self.seen = []
+        seen = self.seen
+
+        class Upstream(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _answer(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                seen.append((self.command, self.path, self.rfile.read(n)))
+                data = b'{"ok": true}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            do_GET = do_POST = do_DELETE = _answer
+
+        self.up = ThreadingHTTPServer(("127.0.0.1", 0), Upstream)
+        import threading
+        threading.Thread(target=self.up.serve_forever, daemon=True).start()
+        self.gate = bs.OllamaGate("qwen3-coder:30b",
+                                  upstream=f"http://127.0.0.1:{self.up.server_port}", port=0)
+        self.gate.port = 0
+        self.gate.start()
+        self.gate.port = self.gate._server.server_port
+
+    def tearDown(self) -> None:
+        self.gate.stop()
+        self.up.shutdown()
+        self.up.server_close()
+        super().tearDown()
+
+    def call(self, method, path, body=None):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", self.gate.port, timeout=10)
+        data = json.dumps(body).encode() if body is not None else None
+        conn.request(method, path, body=data, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        out = resp.status, resp.read()
+        conn.close()
+        return out
+
+    def test_the_build_models_chat_and_the_listing_pass(self) -> None:
+        self.assertEqual(self.call("POST", "/api/chat", {"model": "qwen3-coder:30b",
+                                                         "messages": []})[0], 200)
+        self.assertEqual(self.call("POST", "/api/show", {"name": "qwen3-coder:30b"})[0], 200)
+        self.assertEqual(self.call("GET", "/api/tags")[0], 200)
+        self.assertEqual([m for m, _p, _b in self.seen], ["POST", "POST", "GET"])
+
+    def test_everything_else_is_refused_and_never_reaches_ollama(self) -> None:
+        for method, path, body in (
+                ("POST", "/api/pull", {"model": "qwen3-coder:30b"}),
+                ("DELETE", "/api/delete", {"model": "gemma3:12b"}),
+                ("POST", "/api/create", {"model": "qwen3-coder:30b"}),
+                ("POST", "/api/copy", {"source": "a", "destination": "b"}),
+                ("POST", "/api/push", {"model": "qwen3-coder:30b"}),
+                ("POST", "/api/chat", {"model": "gemma3:12b", "messages": []}),
+                ("POST", "/api/generate", {"prompt": "no model named"}),
+                ("GET", "/api/blobs/sha256:00", None)):
+            status, _ = self.call(method, path, body)
+            self.assertEqual(status, 403, path)
+        self.assertEqual(self.seen, [])
 
 
 if __name__ == "__main__":

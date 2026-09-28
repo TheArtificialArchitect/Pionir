@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pionir.adapters.daedalus import SANDBOX_MARKER, sandbox_repo_problem
-from pionir.sandbox_git import GitError, run_git, sanitize
+from pionir.sandbox_git import GitError, is_reparse, prepare, run_git, sanitize
 
 from .backlog import listing
 
@@ -42,11 +42,15 @@ class SandboxError(RuntimeError):
 def git(args: list, cwd, *, run=subprocess.run, timeout: float = GIT_TIMEOUT,
         text: bool = True):
     """One git command in ``cwd``; its stdout, or SandboxError. Never a shell, always the
-    safe way (pionir/sandbox_git.py: no hooks, no fsmonitor, no system or global config,
-    a minimal environment): the repo is written by generated code."""
+    safe way (pionir/sandbox_git.py: no hooks, no fsmonitor, no attributes, no system or
+    global config, a minimal environment) - and, once the repo exists, only after its
+    ``.git`` has been rewritten to canonical content (``prepare``): the repo is written by
+    generated code, and git runs here as the OWNER."""
     try:
+        if (Path(cwd) / ".git").exists() or is_reparse(Path(cwd) / ".git"):
+            prepare(cwd)
         return run_git(args, cwd, run=run, timeout=timeout, text=text)
-    except GitError as exc:
+    except (GitError, OSError) as exc:
         raise SandboxError(str(exc)) from exc
 
 
@@ -194,13 +198,13 @@ def create(root, entry: dict, *, year: int, created_at: float, run=subprocess.ru
     root = Path(root)
     # the root first, before anything is made: it exists (the setup made it, with its
     # ACL), it is a real folder and not a link or junction to somewhere else
-    if root.is_symlink() or _is_junction(root) or not root.is_dir():
+    if is_reparse(root) or not root.is_dir():
         raise SandboxError(f"the sandbox workspace {root} is missing or is a link; run "
                            r"tools\setup-build-sandbox.ps1")
     if os.path.normcase(os.path.realpath(root)) != os.path.normcase(os.path.abspath(root)):
         raise SandboxError(f"the sandbox workspace {root} resolves somewhere else")
     repo = root / entry["slug"]
-    if repo.exists() or repo.is_symlink():
+    if repo.exists() or is_reparse(repo):
         raise SandboxError(f"{repo} already exists; a sandbox repo is always fresh")
     repo.mkdir()
     git(["init", "-q", "-b", "main"], repo, run=run)
@@ -225,20 +229,34 @@ def create(root, entry: dict, *, year: int, created_at: float, run=subprocess.ru
 
 
 def head(repo, *, run=subprocess.run) -> str:
-    return str(git(["rev-parse", "HEAD"], repo, run=run)).strip()
+    out = str(git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], repo, run=run)).strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", out):
+        raise SandboxError("HEAD is not a commit")
+    return out
 
 
-def fast_forward(repo, commit: str, *, run=subprocess.run) -> None:
-    """Bring the sandbox's own branch up to a commit Daedalus left elsewhere (its fallback
-    when it finds the tree dirty)."""
+def built_commit(repo, base: str, commit: str, *, run=subprocess.run) -> str:
+    """The full id of a commit Daedalus reports (on a branch of its own, when it found the
+    tree dirty) - only if it exists and descends from the seed. NEVER checked out or merged
+    on the owner's side: its files are read from its objects (``export``)."""
     if not re.fullmatch(r"[0-9a-f]{7,64}", commit or ""):
         raise SandboxError("not a commit id")
-    git(["merge", "-q", "--ff-only", commit], repo, run=run)
+    full = str(git(["rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"], repo,
+                   run=run)).strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", full):
+        raise SandboxError(f"{commit} is not a commit in the sandbox")
+    try:
+        git(["merge-base", "--is-ancestor", base, full], repo, run=run)
+    except SandboxError as exc:
+        raise SandboxError(f"{commit} does not descend from the seed commit") from exc
+    return full
 
 
-def changed_files(repo, base: str, *, run=subprocess.run) -> list:
-    """The files changed since the seed commit, as git reports them."""
-    out = git(["diff", "--name-status", base, "HEAD"], repo, run=run)
+def changed_files(repo, base: str, rev: str = "HEAD", *, run=subprocess.run) -> list:
+    """The files changed since the seed commit, read from the two trees (plumbing: no
+    diff driver, no textconv, no external diff)."""
+    out = git(["diff-tree", "-r", "--no-renames", "--no-ext-diff", "--no-textconv",
+               "--name-status", base, rev], repo, run=run)
     return [" ".join(line.split()) for line in str(out).splitlines() if line.strip()][:200]
 
 
@@ -250,13 +268,6 @@ class Tree:
 
 _RESERVED = re.compile(r"(?i)^(?:con|prn|aux|nul|com[0-9\u00b9\u00b2\u00b3]|"
                        r"lpt[0-9\u00b9\u00b2\u00b3]|conin\$|conout\$)(?:\..*)?$")
-
-
-def _is_junction(path: Path) -> bool:
-    try:
-        return path.is_junction()
-    except (AttributeError, OSError):
-        return False
 
 
 def _path_problem(rel: str) -> str | None:
@@ -272,11 +283,12 @@ def _path_problem(rel: str) -> str | None:
     return None
 
 
-def export(repo, *, run=subprocess.run) -> Tree:
-    """Every file committed at HEAD, read from git (never the working tree): a link, a
-    submodule, an odd path or an oversized tree is a problem, reported and not read."""
+def export(repo, rev: str = "HEAD", *, run=subprocess.run) -> Tree:
+    """Every file committed at ``rev``, read from its objects (never a checkout, never the
+    working tree, no filter or smudge ever runs): a link, a submodule, an odd path or an
+    oversized tree is a problem, reported and not read."""
     tree = Tree()
-    raw = git(["ls-tree", "-r", "-z", "--full-tree", "HEAD"], repo, run=run, text=False)
+    raw = git(["ls-tree", "-r", "-z", "--full-tree", rev], repo, run=run, text=False)
     total = 0
     folded: dict = {}
     for item in bytes(raw).split(b"\x00"):

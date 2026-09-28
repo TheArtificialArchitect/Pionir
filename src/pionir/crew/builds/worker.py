@@ -335,8 +335,9 @@ class BuildsWorker(_Base):
             head = sandbox.head(p["repo"], **self._git())
             commit = str(output.get("commit") or "")
             if head == p["base"] and commit:
-                sandbox.fast_forward(p["repo"], commit, **self._git())
-                head = sandbox.head(p["repo"], **self._git())
+                # Daedalus left it on a branch of its own: take that commit by id. The
+                # owner's side never checks out or merges a build repo.
+                head = sandbox.built_commit(p["repo"], p["base"], commit, **self._git())
         except sandbox.SandboxError as exc:
             a.update(outcome="failed", why=_clip(exc, 300))
             self._failed_attempt(ctx, rec, p, f"its commit could not be found in the sandbox "
@@ -393,7 +394,7 @@ class BuildsWorker(_Base):
             return
         entry = p["entry"]
         try:
-            tree = sandbox.export(p["repo"], **self._git())
+            tree = sandbox.export(p["repo"], p["head"], **self._git())
         except sandbox.SandboxError as exc:
             self._shelve(ctx, rec, p, f"its sandbox repo could not be read ({_clip(exc, 200)})",
                          events)
@@ -470,7 +471,7 @@ class BuildsWorker(_Base):
 
     def _changed(self, p: dict) -> list:
         try:
-            return sandbox.changed_files(p["repo"], p["base"], **self._git())
+            return sandbox.changed_files(p["repo"], p["base"], p["head"], **self._git())
         except sandbox.SandboxError:
             return []
 

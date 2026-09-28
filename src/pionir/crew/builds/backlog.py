@@ -27,7 +27,9 @@ from ..blog import _clip
 
 BACKLOG_FILE = "backlog.json"
 MIN_PRICE, MAX_PRICE = 900, 1900          # the owner's $9-19 product line
-LANGUAGES = ("python", "javascript")
+# Python only: a JavaScript product needs node.exe set up for the sandbox user (an absolute
+# path in the setup record, its own firewall rule) before its tests can run contained.
+LANGUAGES = ("python",)
 MAX_ENTRIES = 40
 SLUG = re.compile(r"[a-z0-9][a-z0-9-]{2,39}")
 _PACKAGE = re.compile(r"[a-z][a-z0-9_]{1,39}")

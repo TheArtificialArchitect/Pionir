@@ -64,6 +64,7 @@ from pionir.contracts import (
     TaskResult,
 )
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
+from pionir.sandbox_git import is_reparse
 
 SOLVE = "coding.daedalus_solve"
 BUILD = "coding.daedalus_build"
@@ -138,7 +139,7 @@ def sandbox_repo_problem(repo: Any, root: str | os.PathLike) -> str | None:
         root_real = os.path.realpath(root_abs, strict=True)
     except OSError:
         return f"the sandbox workspace {root_abs} does not exist"
-    if os.path.normcase(root_real) != os.path.normcase(root_abs):
+    if is_reparse(root_abs) or os.path.normcase(root_real) != os.path.normcase(root_abs):
         return f"the sandbox workspace {root_abs} is itself a link or junction"
     repo_abs = os.path.abspath(raw)
     parent, name = os.path.split(repo_abs)
@@ -148,11 +149,7 @@ def sandbox_repo_problem(repo: Any, root: str | os.PathLike) -> str | None:
     if not SANDBOX_SLUG.fullmatch(name):
         return f"{name[:60]!r} is not a sandbox repo's name (a slug: a-z, 0-9 and -)"
     path = Path(repo_abs)
-    try:
-        linked = path.is_symlink() or path.is_junction()
-    except (OSError, AttributeError):
-        linked = path.is_symlink()
-    if linked:
+    if is_reparse(path):
         return f"{repo_abs[:120]} is a link or junction"
     try:
         real = os.path.realpath(repo_abs, strict=True)
@@ -163,7 +160,7 @@ def sandbox_repo_problem(repo: Any, root: str | os.PathLike) -> str | None:
     if not path.is_dir():
         return f"{repo_abs[:120]} is not a folder"
     git = path / ".git"
-    if git.is_symlink() or not git.is_dir():
+    if is_reparse(git) or not git.is_dir():
         return (f"{repo_abs[:120]} has no .git folder of its own (a linked worktree or "
                 "not a repository)")
     if (git / "commondir").exists():
@@ -231,6 +228,27 @@ def _default_launcher(setup, settings: DaedalusSettings):
     return BuildDaedalus(setup, port=settings.build_port, model=settings.model_id)
 
 
+def owner_daedalus_open(base_url: str, *, opener=None) -> bool:
+    """True when the owner's Daedalus (:8771, reach: all of C:\\src, policy full) takes a
+    job-changing call WITHOUT a bearer token - then any local process, generated code
+    included, could land commits in a live repo, and no build may run. A POST with no
+    Authorization to a cancel route: 401 is the only locked answer; not answering at all is
+    "not running", which is not open."""
+    import urllib.error
+    import urllib.request
+    open_ = opener or urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+    req = urllib.request.Request(base_url.rstrip("/") + "/jobs/pionir-probe/cancel",
+                                 data=b"{}", method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with open_(req, timeout=5.0):
+            return True
+    except urllib.error.HTTPError as exc:
+        return exc.code != 401
+    except (urllib.error.URLError, OSError):
+        return False
+
+
 def _default_sanitize(repo: str) -> None:
     from pionir.sandbox_git import sanitize
     sanitize(repo)
@@ -251,6 +269,8 @@ class DaedalusAdapter:
         launcher: Callable[..., Any] | None = None,
         build_client: Callable[[str, str], Any] | None = None,
         sanitize: Callable[[str], None] | None = None,
+        owner_open: Callable[[], bool] | None = None,
+        auth_compat: Callable[[], bool] | None = None,
     ) -> None:
         self.settings = settings or DaedalusSettings()
         self._client = client or LoopbackJsonClient("Daedalus", self.settings)
@@ -262,6 +282,10 @@ class DaedalusAdapter:
         self._build_client = build_client or (lambda base, token: LoopbackJsonClient(
             "Build Daedalus", LoopbackHttpSettings(base_url=base, token=token)))
         self._sanitize = sanitize or _default_sanitize
+        self._owner_open = owner_open or (lambda: owner_daedalus_open(self.settings.base_url))
+        if auth_compat is None:
+            from pionir.auth import compat_from_environment as auth_compat
+        self._auth_compat = auth_compat
         self._lock = threading.RLock()
         self._running: dict[str, dict[str, Any]] = {}     # build_id -> {client, job, launcher}
         self._leftovers_checked = False
@@ -511,6 +535,17 @@ class DaedalusAdapter:
         setup, why = self._setup()
         if setup is None:
             return self._refused(task, why or "not configured", not_configured=True)
+        if self._auth_compat():
+            # a tokenless caller is still served: generated code on loopback could task
+            # Pionir itself. No build runs until every client sends its token.
+            return self._refused(task, "not configured: turn off auth compat "
+                                       "(PIONIR_AUTH_COMPAT=off) before any build runs",
+                                 not_configured=True)
+        if self._owner_open():
+            return self._refused(task, "not configured: the owner's Daedalus on "
+                                       f"{self.settings.base_url} takes jobs without a token - "
+                                       "restart it with pionir.ps1, which now gives it one "
+                                       "(DAEDALUS_TOKEN)", not_configured=True)
         repo = os.path.abspath(str(payload["repo"]).strip())
         try:
             self._sanitize(repo)

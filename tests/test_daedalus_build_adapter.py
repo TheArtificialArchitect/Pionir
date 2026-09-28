@@ -12,6 +12,7 @@ temporary folders.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -121,7 +122,7 @@ class _Case(unittest.TestCase):
         return self.root / slug
 
     def adapter(self, client, *, clock=None, wall=T0, launcher=None, configured=True,
-                sleep=None, **settings) -> DaedalusAdapter:
+                sleep=None, owner_open=False, compat=False, **settings) -> DaedalusAdapter:
         clock = clock or Clock()
         self.launcher = launcher or FakeLauncher()
         self.tokens: list = []
@@ -137,7 +138,8 @@ class _Case(unittest.TestCase):
                                setup=lambda: (object(), None) if configured else (
                                    None, r"not configured: run tools\setup-build-sandbox.ps1"),
                                launcher=lambda _setup: self.launcher,
-                               build_client=build_client)
+                               build_client=build_client,
+                               owner_open=lambda: owner_open, auth_compat=lambda: compat)
 
     def build(self, repo, **over) -> Task:
         payload = {"intent": "build the product in BRIEF.md", "repo": str(repo),
@@ -256,6 +258,31 @@ class SandboxRuleTests(_Case):
         subprocess.run(["git", "worktree", "add", "-q", str(wt)], cwd=repo, check=True,
                        capture_output=True)
         self.assertIn("no .git folder", sandbox_repo_problem(str(wt), str(self.root)))
+
+    def test_a_work_tree_redirect_is_refused(self) -> None:
+        repo = self.make_sandbox()
+        with (repo / ".git" / "config").open("a", encoding="utf-8") as f:
+            f.write("\tworktree = C:/src/Pionir\n")
+        self.assertIn("core.worktree", sandbox_repo_problem(str(repo), str(self.root)))
+
+    def test_a_path_that_would_expand_is_refused_for_that_reason(self) -> None:
+        for bad in ("~\\cron-explain", str(self.root) + "\\%USERNAME%",
+                    str(self.root) + "\\$x"):
+            self.assertIn("expand", sandbox_repo_problem(bad, str(self.root)), bad)
+
+    def test_a_repo_that_resolves_elsewhere_is_refused_even_past_the_link_check(self) -> None:
+        # defence in depth: were a link to slip past the reparse check, the path must still
+        # resolve to itself
+        from unittest import mock
+        if os.name != "nt":
+            self.skipTest("junctions are Windows")
+        import _winapi
+        live = self.tmp / "live-repo"
+        subprocess.run(["git", "init", "-q", str(live)], check=True)
+        _winapi.CreateJunction(str(live), str(self.root / "linked-repo"))
+        with mock.patch("pionir.adapters.daedalus.is_reparse", return_value=False):
+            problem = sandbox_repo_problem(str(self.root / "linked-repo"), str(self.root))
+        self.assertIn("resolves somewhere else", problem)
 
     def test_a_marker_for_another_repo_is_refused(self) -> None:
         repo = self.make_sandbox()
@@ -438,6 +465,40 @@ class ContainmentTests(_Case):
         self.assertIn("setup-build-sandbox", out["refused"])
         self.assertEqual(self.launcher.starts, [])
         self.assertEqual(client.calls, [])
+
+    def test_no_build_while_the_owners_daedalus_takes_tokenless_jobs(self) -> None:
+        repo = self.make_sandbox()
+        client = FakeDaedalus()
+        out = self.adapter(client, owner_open=True).execute(self.build(repo)).output
+        self.assertTrue(out["not_configured"])
+        self.assertIn("without a token", out["refused"])
+        self.assertEqual(self.launcher.starts, [])
+
+    def test_no_build_while_auth_compat_is_on(self) -> None:
+        repo = self.make_sandbox()
+        out = self.adapter(FakeDaedalus(), compat=True).execute(self.build(repo)).output
+        self.assertTrue(out["not_configured"])
+        self.assertIn("PIONIR_AUTH_COMPAT=off", out["refused"])
+        self.assertEqual(self.launcher.starts, [])
+
+    def test_the_owners_daedalus_is_open_unless_it_says_401(self) -> None:
+        import urllib.error
+        from pionir.adapters.daedalus import owner_daedalus_open
+
+        def answers(code):
+            def opener(req, timeout=None):
+                self.assertNotIn("Authorization", req.headers)
+                if code is None:
+                    raise urllib.error.URLError("refused")
+                if code == 200:
+                    return io.BytesIO(b"{}")
+                raise urllib.error.HTTPError(req.full_url, code, "x", {}, None)
+            return opener
+
+        self.assertFalse(owner_daedalus_open("http://127.0.0.1:8771", opener=answers(401)))
+        self.assertFalse(owner_daedalus_open("http://127.0.0.1:8771", opener=answers(None)))
+        for code in (404, 200, 422, 500):
+            self.assertTrue(owner_daedalus_open("http://127.0.0.1:8771", opener=answers(code)))
 
     def test_the_build_uses_its_own_daedalus_and_token_then_kills_it(self) -> None:
         repo = self.make_sandbox()
