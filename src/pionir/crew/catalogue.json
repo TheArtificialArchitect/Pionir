@@ -168,7 +168,7 @@
                       "build.not_set_up": 2, "build.checks_unavailable": 2,
                       "build.backlog_unreadable": 2},
       "workers": [
-        {"name": "daedalus", "impl": "daedalus_builds", "kind": "build", "cadence_seconds": 300,
+        {"name": "daedalus", "impl": "daedalus_builds", "uses": ["builds.card", "builds.inbox", "coding.daedalus_build", "coding.daedalus_build_cancel"], "kind": "build", "cadence_seconds": 300,
          "provider": "claude", "entities": ["Daedalus", "Claude"],
          "note": "one small developer tool a night, built by Daedalus in a fresh sandbox repo inside the overnight GPU window, reviewed by Claude on the daily cap, and staged for the product shelf (still the owner's approval before any sale)",
          "params": {"window": "01:00-07:00", "budget_minutes": 45, "max_attempts": 2, "ssh_dir": "~/.ssh"}}
