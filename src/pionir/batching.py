@@ -38,13 +38,14 @@ import os
 import re
 import threading
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
 from . import atomic
+from .contracts import RiskLevel
 
 _log = logging.getLogger(__name__)
 
@@ -79,17 +80,32 @@ BATCHED_GRANT = "approval.batched"
 NEW_ONLY_GRANT = "approval.new_only"
 
 
-def batch_refusal(capability: Any, payload: Mapping[str, Any] | None,
-                  context: Mapping[str, Any] | None = None) -> str | None:
-    """None if this parked action may wait for the daily digest; otherwise why it must
-    be its own card at once. Fails closed: anything unknown or odd is refused.
+def every_call_approval(capability: Any) -> bool:
+    """Whether this capability parks for the owner's yes on EVERY call, whatever the
+    caller holds: spending money or anything declared ``requires_approval`` (publishing,
+    client mail). Holding its permission is not a way around it."""
+    return bool(getattr(capability, "requires_approval", False)
+                or getattr(capability, "spends_money", False))
 
-    ``context`` is what the capability's adapter found when it was parked
-    (``park_context``): it can refuse by itself (``batch_refusal``), and a capability that
-    carries its own sale price (``sale_price_keys``) is batchable only as a listing the
-    adapter confirmed is NEW - an update of a live listing, and so any price change, is
-    always its own card."""
 
+def parks(capability: Any, granted: Iterable[str] = ()) -> bool:
+    """Whether a call holding ``granted`` is parked for the owner rather than run: an
+    every-call approval always; any other PRIVILEGED capability when the caller lacks a
+    permission it needs. The server's parking decision (PionirApp._needs_approval) is this
+    function, so what /api/capabilities reports cannot drift from what happens."""
+    if capability is None:
+        return False   # unknown capability: execute() reports it as it always has
+    if every_call_approval(capability):
+        return True
+    return (getattr(capability, "risk", None) is RiskLevel.PRIVILEGED
+            and not set(getattr(capability, "required_permissions", ())).issubset(
+                set(granted)))
+
+
+def declared_batch_refusal(capability: Any) -> str | None:
+    """The part of ``batch_refusal`` that depends on the capability alone, not on a call:
+    None if it MAY wait for the digest (a call's payload and park context can still keep
+    it out); otherwise why it is always its own card."""
     if capability is None:
         return "unknown capability"
     if getattr(capability, "batchable", False) is not True:
@@ -101,6 +117,54 @@ def batch_refusal(capability: Any, payload: Mapping[str, Any] | None,
     name = str(getattr(capability, "name", "") or "")
     if not name or set(re.split(r"[^a-z]+", name.lower())) & NEVER_BATCH_WORDS:
         return "a money or client capability"
+    return None
+
+
+def batch_condition(capability: Any) -> str | None:
+    """In words, the narrower case a digest-eligible capability is batched in (beyond 'no
+    money in the payload', which holds for every one), or None if there is none."""
+    if declared_batch_refusal(capability) is not None:
+        return None
+    if getattr(capability, "sale_price_keys", frozenset()):
+        return "new listing only"
+    return None
+
+
+APPROVAL_LEVELS = ("auto", "digest", "card")
+
+
+def approval_level(capability: Any, granted: Iterable[str] = (), *,
+                   digest_enabled: bool = True) -> str:
+    """How a call holding ``granted`` reaches the owner, decided by the same functions the
+    server parks and batches with: ``auto`` (it just runs), ``digest`` (it waits for the
+    owner's daily digest - within ``batch_condition`` and with a payload that moves no
+    money, else it is its own card) or ``card`` (its own approval card at once: money, a
+    client, any privileged action the caller holds no permission for).
+
+    ``granted`` defaults to nothing, which is what every HTTP client holds today
+    (auth.GRANTABLE_PERMISSIONS is empty)."""
+    if not parks(capability, granted):
+        return "auto"
+    if digest_enabled and declared_batch_refusal(capability) is None:
+        return "digest"
+    return "card"
+
+
+def batch_refusal(capability: Any, payload: Mapping[str, Any] | None,
+                  context: Mapping[str, Any] | None = None) -> str | None:
+    """None if this parked action may wait for the daily digest; otherwise why it must
+    be its own card at once. Fails closed: anything unknown or odd is refused.
+
+    ``context`` is what the capability's adapter found when it was parked
+    (``park_context``): it can refuse by itself (``batch_refusal``), and a capability that
+    carries its own sale price (``sale_price_keys``) is batchable only as a listing the
+    adapter confirmed is NEW - an update of a live listing, and so any price change, is
+    always its own card."""
+
+    declared = declared_batch_refusal(capability)
+    if declared is not None:
+        return declared
+    name = str(getattr(capability, "name", "") or "")
     if not isinstance(payload, Mapping):
         return "no payload"
     context = context if isinstance(context, Mapping) else {}

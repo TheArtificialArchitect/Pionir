@@ -119,6 +119,16 @@ class GoalTests(_Case):
                 crew.direction.set_goal(division, goal, priority=priority)
 
 
+class DivisionsTests(_Case):
+    def test_each_worker_lists_the_capabilities_it_uses(self) -> None:
+        crew = self.crew(divisions={"alpha": [{"name": "a1", "uses": ["x.read", "x.post"]},
+                                              {"name": "a2"}]})
+        (alpha,) = crew.direction.divisions()
+        self.assertEqual(alpha["workers"], [
+            {"id": "alpha.a1", "live": True, "uses": ["x.read", "x.post"]},
+            {"id": "alpha.a2", "live": True, "uses": []}])
+
+
 class DigestTests(_Case):
     def test_the_digest_is_bounded_and_most_urgent_first(self) -> None:
         crew = self.crew()

@@ -162,7 +162,11 @@ class Direction:
                 "division": d.division_id, "title": d.title,
                 "goal": (goals.get(d.division_id) or {}).get("goal"),
                 "priority": (goals.get(d.division_id) or {}).get("priority"),
-                "workers": [{"id": w.worker_id, "live": bool(w.live)} for w in workers],
+                # "uses": the Pionir capabilities the worker calls (the
+                # catalogue's declaration), so a reader can look up each one's approval
+                "workers": [{"id": w.worker_id, "live": bool(w.live),
+                             "uses": list(self.registry.uses(w.worker_id))}
+                            for w in workers],
                 "health": _health_line(health),
             })
         return out

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from . import benchmark, bryofeed, recallcheck, routecheck
+from .batching import DigestSettings, approval_level, batch_condition
 from .bootstrap import PionirRuntime, build_runtime
 from .config import PionirSettings
 from .contracts import Task
@@ -385,7 +386,16 @@ def _declared_models(runtime: PionirRuntime) -> list[dict[str, Any]]:
     ]
 
 
-def _capabilities(runtime: PionirRuntime) -> list[dict[str, Any]]:
+def _capabilities(runtime: PionirRuntime, *,
+                  digest_enabled: bool | None = None) -> list[dict[str, Any]]:
+    """Every registered capability, with how a call to it reaches the owner.
+
+    ``approval`` is ``batching.approval_level`` for a caller holding no pre-granted
+    permission (every HTTP client today): the very functions the server parks and batches
+    with, never a copy of them. ``digest_enabled`` is the server's digest switch; the CLI
+    reads it from the same settings the server does."""
+    if digest_enabled is None:
+        digest_enabled = DigestSettings.from_environment(runtime.settings.state_root).enabled
     output: list[dict[str, Any]] = []
     for manifest in runtime.executive.registry.manifests():
         for capability in manifest.capabilities:
@@ -396,6 +406,12 @@ def _capabilities(runtime: PionirRuntime) -> list[dict[str, Any]]:
                     "name": capability.name,
                     "description": capability.description,
                     "risk": capability.risk.value,
+                    "requires_approval": capability.requires_approval,
+                    "spends_money": capability.spends_money,
+                    "batchable": capability.batchable,
+                    "batch_condition": batch_condition(capability),
+                    "routable": capability.routable,
+                    "approval": approval_level(capability, digest_enabled=digest_enabled),
                     "required_permissions": sorted(capability.required_permissions),
                     "model": (
                         {

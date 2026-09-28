@@ -25,7 +25,7 @@ _TOP = frozenset({"_how", "providers", "known_names", "divisions"})
 _DIVISION = frozenset({"id", "title", "leader_cadence_seconds", "workers", "brief_quota",
                        "entities", "leader_notes", "_note"})
 _WORKER = frozenset({"name", "impl", "kind", "cadence_seconds", "provider", "stage",
-                     "entities", "note", "params", "_note"})
+                     "entities", "note", "params", "uses", "_note"})
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,11 @@ class WorkerSpec:
     entities: tuple = ()
     note: str = ""
     params: dict = field(default_factory=dict)
+    # The Pionir capabilities this worker's code calls (every ``Job(...)`` it can build),
+    # declared so /api/divisions can say so and Pionir Desktop can show each worker's
+    # approval level from Pionir's /api/capabilities. tests/test_crew_uses.py reads the
+    # worker classes and fails if this and the code disagree.
+    uses: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -61,6 +66,22 @@ def _unknown(where: str, d: dict, allowed: frozenset) -> None:
                          f"known: {', '.join(sorted(allowed))}")
 
 
+def _uses(where: str, v) -> tuple:
+    """A worker's declared Pionir capabilities: distinct names like ``content.publish``."""
+    if v is None:
+        return ()
+    if not isinstance(v, list):
+        # ValueError, as for every other catalogue fault: one kind of load-time error
+        raise ValueError(f"{where} is a list of capability names, not {v!r}")  # noqa: TRY004
+    for name in v:
+        if (not isinstance(name, str) or "." not in name
+                or any(ch.isspace() for ch in name) or name != name.strip(".")):
+            raise ValueError(f"{where}: {name!r} is not a Pionir capability name")
+    if len(set(v)) != len(v):
+        raise ValueError(f"{where} names a capability twice")
+    return tuple(v)
+
+
 def _positive_int(where: str, v) -> int:
     if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
         raise ValueError(f"{where} must be a positive whole number of seconds, not {v!r}")
@@ -69,7 +90,7 @@ def _positive_int(where: str, v) -> int:
 
 class Registry:
     def __init__(self, divisions, workers, providers: Mapping[str, float],
-                 known_names=()) -> None:
+                 known_names=(), uses: Mapping[str, tuple] | None = None) -> None:
         self._divisions: dict = {}
         for d in divisions:
             if d.division_id in self._divisions:
@@ -93,6 +114,7 @@ class Registry:
                 if wid not in self._by_id:
                     raise ValueError(f"division {d.division_id!r} lists unknown worker {wid!r}")
         self.known_names = tuple(known_names)
+        self._uses = {wid: tuple(caps) for wid, caps in (uses or {}).items()}
 
     def __len__(self) -> int:
         return len(self._by_id)
@@ -112,6 +134,11 @@ class Registry:
         if w is None:
             raise KeyError(f"no such worker {worker_id!r}; known: {', '.join(self.ids())}")
         return w
+
+    def uses(self, worker_id: str) -> tuple:
+        """The Pionir capabilities the catalogue declares this worker calls (WorkerSpec.uses)."""
+        self.require(worker_id)
+        return self._uses.get(worker_id, ())
 
     def divisions(self) -> tuple:
         return tuple(self._divisions.values())
@@ -154,6 +181,7 @@ def build_registry(catalogue: dict, impls: Mapping | None = None) -> Registry:
         if isinstance(interval, bool) or not isinstance(interval, (int, float)) or interval < 0:
             raise ValueError(f"provider {name!r} interval must be seconds >= 0, not {interval!r}")
     divisions, workers = [], []
+    uses: dict = {}
     for i, d in enumerate(catalogue.get("divisions") or ()):
         _unknown(f"division #{i}", d, _DIVISION)
         did = str(d.get("id") or "").strip()
@@ -178,12 +206,14 @@ def build_registry(catalogue: dict, impls: Mapping | None = None) -> Registry:
                 cadence_seconds=_positive_int(f"{wid}.cadence_seconds", w.get("cadence_seconds")),
                 provider=str(w.get("provider") or ""), stage=int(w.get("stage", 0)),
                 entities=tuple(w.get("entities") or ()), note=str(w.get("note") or ""),
-                params=dict(w.get("params") or {}))
+                params=dict(w.get("params") or {}),
+                uses=_uses(f"{wid}.uses", w.get("uses")))
             try:
                 workers.append(impls[impl](spec, **spec.params))
             except TypeError as exc:
                 raise ValueError(f"worker {wid!r}: impl {impl!r} does not take these params "
                                  f"({', '.join(sorted(spec.params)) or 'none'}): {exc}") from exc
+            uses[wid] = spec.uses
             ids.append(wid)
         quota = d.get("brief_quota") or {}
         for k, v in quota.items():
@@ -195,7 +225,7 @@ def build_registry(catalogue: dict, impls: Mapping | None = None) -> Registry:
             worker_ids=tuple(ids), brief_quota=dict(quota),
             entities=tuple(d.get("entities") or ()),
             leader_notes=str(d.get("leader_notes") or "").strip()))
-    return Registry(divisions, workers, providers, catalogue.get("known_names") or ())
+    return Registry(divisions, workers, providers, catalogue.get("known_names") or (), uses)
 
 
 def default_registry(path: Path | None = None) -> Registry:

@@ -55,6 +55,7 @@ from .batching import (
     DigestSettings,
     batch_refusal,
     local_now,
+    parks,
     read_request,
     request_digest,
 )
@@ -414,7 +415,7 @@ class PionirApp:
         behind it.
         """
 
-        return _capabilities(self.runtime)
+        return _capabilities(self.runtime, digest_enabled=self.digest.enabled)
 
     def gpu(self) -> dict[str, Any]:
         budget = self.runtime.settings.resource_budget
@@ -708,14 +709,10 @@ class PionirApp:
         except a capability that requires approval (spending money, publishing
         publicly), which is held on EVERY call."""
         _agent, cap = self._cap_and_agent(capability)
-        if cap is None:
-            return False   # unknown capability: let execute() report it as it always has
-        if cap.requires_approval or cap.spends_money:
-            # money never moves, and nothing goes public, without a human yes -
-            # holding the permission is not enough
-            return True
-        return (cap.risk is RiskLevel.PRIVILEGED
-                and not set(cap.required_permissions).issubset(set(granted)))
+        # money never moves, and nothing goes public, without a human yes - holding the
+        # permission is not enough. One function decides, and /api/capabilities reports
+        # the same one (batching.approval_level), so the two cannot drift apart.
+        return parks(cap, granted)
 
     def _park_context(self, capability: str, payload: dict[str, Any],
                       granted: list[str]) -> dict[str, Any] | None:
