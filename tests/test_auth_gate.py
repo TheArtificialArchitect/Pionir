@@ -302,20 +302,32 @@ class GateOverHttp(unittest.TestCase):
         self.assertEqual(self.ran("manager.atani_manage"), [])
 
     # ---- 6. the owner's dashboard session --------------------------------------------
+    def _session(self) -> dict:
+        """Sign in the way the dashboard page does: /?code=, keep the cookie, take the
+        proof from the redirect's #fragment into X-Session-Proof."""
+        status, _doc, response = self._raw("GET", f"/?code={self.app.signin_codes.mint()}")
+        self.assertEqual(status, 303)
+        return {"Cookie": response.getheader("Set-Cookie").split(";", 1)[0],
+                "X-Session-Proof": response.getheader("Location").split("#proof=", 1)[1]}
+
     def test_the_dashboard_link_sets_a_strict_http_only_session(self) -> None:
         key = self.app.auth.tokens["dashboard"]
         code = self.app.signin_codes.mint()
         self.assertNotIn(key, code)
         status, _doc, response = self._raw("GET", f"/?code={code}")
         self.assertEqual(status, 303)
-        self.assertEqual(response.getheader("Location"), "/")
+        location = response.getheader("Location")
+        self.assertTrue(location.startswith("/#proof="), location[:12])   # the proof in the fragment
+        proof = location.split("#proof=", 1)[1]
         cookie = response.getheader("Set-Cookie")
-        for part in ("HttpOnly", "SameSite=Strict", f"{auth.SESSION_COOKIE}={key}"):
+        for part in ("HttpOnly", "SameSite=Strict", f"{auth.SESSION_COOKIE}="):
             self.assertIn(part, cookie)
+        for secret in list(self.app.auth.tokens.values()) + [proof]:
+            self.assertNotIn(secret, cookie)                  # a random id, never the token
         # the session approves (the owner's page), and runs what the dashboard may
         aid = self._parked("atani")
-        session = f"{auth.SESSION_COOKIE}={key}"
-        status, out = self.post("/api/approvals/approve", {"id": aid}, Cookie=session)
+        session = {"Cookie": cookie.split(";", 1)[0], "X-Session-Proof": proof}
+        status, out = self.post("/api/approvals/approve", {"id": aid}, **session)
         self.assertIn(status, (200, 202), out)
         # used once
         status, _doc, response = self._raw("GET", f"/?code={code}")
@@ -330,6 +342,43 @@ class GateOverHttp(unittest.TestCase):
         status, _doc, response = self._raw("GET", url.split(str(self.port), 1)[1])
         self.assertEqual(status, 303)
         self.assertIn("HttpOnly", response.getheader("Set-Cookie"))
+
+    def test_the_cookie_alone_is_no_session(self) -> None:
+        # cookies ignore the port: a server another local user runs on 127.0.0.1:5555 is
+        # sent this one - it must be worth nothing there, even with a forged Origin
+        s = self._session()
+        other = self._session()
+        aid = self._parked()
+        origin = {"Origin": f"http://127.0.0.1:{self.port}"}
+        for headers in ({"Cookie": s["Cookie"]},
+                        {"Cookie": s["Cookie"], "X-Session-Proof": "p" * 43},
+                        {"Cookie": s["Cookie"], "X-Session-Proof": other["X-Session-Proof"]}):
+            status, _ = self.post("/api/approvals/approve", {"id": aid}, **headers, **origin)
+            self.assertEqual(status, 401, headers.keys())
+            status, _out, _ = self._raw("GET", "/api/voice_link", headers=headers)
+            self.assertEqual(status, 401)
+        # and the cookie carries no token to lift: the dashboard token as a cookie is refused
+        status, _ = self.post("/api/approvals/approve", {"id": aid}, **origin,
+                              Cookie=f"{auth.SESSION_COOKIE}={self.app.auth.tokens['dashboard']}",
+                              **{"X-Session-Proof": s["X-Session-Proof"]})
+        self.assertEqual(status, 401)
+        self.assertEqual(self.app.approvals.get(aid)["status"], "pending")
+
+    def test_signing_out_and_expiry_end_the_session(self) -> None:
+        s = self._session()
+        aid = self._parked()
+        status, out = self.post("/api/logout", {}, **s)
+        self.assertEqual(status, 200, out)
+        status, _ = self.post("/api/approvals/approve", {"id": aid}, **s)
+        self.assertEqual(status, 401)
+        s = self._session()
+        clock = self.app.auth._clock
+        self.app.auth._clock = lambda: clock() + auth.SESSION_TTL + 1
+        try:
+            status, _ = self.post("/api/approvals/approve", {"id": aid}, **s)
+            self.assertEqual(status, 401)
+        finally:
+            self.app.auth._clock = clock
 
     def test_a_stale_code_is_no_session(self) -> None:
         from pionir.signin import CODE_TTL, SigninCodes
@@ -409,8 +458,7 @@ class GateOverHttp(unittest.TestCase):
 
     def test_a_foreign_origin_is_refused_even_with_the_owner_session(self) -> None:
         aid = self._parked()
-        session = f"{auth.SESSION_COOKIE}={self.app.auth.tokens['dashboard']}"
-        status, _ = self.post("/api/approvals/approve", {"id": aid}, Cookie=session,
+        status, _ = self.post("/api/approvals/approve", {"id": aid}, **self._session(),
                               Origin="http://evil.example")
         self.assertEqual(status, 403)
         self.assertEqual(self.app.approvals.get(aid)["status"], "pending")
@@ -462,8 +510,7 @@ class GateOverHttp(unittest.TestCase):
     def test_the_owners_session_gets_her_glass_with_a_one_time_ticket(self) -> None:
         key = self._glass()
         url = self._her(key)
-        session = f"{auth.SESSION_COOKIE}={self.app.auth.tokens['dashboard']}"
-        status, out, response = self._raw("GET", "/api/voice_link", headers={"Cookie": session})
+        status, out, response = self._raw("GET", "/api/voice_link", headers=self._session())
         self.assertEqual(status, 200, out)
         self.assertEqual(out["url"], f"{url}/?ticket={'t' * 32}")
         self.assertEqual(response.getheader("Cache-Control"), "no-store")
@@ -474,8 +521,7 @@ class GateOverHttp(unittest.TestCase):
     def test_a_squatter_on_her_port_is_handed_nothing(self) -> None:
         key = self._glass()
         self._her(key, honest=False)
-        session = f"{auth.SESSION_COOKIE}={self.app.auth.tokens['dashboard']}"
-        status, out, _ = self._raw("GET", "/api/voice_link", headers={"Cookie": session})
+        status, out, _ = self._raw("GET", "/api/voice_link", headers=self._session())
         self.assertEqual(status, 502, out)
         self.assertNotIn("url", out)
         self.assertNotIn(key, json.dumps(self.her_asks))
@@ -488,15 +534,14 @@ class GateOverHttp(unittest.TestCase):
                   "Tailscale-User-Login": "ian@example.com"}]
         tries += [{"Authorization": f"Bearer {self.app.auth.tokens[c]}"}
                   for c in ("crew", "galatea", "atani", "desktop", "phone")]
-        tries += [{"Cookie": f"{auth.SESSION_COOKIE}={self.app.auth.tokens['phone']}"}]
+        tries += [{"Cookie": f"{auth.SESSION_COOKIE}={self.app.auth.tokens[c]}"} for c in ("phone", "dashboard")]
         for headers in tries:
             status, out, _ = self._raw("GET", "/api/voice_link", headers=headers)
             self.assertEqual(status, 401, headers)
             self.assertNotIn("ticket", json.dumps(out))
         # nor a rebound name, even carrying the session
-        session = f"{auth.SESSION_COOKIE}={self.app.auth.tokens['dashboard']}"
         status, out, _ = self._raw("GET", "/api/voice_link",
-                                   headers={"Cookie": session, "Host": "evil.example"})
+                                   headers={**self._session(), "Host": "evil.example"})
         self.assertEqual(status, 403)
         self.assertNotIn(key, json.dumps(out))
         # and the open state names her address, never her key
@@ -505,8 +550,7 @@ class GateOverHttp(unittest.TestCase):
         self.assertNotIn(key, json.dumps(out))
 
     def test_no_glass_key_yet_is_said_plainly(self) -> None:
-        session = f"{auth.SESSION_COOKIE}={self.app.auth.tokens['dashboard']}"
-        status, out, _ = self._raw("GET", "/api/voice_link", headers={"Cookie": session})
+        status, out, _ = self._raw("GET", "/api/voice_link", headers=self._session())
         self.assertEqual(status, 503, out)
         self.assertIn("galatea-glass-token.txt", out["reason"])
 

@@ -43,11 +43,13 @@ from .auth import (
     APPROVE,
     APPROVERS,
     INTENT,
+    PROOF_HEADER,
     ROUTE,
     SESSION_COOKIE,
     TASK,
     ClientAuth,
     Unauthenticated,
+    cookie_value,
 )
 from .batching import (
     BATCHED_GRANT,
@@ -474,15 +476,15 @@ class PionirApp:
         in the browser on start. Never the token itself."""
         return f"{base.rstrip('/')}/?code={self.signin_codes.mint()}"
 
-    def voice_link(self, authorization: str | None, cookie: str | None
-                   ) -> tuple[int, dict[str, Any]]:
+    def voice_link(self, authorization: str | None, cookie: str | None,
+                   proof: str | None = None) -> tuple[int, dict[str, Any]]:
         """The Voice view's signed-in address of her glass: her URL with a one-time
         sign-in ticket (60 s, used once), asked of her with an HMAC of her glass key and
         taken only with her proof (pionir/signin.py) - so a squatter on her port is
         handed nothing and cannot pass for her. Only for the owner's own dashboard -
         its session cookie or its token; none of it goes out on the open /api/state.
         No key is ever in the URL; her page trades the ticket for its session cookie."""
-        client, refused = self.auth.from_headers(authorization, cookie)
+        client, refused = self.auth.from_headers(authorization, cookie, proof)
         if client != "dashboard":
             return 401, {"error": "unauthorized",
                          "reason": refused or "her glass opens only in the signed-in dashboard: "
@@ -1208,12 +1210,14 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                             "reason": "that sign-in link is used or stale - open the "
                                       "dashboard from the launcher again"}, 401)
                 return
-            key = app.auth.tokens["dashboard"]
+            sid, proof = app.auth.start_session()
             self.send_response(303)
-            self.send_header("Set-Cookie", f"{SESSION_COOKIE}={key}; HttpOnly; "
+            # a random session id, never the token; and alone it is nothing - the proof
+            # rides in the fragment (never sent to a server) into the page's sessionStorage
+            self.send_header("Set-Cookie", f"{SESSION_COOKIE}={sid}; HttpOnly; "
                                            "SameSite=Strict; Path=/")
             self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Location", "/")
+            self.send_header("Location", f"/#proof={proof}")
             self.send_header("Content-Length", "0")
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
@@ -1251,7 +1255,8 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                     self._send(app.approvals_view())
                 elif route.path == "/api/voice_link":
                     status, document = app.voice_link(self.headers.get("Authorization"),
-                                                      self.headers.get("Cookie"))
+                                                      self.headers.get("Cookie"),
+                                                      self.headers.get(PROOF_HEADER))
                     self._send(document, status)
                 elif route.path == "/api/tasks":
                     n = int(parse_qs(route.query).get("n", ["20"])[0] or 20)
@@ -1277,7 +1282,8 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
             present must be right; none at all is ``anonymous``, served only in the
             compatibility window and never for the approval routes."""
             client, refused = app.auth.from_headers(self.headers.get("Authorization"),
-                                                    self.headers.get("Cookie"))
+                                                    self.headers.get("Cookie"),
+                                                    self.headers.get(PROOF_HEADER))
             if refused is not None:
                 return None, 401, refused
             needed = _POST_ROUTES[path]
@@ -1295,6 +1301,16 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
             if refused is not None:
                 self._drain()
                 self._send({"error": "forbidden", "reason": refused}, 403)
+                return
+            if route.path == "/api/logout":
+                # the owner signing out: the session (cookie and proof) is gone
+                self._drain()
+                sid = cookie_value(self.headers.get("Cookie"), SESSION_COOKIE)
+                if not app.auth.session_ok(sid, self.headers.get(PROOF_HEADER)):
+                    self._send({"error": "unauthorized", "reason": "no session to end"}, 401)
+                    return
+                app.auth.end_session(sid)
+                self._send({"ok": True})
                 return
             if route.path == "/api/signin_code":
                 # a launcher, signed with the dashboard token (never sent): its signature

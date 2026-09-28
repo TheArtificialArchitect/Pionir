@@ -17,8 +17,14 @@ So, here:
 - **Callers are identified by a bearer token**, one per client, kept as a file
   ``pionir-client-<client>.token`` in the client token directory (``~/.pionir/secrets``
   on the live box). Pionir makes any missing one on start: 32 random bytes, url-safe,
-  readable by the user. A client sends ``Authorization: Bearer <token>``; the owner's
-  dashboard holds the dashboard token as an HttpOnly session cookie instead. Tokens are
+  readable by the user. A client sends ``Authorization: Bearer <token>``. The owner's
+  dashboard holds a SESSION instead: an HttpOnly cookie with a random session id (never
+  the token) AND the session's proof, sent as ``X-Session-Proof`` on every call. The
+  cookie alone is nothing - cookies ignore the port, so a server another local user
+  runs on 127.0.0.1:5555 (or on this port while Pionir is down) is sent it the moment
+  the owner's browser goes there. The proof reaches the page in the sign-in
+  redirect's #fragment (never sent to a server) and lives in the page's
+  sessionStorage, which belongs to this origin alone, port included. Tokens are
   compared in constant time, against every client, with no early exit.
 - **Routes are granted per client.** ``approve`` (approve / deny / the digest request)
   belongs to the owner's own surfaces only - ``dashboard`` and ``phone`` - and code, not
@@ -63,6 +69,9 @@ TOKEN_BYTES = 32
 _TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_-]{43,256}")
 ANONYMOUS = "anonymous"
 SESSION_COOKIE = "pionir_session"
+PROOF_HEADER = "X-Session-Proof"
+SESSION_TTL = 12 * 3600.0
+_MAX_SESSIONS = 64
 
 # Routes a grant can name.
 TASK = "task"          # POST /api/task
@@ -117,6 +126,11 @@ DEFAULT_GRANTS: Mapping[str, ClientGrant] = {
 }
 # Served only while the compatibility window is open, and never anything privileged.
 ANONYMOUS_GRANT = ClientGrant(frozenset({TASK, INTENT, ROUTE}), ("*",))
+
+
+def _sha(value: str) -> str:
+    import hashlib
+    return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()
 
 
 # ---- token files ------------------------------------------------------------------------
@@ -239,6 +253,35 @@ class ClientAuth:
     compat: bool = True
     _warned: dict[str, float] = field(default_factory=dict, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # the owner's dashboard sessions: sha256(session id) -> (expires, sha256(proof)).
+    # In memory: a restart signs the dashboard out (the launcher signs it in again).
+    _sessions: dict[str, tuple[float, str]] = field(default_factory=dict, repr=False)
+    _clock: Any = field(default=time.time, repr=False)
+
+    def start_session(self) -> tuple[str, str]:
+        """A new dashboard session: (its id, for the cookie; its proof, for the page)."""
+        sid, proof = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+        now = self._clock()
+        with self._lock:
+            self._sessions = {h: v for h, v in self._sessions.items() if v[0] > now}
+            while len(self._sessions) >= _MAX_SESSIONS:
+                self._sessions.pop(min(self._sessions, key=lambda h: self._sessions[h][0]))
+            self._sessions[_sha(sid)] = (now + SESSION_TTL, _sha(proof))
+        return sid, proof
+
+    def end_session(self, sid: str | None) -> bool:
+        if not sid:
+            return False
+        with self._lock:
+            return self._sessions.pop(_sha(sid), None) is not None
+
+    def session_ok(self, sid: str | None, proof: str | None) -> bool:
+        """The cookie's session is live AND the proof is the one bound to it."""
+        if not sid or not proof or len(sid) > 256 or len(proof) > 256:
+            return False
+        with self._lock:
+            got = self._sessions.get(_sha(sid))
+        return bool(got) and got[0] > self._clock() and hmac.compare_digest(got[1], _sha(proof))
 
     @classmethod
     def for_settings(cls, settings: Any) -> ClientAuth:
@@ -261,19 +304,20 @@ class ClientAuth:
                 found = client
         return found
 
-    def from_headers(self, authorization: str | None, cookie: str | None
-                     ) -> tuple[str | None, str | None]:
-        """(client, refusal). ``(None, None)`` is a request that carried no credential."""
+    def from_headers(self, authorization: str | None, cookie: str | None,
+                     proof: str | None = None) -> tuple[str | None, str | None]:
+        """(client, refusal). ``(None, None)`` is a request that carried no credential.
+        A session is the owner's dashboard only with its proof; the cookie alone is
+        refused, as is a token in the cookie."""
         present, token = parse_bearer(authorization)
         if present:
             client = self.identify(token)
             return (client, None) if client else (None, "invalid bearer token")
         session = cookie_value(cookie, SESSION_COOKIE)
         if session is not None:
-            # the session cookie only ever carries the owner's dashboard token
-            if self.identify(session) == "dashboard":
+            if self.session_ok(session, proof):
                 return "dashboard", None
-            return None, "invalid session"
+            return None, "invalid session (sign in again from the launcher)"
         return None, None
 
     def grant(self, client: str) -> ClientGrant:

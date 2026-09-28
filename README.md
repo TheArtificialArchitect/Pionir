@@ -84,9 +84,11 @@ Loopback is not an identity: any local process can reach `127.0.0.1:8780`. So
   `Authorization: Bearer <token>`. One token per client - `crew`, `galatea`, `atani`,
   `desktop`, `dashboard`, `phone` - in `~/.pionir/secrets/pionir-client-<client>.token`
   (or `PIONIR_CLIENT_TOKEN_DIR`), made by Pionir on first start. The owner's dashboard
-  holds its token as an HttpOnly session cookie, set by the one-time sign-in link a
-  launcher opens (`/?code=...`, 60 s, used once; `pionir/signin.py`) - the token itself
-  is never in a URL or on a command line.
+  holds a session instead - an HttpOnly cookie with a random id, never the token, plus
+  a proof in the page's sessionStorage sent as `X-Session-Proof` (cookies ignore the
+  port, so the cookie alone is refused) - set by the one-time sign-in link a launcher
+  opens (`/?code=...`, 60 s, used once; `pionir/signin.py`). The token itself is never
+  in a URL, a cookie or on a command line.
 - Approve / deny / the digest request are the owner's alone: only `dashboard` and
   `phone` (Galatea's phone glass relays with it), and never for an item that client
   parked. Code, not config, decides that.

@@ -245,8 +245,21 @@ const STATE_COLOR = {up:"#74d68f",busy:"#e2a552",idle:"#606579",down:"#e2726e",n
 
 let ROSTER=[], HEALTH={}, EVENTS=[], VOICE_URL=null, SELECTED_ORGAN=null, SELECTED_TASK=null, GPU={};
 
-function jget(u){ return fetch(u).then(r=>r.json()); }
-function jpost(u,b){ return fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)}).then(r=>r.json()); }
+// The owner's session is the HttpOnly cookie AND its proof: the sign-in redirect puts
+// the proof in the #fragment (never sent to a server); it moves into this origin's
+// sessionStorage (the port is part of the origin) and off the address bar, and goes
+// out as X-Session-Proof on every call. The cookie alone is refused - cookies ignore
+// the port, so any server on 127.0.0.1 can be sent it.
+let PROOF = null;
+try {
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (h.get("proof")) { PROOF = h.get("proof"); sessionStorage.setItem("pionir.proof", PROOF);
+                        history.replaceState(null, "", location.pathname + location.search); }
+  else PROOF = sessionStorage.getItem("pionir.proof");
+} catch (e) { /* no storage: the proof lives for this page only */ }
+function authHeaders(extra){ const h = Object.assign({}, extra || {}); if (PROOF) h["X-Session-Proof"] = PROOF; return h; }
+function jget(u){ return fetch(u,{headers:authHeaders()}).then(r=>r.json()); }
+function jpost(u,b){ return fetch(u,{method:"POST",headers:authHeaders({"Content-Type":"application/json"}),body:JSON.stringify(b)}).then(r=>r.json()); }
 function fmtMB(v){ return v==null?"—":(v>=1024?(v/1024).toFixed(1)+" GB":v+" MB"); }
 function hhmmss(s){ return (s||"").slice(11,19); }
 
@@ -261,7 +274,7 @@ function setView(v){
     else if(f && !f.getAttribute("src")){
       // her glass needs her key; only this signed-in page is handed it (never /api/state)
       const say=(t)=>{ const d=document.createElement("div"); d.className="voice-empty"; d.textContent=t; $id("view-voice").replaceChildren(d); };
-      fetch("/api/voice_link",{cache:"no-store"})
+      fetch("/api/voice_link",{cache:"no-store",headers:authHeaders()})
         .then(async r=>{ const j=await r.json().catch(()=>({})); if(r.ok&&j.url) f.setAttribute("src",j.url); else say(j.reason||j.error||("HTTP "+r.status)); })
         .catch(()=>say("Pionir is not answering."));
     }
