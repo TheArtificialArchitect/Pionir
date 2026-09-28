@@ -24,6 +24,7 @@ from pionir.adapters.crew import NOT_RUNNING, CrewAdapter, CrewAdapterSettings
 from pionir.bootstrap import build_runtime
 from pionir.config import PionirSettings
 from pionir.contracts import RiskLevel, Task, outcome_kind
+from pionir.crew.direction import DIGEST_CHARS
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
 from pionir.reliability import CircuitState
 from pionir.server import PionirApp
@@ -68,7 +69,8 @@ class EndpointTests(unittest.TestCase):
 
     def test_reads_hit_their_endpoints_and_pass_the_answer_through(self) -> None:
         answer = {"ok": True, "divisions": [{"division": "alpha"}], "truncated": False}
-        for capability, path in (("crew.digest", "/api/digest?max_chars=4000"),
+        # Moss asks with no budget: she gets the digest's default, which holds every division
+        for capability, path in (("crew.digest", f"/api/digest?max_chars={DIGEST_CHARS}"),
                                  ("crew.divisions", "/api/divisions"),
                                  ("crew.compute", "/api/compute")):
             with self.subTest(capability=capability):

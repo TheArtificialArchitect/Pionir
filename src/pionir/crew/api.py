@@ -6,7 +6,7 @@ direction change passes Pionir's gates and lands in its audit ledger like any ot
 action. The API is the Direction API (direction.py) over HTTP, nothing more:
 
     GET  /api/health                       is the crew up, paused, which divisions
-    GET  /api/digest?max_chars=N           Direction.digest (bounded, most urgent first)
+    GET  /api/digest?max_chars=N           Direction.digest (bounded, never drops a division)
     GET  /api/divisions                    Direction.divisions
     GET  /api/compute                      Direction.compute
     POST /api/goal     {division, goal, priority?, by?}     Direction.set_goal
@@ -44,7 +44,11 @@ from .log import lesion, log
 DEFAULT_PORT = 8782
 BIND_HOST = "127.0.0.1"
 MAX_BODY_BYTES = 64 * 1024
-MIN_DIGEST_CHARS = 200
+# The smallest budget the digest can honour: its floor (every division's name, status
+# and attention, which are never cut) for the seven divisions of today is about 490
+# characters. A registry that outgrows it still gets every division, over the budget and
+# marked truncated.
+MIN_DIGEST_CHARS = 600
 MAX_DIGEST_CHARS = 20_000
 MAX_BY_CHARS = 120
 # Who asked, when a direct caller does not say. Pionir's adapter always says.
@@ -59,7 +63,7 @@ Reply = tuple[int, dict]
 
 # ---- validators, shared with pionir.adapters.crew -------------------------------
 def parse_max_chars(raw: Any) -> int:
-    """The digest's character budget: a whole number from MIN to MAX, default 4000."""
+    """The digest's character budget: a whole number from MIN to MAX, default DIGEST_CHARS."""
     if raw is None or raw == "":
         return DIGEST_CHARS
     if isinstance(raw, str) and raw.strip().isdigit():

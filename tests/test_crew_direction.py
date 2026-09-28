@@ -3,7 +3,9 @@ a bounded digest.
 
 Each test fails if the rule is reverted: the brain letting a division past the share
 Moss allocated, a resource other than compute being allocatable, a goal not reaching the
-leader's prompt, or the digest growing past its bound.
+leader's prompt, the digest growing past its bound, or the digest keeping to its bound
+by leaving a division out (a division left out reads as one that does not exist: Moss
+never saw treasury, watch or fiverr that way).
 """
 
 import inspect
@@ -15,7 +17,9 @@ from crew_support import temp_dir
 from test_crew_fakes import catalogue, make_crew
 
 from pionir.crew import direction as direction_module
-from pionir.crew.direction import RESOURCES, Direction
+from pionir.crew.api import MIN_DIGEST_CHARS
+from pionir.crew.direction import DIGEST_CHARS, RESOURCES, Direction
+from pionir.crew.figures import Figure
 from pionir.crew.leader import Leader
 
 DIVISIONS = {"alpha": [{"name": "a1"}], "beta": [{"name": "b1"}], "gamma": [{"name": "c1"}]}
@@ -134,6 +138,150 @@ class DigestTests(_Case):
         entries = crew.direction.digest()["divisions"]
         self.assertEqual({e["division"] for e in entries}, {"alpha", "beta", "gamma"})
         self.assertTrue(all(e["status"] == "silent" for e in entries))
+
+
+# Seven divisions, as the live crew has: (division, attention, priority). Most urgent first
+# is attention (act, watch, none), then priority (1 most).
+SEVEN = (("contracts", "act", 1), ("products", "act", 2), ("posting", "watch", 1),
+         ("builds", "watch", 3), ("fiverr", "none", 1), ("watch", "none", 2),
+         ("treasury", "none", 4))
+SEVEN_ORDER = [d for d, _a, _p in SEVEN]
+ESSENTIAL = {"division", "status", "attention", "headline", "age_s"}
+
+
+class EveryDivisionTests(_Case):
+    """The bound cuts detail in stages, and never a division."""
+
+    def seven(self):
+        crew = self.crew(divisions={d: [{"name": "w1"}] for d, _a, _p in SEVEN})
+        now = time.time()
+        for d, attention, priority in SEVEN:
+            crew.direction.set_goal(d, f"{d} goal " + "g" * 400, priority=priority)
+            figs = [Figure(i * 100, "usd_cents" if i == 0 else "count",
+                           f"{d} measure number {i}", window="now") for i in range(8)]
+            crew.store.add_report(division=d, written_at=now - 60, status="report", stamp=now,
+                                  headline=f"{d}: " + "the headline says a lot " * 6,
+                                  summary=f"{d} summary " + "word " * 240, attention=attention,
+                                  figures=figs, escalation={"answer": "claude " * 100})
+        return crew
+
+    def full(self, crew):
+        full = crew.direction.digest(max_chars=100_000)
+        return full, len(json.dumps(full["divisions"]))
+
+    def assert_every_division(self, got, budget=None):
+        self.assertEqual([e["division"] for e in got["divisions"]], SEVEN_ORDER)
+        for e in got["divisions"]:
+            self.assertEqual(e["status"], "report")
+            self.assertIn(e["attention"], ("act", "watch", "none"))
+        for d in got["dropped"]:
+            self.assertEqual(set(d), {"division", "cut"})       # a cut, never a division
+            self.assertIn(d["division"], SEVEN_ORDER)
+            self.assertTrue(d["cut"])
+        self.assertEqual(got["truncated"], bool(got["dropped"]))
+        if budget is not None:
+            self.assertLessEqual(len(json.dumps(got["divisions"])), budget)
+
+    def assert_cuts_described(self, full, got):
+        """``dropped`` says exactly what differs from the full digest, and nothing else."""
+        whole = {e["division"]: e for e in full["divisions"]}
+        said = {d["division"]: d["cut"] for d in got["dropped"]}
+        for e in got["divisions"]:
+            f = whole[e["division"]]
+            expect = []
+            for k, v in f.items():
+                if k == "figures":
+                    kept = e.get("figures", [])
+                    self.assertEqual(kept, v[:len(kept)])       # the first K, in order
+                    if len(v) > len(kept):
+                        expect.append(f"figures:{len(v) - len(kept)}")
+                elif k not in e:
+                    expect.append(k)
+                elif k in ("age_s", "as_of_age_s"):
+                    continue                                # the clock ticked between reads
+                elif e[k] != v:
+                    self.assertTrue(e[k].endswith("...") and v.startswith(e[k][:-3]))
+                    expect.append(f"{k}:shortened")
+            self.assertEqual(sorted(said.get(e["division"], [])), sorted(expect), e["division"])
+
+    def test_a_generous_budget_cuts_nothing(self) -> None:
+        full, _size = self.full(self.seven())
+        self.assert_every_division(full)
+        self.assertEqual(full["dropped"], [])
+        self.assertFalse(full["truncated"])
+        self.assertEqual({len(e["figures"]) for e in full["divisions"]}, {8})
+
+    def test_every_budget_keeps_every_division_and_says_what_it_cut(self) -> None:
+        crew = self.seven()
+        full, size = self.full(crew)
+        for budget in [*range(MIN_DIGEST_CHARS, size + 200, 97), size, size - 1]:
+            with self.subTest(budget=budget):
+                got = crew.direction.digest(max_chars=budget)
+                self.assert_every_division(got, budget)
+                self.assertEqual(got["truncated"], budget < size)
+                self.assert_cuts_described(full, got)
+
+    def test_detail_goes_in_stages(self) -> None:
+        crew = self.seven()
+        _full, size = self.full(crew)
+        prose = ("text", "claude", "goal")
+        seen = set()
+        for budget in range(MIN_DIGEST_CHARS, size, 53):
+            with self.subTest(budget=budget):
+                got = crew.direction.digest(max_chars=budget)
+                es = got["divisions"]
+                cuts = {c for d in got["dropped"] for c in d["cut"]}
+                if any(c.startswith("figures:") for c in cuts):   # (c) after (b), for all
+                    seen.add("c")
+                    self.assertFalse(any(k in e for e in es for k in prose))
+                if "workers" in cuts:                   # (d) after (c) for all
+                    seen.add("d")
+                    self.assertTrue(all(len(e.get("figures", [])) <= 1 for e in es))
+                if {"headline", "headline:shortened"} & cuts:   # (e) after (d) for all
+                    seen.add("e")
+                    self.assertTrue(all(set(e) <= ESSENTIAL for e in es))
+                if cuts & set(prose):                   # (b) after (a) for all
+                    seen.add("b")
+                    self.assertTrue(all(len(e[k]) <= 80 for e in es for k in prose if k in e))
+        self.assertEqual(seen, {"b", "c", "d", "e"})    # the sweep reached every stage
+
+    def test_the_least_urgent_division_gives_up_detail_first(self) -> None:
+        crew = self.seven()
+        _full, size = self.full(crew)
+        got = crew.direction.digest(max_chars=size - 1)
+        self.assertEqual(got["dropped"], [{"division": "treasury", "cut": ["text:shortened"]}])
+
+    def test_figures_are_cut_to_the_first_k(self) -> None:
+        crew = self.seven()
+        full, _size = self.full(crew)
+        whole = {e["division"]: e["figures"] for e in full["divisions"]}
+        for budget in range(MIN_DIGEST_CHARS, 6000, 131):
+            for e in crew.direction.digest(max_chars=budget)["divisions"]:
+                kept = e.get("figures")
+                if kept is not None:
+                    self.assertEqual(kept, whole[e["division"]][:len(kept)])
+                    self.assertTrue(kept[0].startswith("$0.00"))  # the leader's first stays
+
+    def test_the_minimum_budget_names_every_division(self) -> None:
+        got = self.seven().direction.digest(max_chars=MIN_DIGEST_CHARS)
+        self.assert_every_division(got, MIN_DIGEST_CHARS)
+        for d in got["dropped"]:
+            self.assertIn("text", d["cut"])
+            self.assertIn("figures:8", d["cut"])
+
+    def test_a_budget_too_small_even_for_the_floor_still_names_every_division(self) -> None:
+        got = self.seven().direction.digest(max_chars=10)   # the API refuses it; the floor holds
+        self.assert_every_division(got)
+        for e in got["divisions"]:
+            self.assertEqual(set(e), {"division", "status", "attention"})
+        self.assertTrue(got["truncated"])
+        self.assertEqual({d["division"] for d in got["dropped"]}, set(SEVEN_ORDER))
+        self.assertLessEqual(len(json.dumps(got["divisions"])), MIN_DIGEST_CHARS)
+
+    def test_the_default_holds_seven_full_divisions(self) -> None:
+        """The live seven measured 7,221 characters at full detail; the default is above it
+        with headroom, so Moss's hourly read (no budget given) sees every division whole."""
+        self.assertGreaterEqual(DIGEST_CHARS, 7_221 * 1.3)
 
 
 if __name__ == "__main__":

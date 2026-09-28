@@ -39,7 +39,10 @@ RESOURCES = {
 
 ATTENTION = ("act", "watch", "none")
 MAX_GOAL_CHARS = 500
-DIGEST_CHARS = 4000
+# Moss reads the digest with this default. It holds all seven divisions today at full
+# detail with room to spare (7,221 characters measured live on 2026-09-27); past it the
+# digest degrades detail, never divisions (see _bounded).
+DIGEST_CHARS = 10_000
 
 
 class Allocation:
@@ -165,8 +168,9 @@ class Direction:
         return out
 
     def digest(self, *, max_chars: int = DIGEST_CHARS) -> dict:
-        """The newest word from every division, most urgent first, within ``max_chars``
-        of text. Built for a model to read: bounded so it cannot crowd her context."""
+        """The newest word from EVERY division, most urgent first, within ``max_chars``
+        of JSON. Built for a model to read: bounded so it cannot crowd her context, and
+        bounded by cutting detail, never whole divisions (see ``_bounded``)."""
         now = self._clock()
         goals = self.store.directions()
         entries = []
@@ -244,21 +248,90 @@ def _health_line(health: list) -> dict:
     }
 
 
-def _bounded(entries: list, max_chars: int) -> dict:
-    """Trim texts first, then drop the least urgent entries, until it fits."""
-    def size(es) -> int:
-        return len(json.dumps(es, default=str))
+# ---- the bound ------------------------------------------------------------------
+# The digest NEVER drops a division: a division left out reads, to the model reading it,
+# exactly like a division that does not exist - revenue, site health and orders went
+# unseen that way. So a digest over its budget gives up DETAIL, in stages, least urgent
+# division first within each stage, until it fits:
+#   (a) prose shortened: the report text, Claude's answer, the goal (_PROSE_CAPS);
+#   (b) prose removed;
+#   (c) figures cut to the first K (_FIGURE_KEEP). A report's figures are stored in the
+#       leader's own order, most important first (a figures-only report puts money
+#       first), so the first K are the ones the report leans on hardest;
+#   (d) everything but _ESSENTIAL: division, status, attention, headline, age;
+#   (e) the floor: the headline shortened, then it and the age removed, leaving
+#       _FLOOR - the division, its status and its attention - which is never cut. If
+#       even the floor is over the budget it is returned anyway, ``truncated``.
+# ``dropped`` names what was cut, per division, never a whole division:
+#   {"division": "posting", "cut": ["text", "figures:3"]}
+# where "<field>" was removed, "<field>:shortened" was shortened, and "figures:N" is how
+# many of its figures were cut.
+_PROSE = ("text", "claude", "goal")
+_PROSE_CAPS = (600, 300, 150, 80)
+_FIGURE_KEEP = (4, 2, 1)
+_ESSENTIAL = ("division", "status", "attention", "headline", "age_s")
+_FLOOR = ("division", "status", "attention")
+_HEADLINE_CAP = 80
 
-    truncated = False
-    for cap in (600, 300, 150, 80):
-        if size(entries) <= max_chars:
+
+def _bounded(entries: list, max_chars: int) -> dict:
+    """Fit ``entries`` (most urgent first) into ``max_chars`` of JSON by cutting detail,
+    never divisions. See the stages above."""
+    cuts: dict = {e["division"]: {} for e in entries}
+
+    def fits() -> bool:
+        return len(json.dumps(entries, default=str)) <= max_chars
+
+    def cut(e: dict, key: str, how: str = "") -> None:
+        mark = cuts[e["division"]]
+        if key == "figures":
+            mark[key] = mark.get(key, 0) + int(how)
+        elif mark.get(key) != "":          # removed outranks shortened
+            mark[key] = how
+
+    def shorten(e: dict, key: str, cap: int) -> None:
+        v = e.get(key)
+        if isinstance(v, str) and len(v) > cap:
+            e[key] = v[:cap - 3] + "..."
+            cut(e, key, "shortened")
+
+    def remove(e: dict, key: str) -> None:
+        if key not in e:
+            return
+        v = e.pop(key)
+        if key == "figures":
+            if v:
+                cut(e, key, str(len(v)))
+        else:
+            cut(e, key)
+
+    def stage(step) -> bool:
+        """Apply ``step`` to one division at a time, least urgent first, until it fits."""
+        for e in reversed(entries):
+            if fits():
+                return True
+            step(e)
+        return fits()
+
+    def keep_figures(k: int):
+        def step(e: dict) -> None:
+            figs = e.get("figures") or []
+            if len(figs) > k:
+                e["figures"] = figs[:k]
+                cut(e, "figures", str(len(figs) - k))
+        return step
+
+    steps = [lambda e, c=c: [shorten(e, k, c) for k in _PROSE] for c in _PROSE_CAPS]  # (a)
+    steps.append(lambda e: [remove(e, k) for k in _PROSE])                            # (b)
+    steps += [keep_figures(k) for k in _FIGURE_KEEP]                                  # (c)
+    steps.append(lambda e: [remove(e, k) for k in list(e) if k not in _ESSENTIAL])    # (d)
+    steps.append(lambda e: shorten(e, "headline", _HEADLINE_CAP))                     # (e)
+    steps.append(lambda e: [remove(e, k) for k in ("headline", "age_s")])
+    for step in steps:
+        if stage(step):
             break
-        truncated = True
-        for e in entries:
-            if len(e.get("text") or "") > cap:
-                e["text"] = e["text"][:cap - 3] + "..."
-    dropped = []
-    while entries and size(entries) > max_chars:
-        truncated = True
-        dropped.append(entries.pop()["division"])
-    return {"divisions": entries, "truncated": truncated, "dropped": dropped}
+    # _FLOOR is never cut: whatever the budget, every division is here by name and status
+    dropped = [{"division": d, "cut": [k if how == "" else f"{k}:{how}"
+                                       for k, how in mark.items()]}
+               for d, mark in cuts.items() if mark]
+    return {"divisions": entries, "truncated": bool(dropped), "dropped": dropped}

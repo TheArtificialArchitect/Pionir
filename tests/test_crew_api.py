@@ -11,6 +11,7 @@ import http.client
 import json
 import os
 import socket
+import time
 import unittest
 from typing import ClassVar
 from unittest import mock
@@ -19,8 +20,9 @@ from crew_support import FakeTime, temp_dir
 from test_crew_fakes import catalogue, make_crew
 
 from pionir.crew import log as crewlog
-from pionir.crew.api import MAX_BODY_BYTES, CrewApi
+from pionir.crew.api import MAX_BODY_BYTES, MIN_DIGEST_CHARS, CrewApi
 from pionir.crew.config import CrewSettings
+from pionir.crew.direction import DIGEST_CHARS
 
 DIVISIONS = {"alpha": [{"name": "a1"}], "beta": [{"name": "b1"}]}
 
@@ -70,10 +72,15 @@ class ReadTests(_Case):
         self.assertEqual({e["division"] for e in got["divisions"]}, {"alpha", "beta"})
 
     def test_digest_honours_its_budget(self) -> None:
-        _s, small = self.get("/api/digest?max_chars=200")
+        now = time.time()
+        self.crew.store.add_report(division="alpha", written_at=now, status="report", stamp=now,
+                                   headline="alpha headline", summary="word " * 400,
+                                   attention="act")
+        _s, small = self.get(f"/api/digest?max_chars={MIN_DIGEST_CHARS}")
         _s, big = self.get("/api/digest")
-        self.assertEqual(big["max_chars"], 4000)                  # the Direction default
-        self.assertLessEqual(len(json.dumps(small["divisions"])), 200)
+        self.assertEqual(big["max_chars"], DIGEST_CHARS)          # the Direction default
+        self.assertLessEqual(len(json.dumps(small["divisions"])), MIN_DIGEST_CHARS)
+        self.assertEqual({e["division"] for e in small["divisions"]}, {"alpha", "beta"})
         self.assertTrue(small["truncated"])
         self.assertFalse(big["truncated"])
 
