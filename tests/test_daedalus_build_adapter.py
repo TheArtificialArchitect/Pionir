@@ -122,7 +122,8 @@ class _Case(unittest.TestCase):
         return self.root / slug
 
     def adapter(self, client, *, clock=None, wall=T0, launcher=None, configured=True,
-                sleep=None, owner_open=False, compat=False, **settings) -> DaedalusAdapter:
+                sleep=None, owner_open=False, compat=False, galatea=False,
+                **settings) -> DaedalusAdapter:
         clock = clock or Clock()
         self.launcher = launcher or FakeLauncher()
         self.tokens: list = []
@@ -139,7 +140,8 @@ class _Case(unittest.TestCase):
                                    None, r"not configured: run tools\setup-build-sandbox.ps1"),
                                launcher=lambda _setup: self.launcher,
                                build_client=build_client,
-                               owner_open=lambda: owner_open, auth_compat=lambda: compat)
+                               owner_open=lambda: owner_open, auth_compat=lambda: compat,
+                               galatea_open=lambda: galatea)
 
     def build(self, repo, **over) -> Task:
         payload = {"intent": "build the product in BRIEF.md", "repo": str(repo),
@@ -480,6 +482,36 @@ class ContainmentTests(_Case):
         self.assertTrue(out["not_configured"])
         self.assertIn("PIONIR_AUTH_COMPAT=off", out["refused"])
         self.assertEqual(self.launcher.starts, [])
+
+    def test_no_build_while_galatea_serves_a_tokenless_loopback_caller(self) -> None:
+        repo = self.make_sandbox()
+        out = self.adapter(FakeDaedalus(), galatea=True).execute(self.build(repo)).output
+        self.assertTrue(out["not_configured"])
+        self.assertIn("Galatea", out["refused"])
+        self.assertEqual(self.launcher.starts, [])
+
+    def test_galatea_is_open_unless_she_refuses_a_tokenless_caller(self) -> None:
+        import urllib.error
+        from pionir.adapters.daedalus import galatea_open
+
+        def answers(code):
+            def opener(req, timeout=None):
+                self.assertNotIn("Authorization", req.headers)
+                self.assertNotIn("X-galatea-token", req.headers)
+                self.assertEqual(req.get_method(), "GET")
+                if code is None:
+                    raise urllib.error.URLError("refused")
+                if code == 200:
+                    return io.BytesIO(b"{}")
+                raise urllib.error.HTTPError(req.full_url, code, "x", {}, None)
+            return opener
+
+        url = "http://127.0.0.1:65001"
+        self.assertFalse(galatea_open(url, opener=answers(401)))
+        self.assertFalse(galatea_open(url, opener=answers(403)))
+        self.assertFalse(galatea_open(url, opener=answers(None)))
+        for code in (200, 404, 500):
+            self.assertTrue(galatea_open(url, opener=answers(code)), code)
 
     def test_the_owners_daedalus_is_open_unless_it_says_401(self) -> None:
         import urllib.error

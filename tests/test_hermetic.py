@@ -80,7 +80,8 @@ class HermeticSuiteTests(unittest.TestCase):
             for fn in ast.walk(tree):
                 if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
-                for name in ("bridge_report", "daedalus_open", "daedalus_token_accepted"):
+                for name in ("bridge_report", "daedalus_open", "daedalus_token_accepted",
+                             "galatea_open", "owner_daedalus_open"):
                     offenders += [f"{path.name}:{c.lineno} {name}() without opener="
                                   for c in _calls(fn, name) if "opener" not in _keywords(c)]
                 offenders += [f"{path.name}:{c.lineno} bridge_report() without started="

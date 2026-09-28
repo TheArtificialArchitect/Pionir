@@ -28,16 +28,28 @@
        other top-level data folder of every fixed drive that ordinary users can write -
        each one is listed as it is done
     6. Windows Firewall rules (group "Pionir builds"): pionir-builds' outbound traffic -
-       any program - blocked except loopback, and loopback blocked except the build gate
-       (127.0.0.1:8773); the dedicated Python blocked except loopback. A rule Windows will
-       not take, or a firewall profile that is off, STOPS the setup.
+       any program - blocked except loopback; the dedicated Python blocked except loopback;
+       and a best-effort rule against loopback except the build gate (127.0.0.1:8773), which
+       Windows does not enforce for ordinary programs. A rule Windows will not take, or a
+       firewall profile that is off, STOPS the setup.
     7. %ProgramData%\PionirBuilds\setup.json, the record Pionir checks, written last.
-  It makes NO scheduled task, NO service and NO autostart of any kind.
+  It makes NO scheduled task, NO service and NO autostart of any kind. It changes nothing in
+  your secrets folder: it only checks it.
+
+  LOOPBACK IS OPEN, by the owner's decision of 2026-09-28 ("I'm okay with it reaching
+  programs"): pionir-builds can connect to Ollama, Pionir and the other services on
+  127.0.0.1. The setup reports each one it reaches as an ACCEPTED line and does not stop for
+  it. What makes that acceptable is checked instead: your secrets folder grants pionir-builds
+  (and every group it is in) nothing, and night builds refuse to run while any loopback
+  service serves a caller that sends no token (Pionir with PIONIR_AUTH_COMPAT on, a Daedalus
+  started without its token, Galatea trusting any loopback caller).
 
   Before the record is written it proves the containment by running AS pionir-builds - the
-  dedicated Python, git.exe and powershell.exe: each must fail to reach the internet, the
-  loopback services (Ollama, Pionir), C:\src and your profile, and the Python must be able to
-  write the sandbox. Anything not contained stops the setup, and nothing is used.
+  dedicated Python, git.exe and powershell.exe: each must fail to reach the internet; the
+  Python must run at LOW integrity, write the sandbox and nothing else (C:\src, the data
+  folders, C:\Users\Public, your profile), and read none of your secrets. Then Pionir's own
+  preflight runs the same proof through the exact path a build takes. Anything not contained
+  stops the setup, and nothing is used.
 
 .PARAMETER ResetPassword
   Make a new password (and credential file) even if the current one still works.
@@ -63,7 +75,20 @@ $PyDir = Join-Path $InstallDir "python"
 $PyExe = Join-Path $PyDir "python.exe"
 $DaedalusCopy = Join-Path $InstallDir "daedalus"
 $Record = Join-Path $InstallDir "setup.json"
-$CredFile = Join-Path $env:USERPROFILE ".pionir\secrets\pionir-builds.cred"
+$SecretsDir = Join-Path $env:USERPROFILE ".pionir\secrets"
+$CredFile = Join-Path $SecretsDir "pionir-builds.cred"
+$PionirSrc = Join-Path (Split-Path $PSScriptRoot -Parent) "src"
+$LoopbackDecision = "accepted by the owner, 2026-09-28 (`"I'm okay with it reaching programs`")"
+# every loopback service pionir-builds can reach, and what stands between it and harm
+$LoopbackServices = @(
+    @{ name = "Ollama"; port = 11434; guard = "NO token (Ollama has none): pull from any registry = network egress as you; delete/create models" },
+    @{ name = "Pionir API"; port = 8780; guard = "client token for privileged work and approvals; builds refuse to run while PIONIR_AUTH_COMPAT is on" },
+    @{ name = "crew API"; port = 8782; guard = "crew token for writes; builds refuse to run while PIONIR_AUTH_COMPAT is on" },
+    @{ name = "Daedalus (yours)"; port = 8771; guard = "DAEDALUS_TOKEN; builds refuse to run while it answers without one" },
+    @{ name = "Melete"; port = 8770; guard = "MELETE_TOKEN" },
+    @{ name = "Galatea (Moss)"; port = 8799; guard = "builds refuse to run while she serves a loopback caller with no token" },
+    @{ name = "Pionir Desktop relay"; port = 8830; guard = "per-run token (only its world and events reads are open)" }
+)
 $RegKey = "HKCU:\Software\Pionir\BuildSandbox"
 $Requirements = Join-Path $PSScriptRoot "build-sandbox-requirements.txt"
 $NotLoopback = @("0.0.0.0-126.255.255.255", "128.0.0.0-255.255.255.255",
@@ -267,7 +292,7 @@ foreach ($drive in Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3") {
 Did "denied $($dataRoots.Count) data folder(s)"
 
 # ---- 6. the firewall ----------------------------------------------------------------------------
-Step "Windows Firewall: $User reaches the build gate on loopback, and nothing else"
+Step "Windows Firewall: $User reaches nothing but loopback"
 Get-NetFirewallRule -Group $RuleGroup -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 $rules = @()
 try {
@@ -286,12 +311,49 @@ try {
     New-NetFirewallRule -DisplayName $name -Group $RuleGroup -Direction Outbound -Action Block `
         -LocalUser $sddl -RemoteAddress $Loopback -Protocol TCP `
         -RemotePort @("1-$($GatePort - 1)", "$($GatePort + 1)-65535") -Profile Any | Out-Null
-    Did "rule: $name (loopback only to the build gate, port $GatePort)"; $rules += $name
+    Did "rule: $name (best effort: Windows does not filter loopback for ordinary programs; loopback is $LoopbackDecision)"; $rules += $name
 } catch {
     Fail "Windows refused a firewall rule ($($_.Exception.Message)); the user cannot be contained without it"
 }
 
-# ---- 7. prove it -------------------------------------------------------------------------------
+# ---- 7. your secrets: nothing in them may be readable by the user ----------------------------
+Step "Your secrets folder: $User, and every group it is in, may read none of it"
+if (-not (Test-Path $SecretsDir)) { Fail "no $SecretsDir" }
+# the SIDs a process of the user carries: its own, the well-known ones every signed-in local
+# user has, and every local group it is a member of
+$reach = @($UserSid, "S-1-1-0", "S-1-5-11", "S-1-5-32-545", "S-1-5-4", "S-1-2-0", "S-1-2-1",
+           "S-1-5-113", "S-1-5-15", "S-1-5-32-546", "S-1-5-7")
+foreach ($g in Get-LocalGroup) {
+    try { $members = @(Get-LocalGroupMember -Group $g -ErrorAction Stop) } catch { continue }
+    if ($members | Where-Object { $_.SID -and $_.SID.Value -eq $UserSid }) { $reach += $g.SID.Value }
+}
+$ownerOnly = @($OwnerSid, "S-1-5-18", "S-1-5-32-544")
+$exposed = @()
+$alsoReads = @{}
+$secretItems = @(Get-Item -Force $SecretsDir) + @(Get-ChildItem -Force -Recurse $SecretsDir -ErrorAction SilentlyContinue)
+foreach ($item in $secretItems) {
+    try { $acl = Get-Acl -LiteralPath $item.FullName } catch { Fail "cannot read the permissions of $($item.FullName)" }
+    foreach ($ace in $acl.Access) {
+        if ($ace.AccessControlType -ne "Allow") { continue }
+        if ($ace.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly) { continue }
+        $bits = [int]$ace.FileSystemRights
+        # ReadData/ListDirectory, GENERIC_ALL or GENERIC_READ (the sign bit)
+        if (-not ((($bits -band 1) -ne 0) -or (($bits -band 0x10000000) -ne 0) -or ($bits -lt 0))) { continue }
+        try { $sid = $ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { $sid = [string]$ace.IdentityReference }
+        if ($reach -contains $sid) { $exposed += "$($item.FullName) ($($ace.IdentityReference))" }
+        elseif ($ownerOnly -notcontains $sid) { $alsoReads[[string]$ace.IdentityReference] = $true }
+    }
+}
+if ($exposed.Count) {
+    foreach ($e in $exposed) { Write-Host "    READABLE BY $User  $e" -ForegroundColor Red }
+    Fail "$User could read your secrets (above). Make each one yours only (icacls <file> /inheritance:r /grant:r `"$($OwnerName):F`") and run this again."
+}
+Did "no permission in $SecretsDir reaches $User or a group it is in ($($secretItems.Count) item(s))"
+foreach ($who in $alsoReads.Keys) {
+    Write-Host "    NOTE     $who (not $User) can also read some of your secrets; not this sandbox's concern, but worth a look" -ForegroundColor Yellow
+}
+
+# ---- 8. prove it -------------------------------------------------------------------------------
 Step "Proving the containment, as $User"
 $cred = New-Object System.Management.Automation.PSCredential(".\$User", (ConvertTo-SecureString (Get-Content $CredFile)))
 $probeDir = Join-Path $SandboxRoot ".setup-probe"
@@ -299,33 +361,77 @@ New-Item -ItemType Directory -Force $probeDir | Out-Null
 $srcFile = (Get-ChildItem $SrcRoot -File -Recurse -Depth 1 -ErrorAction SilentlyContinue |
     Where-Object { -not $_.FullName.StartsWith($SandboxRoot, [StringComparison]::OrdinalIgnoreCase) } |
     Select-Object -First 1).FullName
+$secretFiles = @(Get-ChildItem -Force -Recurse -File $SecretsDir -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+$loopbackPorts = [ordered]@{}
+foreach ($svc in $LoopbackServices) { $loopbackPorts[$svc.name] = $svc.port }
 $targets = @{ sandbox = (Join-Path $probeDir "w.txt"); src = (Join-Path $SrcRoot "probe-$User.txt");
-              srcfile = $srcFile; profile = (Join-Path $env:USERPROFILE ".pionir"); roots = $dataRoots }
-$targets | ConvertTo-Json | Set-Content (Join-Path $probeDir "targets.json") -Encoding UTF8
+              srcfile = $srcFile; profile = (Join-Path $env:USERPROFILE ".pionir");
+              profilewrite = (Join-Path $env:USERPROFILE ".pionir\probe-$User.txt");
+              public = (Join-Path $env:PUBLIC "Documents\probe-$User.txt");
+              programdata = (Join-Path $env:ProgramData "probe-$User.txt");
+              wintemp = (Join-Path $env:windir "Temp\probe-$User.txt");
+              install = (Join-Path $InstallDir "probe-$User.txt");
+              secrets = $secretFiles; secretsdir = $SecretsDir;
+              roots = $dataRoots; loopback = $loopbackPorts }
+$targets | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $probeDir "targets.json") -Encoding UTF8
 $pyProbe = @"
-import json, os, socket
+import ctypes, json, os, socket
+from ctypes import wintypes
 t = json.load(open(r'$probeDir\targets.json', encoding='utf-8-sig'))
-out = {}
+checks, loopback = {}, {}
 def attempt(name, fn):
     try:
-        fn(); out[name] = 'allowed'
+        fn(); checks[name] = 'allowed'
     except Exception as exc:
-        out[name] = 'blocked (' + type(exc).__name__ + ')'
+        checks[name] = 'blocked (' + type(exc).__name__ + ')'
 def write(path):
     with open(path, 'w') as f: f.write('x')
     os.remove(path)
 def connect(host, port):
     s = socket.create_connection((host, port), timeout=5); s.close()
+def integrity():
+    k = ctypes.WinDLL('kernel32'); a = ctypes.WinDLL('advapi32')
+    k.GetCurrentProcess.restype = wintypes.HANDLE
+    a.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    a.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    a.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+    a.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+    a.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    a.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+    h = wintypes.HANDLE()
+    if not a.OpenProcessToken(k.GetCurrentProcess(), 8, ctypes.byref(h)): return None
+    n = wintypes.DWORD(0)
+    a.GetTokenInformation(h, 25, None, 0, ctypes.byref(n))
+    buf = ctypes.create_string_buffer(max(n.value, 1))
+    if not a.GetTokenInformation(h, 25, buf, n, ctypes.byref(n)): return None
+    sid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+    return int(a.GetSidSubAuthority(sid, a.GetSidSubAuthorityCount(sid)[0] - 1)[0])
+try:
+    rid = integrity()
+except Exception:
+    rid = None
 attempt('write the sandbox', lambda: write(t['sandbox']))
 attempt('write C:\\src', lambda: write(t['src']))
 if t.get('srcfile'): attempt('read a file in C:\\src', lambda: open(t['srcfile'], 'rb').read(1))
 attempt('read your profile', lambda: os.listdir(t['profile']))
+attempt('write your profile', lambda: write(t['profilewrite']))
+attempt('list your secrets folder', lambda: os.listdir(t['secretsdir']))
+for s in (t.get('secrets') or []):
+    attempt('read your secret ' + os.path.basename(s), lambda s=s: open(s, 'rb').read(1))
+attempt('write Public Documents', lambda: write(t['public']))
+attempt('write C:\\ProgramData', lambda: write(t['programdata']))
+attempt('write the Windows temp folder', lambda: write(t['wintemp']))
+attempt('write the install folder', lambda: write(t['install']))
 for r in (t.get('roots') or []):
     attempt('write ' + r, lambda r=r: write(os.path.join(r, 'probe.txt')))
 attempt('reach the internet (1.1.1.1:443)', lambda: connect('1.1.1.1', 443))
-attempt('reach Ollama on loopback (127.0.0.1:11434)', lambda: connect('127.0.0.1', 11434))
-attempt('reach Pionir on loopback (127.0.0.1:8780)', lambda: connect('127.0.0.1', 8780))
-json.dump(out, open(r'$probeDir\python.json', 'w'), indent=1)
+for name, port in (t.get('loopback') or {}).items():
+    try:
+        connect('127.0.0.1', int(port)); loopback[name] = 'reachable'
+    except Exception as exc:
+        loopback[name] = 'not reachable (' + type(exc).__name__ + ')'
+json.dump({'integrity': rid, 'checks': checks, 'loopback': loopback},
+          open(r'$probeDir\python.json', 'w'), indent=1)
 "@
 [IO.File]::WriteAllText((Join-Path $probeDir "probe.py"), $pyProbe, $utf8NoBom)
 Start-Process -FilePath $PyExe -ArgumentList @("-I", "`"$probeDir\probe.py`"") -Credential $cred `
@@ -341,9 +447,13 @@ if ($gitExe) {
 } else { $gitResult = "git.exe not found (not tested)" }
 
 $results = [ordered]@{}
+$loopbackSeen = [ordered]@{}
+$rid = $null
 if (Test-Path "$probeDir\python.json") {
     $got = Get-Content "$probeDir\python.json" -Raw | ConvertFrom-Json
-    foreach ($p in $got.PSObject.Properties) { $results["python: " + $p.Name] = [string]$p.Value }
+    foreach ($p in $got.checks.PSObject.Properties) { $results["python: " + $p.Name] = [string]$p.Value }
+    foreach ($p in $got.loopback.PSObject.Properties) { $loopbackSeen[$p.Name] = [string]$p.Value }
+    $rid = $got.integrity
 } else { $results["python probe"] = "did not run as $User" }
 $results["powershell.exe: reach the internet"] = if (Test-Path "$probeDir\powershell.txt") { (Get-Content "$probeDir\powershell.txt" -Raw).Trim() } else { "did not run" }
 $results["git.exe: reach the internet"] = $gitResult
@@ -356,22 +466,65 @@ foreach ($k in $results.Keys) {
     if ($v.StartsWith($want) -or $v -like "*not tested*") { Did "$k : $v" }
     else { Write-Host "    NOT CONTAINED  $k : $v" -ForegroundColor Red; $contained = $false }
 }
+# Low integrity (CreateProcessWithLogonW + the Low label on python.exe) has never been seen
+# working on this machine before this line: it is required, never assumed
+if ($null -eq $rid) {
+    Write-Host "    NOT CONTAINED  python: its integrity level could not be read (the probe did not run, or could not open its own token)" -ForegroundColor Red
+    $contained = $false
+} elseif ([int]$rid -ne 0x1000) {
+    Write-Host ("    NOT CONTAINED  python: runs at integrity 0x{0:x4}, not Low (0x1000): the Low label on {1} did not take effect when started as {2}" -f [int]$rid, $PyExe, $User) -ForegroundColor Red
+    $contained = $false
+} else { Did "python: runs at LOW integrity (0x1000) when started as $User" }
+# loopback: reported, never a stop (the owner's decision), with what guards each service
+foreach ($svc in $LoopbackServices) {
+    $seen = if ($loopbackSeen.Contains($svc.name)) { $loopbackSeen[$svc.name] } else { "not probed" }
+    if ($seen -eq "reachable") {
+        Write-Host ("    ACCEPTED {0} on 127.0.0.1:{1} is reachable - {2}. Guard: {3}" -f $svc.name, $svc.port, $LoopbackDecision, $svc.guard) -ForegroundColor DarkYellow
+    } else {
+        Write-Host ("    INFO     {0} on 127.0.0.1:{1}: {2} now (reachable whenever it runs). Guard: {3}" -f $svc.name, $svc.port, $seen, $svc.guard) -ForegroundColor DarkGray
+    }
+}
 if (-not $contained) {
-    Fail "the containment did not hold (above). Pionir will not use the sandbox. If only loopback is open, Windows is not filtering loopback traffic for this user: builds must not run until that is solved."
+    Fail "the containment did not hold (above). Pionir will not use the sandbox. (Loopback is not part of this: it is $LoopbackDecision.)"
 }
 
-# ---- 8. the record (last: Pionir uses the sandbox only once this exists) ---------------------
+# ---- 9. Pionir's own preflight, through the path a build takes -----------------------------
+Step "Pionir's preflight: the dedicated Python started exactly as a build starts it"
+$ownerPy = Join-Path $PythonSource "python.exe"
+$eap = $ErrorActionPreference
+$ErrorActionPreference = "Continue"      # its stderr is part of the report, not a failure
+$preOut = @(& $ownerPy -I -c "import sys; sys.path.insert(0, sys.argv[1]); from pionir.build_sandbox import _main; raise SystemExit(_main(sys.argv[2:]))" $PionirSrc preflight --python $PyExe --sandbox $SandboxRoot --credential $CredFile --secrets $SecretsDir 2>&1)
+$preCode = $LASTEXITCODE
+$ErrorActionPreference = $eap
+$preLine = $preOut | ForEach-Object { [string]$_ } | Where-Object { $_.TrimStart().StartsWith("{") } | Select-Object -Last 1
+$pre = $null
+if ($preLine) { try { $pre = $preLine | ConvertFrom-Json } catch { $pre = $null } }
+if ($null -eq $pre) {
+    foreach ($l in $preOut) { Write-Host "    $l" -ForegroundColor DarkGray }
+    Fail "Pionir's preflight gave no report (exit $preCode): Low integrity through CreateProcessWithLogonW is NOT proven, so nothing is used"
+}
+if ($preCode -ne 0 -or -not $pre.ok) {
+    foreach ($p in $pre.problems) { Write-Host "    NOT CONTAINED  $p" -ForegroundColor Red }
+    Fail "Pionir's preflight did not prove the containment (above); nothing is used"
+}
+Did ("preflight as ${User}: integrity 0x{0:x4} (Low), {1} secret(s) tried, none readable" -f [int]$pre.report.integrity, [int]$pre.report.files)
+
+# ---- 10. the record (last: Pionir uses the sandbox only once this exists) --------------------
 Step "The record Pionir checks"
 if ($script:Problems.Count) { Fail ("some permissions could not be set: " + ($script:Problems -join "; ")) }
 $doc = [ordered]@{
-    version = 2; user = $User; sid = $UserSid; owner = $OwnerName; owner_sid = $OwnerSid
+    version = 3; user = $User; sid = $UserSid; owner = $OwnerName; owner_sid = $OwnerSid
     python = $PyExe; sandbox_root = (Resolve-Path $SandboxRoot).Path; src_root = $SrcRoot
     daedalus_src = $DaedalusCopy; credential = $CredFile; gate_port = $GatePort
     denied_folders = @($SrcRoot) + $protected + $dataRoots
     firewall_group = $RuleGroup; firewall_rules = $rules
+    low_integrity = $true; secrets_readable = 0
+    loopback = "open: $LoopbackDecision"
     set_up_at = (Get-Date).ToString("o")
 }
 [IO.File]::WriteAllText($Record, ($doc | ConvertTo-Json -Depth 4), $utf8NoBom)
 Did "wrote $Record"
 Write-Host ""
-Write-Host "Done. Pionir's Builds division can now run. Undo with tools\remove-build-sandbox.ps1." -ForegroundColor Cyan
+Write-Host "Done. The sandbox is proven. Night builds still wait for Pionir's own checks at each build:" -ForegroundColor Cyan
+Write-Host "  PIONIR_AUTH_COMPAT off, your Daedalus holding its token, Galatea requiring her token from loopback." -ForegroundColor Cyan
+Write-Host "Undo with tools\remove-build-sandbox.ps1." -ForegroundColor Cyan

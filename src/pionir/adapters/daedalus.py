@@ -249,6 +249,37 @@ def owner_daedalus_open(base_url: str, *, opener=None) -> bool:
         return False
 
 
+GALATEA_LOOPBACK = "http://127.0.0.1:8799"
+
+
+def galatea_open(base_url: str = GALATEA_LOOPBACK, *, opener=None) -> bool:
+    """True when Galatea (Moss, :8799) serves a caller that sends NO token from loopback.
+    Loopback is open to the build user (owner decision, 2026-09-28), and a Galatea that
+    trusts any loopback caller hands it her phone link (her token), her settings and - with
+    a forged Origin - the owner's approve, relayed to Pionir as his phone: no build may run
+    then. A GET of her state with no token and no Origin: only 401/403 is locked; not
+    answering at all is "not running", which is not open."""
+    import urllib.error
+    import urllib.request
+    open_ = opener or urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+    req = urllib.request.Request(base_url.rstrip("/") + "/api/state", method="GET")
+    try:
+        with open_(req, timeout=5.0):
+            return True
+    except urllib.error.HTTPError as exc:
+        return exc.code not in (401, 403)
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def _default_galatea_open() -> bool:
+    urls = {GALATEA_LOOPBACK}
+    configured = (os.environ.get("PIONIR_GALATEA_URL") or "").strip()
+    if configured:
+        urls.add(configured)
+    return any(galatea_open(url) for url in sorted(urls))
+
+
 def _default_sanitize(repo: str) -> None:
     from pionir.sandbox_git import sanitize
     sanitize(repo)
@@ -271,6 +302,7 @@ class DaedalusAdapter:
         sanitize: Callable[[str], None] | None = None,
         owner_open: Callable[[], bool] | None = None,
         auth_compat: Callable[[], bool] | None = None,
+        galatea_open: Callable[[], bool] | None = None,
     ) -> None:
         self.settings = settings or DaedalusSettings()
         self._client = client or LoopbackJsonClient("Daedalus", self.settings)
@@ -283,6 +315,7 @@ class DaedalusAdapter:
             "Build Daedalus", LoopbackHttpSettings(base_url=base, token=token)))
         self._sanitize = sanitize or _default_sanitize
         self._owner_open = owner_open or (lambda: owner_daedalus_open(self.settings.base_url))
+        self._galatea_open = galatea_open or _default_galatea_open
         if auth_compat is None:
             from pionir.auth import compat_from_environment as auth_compat
         self._auth_compat = auth_compat
@@ -546,6 +579,14 @@ class DaedalusAdapter:
                                        f"{self.settings.base_url} takes jobs without a token - "
                                        "restart it with pionir.ps1, which now gives it one "
                                        "(DAEDALUS_TOKEN)", not_configured=True)
+        if self._galatea_open():
+            # loopback is open to the build user (owner decision, 2026-09-28): a Galatea
+            # that trusts any loopback caller is a way to the owner's approvals
+            return self._refused(task, "not armed: Galatea (:8799) serves a loopback caller "
+                                       "that sends no token - generated code could take her "
+                                       "phone link or relay an approval as your phone; no "
+                                       "build runs until she requires her token from "
+                                       "loopback too", not_configured=True)
         repo = os.path.abspath(str(payload["repo"]).strip())
         try:
             self._sanitize(repo)

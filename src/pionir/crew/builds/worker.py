@@ -51,6 +51,7 @@ from datetime import datetime
 from pathlib import Path
 
 from pionir import build_sandbox
+from pionir.auth import compat_from_environment
 from pionir.adapters.deliveries import DeliveryProblem
 
 from ..blog import _clip, _Unreadable, read_record, record_path, save_record
@@ -113,6 +114,10 @@ class BuildsWorker(_Base):
         self.git_run = None                 # None: subprocess.run
         # the contained sandbox user, as the setup script left it (None: not configured)
         self.load_sandbox = lambda root: build_sandbox.load_setup(root)
+        # loopback is open to the sandbox user (owner decision, 2026-09-28): while auth compat
+        # is on, a caller with no token is still served by Pionir and the crew API, so night
+        # builds are not armed at all - nothing is built, and no generated code is run
+        self.auth_compat = compat_from_environment
         self._setup = None
         self.load_guard = lambda secrets_dir: checks.load_guard(
             secrets_dir, self.ssh_dir, checks.owner_markers())
@@ -124,7 +129,14 @@ class BuildsWorker(_Base):
         root = os.environ.get("PIONIR_DAEDALUS_SANDBOX", "").strip() or \
             build_sandbox.default_sandbox_root()
         _setup, why = self.load_sandbox(root)
-        return why
+        return why or self._compat_refusal()
+
+    def _compat_refusal(self) -> str | None:
+        if self.auth_compat():
+            return ("not armed: PIONIR_AUTH_COMPAT is on, so a process with no token (generated "
+                    "code on loopback included) is still served; set PIONIR_AUTH_COMPAT=off "
+                    "once every client sends its token")
+        return None
 
     # ---- the record --------------------------------------------------------------------
     @staticmethod
@@ -165,6 +177,9 @@ class BuildsWorker(_Base):
             # no job is asked for, no generated code is run
             return self._err(ErrorKind.NOT_CONFIGURED, why or build_sandbox.SETUP_HINT,
                              retryable=False)
+        compat = self._compat_refusal()
+        if compat:
+            return self._err(ErrorKind.NOT_CONFIGURED, compat, retryable=False)
         self._setup = setup
         try:
             rec = self.load(ctx.state_dir)

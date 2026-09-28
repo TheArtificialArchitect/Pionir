@@ -32,6 +32,14 @@ got out of its job some other way included - and nothing starts while any surviv
 
 The build Daedalus reaches Ollama only through ``OllamaGate``: chat, generate and embed for
 its one model, and the read-only model listing - never pull, delete, create, copy or push.
+
+LOOPBACK IS OPEN (owner decision, 2026-09-28: "I'm okay with it reaching programs"). Windows
+Firewall does not filter loopback for ordinary programs, so a process of the sandbox user can
+connect to any 127.0.0.1 port - Ollama itself included, not only the gate. What holds instead:
+every service there that could do harm must demand a token the sandbox user cannot read, and
+``preflight`` proves, AS that user, before any generated code runs, that it is at Low
+integrity and can read none of the owner's secrets. Night builds also refuse to run while
+``PIONIR_AUTH_COMPAT`` is on (a tokenless caller is still served by Pionir then).
 """
 from __future__ import annotations
 
@@ -59,6 +67,8 @@ RECORD_NAME = "setup.json"
 CREDENTIAL_NAME = "pionir-builds.cred"
 BUILD_PORT = 8772
 GATE_PORT = 8773
+RECORD_VERSION = 3
+LOW_RID = 0x1000                    # SECURITY_MANDATORY_LOW_RID
 STATE_DIR_NAME = ".daedalus-state"
 RUNS_DIR_NAME = ".runs"
 _LOW_LABEL = re.compile(r"(?im)^.*Mandatory Label\\Low Mandatory Level:.*$")
@@ -75,7 +85,11 @@ def default_sandbox_root() -> str:
 
 
 def default_credential_path() -> Path:
-    return Path.home() / ".pionir" / "secrets" / CREDENTIAL_NAME
+    return default_secrets_dir() / CREDENTIAL_NAME
+
+
+def default_secrets_dir() -> Path:
+    return Path.home() / ".pionir" / "secrets"
 
 
 # ---- Win32 ------------------------------------------------------------------------------------
@@ -343,6 +357,14 @@ class SandboxSetup:
         """Kill every process this user has; raise if any survives."""
         ensure_no_strays(self)
 
+    def preflight(self) -> dict:
+        """Prove, as this user, that it runs Low and reads none of the owner's secrets;
+        raise SandboxError otherwise. Run before any generated code runs."""
+        return require_preflight(self.python,
+                                 work=self.runs_dir / f"preflight-{secrets.token_hex(4)}",
+                                 logon=self.logon(), sid=self.sid,
+                                 secrets_dir=default_secrets_dir())
+
 
 def _inside(path: Path, folder: Path) -> bool:
     try:
@@ -366,8 +388,12 @@ def load_setup(sandbox_root, *, record: Path | None = None, credential: Path | N
         return None, f"{SETUP_HINT} ({record} is unreadable: {type(exc).__name__})"
     if not isinstance(doc, dict) or doc.get("user") != USER:
         return None, f"{SETUP_HINT} ({record} does not describe the {USER} user)"
-    if doc.get("version") != 2:
+    if doc.get("version") != RECORD_VERSION:
         return None, f"{SETUP_HINT} ({record} is from an older setup; run it again)"
+    if doc.get("low_integrity") is not True or doc.get("secrets_readable") != 0:
+        # written only by a setup whose own preflight, AS the user, proved both
+        return None, (f"{SETUP_HINT} ({record} does not show that the {USER} user was proven "
+                      "to run at Low integrity and to read none of your secrets)")
     sid = lookup(USER)
     if not sid or sid != doc.get("sid"):
         return None, f"{SETUP_HINT} (the {USER} account is missing or not the one set up)"
@@ -799,6 +825,137 @@ def ensure_no_strays(setup: SandboxSetup, *, runner=None) -> None:
                            f"({', '.join(left[:5])}); nothing is started until they are gone")
 
 
+# ---- the preflight: what a process of the sandbox user really is ---------------------------------
+# Run with the dedicated interpreter, AS the sandbox user, through ``spawn`` - the very path a
+# build and our test runs take. The child reports its OWN token's integrity level (nothing on
+# our side has to open another user's token) and tries to read each of the owner's secrets.
+PREFLIGHT_CODE = r"""
+import ctypes, json, os, sys
+from ctypes import wintypes
+out = {"integrity": None, "readable": [], "listable": []}
+try:
+    k = ctypes.WinDLL("kernel32")
+    a = ctypes.WinDLL("advapi32")
+    k.GetCurrentProcess.restype = wintypes.HANDLE
+    a.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                   ctypes.POINTER(wintypes.HANDLE)]
+    a.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                      wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    a.GetSidSubAuthorityCount.argtypes = [ctypes.c_void_p]
+    a.GetSidSubAuthorityCount.restype = ctypes.POINTER(ctypes.c_ubyte)
+    a.GetSidSubAuthority.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+    a.GetSidSubAuthority.restype = ctypes.POINTER(wintypes.DWORD)
+    h = wintypes.HANDLE()
+    if a.OpenProcessToken(k.GetCurrentProcess(), 8, ctypes.byref(h)):
+        n = wintypes.DWORD(0)
+        a.GetTokenInformation(h, 25, None, 0, ctypes.byref(n))
+        buf = ctypes.create_string_buffer(max(n.value, 1))
+        if a.GetTokenInformation(h, 25, buf, n, ctypes.byref(n)):
+            sid = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+            count = a.GetSidSubAuthorityCount(sid)[0]
+            out["integrity"] = int(a.GetSidSubAuthority(sid, count - 1)[0])
+except Exception as exc:
+    out["error"] = type(exc).__name__
+ask = json.loads(sys.argv[1])
+for p in ask.get("files", []):
+    try:
+        with open(p, "rb") as f:
+            f.read(1)
+        out["readable"].append(p)
+    except OSError:
+        pass
+for p in ask.get("dirs", []):
+    try:
+        os.listdir(p)
+        out["listable"].append(p)
+    except OSError:
+        pass
+print("PREFLIGHT " + json.dumps(out))
+"""
+_PREFLIGHT_LINE = re.compile(r"(?m)^PREFLIGHT (\{.*\})\s*$")
+
+
+def _secret_targets(secrets_dir: Path) -> dict:
+    """Every file in the owner's secrets folder (as the owner sees it), and the folders a
+    contained process must not be able to list."""
+    secrets_dir = Path(secrets_dir)
+    files = sorted(str(p) for p in secrets_dir.rglob("*") if p.is_file()) \
+        if secrets_dir.is_dir() else []
+    return {"files": files,
+            "dirs": [str(secrets_dir), str(secrets_dir.parent), str(Path.home())]}
+
+
+def preflight(python, *, work: Path, logon, sid, secrets_dir: Path, runner=None) -> dict:
+    """Run the preflight as ``logon``'s user with ``python`` (contained, like everything
+    else). ``{"integrity": rid|None, "readable": [...], "listable": [...], "files": n}``,
+    or ``{"failed": why}`` when it did not run or said nothing we could read."""
+    import shutil
+    work = Path(work)
+    targets = _secret_targets(secrets_dir)
+    try:
+        work.mkdir(parents=True, exist_ok=True)
+        system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+        env = minimal_env(work=work / "env", path_dirs=[Path(python).parent, system32])
+        done = (runner or run)([str(python), "-I", "-S", "-c", PREFLIGHT_CODE,
+                                json.dumps(targets)],
+                               cwd=work, env=env, out_dir=work / "out", timeout=60,
+                               limits=JobLimits(active_processes=2, job_memory_mb=256,
+                                                cpu_seconds=30),
+                               logon=logon, sid=sid)
+    except (SandboxError, OSError) as exc:
+        return {"failed": f"it could not start ({exc})"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if done.timed_out:
+        return {"failed": "it did not finish within 60 s"}
+    found = _PREFLIGHT_LINE.search(done.stdout or "")
+    if done.returncode != 0 or not found:
+        return {"failed": f"it exited {done.returncode} without a report "
+                          f"({(done.stderr or '').strip()[-300:]})"}
+    try:
+        doc = json.loads(found.group(1))
+    except ValueError:
+        return {"failed": "its report is not JSON"}
+    if not isinstance(doc, dict):
+        return {"failed": "its report is not an object"}
+    doc["files"] = len(targets["files"])
+    return doc
+
+
+def preflight_problems(doc: dict) -> list:
+    """Why a preflight report does not prove the containment - empty only when it does."""
+    if doc.get("failed"):
+        return [f"the preflight did not run: {doc['failed']}"]
+    problems = []
+    rid = doc.get("integrity")
+    if rid is None:
+        problems.append("it could not read its own integrity level, so it is not proven "
+                        "to run at Low integrity")
+    elif rid != LOW_RID:
+        problems.append(f"it runs at integrity 0x{int(rid):04x}, not Low (0x{LOW_RID:04x}): "
+                        "the Low label on the dedicated python.exe did not take effect")
+    readable = list(doc.get("readable") or [])
+    if readable:
+        problems.append(f"it can read {len(readable)} of your secrets: "
+                        + ", ".join(Path(p).name for p in readable[:6]))
+    listable = list(doc.get("listable") or [])
+    if listable:
+        problems.append("it can list " + ", ".join(listable[:3]))
+    return problems
+
+
+def require_preflight(python, *, work: Path, logon, sid, secrets_dir: Path,
+                      runner=None) -> dict:
+    """``preflight``, and raise SandboxError unless it proves the containment."""
+    doc = preflight(python, work=work, logon=logon, sid=sid, secrets_dir=secrets_dir,
+                    runner=runner)
+    problems = preflight_problems(doc)
+    if problems:
+        raise SandboxError(f"the {USER} user is not contained - " + "; ".join(problems)
+                           + ". Nothing of a build runs until it is.")
+    return doc
+
+
 # ---- the Ollama gate -----------------------------------------------------------------------------
 GATE_READS = frozenset({"/api/tags", "/api/ps", "/api/version"})
 GATE_MODEL_CALLS = frozenset({"/api/chat", "/api/generate", "/api/embed", "/api/embeddings",
@@ -1007,6 +1164,8 @@ class BuildDaedalus:
             raise SandboxError("the build Daedalus is already running")
         # nothing of the sandbox user's may be running before a new build starts
         self.setup.reap()
+        # ... and it is proven, as that user, to run Low and to read none of the secrets
+        self.setup.preflight()
         if self._answers():
             raise SandboxError(f"something already answers on 127.0.0.1:{self.port}; the "
                                "build Daedalus is started only on a free port")
@@ -1112,3 +1271,38 @@ def info(setup: SandboxSetup | None) -> dict[str, Any]:
         return {"configured": False}
     return {"configured": True, "user": setup.user, "python": str(setup.python),
             "sandbox_root": str(setup.sandbox_root)}
+
+
+def _main(argv=None) -> int:
+    """``python -m pionir.build_sandbox preflight ...``: the setup script's last proof, run
+    through ``spawn`` exactly as a build is (CreateProcessWithLogonW, the job, the desktop).
+    Prints the report as JSON; exit 0 only when it proves the containment. It can be run
+    again later WITHOUT elevation, which is how Pionir itself runs it before every build."""
+    import argparse
+    parser = argparse.ArgumentParser(prog="python -m pionir.build_sandbox")
+    sub = parser.add_subparsers(dest="command", required=True)
+    pre = sub.add_parser("preflight")
+    pre.add_argument("--python", required=True)
+    pre.add_argument("--sandbox", required=True)
+    pre.add_argument("--credential", default=str(default_credential_path()))
+    pre.add_argument("--secrets", default=str(default_secrets_dir()))
+    args = parser.parse_args(argv)
+    sid = lookup_sid(USER)
+    if not sid:
+        print(json.dumps({"ok": False, "problems": [f"there is no {USER} account"]}))
+        return 1
+    try:
+        logon = (USER, ".", read_password(Path(args.credential)))
+    except (OSError, SandboxError, UnicodeDecodeError) as exc:
+        print(json.dumps({"ok": False, "problems": [f"the credential: {exc}"]}))
+        return 1
+    work = Path(args.sandbox) / RUNS_DIR_NAME / f"preflight-{secrets.token_hex(4)}"
+    doc = preflight(args.python, work=work, logon=logon, sid=sid,
+                    secrets_dir=Path(args.secrets))
+    problems = preflight_problems(doc)
+    print(json.dumps({"ok": not problems, "problems": problems, "report": doc}))
+    return 0 if not problems else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

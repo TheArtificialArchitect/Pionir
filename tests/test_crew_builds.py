@@ -98,6 +98,7 @@ class FakeSetup:
         self.sid = None
         self.logons = 0
         self.reaps = 0
+        self.preflights = 0
 
     def logon(self):
         self.logons += 1
@@ -105,6 +106,10 @@ class FakeSetup:
 
     def reap(self):
         self.reaps += 1
+
+    def preflight(self):
+        self.preflights += 1
+        return {"integrity": 0x1000, "readable": [], "listable": []}
 
 
 def commit(repo: Path, files: dict, message="Daedalus: build") -> str:
@@ -212,6 +217,8 @@ class _Case(unittest.TestCase):
         self.worker.load_sandbox = lambda root: (
             (self.setup, None) if self.configured else
             (None, "not configured: run tools\\setup-build-sandbox.ps1 once, as administrator"))
+        self.compat = False
+        self.worker.auth_compat = lambda: self.compat
         self.pionir = FakePionir()
         self.http = FakeHttp()
         self.answers: list = []          # Claude's next answers (Ok text or Err refusal)
@@ -471,6 +478,26 @@ class StartTests(_Case):
         self.assertEqual(self.test_runs, 0)                  # not a line of generated code
         self.assertEqual(self.prompts, [])
         self.assertIn("setup-build-sandbox", self.worker.readiness(self.secrets))
+
+    def test_while_auth_compat_is_on_nothing_runs_at_all(self) -> None:
+        # loopback is open to the sandbox user: a tokenless caller must get nothing
+        self.compat = True
+        for now in (at(1, 1, 30), at(1, 2, 30)):
+            ctx = WorkContext(now=now, http=self.http, secrets_dir=self.secrets,
+                              job=self.pionir.job, state_dir=self.state,
+                              products_dir=self.shelf, review=self.review,
+                              task=self.pionir.task, builds_dir=self.builds,
+                              builds_sandbox=self.sandbox)
+            result = self.worker.run(ctx)
+            self.assertIsInstance(result, Err)
+            self.assertEqual(result.error.kind, "not_configured")
+            self.assertIn("PIONIR_AUTH_COMPAT", result.error.message)
+        self.assertEqual(self.pionir.jobs, [])
+        self.assertEqual(list(self.sandbox.iterdir()), [])
+        self.assertEqual(self.test_runs, 0)
+        self.assertIn("PIONIR_AUTH_COMPAT", self.worker.readiness(self.secrets))
+        self.compat = False
+        self.assertIsNone(self.worker._compat_refusal())
 
     def test_daedalus_down_is_waiting_not_failure(self) -> None:
         # the build Daedalus could not be started (or reached): not an attempt
@@ -1265,6 +1292,25 @@ class StdlibOnlyTests(unittest.TestCase):
                                timeout=120)
         self.assertTrue(run.passed, run.tail)
         self.assertEqual(setup.reaps, 2)                # before and after
+        self.assertEqual(setup.preflights, 1)           # proven contained before it ran
+
+    def test_no_test_run_unless_the_preflight_proves_the_containment(self) -> None:
+        from pionir import build_sandbox as bs
+        e = dict(backlog.SEED[0])
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        setup = FakeSetup(Path(tmp.name))
+
+        def uncontained():
+            raise bs.SandboxError("the pionir-builds user is not contained - it can read 1 "
+                                  "of your secrets")
+        setup.preflight = uncontained
+        spawned = []
+        run = review.run_tests(as_bytes(product(e)), "python", setup=setup, timeout=120,
+                               spawner=lambda *a, **k: spawned.append(a))
+        self.assertFalse(run.passed)
+        self.assertIn("not contained", run.tail)
+        self.assertEqual(spawned, [])                   # not a line of it ran
 
     def test_javascript_is_not_in_the_backlog_until_node_is_set_up(self) -> None:
         entry = dict(backlog.SEED[0], language="javascript")

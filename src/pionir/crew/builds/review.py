@@ -146,6 +146,7 @@ def run_tests(files: dict, language: str, *, setup, timeout: float = TEST_TIMEOU
                               cpu_seconds=max(30.0, timeout))
         try:
             setup.reap()                    # nothing of the sandbox user's runs before
+            setup.preflight()               # proven Low, and blind to the owner's secrets
             done = bs.run(argv, cwd=product, env=env, out_dir=work / "out", timeout=timeout,
                           limits=limits, logon=setup.logon(), spawner=spawner,
                           sid=getattr(setup, "sid", None))

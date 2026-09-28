@@ -56,9 +56,10 @@ class SetupRecordTests(_Case):
         python = self.root / "python" / "python.exe"      # the copy in the install folder
         python.parent.mkdir(exist_ok=True)
         python.write_bytes(b"MZ")
-        doc = {"version": 2, "user": bs.USER, "sid": SID, "python": str(python),
+        doc = {"version": 3, "user": bs.USER, "sid": SID, "python": str(python),
                "sandbox_root": str(sandbox), "daedalus_src": str(src),
-               "credential": str(self.root / "c.cred")}
+               "credential": str(self.root / "c.cred"),
+               "low_integrity": True, "secrets_readable": 0}
         doc.update(over)
         self.n = getattr(self, "n", 0) + 1
         path = self.root / f"setup-{self.n}.json"                   # one record per case
@@ -90,6 +91,11 @@ class SetupRecordTests(_Case):
             "bad credential": dict(record=self.record(), read=bad_cred),
             "not our user": dict(record=self.record(user="someone")),
             "an older setup": dict(record=self.record(version=1)),
+            "a v2 setup (before the preflight)": dict(record=self.record(version=2)),
+            "Low integrity never proven": dict(record=self.record(low_integrity=None)),
+            "Low integrity proven false": dict(record=self.record(low_integrity=False)),
+            "secrets readable": dict(record=self.record(secrets_readable=2)),
+            "secrets never checked": dict(record=self.record(secrets_readable=None)),
             "interpreter outside the install": dict(record=self.record(python=sys.executable)),
             "daedalus left in C:\\src": dict(
                 record=self.record(daedalus_src=r"C:\src\Tech-Support\daedalus")),
@@ -107,6 +113,8 @@ class SetupRecordTests(_Case):
         self.assertIn("credential", self.load(record=self.record(), read=bad_cred)[1])
         self.assertIn("Low", self.load(record=self.record(),
                                         low=lambda path: "python" not in str(path))[1])
+        self.assertIn("proven", self.load(record=self.record(low_integrity=False))[1])
+        self.assertIn("secrets", self.load(record=self.record(secrets_readable=1))[1])
 
     def test_the_credential_is_dpapi_for_this_account(self) -> None:
         cred = self.root / "c.cred"
@@ -264,7 +272,7 @@ class BuildDaedalusTests(_Case):
                                logon=lambda: ("pionir-builds", ".", "pw"))
 
     def launcher(self, *, health=None, before=False, accepts_wrong=False, wrong_ok=False,
-                 strays=None):
+                 strays=None, uncontained=False):
         setup = self.setup()
         self.reaps = []
 
@@ -273,7 +281,17 @@ class BuildDaedalusTests(_Case):
             if strays:
                 raise bs.SandboxError(f"processes of pionir-builds survived ({strays})")
 
+        self.preflights = []
+
+        def preflight():
+            self.preflights.append(len(spawned))
+            if uncontained:
+                raise bs.SandboxError("the pionir-builds user is not contained - it runs at "
+                                      "integrity 0x2000, not Low")
+            return {"integrity": bs.LOW_RID, "readable": [], "listable": []}
+
         setup.reap = reap
+        setup.preflight = preflight
         self.gate = FakeGate()
         state = {"up": before}
         spawned: list = []
@@ -345,6 +363,18 @@ class BuildDaedalusTests(_Case):
         launcher.stop()
         self.assertFalse(self.gate.running)
         self.assertEqual(len(self.reaps), 2)                  # and after it was killed
+
+    def test_nothing_starts_unless_the_preflight_proves_the_containment(self) -> None:
+        launcher, spawned = self.launcher()
+        launcher.start(not_after=time.time() + 3600)
+        self.assertEqual(self.preflights, [0])               # once, before the spawn
+        launcher.stop()
+        launcher, spawned = self.launcher(uncontained=True)
+        with self.assertRaises(bs.SandboxError) as caught:
+            launcher.start(not_after=time.time() + 3600)
+        self.assertIn("not Low", str(caught.exception))
+        self.assertEqual(spawned, [])
+        self.assertFalse(self.gate.running)
 
     def test_nothing_starts_while_a_stray_survives(self) -> None:
         launcher, spawned = self.launcher(strays="evil.exe")
@@ -538,6 +568,119 @@ class ReapTests(_Case):
     def test_a_check_that_fails_is_not_clean(self) -> None:
         setup, runner, _calls = self.setup(listing="", code=1)
         self.assertTrue(bs.reap(setup, runner=runner))
+
+
+class PreflightReportTests(_Case):
+    """What the preflight's report must say before anything of a build runs."""
+
+    def run_with(self, stdout: str, *, code: int = 0, timed_out: bool = False):
+        calls = []
+
+        def runner(argv, **kw):
+            calls.append((argv, kw))
+            return bs.RunResult(None if timed_out else code, timed_out, stdout, "boom")
+
+        secrets = self.root / "secrets"
+        secrets.mkdir(exist_ok=True)
+        (secrets / "daedalus-token.txt").write_text("t" * 43, encoding="utf-8")
+        doc = bs.preflight(Path(r"C:\ProgramData\PionirBuilds\python\python.exe"),
+                           work=self.root / "w", logon=("pionir-builds", ".", "pw"), sid=SID,
+                           secrets_dir=secrets, runner=runner)
+        return doc, calls
+
+    def report(self, **over) -> str:
+        body = {"integrity": bs.LOW_RID, "readable": [], "listable": []}
+        body.update(over)
+        return "noise\nPREFLIGHT " + json.dumps(body) + "\n"
+
+    def test_a_low_process_that_reads_nothing_passes(self) -> None:
+        doc, calls = self.run_with(self.report())
+        self.assertEqual(bs.preflight_problems(doc), [])
+        (argv, kw), = calls
+        self.assertEqual(kw["logon"], ("pionir-builds", ".", "pw"))      # AS the user
+        self.assertEqual(argv[1:4], ["-I", "-S", "-c"])
+        asked = json.loads(argv[5])
+        self.assertEqual([Path(f).name for f in asked["files"]], ["daedalus-token.txt"])
+        self.assertIn(str(Path.home()), asked["dirs"])
+        self.assertEqual(doc["files"], 1)
+
+    def test_anything_short_of_proof_is_a_problem(self) -> None:
+        cases = {
+            "medium": self.report(integrity=0x2000),
+            "untrusted is not low": self.report(integrity=0),
+            "no integrity": self.report(integrity=None),
+            "a secret read": self.report(readable=[r"C:\Users\x\.pionir\secrets\t.txt"]),
+            "the profile listed": self.report(listable=[r"C:\Users\x"]),
+            "no report": "nothing here\n",
+            "not json": "PREFLIGHT {nope}\n",
+        }
+        for name, out in cases.items():
+            doc, _calls = self.run_with(out)
+            self.assertTrue(bs.preflight_problems(doc), name)
+        for kw in ({"code": 1}, {"timed_out": True}):
+            doc, _calls = self.run_with(self.report(), **kw)
+            self.assertTrue(bs.preflight_problems(doc), kw)
+        doc, _calls = self.run_with(self.report(), timed_out=True)
+        self.assertIn("did not finish", doc["failed"])
+        doc, _calls = self.run_with(self.report(integrity=0x2000))
+        self.assertIn("not Low", " ".join(bs.preflight_problems(doc)))
+        doc, _calls = self.run_with(self.report(readable=["a", "b"]))
+        self.assertIn("read 2 of your secrets", " ".join(bs.preflight_problems(doc)))
+
+    def test_require_preflight_raises_unless_proven(self) -> None:
+        def runner(argv, **kw):
+            return bs.RunResult(0, False, self.report(integrity=0x2000), "")
+        with self.assertRaises(bs.SandboxError):
+            bs.require_preflight("python.exe", work=self.root / "w", logon=None, sid=None,
+                                 secrets_dir=self.root, runner=runner)
+
+
+@unittest.skipUnless(WINDOWS, "integrity levels are Windows")
+class LowIntegrityProbeTests(_Case):
+    """The non-admin probe: a copy of this interpreter, labelled Low the way setup labels
+    the dedicated one, started through ``spawn`` as THIS user (CreateProcessW - the
+    CreateProcessWithLogonW path needs the pionir-builds account, so setup proves that one).
+    Only temporary files are touched."""
+
+    def interpreter(self, *, low: bool) -> Path:
+        import shutil
+        base = Path(sys.base_prefix)
+        target = self.root / ("low" if low else "medium")
+        target.mkdir()
+        for name in ("python.exe", f"python{sys.version_info[0]}{sys.version_info[1]}.dll",
+                     "python3.dll", "vcruntime140.dll", "vcruntime140_1.dll"):
+            if (base / name).exists():
+                shutil.copy2(base / name, target / name)
+        (target / "pyvenv.cfg").write_text(f"home = {base}\n", encoding="utf-8")
+        exe = target / "python.exe"
+        if low:
+            done = subprocess.run(["icacls", str(exe), "/setintegritylevel", "low"],
+                                  capture_output=True, text=True, check=False)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertTrue(bs.is_low_labelled(exe))
+        return exe
+
+    def secrets(self) -> Path:
+        folder = self.root / "secrets"
+        folder.mkdir()
+        (folder / "a-token.txt").write_text("t" * 43, encoding="utf-8")
+        return folder
+
+    def test_a_low_labelled_interpreter_runs_at_low_integrity(self) -> None:
+        doc = bs.preflight(self.interpreter(low=True), work=self.root / "w", logon=None,
+                           sid=None, secrets_dir=self.secrets())
+        self.assertEqual(doc.get("integrity"), bs.LOW_RID, doc)
+        # Low alone does not hide a file: its DACL does (no-read-up is not on for files),
+        # which is why the preflight reads every secret as the sandbox user
+        self.assertEqual(len(doc["readable"]), 1)
+        self.assertTrue(any("not Low" in p or "secrets" in p
+                            for p in bs.preflight_problems(doc)))
+
+    def test_an_unlabelled_interpreter_is_not_low_and_is_refused(self) -> None:
+        doc = bs.preflight(self.interpreter(low=False), work=self.root / "w", logon=None,
+                           sid=None, secrets_dir=self.secrets())
+        self.assertGreaterEqual(doc.get("integrity") or 0, 0x2000, doc)
+        self.assertIn("not Low", " ".join(bs.preflight_problems(doc)))
 
 
 class OllamaGateTests(_Case):
