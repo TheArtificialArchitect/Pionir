@@ -13,11 +13,16 @@ back to ``MELETE_TOKEN``), Melete checks ``MELETE_TOKEN`` (melete/config.py); ea
   its token and hands Pionir both (``PIONIR_DAEDALUS_TOKEN`` / ``PIONIR_MELETE_TOKEN``);
   Pionir's config also reads the files when those variables are unset.
 - ``daedalus_open`` asks the running Daedalus a job-changing call WITHOUT a token (a cancel
-  of a job that does not exist - it changes nothing): only 401 is a locked Daedalus.
-  ``pionir doctor`` warns when it is open. Melete cannot be asked the same way: its only
-  job route validates the request body before it checks the token, so the only way to see
-  an open Melete is to hand it a real job. Doctor therefore warns when Pionir holds no Melete
-  token (then Melete was not started with one by the launcher) and says it cannot probe.
+  of a job that does not exist - it changes nothing): only 401 is a locked Daedalus. The
+  same call WITH Pionir's token must be answered 404 (past the token check); 401 there is a
+  Daedalus started with a different token. ``pionir doctor`` fails on either.
+- Melete cannot be asked the same way: its only job route validates the request body
+  before it checks the token, so the only unauthenticated probe is a real job. Instead the
+  start time of the process listening on its port is compared with the token file's: a
+  Melete that has run since before its token was made was started without it. Doctor
+  fails on that, and on a Melete it cannot tell about.
+- ``pionir bridge-tokens`` reports the same for both bridges (``open_bridges``) so the
+  launcher can warn loudly about a bridge that is already up without its token.
 """
 from __future__ import annotations
 
@@ -26,6 +31,7 @@ import os
 import secrets
 import subprocess
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -133,20 +139,47 @@ def ensure_tokens(directory: Path | None = None) -> dict[str, str]:
     return out
 
 
+RESTART = "Stop the stack (pionir.ps1 -Stop) and start it again with pionir.ps1."
+# The launcher's bridges: token file -> (name, port). pionir.ps1 starts them on these.
+BRIDGES = {"daedalus-token.txt": ("Daedalus", 8771), "melete-token.txt": ("Melete", 8770)}
+PROBE = "/jobs/pionir-auth-probe/cancel"
+
+
+def _cancel_probe(base_url: str, token: str | None, *, opener=None) -> int | None:
+    """POST a cancel of a job that does not exist (it changes nothing) and return the HTTP
+    status; None when nothing answers there."""
+    open_ = opener or urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(base_url.rstrip("/") + PROBE, data=b"{}", method="POST",
+                                 headers=headers)
+    try:
+        with open_(req, timeout=5.0) as answer:
+            return int(getattr(answer, "status", 200) or 200)
+    except urllib.error.HTTPError as exc:
+        return exc.code
+    except (urllib.error.URLError, OSError):
+        return None
+
+
 def daedalus_open(base_url: str, *, opener=None) -> bool | None:
     """True when the Daedalus at ``base_url`` takes a job-changing call without a token;
     False when it refuses (401); None when nothing answers there."""
-    open_ = opener or urllib.request.build_opener(urllib.request.ProxyHandler({})).open
-    req = urllib.request.Request(base_url.rstrip("/") + "/jobs/pionir-auth-probe/cancel",
-                                 data=b"{}", method="POST",
-                                 headers={"Content-Type": "application/json"})
-    try:
-        with open_(req, timeout=5.0):
-            return True
-    except urllib.error.HTTPError as exc:
-        return exc.code != 401
-    except (urllib.error.URLError, OSError):
-        return None
+    code = _cancel_probe(base_url, None, opener=opener)
+    return None if code is None else code != 401
+
+
+def daedalus_token_accepted(base_url: str, token: str, *, opener=None) -> bool | None:
+    """Whether Daedalus takes ``token``: the same harmless cancel WITH it is answered 404 (no
+    such job - it got past the token check). 401 is a token it was not started with; None
+    is anything else (not running, or an answer that says neither)."""
+    code = _cancel_probe(base_url, token, opener=opener)
+    if code == 404:
+        return True
+    if code == 401:
+        return False
+    return None
 
 
 def _answers(base_url: str, *, opener=None) -> bool:
@@ -161,38 +194,165 @@ def _answers(base_url: str, *, opener=None) -> bool:
         return False
 
 
-def bridge_report(settings: Any, *, opener=None) -> dict[str, Any]:
+def listener_started(port: int) -> float | None:
+    """When the process listening on local TCP ``port`` started (epoch seconds), or None
+    when nothing listens there or it cannot be told. A read of the TCP table; it sends
+    nothing."""
+    if os.name != "nt":
+        return None
+    from ctypes import wintypes
+    iphlp = ctypes.WinDLL("iphlpapi")
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    size = wintypes.DWORD(0)
+    iphlp.GetExtendedTcpTable(None, ctypes.byref(size), False, 2, 3, 0)  # v4, OWNER_PID_LISTENER
+    buf = ctypes.create_string_buffer(size.value + 4096)
+    size = wintypes.DWORD(len(buf))
+    if iphlp.GetExtendedTcpTable(buf, ctypes.byref(size), False, 2, 3, 0) != 0:
+        return None
+    count = ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD))[0]
+    rows = ctypes.cast(ctypes.addressof(buf) + 4, ctypes.POINTER(wintypes.DWORD * 6))
+    pid = None
+    for i in range(count):
+        row = rows[i]
+        local_port = ((row[2] & 0xFF) << 8) | ((row[2] >> 8) & 0xFF)
+        if local_port == port:
+            pid = row[5]
+            break
+    if not pid:
+        return None
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    handle = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not k32.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+            return None
+        ticks = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+        return ticks / 10_000_000 - 11_644_473_600
+    finally:
+        k32.CloseHandle(handle)
+
+
+def started_before_token(port: int, name: str, directory: Path | None = None, *,
+                         started=listener_started) -> bool | None:
+    """True when the bridge listening on ``port`` has run since before its token file was
+    made - so it was started without it. None when that cannot be told (nothing listening,
+    no token file, or the listener's start time unreadable)."""
+    began = started(port)
+    if began is None:
+        return None
+    try:
+        made = ((directory or secrets_dir()) / name).stat().st_mtime
+    except OSError:
+        return None
+    return began < made
+
+
+def _port(url: str) -> int | None:
+    try:
+        return urllib.parse.urlsplit(url).port
+    except ValueError:
+        return None
+
+
+def open_bridges(made: dict[str, str], directory: Path | None = None, *,
+                 started=listener_started, listening=None) -> list[dict[str, Any]]:
+    """The launcher's bridges already listening WITHOUT the token just made or kept: one
+    whose token was made now while its port listens, or whose listener is older than its
+    token file. pionir.ps1 prints each loudly - it never leaves one silently."""
+    listening = listening or _port_listens
+    out = []
+    for name, (bridge, port) in BRIDGES.items():
+        if made.get(name) == "made" and listening(port):
+            why = "its token was just made, after it started"
+        elif started_before_token(port, name, directory, started=started):
+            why = "it has run since before its token was made"
+        else:
+            continue
+        out.append({"bridge": bridge, "port": port, "why": why})
+    return out
+
+
+def _port_listens(port: int) -> bool:
+    import socket
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def bridge_report(settings: Any, *, opener=None, started=listener_started,
+                  directory: Path | None = None) -> dict[str, Any]:
     """What doctor says about the bridges' tokens: an entry per configured bridge, with a
-    ``warning`` on each one that takes jobs from anyone."""
+    ``warning`` on each one that takes jobs from anyone or refuses Pionir's token."""
     report: dict[str, Any] = {}
     if settings.daedalus_url:
-        state = daedalus_open(settings.daedalus_url, opener=opener)
-        entry: dict[str, Any] = {"url": settings.daedalus_url,
-                                 "token_held": bool(settings.daedalus_token)}
-        if state is None:
-            entry["status"] = "not_running"
-        elif state:
-            entry["status"] = "open"
-            entry["warning"] = ("Daedalus answered a job call WITHOUT a token: any local "
-                                "process can hand it work in any of the owner's repos. Stop "
-                                "the stack (pionir.ps1 -Stop) and start it with pionir.ps1, "
-                                "which starts Daedalus with DAEDALUS_TOKEN.")
-        else:
-            entry["status"] = "token_required"
-        report["daedalus"] = entry
+        report["daedalus"] = _daedalus_entry(settings, opener)
     if settings.melete_url:
-        entry = {"url": settings.melete_url, "token_held": bool(settings.melete_token)}
-        if not _answers(settings.melete_url, opener=opener):
-            entry["status"] = "not_running"
-        else:
-            # Melete reads and validates a whole job before it checks the token, so an
-            # unauthenticated probe would have to be a real job. Not probed.
-            entry["status"] = "not_probed"
-            entry["note"] = "Melete checks its token only after reading a whole job"
-            if not settings.melete_token:
-                entry["warning"] = ("Melete is up and Pionir holds no Melete token, so it "
-                                    "was not started with one and takes jobs from any local "
-                                    "process. Stop the stack (pionir.ps1 -Stop) and start it "
-                                    "with pionir.ps1, which starts Melete with MELETE_TOKEN.")
-        report["melete"] = entry
+        report["melete"] = _melete_entry(settings, opener, started, directory)
     return report
+
+
+def _daedalus_entry(settings: Any, opener) -> dict[str, Any]:
+    entry: dict[str, Any] = {"url": settings.daedalus_url,
+                             "token_held": bool(settings.daedalus_token)}
+    state = daedalus_open(settings.daedalus_url, opener=opener)
+    if state is None:
+        entry["status"] = "not_running"
+    elif state:
+        entry["status"] = "open"
+        entry["warning"] = ("Daedalus answered a job call WITHOUT a token: any local "
+                            "process can hand it work in any of the owner's repos. "
+                            + RESTART)
+    elif not settings.daedalus_token:
+        entry["status"] = "no_token_held"
+        entry["warning"] = ("Daedalus wants a token and Pionir holds none, so it refuses "
+                            "every job Pionir sends. " + RESTART)
+    else:
+        accepted = daedalus_token_accepted(settings.daedalus_url, settings.daedalus_token,
+                                           opener=opener)
+        if accepted:
+            entry["status"] = "token_required"
+        elif accepted is False:
+            entry["status"] = "token_mismatch"
+            entry["warning"] = ("Daedalus refuses Pionir's token (401): it was started with "
+                                "a different one, so every job Pionir sends fails. " + RESTART)
+        else:
+            entry["status"] = "token_unverified"
+            entry["note"] = "Daedalus locks out callers without a token; Pionir's was not confirmed"
+    return entry
+
+
+def _melete_entry(settings: Any, opener, started, directory: Path | None) -> dict[str, Any]:
+    entry: dict[str, Any] = {"url": settings.melete_url,
+                             "token_held": bool(settings.melete_token)}
+    if not _answers(settings.melete_url, opener=opener):
+        entry["status"] = "not_running"
+        return entry
+    # Melete reads and validates a whole job before it checks the token, so an
+    # unauthenticated probe would have to be a real job. Instead: a Melete that has run since
+    # before its token file was made cannot have been started with it.
+    port = _port(settings.melete_url)
+    older = (started_before_token(port, "melete-token.txt", directory, started=started)
+             if port else None)
+    if older:
+        entry["status"] = "open"
+        entry["warning"] = ("Melete has run since before its token was made, so it was "
+                            "started without one and takes jobs from any local process. "
+                            + RESTART)
+    elif not settings.melete_token:
+        entry["status"] = "no_token_held"
+        entry["warning"] = ("Melete is up and Pionir holds no Melete token, so it was not "
+                            "started with one by the launcher. " + RESTART)
+    elif older is False:
+        entry["status"] = "started_after_token"
+        entry["note"] = ("Melete cannot be probed without running a job; it started after "
+                         "its token was made")
+    else:
+        entry["status"] = "unverified"
+        entry["warning"] = ("Melete is up but whether it holds its token cannot be told "
+                            "(its start time or token file is unreadable). " + RESTART)
+    return entry

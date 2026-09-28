@@ -7,6 +7,7 @@ MELETE_TOKEN); Melete (melete/config.py) reads MELETE_TOKEN; both then want
 variable is unset. Every probe here goes to a fake opener - nothing reaches a live bridge.
 """
 import io
+import json
 import os
 import re
 import subprocess
@@ -129,10 +130,15 @@ class TokenFileTests(unittest.TestCase):
 
     def test_the_cli_command_makes_them_in_the_owners_secrets_folder(self) -> None:
         home = Path(self._tmp.name)
+        shout = [{"bridge": "Melete", "port": 8770, "why": "x"}]
         with patch.dict(os.environ, {"USERPROFILE": str(home), "HOME": str(home)}), \
+                patch.object(bridge_auth, "open_bridges", return_value=shout) as seen, \
                 patch("sys.stdout", new=io.StringIO()) as out:
             self.assertEqual(cli.main(["bridge-tokens"]), 0)
         self.assertIn('"made"', out.getvalue())
+        self.assertEqual(json.loads(out.getvalue())["open_bridges"], shout)
+        self.assertEqual(seen.call_args.args[0],
+                         {"daedalus-token.txt": "made", "melete-token.txt": "made"})
         self.assertNotIn(bridge_auth.read_token("daedalus-token.txt",
                                                 home / ".pionir" / "secrets") or "?",
                          out.getvalue())                     # a token is never printed
@@ -212,6 +218,45 @@ class LauncherTests(unittest.TestCase):
             self.assertRegex(self.text, r"if \(-not \$bridgeTokensOk\) \{ \}\s+elseif "
                                         rf"\(Test-Port {port}\)")
 
+    def test_a_bridge_already_up_without_its_token_is_shouted_about(self) -> None:
+        block = self.text[self.text.index("$tokenOut = & python -m pionir bridge-tokens"):
+                          self.text.index("$pionirPrelude = ")]
+        self.assertIn("ConvertFrom-Json", block)
+        self.assertIn("foreach ($open in @($tokenReport.open_bridges))", block)
+        self.assertRegex(block, r"WITHOUT its token.*-ForegroundColor Red")
+        self.assertIn("run 'pionir doctor'", block)            # an unreadable report says so
+
+    def _run_prelude(self, name: str, home: Path) -> subprocess.CompletedProcess:
+        prelude = _assignment(self.text, name).replace("`$", "$")
+        env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home)}
+        env.pop("DAEDALUS_TOKEN", None)
+        env.pop("MELETE_TOKEN", None)
+        return subprocess.run(["powershell", "-NoProfile", "-Command",
+                               prelude + "Write-Output ('STARTED ' + $env:DAEDALUS_TOKEN.Length"
+                               " + ' ' + $env:MELETE_TOKEN.Length)"],
+                              env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                              text=True, timeout=60)
+
+    @unittest.skipUnless(os.name == "nt", "runs the pane's PowerShell prelude")
+    def test_a_bridge_pane_without_a_usable_token_exits_before_the_server(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            secrets = Path(home) / ".pionir" / "secrets"
+            secrets.mkdir(parents=True)
+            for name, bridge in (("daedalusEnv", "Daedalus"), ("meleteEnv", "Melete")):
+                done = self._run_prelude(name, Path(home))        # no token file at all
+                self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+                self.assertNotIn("STARTED", done.stdout)
+                self.assertIn(f"not starting {bridge} without its token", done.stdout)
+            for file in bridge_auth.TOKENS:
+                (secrets / file).write_text("short", encoding="utf-8")
+            done = self._run_prelude("meleteEnv", Path(home))     # too short to guard it
+            self.assertEqual(done.returncode, 1)
+            self.assertNotIn("STARTED", done.stdout)
+            for file in bridge_auth.TOKENS:
+                (secrets / file).write_text(FAKE + "\r\n", encoding="utf-8")
+            self.assertIn("STARTED 43 0", self._run_prelude("daedalusEnv", Path(home)).stdout)
+            self.assertIn("STARTED 0 43", self._run_prelude("meleteEnv", Path(home)).stdout)
+
     def test_the_names_are_the_ones_the_bridges_and_pionir_read(self) -> None:
         config = (ROOT / "src" / "pionir" / "config.py").read_text(encoding="utf-8")
         for name in ("PIONIR_DAEDALUS_TOKEN", "PIONIR_MELETE_TOKEN"):
@@ -219,6 +264,8 @@ class LauncherTests(unittest.TestCase):
 
 
 class _Answer:
+    status = 200
+
     def __enter__(self):
         return self
 
@@ -226,18 +273,21 @@ class _Answer:
         return None
 
 
-def _opener(daedalus, melete_up=True):
+def _opener(unauth, authed=404, melete_up=True):
+    """A fake bridge: a cancel without a token gets ``unauth``, with one ``authed`` (a code,
+    200, or an exception); GET /health answers while ``melete_up``."""
     seen = []
 
     def open_(request, timeout=None):
         seen.append(request)
         url = request.full_url
         if "/jobs/" in url:
-            if isinstance(daedalus, BaseException):
-                raise daedalus
-            if daedalus == 200:
+            answer = authed if request.get_header("Authorization") else unauth
+            if isinstance(answer, BaseException):
+                raise answer
+            if answer == 200:
                 return _Answer()
-            raise urllib.error.HTTPError(url, daedalus, "x", {}, None)
+            raise urllib.error.HTTPError(url, answer, "x", {}, None)
         if url.endswith("/health"):
             if melete_up:
                 return _Answer()
@@ -248,57 +298,117 @@ def _opener(daedalus, melete_up=True):
 
 def _settings(**overrides) -> PionirSettings:
     values = {"daedalus_url": "http://127.0.0.1:18771", "melete_url": "http://127.0.0.1:18770",
-              "daedalus_token": None, "melete_token": None}
+              "daedalus_token": FAKE, "melete_token": FAKE}
     values.update(overrides)
     return PionirSettings(**values)
 
 
 class DoctorTests(unittest.TestCase):
-    def test_a_daedalus_that_refuses_without_a_token_is_fine(self) -> None:
-        open_, seen = _opener(401)
-        report = bridge_auth.bridge_report(_settings(daedalus_token=FAKE, melete_token=FAKE),
-                                           opener=open_)
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        (self.dir / "melete-token.txt").write_text(FAKE, encoding="utf-8")
+        self.made = (self.dir / "melete-token.txt").stat().st_mtime
+        self.after = lambda port: self.made + 60          # Melete started after its token
+        self.before = lambda port: self.made - 60         # ... or had run since before it
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def report(self, settings, open_, started=None):
+        return bridge_auth.bridge_report(settings, opener=open_, started=started or self.after,
+                                         directory=self.dir)
+
+    def test_a_daedalus_that_takes_pionirs_token_and_refuses_others_is_fine(self) -> None:
+        open_, seen = _opener(401, 404)
+        report = self.report(_settings(), open_)
         self.assertEqual(report["daedalus"]["status"], "token_required")
         self.assertNotIn("warning", report["daedalus"])
-        probe = seen[0]
-        self.assertEqual(probe.get_method(), "POST")
-        self.assertEqual(probe.full_url, "http://127.0.0.1:18771/jobs/pionir-auth-probe/cancel")
-        self.assertIsNone(probe.get_header("Authorization"))     # asked WITHOUT a token
+        bare, bearing = [r for r in seen if "/jobs/" in r.full_url]
+        for probe in (bare, bearing):
+            self.assertEqual(probe.get_method(), "POST")
+            self.assertEqual(probe.full_url,
+                             "http://127.0.0.1:18771/jobs/pionir-auth-probe/cancel")
+        self.assertIsNone(bare.get_header("Authorization"))      # first WITHOUT a token
+        self.assertEqual(bearing.get_header("Authorization"), f"Bearer {FAKE}")
+
+    def test_a_daedalus_started_with_another_token_is_red(self) -> None:
+        open_, _ = _opener(401, 401)
+        report = self.report(_settings(), open_)
+        self.assertEqual(report["daedalus"]["status"], "token_mismatch")
+        self.assertIn("refuses Pionir's token", report["daedalus"]["warning"])
+
+    def test_a_locked_daedalus_pionir_holds_no_token_for_is_red(self) -> None:
+        open_, seen = _opener(401, 404)
+        report = self.report(_settings(daedalus_token=None), open_)
+        self.assertEqual(report["daedalus"]["status"], "no_token_held")
+        self.assertIn("Pionir holds none", report["daedalus"]["warning"])
+
+    def test_an_answer_that_says_neither_is_reported_not_passed(self) -> None:
+        for authed in (500, 200, urllib.error.URLError("gone")):
+            open_, _ = _opener(401, authed)
+            entry = self.report(_settings(), open_)["daedalus"]
+            self.assertEqual(entry["status"], "token_unverified", authed)
+            self.assertNotIn("warning", entry)
 
     def test_a_daedalus_that_answers_a_job_call_without_a_token_is_warned_about(self) -> None:
         for code in (404, 200, 409, 422):
             open_, _ = _opener(code)
-            report = bridge_auth.bridge_report(_settings(melete_token=FAKE), opener=open_)
+            report = self.report(_settings(), open_)
             self.assertEqual(report["daedalus"]["status"], "open", code)
             self.assertIn("WITHOUT a token", report["daedalus"]["warning"])
 
     def test_a_daedalus_that_is_not_running_is_not_warned_about(self) -> None:
         open_, _ = _opener(urllib.error.URLError("refused"))
-        report = bridge_auth.bridge_report(_settings(melete_token=FAKE), opener=open_)
+        report = self.report(_settings(), open_)
         self.assertEqual(report["daedalus"]["status"], "not_running")
         self.assertNotIn("warning", report["daedalus"])
 
-    def test_melete_is_never_sent_a_job_and_is_warned_about_without_a_token(self) -> None:
+    def test_a_melete_older_than_its_token_is_red_even_when_pionir_holds_it(self) -> None:
+        # The defect: Pionir's config falls back to the token file, so "Pionir holds no
+        # Melete token" never fires once the file exists - while a Melete started before
+        # the file was made still takes jobs from anyone.
         open_, seen = _opener(401)
-        report = bridge_auth.bridge_report(_settings(), opener=open_)
-        self.assertEqual(report["melete"]["status"], "not_probed")
-        self.assertIn("no Melete token", report["melete"]["warning"])
+        report = self.report(_settings(), open_, started=self.before)
+        self.assertEqual(report["melete"]["status"], "open")
+        self.assertIn("since before its token was made", report["melete"]["warning"])
         melete_calls = [r for r in seen if "18770" in r.full_url]
         self.assertEqual([(r.get_method(), r.full_url) for r in melete_calls],
-                         [("GET", "http://127.0.0.1:18770/health")])
+                         [("GET", "http://127.0.0.1:18770/health")])   # never sent a job
+
+    def test_a_melete_started_after_its_token_is_fine(self) -> None:
+        ports = []
         open_, _ = _opener(401)
-        held = bridge_auth.bridge_report(_settings(melete_token=FAKE), opener=open_)
-        self.assertNotIn("warning", held["melete"])
+        entry = self.report(_settings(), open_,
+                            started=lambda port: ports.append(port) or self.made + 60)["melete"]
+        self.assertEqual(entry["status"], "started_after_token")
+        self.assertNotIn("warning", entry)
+        self.assertEqual(ports, [18770])                     # the port of Pionir's Melete URL
+
+    def test_a_melete_that_cannot_be_told_about_is_red(self) -> None:
+        open_, _ = _opener(401)
+        entry = self.report(_settings(), open_, started=lambda port: None)["melete"]
+        self.assertEqual(entry["status"], "unverified")
+        self.assertIn("cannot be told", entry["warning"])
+        (self.dir / "melete-token.txt").unlink()             # no token file to compare with
+        entry = self.report(_settings(), open_)["melete"]
+        self.assertEqual(entry["status"], "unverified")
+
+    def test_a_melete_pionir_holds_no_token_for_is_red(self) -> None:
+        open_, _ = _opener(401)
+        entry = self.report(_settings(melete_token=None), open_)["melete"]
+        self.assertEqual(entry["status"], "no_token_held")
+        self.assertIn("no Melete token", entry["warning"])
+
+    def test_a_melete_that_is_not_running_is_not_warned_about(self) -> None:
         open_, _ = _opener(401, melete_up=False)
-        down = bridge_auth.bridge_report(_settings(), opener=open_)
-        self.assertEqual(down["melete"]["status"], "not_running")
-        self.assertNotIn("warning", down["melete"])
+        entry = self.report(_settings(), open_, started=self.before)["melete"]
+        self.assertEqual(entry["status"], "not_running")
+        self.assertNotIn("warning", entry)
 
     def test_a_bridge_that_is_switched_off_is_not_probed(self) -> None:
         open_, seen = _opener(404)
-        self.assertEqual(bridge_auth.bridge_report(_settings(daedalus_url=None,
-                                                             melete_url=None), opener=open_),
-                         {})
+        self.assertEqual(self.report(_settings(daedalus_url=None, melete_url=None), open_), {})
         self.assertEqual(seen, [])
 
     def test_doctor_fails_when_a_bridge_is_open(self) -> None:
@@ -311,6 +421,56 @@ class DoctorTests(unittest.TestCase):
             with patch.object(cli, "_doctor", return_value=report), \
                     patch("sys.stdout", new=io.StringIO()):
                 self.assertEqual(cli._execute(args, runtime=None), code)
+
+
+class OpenBridgeTests(unittest.TestCase):
+    """What ``pionir bridge-tokens`` tells the launcher to shout about."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        for name in bridge_auth.TOKENS:
+            (self.dir / name).write_text(FAKE, encoding="utf-8")
+        self.made = (self.dir / "melete-token.txt").stat().st_mtime
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_a_token_made_while_its_bridge_listens_is_reported(self) -> None:
+        out = bridge_auth.open_bridges(
+            {"daedalus-token.txt": "made", "melete-token.txt": "kept"}, self.dir,
+            started=lambda port: None, listening=lambda port: port == 8771)
+        self.assertEqual(out, [{"bridge": "Daedalus", "port": 8771,
+                                "why": "its token was just made, after it started"}])
+
+    def test_a_bridge_older_than_its_kept_token_is_reported(self) -> None:
+        out = bridge_auth.open_bridges(
+            {"daedalus-token.txt": "kept", "melete-token.txt": "kept"}, self.dir,
+            started=lambda port: self.made - 60 if port == 8770 else self.made + 60,
+            listening=lambda port: True)
+        self.assertEqual([(o["bridge"], o["port"]) for o in out], [("Melete", 8770)])
+
+    def test_nothing_is_reported_for_bridges_started_with_their_tokens(self) -> None:
+        self.assertEqual(bridge_auth.open_bridges(
+            {"daedalus-token.txt": "made", "melete-token.txt": "made"}, self.dir,
+            started=lambda port: self.made + 60, listening=lambda port: False), [])
+        self.assertEqual(bridge_auth.open_bridges(
+            {"daedalus-token.txt": "kept", "melete-token.txt": "kept"}, self.dir,
+            started=lambda port: None, listening=lambda port: True), [])
+
+    @unittest.skipUnless(os.name == "nt", "the Windows TCP table")
+    def test_the_listener_start_time_is_read_from_the_tcp_table(self) -> None:
+        import socket
+        import time
+        with socket.socket() as server:
+            server.bind(("127.0.0.1", 0))
+            server.listen(1)
+            port = server.getsockname()[1]
+            began = bridge_auth.listener_started(port)
+        self.assertIsNotNone(began)                           # this test process
+        self.assertLess(began, time.time())
+        self.assertGreater(began, time.time() - 3600)
+        self.assertIsNone(bridge_auth.listener_started(port))  # closed: nothing listens
 
 
 if __name__ == "__main__":

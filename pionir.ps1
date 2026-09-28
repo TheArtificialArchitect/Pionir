@@ -205,11 +205,24 @@ $env:PIONIR_GALATEA_URL = "http://127.0.0.1:8799"
 # worse than a missing one.
 $savedPythonPath = $env:PYTHONPATH
 $env:PYTHONPATH = $srcDir
-& python -m pionir bridge-tokens
+$tokenOut = & python -m pionir bridge-tokens
 $bridgeTokensOk = ($LASTEXITCODE -eq 0)
 $env:PYTHONPATH = $savedPythonPath
 if (-not $bridgeTokensOk) {
     Write-Host "  ! could not make the bridge tokens in ~/.pionir/secrets; Daedalus and Melete will not be started." -ForegroundColor Yellow
+} else {
+    # A bridge already up without its token (started before the token existed) stays open
+    # to every local process until it is restarted: never leave that silent.
+    $tokenReport = $null
+    try { $tokenReport = ($tokenOut | Out-String) | ConvertFrom-Json } catch { }
+    if ($null -eq $tokenReport) {
+        Write-Host "  ! could not read the bridge-token report; run 'pionir doctor' to check Daedalus and Melete." -ForegroundColor Yellow
+    }
+    foreach ($open in @($tokenReport.open_bridges)) {
+        if ($open) {
+            Write-Host "  !!! $($open.bridge) on :$($open.port) is running WITHOUT its token ($($open.why)): any local process can hand it jobs. Run pionir.ps1 -Stop, then pionir.ps1." -ForegroundColor Red
+        }
+    }
 }
 
 # Decide which bridges this launch brings up: skip any already listening (do not
@@ -267,14 +280,14 @@ if (-not $NoSpecialists) {
         #   THINK 1        - only sent to a model that reports "thinking"; qwen3-coder
         #                    does not (think=true is a 400), so it is inert until the
         #                    model changes. /health brain.thinking_active is the truth.
-        $daedalusEnv = "`$env:DAEDALUS_MODEL='qwen3-coder:30b'; `$env:DAEDALUS_NUM_CTX='32768'; `$env:DAEDALUS_MAX_STEPS='32'; `$env:DAEDALUS_REPAIRS='4'; `$env:DAEDALUS_TEMPERATURE='0.35'; `$env:DAEDALUS_THINK='1'; `$env:DAEDALUS_TOKEN=(Get-Content -Raw (Join-Path `$HOME '.pionir\secrets\daedalus-token.txt')).Trim(); "
+        $daedalusEnv = "`$env:DAEDALUS_MODEL='qwen3-coder:30b'; `$env:DAEDALUS_NUM_CTX='32768'; `$env:DAEDALUS_MAX_STEPS='32'; `$env:DAEDALUS_REPAIRS='4'; `$env:DAEDALUS_TEMPERATURE='0.35'; `$env:DAEDALUS_THINK='1'; `$env:DAEDALUS_TOKEN=(Get-Content -Raw (Join-Path `$HOME '.pionir\secrets\daedalus-token.txt')).Trim(); if (([string]`$env:DAEDALUS_TOKEN).Length -lt 32) { Write-Host '  no usable DAEDALUS_TOKEN (~/.pionir/secrets/daedalus-token.txt): not starting Daedalus without its token.' -ForegroundColor Red; [void](Read-Host); exit 1 }; "
         $panes += ,(Pane-Cmd "Daedalus :8771" $daedalusDir "python -m daedalus.server" $daedalusEnv)
         $ports += 8771
     } else { Write-Host "  ! Daedalus not found at $daedalusDir; skipping." -ForegroundColor Yellow }
     if (-not $bridgeTokensOk) { }
     elseif (Test-Port 8770) { Write-Host "  Melete already up on 8770 (it has a token only if this launcher started it)." -ForegroundColor DarkCyan }
     elseif (Test-Path $meleteDir) {
-        $meleteEnv = "`$env:MELETE_TOKEN=(Get-Content -Raw (Join-Path `$HOME '.pionir\secrets\melete-token.txt')).Trim(); "
+        $meleteEnv = "`$env:MELETE_TOKEN=(Get-Content -Raw (Join-Path `$HOME '.pionir\secrets\melete-token.txt')).Trim(); if (([string]`$env:MELETE_TOKEN).Length -lt 32) { Write-Host '  no usable MELETE_TOKEN (~/.pionir/secrets/melete-token.txt): not starting Melete without its token.' -ForegroundColor Red; [void](Read-Host); exit 1 }; "
         $panes += ,(Pane-Cmd "Melete :8770" $meleteDir "python -m melete.server" $meleteEnv)
         $ports += 8770
     } else { Write-Host "  ! Melete not found at $meleteDir; skipping." -ForegroundColor Yellow }

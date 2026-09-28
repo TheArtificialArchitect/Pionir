@@ -793,7 +793,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             _print({"status": "error", "error_type": type(error).__name__,
                     "message": str(error)})
             return 1
-        _print({"status": "ok", "directory": str(bridge_auth.secrets_dir()), "tokens": made})
+        _print({"status": "ok", "directory": str(bridge_auth.secrets_dir()), "tokens": made,
+                "open_bridges": bridge_auth.open_bridges(made)})
         return 0
     if args.command == "bryo-feed":
         # A standalone poller: it reads the running server over HTTP and needs no
