@@ -21,9 +21,23 @@ Steps (payload["step"]):
   env          set / unset keys in env files (backup first, same owner and mode)
   restart      systemctl try-restart (never STARTS a stopped live-money unit), then verify a
                new MainPID, the armed state unchanged, the expected key names present
-  firewall     ufw: keep 22 open, deny the given API ports (tailscale0 still allowed)
+  ping         answers: the client proves a FRESH ssh login still works
+  tailscale_install  Tailscale from its official apt repository (Debian/Ubuntu, found in
+               /etc/os-release) - no curl|sh; nothing if it is already installed
+  tailscale_up / tailscale_status  bring the node up (--ssh=false, a fixed hostname,
+               --accept-dns=false) in a one-shot transient unit and report BackendState,
+               the login URL Ian clicks (no auth key anywhere), the 100.x address, the name
+  fw_prepare   ufw present; the current rules backed up; allow 22/tcp FIRST and 8000-8002
+               on tailscale0 - permissions only, nothing is denied or enabled yet
+  fw_arm       schedule the automatic revert (a transient systemd timer), THEN deny
+               8000-8002 and enable ufw ('default allow incoming' when it was off, so only
+               those ports close)
+  fw_confirm   called over a FRESH ssh login: cancel the revert
+  nginx_disable  take out any enabled nginx site that forwards to 8000-8002 (nginx -t
+               first; a failed test puts it back)
 
-Importable for tests: every step is a function of its payload.
+Importable for tests: every step is a function of its payload, and every command goes
+through _run (tests replace it).
 """
 from __future__ import annotations
 
@@ -50,6 +64,8 @@ UNIT_RE = re.compile(r"[a-z0-9][a-z0-9@_.-]*\.service")
 USER_RE = re.compile(r"[a-z][a-z0-9-]{0,30}")
 PUBKEY_RE = re.compile(r"ssh-ed25519 [A-Za-z0-9+/]+={0,2}( [A-Za-z0-9@._-]{1,64})?")
 OPEN_RE = re.compile(r"127\.0\.0\.1:\d{1,5}")
+PLAIN_RE = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
+PROC = "/proc"
 ENV_LINE = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=(.*)$")
 
 
@@ -57,9 +73,9 @@ def emit(obj: dict) -> None:
     print(json.dumps(obj, sort_keys=True))
 
 
-def _run(argv: list[str], timeout: float = 30) -> tuple[int, str]:
+def _run(argv: list[str], timeout: float = 30, env: dict | None = None) -> tuple[int, str]:
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
         return done.returncode, done.stdout
     except (OSError, subprocess.TimeoutExpired):
         return 127, ""
@@ -94,33 +110,66 @@ def parse_env(text: str) -> dict[str, str]:
     return out
 
 
+def fingerprint(value: str) -> str:
+    """A short one-way fingerprint of a key, to compare keys without ever showing one."""
+    return hashlib.sha256(("pionir-lockdown:" + value).encode("utf-8")).hexdigest()[:16]
+
+
+def _write_private(path: str, data: bytes, mode: int, uid: int | None, gid: int | None) -> None:
+    """Create `path` owner-only from the first byte (O_EXCL, 0600 - never a moment
+    readable by others), then give it its final mode and owner."""
+    if os.path.lexists(path):
+        os.unlink(path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.chmod(path, mode & 0o7777)
+    if uid is not None and hasattr(os, "chown"):
+        os.chown(path, uid, gid)
+
+
 def update_env_file(path: str, sets: dict[str, str], keep_previous: dict[str, str],
-                    unset: list[str], stamp: str) -> dict:
+                    unset: list[str], stamp: str, plain: dict[str, str] | None = None) -> dict:
     """Set/unset names in an env file, keeping every other line as it was. The first time
-    for this stamp the file is backed up to <path>.bak-pionir-<stamp> (never overwritten, so
-    it always holds the content from before this rotation). keep_previous {OLD: PREV}: the
-    current value of OLD is kept under PREV when OLD changes and PREV is not set yet."""
+    for this stamp the file is backed up to <path>.bak-pionir-<stamp> (0600, never
+    overwritten, so it always holds the content from before this rotation).
+
+    keep_previous {CUR: PREV}: when CUR changes, PREV := the value CUR has NOW - the live
+    key, the one the phone holds - always overwriting an older PREV. An empty CUR is
+    refused: rotating it would drop the key the phone uses. When CUR already has the new
+    value (a re-run) PREV is left as it is. `plain` values are not keys (a deadline)."""
+    plain = dict(plain or {})
     if not os.path.isfile(path):
         return {"path": path, "error": "missing"}
     for name, value in sets.items():
         if not NAME_RE.fullmatch(name) or not isinstance(value, str) or not VALUE_RE.fullmatch(value):
             return {"path": path, "error": f"refused a malformed value for {name}"}
+    for name, value in plain.items():
+        if not NAME_RE.fullmatch(name) or not isinstance(value, str) or not PLAIN_RE.fullmatch(value):
+            return {"path": path, "error": f"refused a malformed value for {name}"}
     for name in list(unset) + list(keep_previous) + list(keep_previous.values()):
         if not NAME_RE.fullmatch(name):
             return {"path": path, "error": f"refused a malformed name {name!r}"}
     st = os.stat(path)
-    text = _read(path)
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    text = raw.decode("utf-8", "replace")
     current = parse_env(text)
     sets = dict(sets)
-    for old, prev in keep_previous.items():
-        if current.get(old) and current[old] != sets.get(old, current[old]) and prev not in current:
-            sets[prev] = current[old]
+    for cur, prev in keep_previous.items():
+        new = sets.get(cur)
+        if new is None or current.get(cur) == new:
+            continue                          # not rotating it, or already rotated
+        if not current.get(cur):
+            return {"path": path, "error": f"{cur} is empty here: refusing to rotate it (the phone's key is unknown)"}
+        sets[prev] = current[cur]
+    sets.update(plain)
     backup = f"{path}.bak-pionir-{stamp}"
     if not os.path.exists(backup):
-        shutil.copy2(path, backup)
-        os.chmod(backup, 0o600)
-        if hasattr(os, "chown"):
-            os.chown(backup, st.st_uid, st.st_gid)
+        _write_private(backup, raw, 0o600, getattr(st, "st_uid", None), getattr(st, "st_gid", None))
+
     def assign(name: str, value: str) -> str:
         if not re.fullmatch(r"[A-Za-z0-9_.+/=~:-]*", value):   # a kept old value, say
             value = '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -142,14 +191,13 @@ def update_env_file(path: str, sets: dict[str, str], keep_previous: dict[str, st
     removed = sorted(n for n in unset if n in current)
     if changed or removed:
         tmp = f"{path}.pionir-tmp"
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write("\n".join(lines) + "\n")
-        os.chmod(tmp, st.st_mode & 0o7777)
-        if hasattr(os, "chown"):
-            os.chown(tmp, st.st_uid, st.st_gid)
+        _write_private(tmp, ("\n".join(lines) + "\n").encode("utf-8"), st.st_mode,
+                       getattr(st, "st_uid", None), getattr(st, "st_gid", None))
         os.replace(tmp, path)
+    final = parse_env(_read(path))
     return {"path": path, "backup": backup, "changed": changed, "unset": removed,
-            "names": sorted(set(parse_env(_read(path))))}
+            "names": sorted(final),
+            "previous_fp": {prev: fingerprint(final[prev]) for prev in keep_previous.values() if final.get(prev)}}
 
 
 def step_env(p: dict) -> dict:
@@ -157,7 +205,7 @@ def step_env(p: dict) -> dict:
     if not re.fullmatch(r"\d{8}T\d{6}Z?", stamp):
         return {"step": "env", "error": "bad stamp"}
     files = [update_env_file(f["path"], f.get("set", {}), f.get("keep_previous", {}),
-                             f.get("unset", []), stamp) for f in p["files"]]
+                             f.get("unset", []), stamp, f.get("plain", {})) for f in p["files"]]
     return {"step": "env", "files": files, "ok": all("error" not in f for f in files)}
 
 
@@ -195,7 +243,7 @@ def _show(unit: str, prop: str) -> str:
 
 def _environ_names(pid: str) -> dict[str, str]:
     try:
-        with open(f"/proc/{int(pid)}/environ", "rb") as fh:
+        with open(posixpath.join(PROC, str(int(pid)), "environ"), "rb") as fh:
             raw = fh.read().split(b"\0")
     except (OSError, ValueError):
         return {}
@@ -210,6 +258,35 @@ def _environ_names(pid: str) -> dict[str, str]:
 def _armed(pid: str) -> bool | None:
     env = _environ_names(pid)
     return None if not env else env.get("PRO_RH_ORDERS_ENABLED") == "1"
+
+
+def configured_env(unit: str) -> dict[str, str]:
+    """What the unit would start with now: its Environment= lines (drop-ins included, as
+    systemctl reports them), then its EnvironmentFiles, which win - systemd's own order."""
+    import shlex
+
+    out: dict[str, str] = {}
+    try:
+        words = shlex.split(_show(unit, "Environment"))
+    except ValueError:
+        words = []
+    for w in words:
+        k, sep, v = w.partition("=")
+        if sep and k:
+            out[k] = v
+    for f in env_files_from_show(_show(unit, "EnvironmentFiles")):
+        out.update(parse_env(_read(f)))
+    return out
+
+
+def _find_file(root: str, name: str, depth: int = 4) -> str | None:
+    if not root.startswith("/"):
+        return None
+    for d in range(depth + 1):
+        hits = sorted(glob.glob(posixpath.join(root, *(["*"] * d), name)))
+        if hits:
+            return hits[0]
+    return None
 
 
 def step_discover(p: dict) -> dict:
@@ -227,14 +304,27 @@ def step_discover(p: dict) -> dict:
             info["key_name"] = key
             info["key_file"] = holders[0] if holders else None
             info["env_names"] = sorted(set().union(*[set(parse_env(_read(f))) for f in env_files])) if env_files else []
+            workdir = _show(unit, "WorkingDirectory")
             if api == "robinhood":
-                script = script_from_execstart(_show(unit, "ExecStart"), MARKERS[api],
-                                               _show(unit, "WorkingDirectory"))
+                script = script_from_execstart(_show(unit, "ExecStart"), MARKERS[api], workdir)
                 info["script"] = script
                 text = _read(script) if script else ""
                 info["read_key_support"] = "PRO_RH_READ_KEY" in text
-                info["previous_key_support"] = "PRO_RH_API_KEY_PREVIOUS" in text
+                info["previous_key_support"] = "PRO_RH_API_KEY_PREVIOUS_UNTIL" in text
                 info["orders_armed"] = _armed(_show(unit, "MainPID"))
+                info["orders_configured"] = configured_env(unit).get("PRO_RH_ORDERS_ENABLED") == "1"
+            elif api == "prometheus":
+                script = _find_file(workdir, "prometheus/webapp.py") or _find_file(workdir, "webapp.py")
+                text = _read(script) if script else ""
+                info["script"] = script
+                info["read_key_support"] = "PROM_READ_KEY" in text
+                info["previous_key_support"] = "PROM_API_KEY_PREVIOUS_UNTIL" in text
+            else:
+                script = script_from_execstart(_show(unit, "ExecStart"), MARKERS[api], workdir)
+                text = _read(script) if script else ""
+                info["script"] = script
+                info["read_key_support"] = False     # its only key opens GETs only already
+                info["previous_key_support"] = "KARKINOS_API_KEY_PREVIOUS_UNTIL" in text
         apis[api] = info
     user = str(p.get("tunnel_user", "pionir-tunnel"))
     home = f"/home/{user}"
@@ -279,6 +369,88 @@ def authorized_line(pubkey: str, opens: list[str]) -> str:
     return f"{opts} {pubkey}\n"
 
 
+SSHD_MAIN = "/etc/ssh/sshd_config"
+SSHD_DROPIN = "/etc/ssh/sshd_config.d/60-pionir-tunnel.conf"
+BEGIN, END = "# BEGIN pionir-tunnel (tools/vps-lockdown.ps1)", "# END pionir-tunnel"
+# What sshd -T must say for the account once the block is in: local forwarding to the
+# three ports and nothing else - no remote (-R) listener, no socket forwarding, no X11,
+# no tty, no agent, and any session runs /bin/false.
+SSHD_WANT = {"allowtcpforwarding": "local", "permitlisten": "none",
+             "allowstreamlocalforwarding": "no", "x11forwarding": "no", "permittty": "no",
+             "allowagentforwarding": "no", "forcecommand": "/bin/false"}
+
+
+def sshd_block(user: str, opens: list[str]) -> str:
+    return "\n".join([BEGIN, f"Match User {user}",
+                      "    AllowTcpForwarding local",
+                      "    PermitListen none",
+                      "    PermitOpen " + " ".join(opens),
+                      "    AllowStreamLocalForwarding no",
+                      "    AllowAgentForwarding no",
+                      "    X11Forwarding no",
+                      "    PermitTTY no",
+                      "    ForceCommand /bin/false",
+                      END]) + "\n"
+
+
+def sshd_effective_ok(text: str, opens: list[str]) -> tuple[bool, list[str]]:
+    cfg: dict[str, str] = {}
+    for line in text.splitlines():
+        k, _, v = line.strip().partition(" ")
+        cfg.setdefault(k.lower(), v.strip())
+    bad = [k for k, v in SSHD_WANT.items() if cfg.get(k, "").lower() != v.lower()]
+    if sorted(cfg.get("permitopen", "").split()) != sorted(opens):
+        bad.append("permitopen")
+    return not bad, bad
+
+
+def install_sshd_block(user: str, opens: list[str]) -> dict:
+    """The server side of the restriction, which authorized_keys cannot express (it has no
+    'no remote forwarding' once port-forwarding is on): a Match block for the account -
+    in sshd_config.d when sshd_config includes it, else between markers at the END of
+    sshd_config. sshd -t first and the effective config (sshd -T -C user=...) must say
+    exactly SSHD_WANT, or the old file is put back and nothing is reloaded."""
+    main = _read(SSHD_MAIN)
+    use_dropin = bool(re.search(r"(?m)^\s*Include\s+/etc/ssh/sshd_config\.d/\*\.conf\s*$", main))
+    target = SSHD_DROPIN if use_dropin else SSHD_MAIN
+    before = _read(target) if os.path.exists(target) else None
+    block = sshd_block(user, opens)
+    if use_dropin:
+        new = block
+    else:
+        stripped = re.sub(re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n?", "", main, flags=re.S)
+        new = stripped.rstrip("\n") + "\n\n" + block
+    if before == new:
+        changed = False
+    else:
+        changed = True
+        tmp = target + ".pionir-tmp"
+        _write_private(tmp, new.encode("utf-8"), 0o644, 0, 0)
+        os.replace(tmp, target)
+
+    def put_back() -> None:
+        if before is None:
+            os.unlink(target)
+        else:
+            _write_private(target + ".pionir-tmp", before.encode("utf-8"), 0o644, 0, 0)
+            os.replace(target + ".pionir-tmp", target)
+
+    if _run(["sshd", "-t"])[0] != 0:
+        if changed:
+            put_back()
+        return {"error": "sshd -t rejected the Match block: put back, nothing reloaded"}
+    code, eff = _run(["sshd", "-T", "-C", f"user={user},host=pionir,addr=127.0.0.1"])
+    ok, bad = sshd_effective_ok(eff, opens) if code == 0 else (False, ["sshd -T failed"])
+    if not ok:
+        if changed:
+            put_back()
+        return {"error": "sshd would not restrict the account as intended (" + ", ".join(bad) + "): put back, nothing reloaded"}
+    if changed:
+        if _run(["systemctl", "reload", "ssh"])[0] != 0 and _run(["systemctl", "reload", "sshd"])[0] != 0:
+            return {"error": "sshd reload failed (the checked config is in place; reload ssh by hand)"}
+    return {"sshd_file": target, "sshd_changed": changed}
+
+
 def step_tunnel_user(p: dict) -> dict:
     import pwd  # the droplet only
 
@@ -307,14 +479,15 @@ def step_tunnel_user(p: dict) -> dict:
     os.chown(tmp, 0, 0)
     os.chmod(tmp, 0o644)
     os.replace(tmp, path)
-    code, sshd = _run(["sshd", "-T", "-C", f"user={user},host=pionir,addr=127.0.0.1"])
-    cfg = dict(line_.partition(" ")[::2] for line_ in sshd.splitlines())
-    forwarding = cfg.get("allowtcpforwarding", "yes") in ("yes", "all", "local") and \
-        cfg.get("disableforwarding", "no") == "no"
+    sshd = install_sshd_block(user, list(p["opens"]))
+    if "error" in sshd:
+        return {"step": "tunnel_user", "error": sshd["error"]}
+    code, eff = _run(["sshd", "-T", "-C", f"user={user},host=pionir,addr=127.0.0.1"])
+    cfg = dict(line_.partition(" ")[::2] for line_ in eff.splitlines())
     allowed = cfg.get("allowusers", "")
     return {"step": "tunnel_user", "user": user, "created": created, "authorized_keys": path,
-            "forwarding_allowed": forwarding if code == 0 else None,
-            "allowusers": allowed[:200] or None}
+            "forwarding_allowed": cfg.get("allowtcpforwarding") == "local" if code == 0 else None,
+            "allowusers": allowed[:200] or None, **sshd}
 
 
 # ---- the server file ------------------------------------------------------------------------
@@ -356,71 +529,353 @@ def step_deploy(p: dict) -> dict:
 
 # ---- restart and verify ---------------------------------------------------------------------
 def step_restart(p: dict) -> dict:
-    """try-restart each unit (a stopped unit stays stopped - a brake is never undone here),
-    then prove it: a new MainPID, active, the orders switch as it was, and the expected key
-    NAMES in the running process's environment (the RH API reads env only at import)."""
+    """p["units"] = {unit: {"keys": [names], "absent": [names], "force": bool}}.
+
+    A unit is restarted when its RUNNING process holds a different value for any of `keys`
+    than its env would give it now (or holds an `absent` name, or `force`) - decided by
+    comparing values here, never by what changed in one run, and never reported (booleans
+    only). Never: a stopped unit is left stopped (try-restart); and a unit whose running
+    PRO_RH_ORDERS_ENABLED differs from its configured one is NOT restarted - that restart
+    would arm or disarm real-money orders, which is Ian's call, not this script's."""
     results = []
-    for unit, expect in p["units"].items():
+    for unit, want in p["units"].items():
         if not UNIT_RE.fullmatch(unit):
             results.append({"unit": unit, "error": "bad unit"})
             continue
+        keys, absent, force = list(want.get("keys", [])), list(want.get("absent", [])), bool(want.get("force"))
         active = _run(["systemctl", "is-active", unit])[1].strip()
         if active != "active":
-            results.append({"unit": unit, "state": active or "unknown", "restarted": False,
+            results.append({"unit": unit, "state": active or "unknown", "restarted": False, "was_active": False,
                             "note": "not running: left as it is (it reads the new keys when next started)"})
             continue
         pid0 = _show(unit, "MainPID")
-        armed0 = _armed(pid0)
+        running, conf = _environ_names(pid0), configured_env(unit)
+        armed_running = running.get("PRO_RH_ORDERS_ENABLED") == "1"
+        armed_conf = conf.get("PRO_RH_ORDERS_ENABLED") == "1"
+        stale = force or any(running.get(k) != conf.get(k) for k in keys) or any(k in running for k in absent)
+        base = {"unit": unit, "was_active": True, "orders_armed_before": armed_running,
+                "orders_armed_configured": armed_conf}
+        if armed_running != armed_conf:
+            results.append({**base, "state": "active", "restarted": False, "armed_mismatch": True, "stale": stale})
+            continue
+        if not stale:
+            results.append({**base, "state": "active", "restarted": False, "current": True,
+                            "orders_armed_after": armed_running, "env_missing": sorted(k for k in keys if not running.get(k)),
+                            "env_stale": [], "absent_present": []})
+            continue
         _run(["systemctl", "try-restart", unit], timeout=60)
         pid1, state = pid0, ""
         for _ in range(30):
-            time.sleep(0.5)
+            SLEEP(0.5)
             pid1 = _show(unit, "MainPID")
             state = _run(["systemctl", "is-active", unit])[1].strip()
             if state == "active" and pid1 not in ("", "0", pid0):
                 break
         env = _environ_names(pid1)
-        results.append({"unit": unit, "state": state, "restarted": pid1 not in ("", "0", pid0),
-                        "orders_armed_before": armed0, "orders_armed_after": _armed(pid1),
-                        "env_present": sorted(n for n in expect if env.get(n)),
-                        "env_missing": sorted(n for n in expect if not env.get(n)),
-                        "env_absent_ok": sorted(n for n in p.get("absent", {}).get(unit, []) if n not in env)})
+        conf = configured_env(unit)
+        results.append({**base, "state": state, "restarted": state == "active" and pid1 not in ("", "0", pid0),
+                        "orders_armed_after": env.get("PRO_RH_ORDERS_ENABLED") == "1" if env else None,
+                        "env_missing": sorted(k for k in keys if not env.get(k)),
+                        "env_stale": sorted(k for k in keys if env.get(k) != conf.get(k)),
+                        "absent_present": sorted(k for k in absent if k in env)})
     return {"step": "restart", "units": results}
 
 
-# ---- the firewall ---------------------------------------------------------------------------
-def step_firewall(p: dict) -> dict:
-    ports = [int(x) for x in p["ports"]]
-    if not ports or any(x not in (8000, 8001, 8002) for x in ports):
-        return {"step": "firewall", "error": "only 8000-8002 are closed here"}
-    if not shutil.which("ufw"):
-        return {"step": "firewall", "error": "ufw is not installed"}
-    status = _run(["ufw", "status"])[1]
-    was_active = "Status: active" in status
-    done = []
-    for argv in (["ufw", "allow", "22/tcp"],):
-        done.append((" ".join(argv[1:]), _run(argv)[0]))
-    tailscale = os.path.exists("/sys/class/net/tailscale0")
-    for port in ports:
-        if tailscale:
-            argv = ["ufw", "allow", "in", "on", "tailscale0", "to", "any", "port", str(port), "proto", "tcp"]
-            done.append((" ".join(argv[1:]), _run(argv)[0]))
-        argv = ["ufw", "deny", f"{port}/tcp"]
-        done.append((" ".join(argv[1:]), _run(argv)[0]))
+def step_restore(p: dict) -> dict:
+    """A unit that was running did not come back after its restart: put its files back from
+    this stamp's backups and start it again (it was running before we touched it)."""
+    stamp, unit = str(p["stamp"]), str(p["unit"])
+    if not re.fullmatch(r"\d{8}T\d{6}Z", stamp) or not UNIT_RE.fullmatch(unit):
+        return {"step": "restore", "error": "bad stamp or unit"}
+    restored = []
+    for path in p.get("files", []):
+        bak = f"{path}.bak-pionir-{stamp}"
+        if os.path.isfile(bak) and os.path.isfile(path):
+            st = os.stat(path)
+            with open(bak, "rb") as fh:
+                data = fh.read()
+            tmp = path + ".pionir-tmp"
+            _write_private(tmp, data, st.st_mode, getattr(st, "st_uid", None), getattr(st, "st_gid", None))
+            os.replace(tmp, path)
+            restored.append(path)
+    _run(["systemctl", "restart", unit], timeout=60)
+    state = ""
+    for _ in range(30):
+        SLEEP(0.5)
+        state = _run(["systemctl", "is-active", unit])[1].strip()
+        if state == "active":
+            break
+    return {"step": "restore", "unit": unit, "restored": restored, "active": state == "active"}
+
+
+def step_ping(p: dict) -> dict:
+    return {"step": "ping", "ok": True}
+
+
+# ---- Tailscale ------------------------------------------------------------------------------
+OS_RELEASE = "/etc/os-release"
+NET_DIR = "/sys/class/net"
+TS_KEYRING = "/usr/share/keyrings/tailscale-archive-keyring.gpg"
+TS_LIST = "/etc/apt/sources.list.d/tailscale.list"
+TS_UP_UNIT = "pionir-tailscale-up"
+HOST_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+TS_IP_RE = re.compile(r"100\.\d{1,3}\.\d{1,3}\.\d{1,3}")
+SLEEP = time.sleep
+WHICH = shutil.which
+
+
+def _fetch(url: str) -> bytes:
+    import urllib.request
+
+    with urllib.request.urlopen(url, timeout=60) as response:   # https, pkgs.tailscale.com only
+        return response.read(1_000_000)
+
+
+def tailscale_repo(os_release_text: str) -> tuple[str, str] | None:
+    """(distro, codename) for Tailscale's own apt repository, or None when this is not a
+    Debian/Ubuntu it publishes for."""
+    osr = parse_env(os_release_text)
+    distro, codename = osr.get("ID", ""), osr.get("VERSION_CODENAME", "")
+    if distro not in ("ubuntu", "debian") or not re.fullmatch(r"[a-z]{2,20}", codename):
+        return None
+    return distro, codename
+
+
+def step_tailscale_install(p: dict) -> dict:
+    if WHICH("tailscale"):
+        return {"step": "tailscale_install", "installed": True, "already": True,
+                "version": _run(["tailscale", "version"])[1].split("\n")[0].strip()}
+    repo = tailscale_repo(_read(OS_RELEASE))
+    if repo is None:
+        return {"step": "tailscale_install", "error": "not a Debian/Ubuntu Tailscale publishes an apt "
+                "repository for: install Tailscale by hand (tailscale.com/download), then run again"}
+    distro, codename = repo
+    base = f"https://pkgs.tailscale.com/stable/{distro}/{codename}"
+    key = _fetch(base + ".noarmor.gpg")
+    listing = _fetch(base + ".tailscale-keyring.list").decode("utf-8", "replace")
+    lines = [ln.strip() for ln in listing.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    want = f"deb [signed-by={TS_KEYRING}] https://pkgs.tailscale.com/stable/{distro} {codename} main"
+    if lines != [want] or not key:
+        return {"step": "tailscale_install", "error": "the repository files from pkgs.tailscale.com were not what was expected"}
+    with open(TS_KEYRING, "wb") as fh:
+        fh.write(key)
+    os.chmod(TS_KEYRING, 0o644)
+    with open(TS_LIST, "w", encoding="ascii", newline="\n") as fh:
+        fh.write(want + "\n")
+    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+    if _run(["apt-get", "update"], timeout=600, env=env)[0] != 0:
+        return {"step": "tailscale_install", "error": "apt-get update failed"}
+    if _run(["apt-get", "install", "-y", "tailscale"], timeout=900, env=env)[0] != 0:
+        return {"step": "tailscale_install", "error": "apt-get install tailscale failed"}
+    return {"step": "tailscale_install", "installed": True, "already": False, "repo": f"{distro} {codename}",
+            "version": _run(["tailscale", "version"])[1].split("\n")[0].strip()}
+
+
+def tailscale_state() -> dict:
+    code, out = _run(["tailscale", "status", "--json"])
+    try:
+        s = json.loads(out) if out.strip() else {}
+    except ValueError:
+        s = {}
+    me = s.get("Self") or {}
+    ips = [ip for ip in (me.get("TailscaleIPs") or []) if TS_IP_RE.fullmatch(str(ip))]
+    url = s.get("AuthURL") or None
+    if url and not re.fullmatch(r"https://login\.tailscale\.com/[A-Za-z0-9/_-]{1,200}", url):
+        url = None                          # only ever show Tailscale's own login link
+    return {"state": s.get("BackendState") or ("unknown" if code == 0 else "not running"),
+            "auth_url": url, "ipv4": ips[0] if ips else None,
+            "dns_name": (me.get("DNSName") or "").rstrip(".") or None,
+            "hostname": me.get("HostName") or None,
+            "interface": os.path.exists(posixpath.join(NET_DIR, "tailscale0"))}
+
+
+def step_tailscale_status(p: dict) -> dict:
+    return {"step": "tailscale_status", **tailscale_state()}
+
+
+def step_tailscale_up(p: dict) -> dict:
+    """Bring the node up, once: `tailscale up` runs in a one-shot transient unit (it waits
+    for Ian's login, then exits); nothing is started when the node is already up or already
+    waiting for a login. No auth key: Ian clicks the login URL this reports."""
+    host = str(p["hostname"])
+    if not HOST_RE.fullmatch(host):
+        return {"step": "tailscale_up", "error": "bad hostname"}
+    st = tailscale_state()
+    if st["state"] == "Running" or st["auth_url"]:
+        return {"step": "tailscale_up", "started": False, **st}
+    running = _run(["systemctl", "is-active", TS_UP_UNIT])[1].strip()
+    if running not in ("active", "activating"):
+        _run(["systemctl", "reset-failed", TS_UP_UNIT])
+        code, _ = _run(["systemd-run", f"--unit={TS_UP_UNIT}", "--collect", "--", "tailscale", "up",
+                        "--ssh=false", f"--hostname={host}", "--accept-dns=false"])
+        if code != 0:
+            return {"step": "tailscale_up", "error": "systemd-run tailscale up failed"}
+    for _ in range(30):
+        st = tailscale_state()
+        if st["state"] == "Running" or st["auth_url"]:
+            break
+        SLEEP(1)
+    return {"step": "tailscale_up", "started": True, **st}
+
+
+# ---- the firewall, with an automatic revert ----------------------------------------------------
+UFW_FILES = ("/etc/ufw/user.rules", "/etc/ufw/user6.rules", "/etc/default/ufw")
+BACKUP_ROOT = "/root"
+API_RANGE = "8000:8002"
+TAILNET_ALLOW = ["allow", "in", "on", "tailscale0", "to", "any", "port", API_RANGE, "proto", "tcp"]
+PUBLIC_DENY = ["deny", f"{API_RANGE}/tcp"]
+STAMP_RE = re.compile(r"\d{8}T\d{6}Z")
+REVERT_UNIT_RE = re.compile(r"pionir-ufw-revert-\d{8}T\d{6}Z")
+
+
+def _ufw_active() -> bool:
+    return "Status: active" in _run(["ufw", "status"])[1]
+
+
+def _fw_dir(stamp: str) -> str:
+    if not STAMP_RE.fullmatch(stamp):
+        raise ValueError("bad stamp")
+    return posixpath.join(BACKUP_ROOT, f".pionir-ufw-{stamp}")
+
+
+def rule_order(numbered: str) -> dict:
+    """From `ufw status numbered`: where the tailnet allow, the public deny and any other
+    rule naming 8000-8002 sit. The tailnet allow must come before the deny, and the deny
+    before any other rule for those ports, or the order does not do what it says."""
+    pos: dict = {"tailnet_allow": None, "deny": None, "other": []}
+    for line in numbered.splitlines():
+        m = re.match(r"\s*\[\s*(\d+)\]\s+(.*)$", line)
+        if not m or "(v6)" in line:
+            continue
+        n, rule = int(m.group(1)), m.group(2)
+        if not re.search(r"\b800[0-2]\b", rule):
+            continue
+        if "on tailscale0" in rule and "ALLOW" in rule and pos["tailnet_allow"] is None:
+            pos["tailnet_allow"] = n
+        elif "DENY" in rule and "8000:8002/tcp" in rule and pos["deny"] is None:
+            pos["deny"] = n
+        else:
+            pos["other"].append(n)
+    ta, dn = pos["tailnet_allow"], pos["deny"]
+    pos["ok"] = bool(ta and dn and ta < dn and all(o > dn for o in pos["other"]))
+    return pos
+
+
+def step_fw_prepare(p: dict) -> dict:
+    """Permissions only - nothing is denied and ufw is not enabled here: back up the rules,
+    allow 22/tcp FIRST, then 8000-8002 on tailscale0."""
+    bdir = _fw_dir(str(p["stamp"]))
+    if not os.path.exists(posixpath.join(NET_DIR, "tailscale0")):
+        return {"step": "fw_prepare", "error": "tailscale0 is not up: closing the ports now would cut the phone off"}
+    if not WHICH("ufw"):
+        env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+        if _run(["apt-get", "install", "-y", "ufw"], timeout=900, env=env)[0] != 0:
+            return {"step": "fw_prepare", "error": "ufw is not installed and apt-get install ufw failed"}
+    marker = posixpath.join(bdir, "was_active")
+    if not os.path.exists(marker):
+        os.makedirs(bdir, mode=0o700, exist_ok=True)
+        for f in UFW_FILES:
+            if os.path.exists(f):
+                shutil.copy2(f, posixpath.join(bdir, posixpath.basename(f)))
+        with open(marker, "w", encoding="ascii") as fh:
+            fh.write("1" if _ufw_active() else "0")
+    was_active = _read(marker).strip() == "1"
+    rules = []
+    for argv in (["ufw", "allow", "22/tcp"], ["ufw", "insert", "1"] + TAILNET_ALLOW):
+        rules.append({"rule": " ".join(argv[1:]), "exit": _run(argv)[0]})
+    return {"step": "fw_prepare", "backup": bdir, "was_active": was_active, "rules": rules,
+            "ok": all(r["exit"] == 0 for r in rules)}
+
+
+def revert_script(bdir: str, was_active: bool) -> str:
+    lines = ["#!/bin/sh", "# Pionir tools/vps-lockdown.ps1: put the firewall back as it was"]
+    for f in UFW_FILES:
+        lines.append(f'[ -f "{bdir}/{posixpath.basename(f)}" ] && cp -p "{bdir}/{posixpath.basename(f)}" "{f}"')
+    lines.append("ufw reload" if was_active else "ufw --force disable")
+    return "\n".join(lines) + "\n"
+
+
+def step_fw_arm(p: dict) -> dict:
+    """The revert is scheduled FIRST - if it cannot be, nothing changes. Then the public deny
+    goes in right after the tailnet allow, and ufw is enabled if it was off ('default allow
+    incoming' first, so every other service stays exactly as reachable as it was)."""
+    stamp = str(p["stamp"])
+    bdir = _fw_dir(stamp)
+    marker = posixpath.join(bdir, "was_active")
+    if not os.path.exists(marker):
+        return {"step": "fw_arm", "error": "fw_prepare has not run for this stamp"}
+    delay = int(p.get("revert_after_s", 300))
+    if not 60 <= delay <= 1800:
+        return {"step": "fw_arm", "error": "revert_after_s must be 60-1800"}
+    was_active = _read(marker).strip() == "1"
+    script = posixpath.join(bdir, "revert.sh")
+    with open(script, "w", encoding="ascii", newline="\n") as fh:
+        fh.write(revert_script(bdir, was_active))
+    os.chmod(script, 0o700)
+    unit = f"pionir-ufw-revert-{stamp}"
+    code, _ = _run(["systemd-run", f"--unit={unit}", f"--on-active={delay}", "/bin/sh", script])
+    armed = _run(["systemctl", "is-active", f"{unit}.timer"])[1].strip() == "active"
+    if code != 0 or not armed:
+        return {"step": "fw_arm", "error": "the automatic revert could not be scheduled: nothing was changed"}
+    rules = [{"rule": "insert 2 " + " ".join(PUBLIC_DENY), "exit": _run(["ufw", "insert", "2"] + PUBLIC_DENY)[0]}]
     if not was_active:
-        # keep every other service reachable exactly as before: only the named ports close
-        done.append(("default allow incoming", _run(["ufw", "default", "allow", "incoming"])[0]))
-        done.append(("--force enable", _run(["ufw", "--force", "enable"])[0]))
-    return {"step": "firewall", "was_active": was_active, "tailscale": tailscale,
-            "rules": [{"rule": r, "exit": c} for r, c in done],
-            "ok": all(c == 0 for _, c in done)}
+        rules.append({"rule": "default allow incoming", "exit": _run(["ufw", "default", "allow", "incoming"])[0]})
+        rules.append({"rule": "--force enable", "exit": _run(["ufw", "--force", "enable"])[0]})
+    order = rule_order(_run(["ufw", "status", "numbered"])[1])
+    return {"step": "fw_arm", "revert_unit": unit, "revert_after_s": delay, "active": _ufw_active(),
+            "rules": rules, "order": order, "ok": all(r["exit"] == 0 for r in rules) and order["ok"]}
+
+
+def step_fw_confirm(p: dict) -> dict:
+    """Reached over a FRESH ssh login (the client proves it can still get in): cancel the
+    revert. If this is never reached, the timer puts the firewall back by itself."""
+    unit = str(p["revert_unit"])
+    if not REVERT_UNIT_RE.fullmatch(unit):
+        return {"step": "fw_confirm", "error": "bad unit"}
+    _run(["systemctl", "stop", f"{unit}.timer"])
+    still = _run(["systemctl", "is-active", f"{unit}.timer"])[1].strip() == "active"
+    return {"step": "fw_confirm", "cancelled": not still, "active": _ufw_active(),
+            "order": rule_order(_run(["ufw", "status", "numbered"])[1])}
+
+
+# ---- nginx ------------------------------------------------------------------------------------
+NGINX_SITES = "/etc/nginx/sites-enabled"
+NGINX_TO_API = re.compile(r"proxy_pass\s+https?://(127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\])?:?800[0-2]\b")
+
+
+def step_nginx_disable(p: dict) -> dict:
+    """Take out every enabled site that forwards to 8000-8002 (moved aside, not deleted);
+    nginx -t must pass or they are put back."""
+    bdir = posixpath.join(BACKUP_ROOT, f".pionir-nginx-{p['stamp']}")
+    if not STAMP_RE.fullmatch(str(p["stamp"])):
+        return {"step": "nginx_disable", "error": "bad stamp"}
+    sites = [f for f in sorted(g.replace("\\", "/") for g in glob.glob(posixpath.join(NGINX_SITES, "*")))
+             if NGINX_TO_API.search(_read(f))]
+    if not sites:
+        return {"step": "nginx_disable", "disabled": [], "backup": None}
+    os.makedirs(bdir, mode=0o700, exist_ok=True)
+    moved = []
+    for f in sites:
+        dest = posixpath.join(bdir, posixpath.basename(f))
+        os.rename(f, dest)
+        moved.append((f, dest))
+    if _run(["nginx", "-t"])[0] != 0:
+        for f, dest in moved:
+            os.rename(dest, f)
+        return {"step": "nginx_disable", "error": "nginx -t failed without those sites: put back, nothing changed"}
+    _run(["systemctl", "reload", "nginx"])
+    return {"step": "nginx_disable", "disabled": [f for f, _ in moved], "backup": bdir}
 
 
 STEPS = {"discover": step_discover, "tunnel_user": step_tunnel_user, "deploy": step_deploy,
-         "env": step_env, "restart": step_restart, "firewall": step_firewall}
+         "env": step_env, "restart": step_restart, "restore": step_restore, "ping": step_ping,
+         "tailscale_install": step_tailscale_install, "tailscale_up": step_tailscale_up,
+         "tailscale_status": step_tailscale_status, "fw_prepare": step_fw_prepare,
+         "fw_arm": step_fw_arm, "fw_confirm": step_fw_confirm, "nginx_disable": step_nginx_disable}
 
 
 def main() -> None:
+    os.umask(0o077)                      # nothing this writes is ever readable by others
     payload = json.load(sys.stdin)
     step = STEPS.get(payload.get("step"))
     if step is None:
