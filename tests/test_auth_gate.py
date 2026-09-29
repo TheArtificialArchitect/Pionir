@@ -303,6 +303,23 @@ class GateOverHttp(unittest.TestCase):
         self.assertEqual(out["reason"], "replayed signature")
         self.assertEqual(self.app.approvals.get(aid2)["status"], "pending")
 
+    def test_the_nonce_cache_fails_closed_when_full_of_live_nonces(self) -> None:
+        now = [1000.0]
+        a = ClientAuth({"desktop": "d" * 43}, _clock=lambda: now[0])
+        with mock.patch.object(auth, "_MAX_NONCES", 2):
+            self.assertTrue(a._nonce_fresh("a" * 16))
+            self.assertTrue(a._nonce_fresh("b" * 16))
+            self.assertFalse(a._nonce_fresh("c" * 16))          # full of live ones: refuse
+            self.assertFalse(a._nonce_fresh("a" * 16))          # and never forget one
+            now[0] += 4 * auth.SIGN_WINDOW + 1
+            self.assertTrue(a._nonce_fresh("c" * 16))           # the dead ones make room
+        # over HTTP: a full cache refuses a good signature rather than risk a replay
+        aid = self._parked()
+        with mock.patch.object(auth, "_MAX_NONCES", 0):
+            status, out = self.signed("/api/approvals/deny", {"id": aid})
+        self.assertEqual(status, 401, out)
+        self.assertEqual(self.app.approvals.get(aid)["status"], "pending")
+
     def test_the_desktop_cannot_approve_what_it_parked(self) -> None:
         status, out = self.signed("/api/task", {"capability": "gate.privileged", "payload": {}})
         self.assertEqual((status, out["status"]), (200, "pending_approval"), out)
