@@ -46,6 +46,7 @@ from .auth import (
     PROOF_HEADER,
     ROUTE,
     SESSION_COOKIE,
+    SIGN_HEADERS,
     TASK,
     ClientAuth,
     Unauthenticated,
@@ -1203,18 +1204,29 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                     break
                 length -= len(chunk)
 
-        def _body(self) -> dict[str, Any] | None:
+        def _raw_body(self) -> bytes | None:
+            """The request body's bytes (what a signature's body hash covers), or None
+            when it is too large or its length is not a number."""
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 return None
             if length <= 0:
-                return {}
+                return b""
             if length > MAX_REQUEST_BYTES:
                 self._drain()
                 return None
+            return self.rfile.read(length)
+
+        def _body(self, raw: bytes | None = None) -> dict[str, Any] | None:
+            if raw is None:
+                raw = self._raw_body()
+                if raw is None:
+                    return None
+            if not raw:
+                return {}
             try:
-                document = json.loads(self.rfile.read(length).decode("utf-8"))
+                document = json.loads(raw.decode("utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError):
                 return None
             return document if isinstance(document, dict) else None
@@ -1296,13 +1308,21 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
             except Exception as error:  # noqa: BLE001
                 self._send({"error": type(error).__name__, "message": str(error)}, 500)
 
-        def _caller(self, path: str) -> tuple[str | None, int, str]:
+        def _caller(self, path: str, raw: bytes | None = None) -> tuple[str | None, int, str]:
             """Who is POSTing, or (None, status, why) to refuse it. A credential that is
             present must be right; none at all is ``anonymous``, served only in the
-            compatibility window and never for the approval routes."""
-            client, refused = app.auth.from_headers(self.headers.get("Authorization"),
-                                                    self.headers.get("Cookie"),
-                                                    self.headers.get(PROOF_HEADER))
+            compatibility window and never for the approval routes. ``raw`` is the body
+            of a SIGNED request (pionir/auth.py request_sig): its signature is its only
+            credential, checked over exactly these bytes."""
+            if raw is not None:
+                head = self.headers
+                client, refused = app.auth.from_signed(
+                    head.get("X-Pionir-Client"), self.command, self.path, head.get("X-Pionir-Ts"),
+                    head.get("X-Pionir-Nonce"), head.get("X-Pionir-Sig"), body=raw)
+            else:
+                client, refused = app.auth.from_headers(self.headers.get("Authorization"),
+                                                        self.headers.get("Cookie"),
+                                                        self.headers.get(PROOF_HEADER))
             if refused is not None:
                 return None, 401, refused
             needed = _POST_ROUTES[path]
@@ -1346,13 +1366,21 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                 self._drain()
                 self._send({"error": "not found"}, 404)
                 return
-            client, status, why = self._caller(route.path)
+            # a signed request: read its body first - the signature covers those bytes
+            raw = None
+            if any(self.headers.get(h) is not None for h in SIGN_HEADERS):
+                raw = self._raw_body()
+                if raw is None:
+                    self._send({"error": "bad body"}, 400)
+                    return
+            client, status, why = self._caller(route.path, raw)
             if client is None:
-                self._drain()
+                if raw is None:
+                    self._drain()
                 self._send({"error": "unauthorized" if status == 401 else "forbidden",
                             "reason": why}, status)
                 return
-            body = self._body()
+            body = self._body(raw)
             if body is None:
                 self._send({"error": "bad json"}, 400)
                 return

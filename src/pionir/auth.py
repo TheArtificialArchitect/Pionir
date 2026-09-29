@@ -27,8 +27,15 @@ So, here:
   sessionStorage, which belongs to this origin alone, port included. Tokens are
   compared in constant time, against every client, with no early exit.
 - **Routes are granted per client.** ``approve`` (approve / deny / the digest request)
-  belongs to the owner's own surfaces only - ``dashboard`` and ``phone`` - and code, not
-  config, decides that (``APPROVERS``). A client never approves an item it parked.
+  belongs to the owner's own surfaces only - ``dashboard``, ``phone`` and ``desktop``
+  (Pionir Desktop, his owner console) - and code, not config, decides that
+  (``APPROVERS``). A client never approves an item it parked.
+- **A signing client never sends its token.** ``desktop`` (``SIGNED_ONLY``) proves
+  itself by an HMAC over each request instead (``request_sig``: method, path and query,
+  time, a nonce and the body's hash, under its token), so whatever holds this port while
+  Pionir is down - a squatter - captures nothing it can use: the signature is bound to
+  that one request, is stale in 30 seconds, is never taken twice, and none from before
+  this server started is taken at all. Its token as a bearer is refused.
 
 Compatibility window (``PIONIR_AUTH_COMPAT``, default on for this release): a request
 with NO token is served as ``anonymous`` - non-privileged work only, a warning logged
@@ -61,7 +68,7 @@ _log = logging.getLogger(__name__)
 
 # Every client that holds a token. ``phone`` is the owner's phone glass, relayed by
 # Galatea's server; ``dashboard`` is the owner's own page on this server; ``desktop`` is
-# Pionir Desktop (it only reads today).
+# Pionir Desktop - the owner's console on this PC, which approves (signed, never a bearer).
 CLIENTS = ("crew", "galatea", "atani", "desktop", "dashboard", "phone")
 TOKEN_PREFIX = "pionir-client-"
 TOKEN_SUFFIX = ".token"
@@ -72,6 +79,7 @@ SESSION_COOKIE = "pionir_session"
 PROOF_HEADER = "X-Session-Proof"
 SESSION_TTL = 12 * 3600.0
 _MAX_SESSIONS = 64
+_MAX_NONCES = 20000
 
 # Routes a grant can name.
 TASK = "task"          # POST /api/task
@@ -81,7 +89,13 @@ APPROVE = "approve"    # POST /api/approvals/approve, /deny, /digest
 ROUTES = frozenset({TASK, INTENT, ROUTE, APPROVE})
 
 # Only the owner's own surfaces approve. Fixed in code: a grants file cannot add one.
-APPROVERS = frozenset({"dashboard", "phone"})
+APPROVERS = frozenset({"dashboard", "phone", "desktop"})
+
+# Clients that authenticate ONLY by signing each request (``request_sig``); their token
+# as a bearer header is refused, so it never crosses the wire at all.
+SIGNED_ONLY = frozenset({"desktop"})
+SIGN_HEADERS = ("X-Pionir-Client", "X-Pionir-Ts", "X-Pionir-Nonce", "X-Pionir-Sig")
+SIGN_WINDOW = 30.0            # seconds a signed request may be off this server's clock
 
 # The hook for the one narrow pre-grant ever planned: the Daedalus sandbox work will let
 # the crew run sandboxed solves without parking. It adds that permission HERE and to the
@@ -122,7 +136,8 @@ DEFAULT_GRANTS: Mapping[str, ClientGrant] = {
     "atani": ClientGrant(frozenset({TASK}), ("*",)),
     "dashboard": ClientGrant(frozenset({TASK, INTENT, ROUTE, APPROVE}), ("*",)),
     "phone": ClientGrant(frozenset({APPROVE}), ()),
-    "desktop": ClientGrant(frozenset(), ()),
+    # the owner's console on this PC: what his dashboard may do (it replaces the browser)
+    "desktop": ClientGrant(frozenset({TASK, INTENT, ROUTE, APPROVE}), ("*",)),
 }
 # Served only while the compatibility window is open, and never anything privileged.
 ANONYMOUS_GRANT = ClientGrant(frozenset({TASK, INTENT, ROUTE}), ("*",))
@@ -182,6 +197,17 @@ def ensure_tokens(directory: Path, clients: Iterable[str] = CLIENTS) -> dict[str
                 token = fresh
         tokens[client] = token
     return tokens
+
+
+def request_sig(token: str, method: str, target: str, ts: object, nonce: str,
+                body: bytes = b"") -> str:
+    """HMAC-SHA256(token, "pionir-request" \\n METHOD \\n path+query \\n ts \\n nonce \\n
+    sha256(body)), hex. The label keeps a signature for this from being one for anything
+    else signed with the same token (the sign-in code request signs ``signin|...``)."""
+    import hashlib
+    msg = "\n".join(["pionir-request", method.upper(), target, str(ts), nonce,
+                     hashlib.sha256(body or b"").hexdigest()])
+    return hmac.new(token.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def parse_bearer(header: str | None) -> tuple[bool, str | None]:
@@ -257,6 +283,10 @@ class ClientAuth:
     # In memory: a restart signs the dashboard out (the launcher signs it in again).
     _sessions: dict[str, tuple[float, str]] = field(default_factory=dict, repr=False)
     _clock: Any = field(default=time.time, repr=False)
+    # signed requests: nonces seen (nonce -> expiry), and when this server started - a
+    # request signed before then was captured while it was down, and is never taken
+    _nonces: dict[str, float] = field(default_factory=dict, repr=False)
+    booted: float = field(default_factory=time.time, repr=False)
 
     def start_session(self) -> tuple[str, str]:
         """A new dashboard session: (its id, for the cookie; its proof, for the page)."""
@@ -304,14 +334,57 @@ class ClientAuth:
                 found = client
         return found
 
+    def _nonce_fresh(self, nonce: str) -> bool:
+        """True the first time a nonce is offered within its window; a full cache of
+        live nonces refuses (fails closed) rather than forget one that could replay."""
+        now = self._clock()
+        with self._lock:
+            if len(self._nonces) >= _MAX_NONCES:
+                self._nonces = {n: t for n, t in self._nonces.items() if t > now}
+                if len(self._nonces) >= _MAX_NONCES:
+                    return False
+            exp = self._nonces.get(nonce)
+            if exp is not None and exp > now:
+                return False
+            self._nonces[nonce] = now + 4 * SIGN_WINDOW
+            return True
+
+    def from_signed(self, client: str | None, method: str, target: str, ts: str | None,
+                    nonce: str | None, sig: str | None,
+                    body: bytes = b"") -> tuple[str | None, str | None]:
+        """(client, refusal) for a signed request: the named client's token signed
+        exactly this method, target, time, nonce and body, within ``SIGN_WINDOW`` of this
+        clock, not before this server started, and the nonce is new. A nonce is spent
+        only by a valid signature."""
+        token = self.tokens.get(client or "")
+        if not client or not token or not ts or not nonce or not sig:
+            return None, "invalid signature"
+        if not 16 <= len(nonce) <= 128 or len(sig) > 256:
+            return None, "invalid signature"
+        try:
+            ts_i = int(ts)
+        except ValueError:
+            return None, "invalid signature"
+        if abs(self._clock() - ts_i) > SIGN_WINDOW or ts_i < int(self.booted):
+            return None, "stale signature"
+        want = request_sig(token, method, target, ts, nonce, body)
+        if not hmac.compare_digest(sig.encode("utf-8", "replace"), want.encode("utf-8")):
+            return None, "invalid signature"
+        if not self._nonce_fresh(nonce):
+            return None, "replayed signature"
+        return client, None
+
     def from_headers(self, authorization: str | None, cookie: str | None,
                      proof: str | None = None) -> tuple[str | None, str | None]:
         """(client, refusal). ``(None, None)`` is a request that carried no credential.
         A session is the owner's dashboard only with its proof; the cookie alone is
-        refused, as is a token in the cookie."""
+        refused, as is a token in the cookie. A signing client's token as a bearer is
+        refused: it signs, and never sends its token."""
         present, token = parse_bearer(authorization)
         if present:
             client = self.identify(token)
+            if client in SIGNED_ONLY:
+                return None, f"{client} signs its requests; its token is never a bearer"
             return (client, None) if client else (None, "invalid bearer token")
         session = cookie_value(cookie, SESSION_COOKIE)
         if session is not None:
