@@ -271,12 +271,20 @@ class LockdownRuns(unittest.TestCase):
         self.pantheon = self.tmp / "pantheon"
         web = self.pantheon / "bots" / "prometheus" / "src" / "prometheus"
         web.mkdir(parents=True)
-        (web / "webapp.py").write_bytes(WEBAPP_NEW)
         pg = ["git", "-C", str(self.pantheon), "-c", "user.email=t@t", "-c", "user.name=t", "-c", "core.autocrlf=false"]
         subprocess.run(pg[:3] + ["init", "-q"], check=True)
-        subprocess.run(pg + ["add", "."], check=True)
-        subprocess.run(pg + ["commit", "-q", "-m", "x"], check=True)
-        self.prom_commit = subprocess.run(pg[:3] + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
+        heads = []
+        # history: Z (an older webapp.py), A (the last real deploy: main's webapp.py), B (an
+        # undeployed commit that leaves webapp.py alone), C (the reviewed change)
+        for subject, name, body in (("Z older webapp", "webapp.py", b"# older\n"),
+                                    ("A last deploy", "webapp.py", WEBAPP_BASE),
+                                    ("B undeployed thing", "notes.txt", b"b\n"),
+                                    ("C the reviewed change", "webapp.py", WEBAPP_NEW)):
+            (web / name).write_bytes(body)
+            subprocess.run(pg + ["add", "."], check=True)
+            subprocess.run(pg + ["commit", "-q", "-m", subject], check=True)
+            heads.append(subprocess.run(pg[:3] + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip())
+        self.prom_older, self.prom_last, _, self.prom_commit = heads
         self.apis = StandIns(self.vps)
         self.addCleanup(lambda: self.apis.close())
 
@@ -585,6 +593,146 @@ class LockdownRuns(unittest.TestCase):
         self.assertEqual(forced.returncode, 0, forced.stdout)
         self.assertIn("-Force: restarting anyway", forced.stdout)
 
+    # ---- review 3, finding 2: the guard fails CLOSED -----------------------------------------------------
+    def test_a_guard_that_cannot_tell_blocks_the_restart(self) -> None:
+        far = int(time.time()) + 6 * 3600
+        for setup, words in (
+                (lambda: self.sim.set(systemd=232), "cannot tell when it fires (systemd 232"),
+                (lambda: self.sim.set(show_fail=True), "its next run could not be read"),
+                (lambda: self.sim.set(show_junk=True), "its next run could not be read"),
+                (lambda: self.sim.set(health_down=True), "did not say how many jobs are in flight"),
+                (lambda: self.sim.set(health_junk=True), "did not say how many jobs are in flight")):
+            with self.subTest(words=words):
+                self.sim.set(units={}, sched={"prometheus-scan.timer": far}, jobs_running=0, systemd=255,
+                             show_fail=False, show_junk=False, health_down=False, health_junk=False)
+                self.sim.boot_units()
+                setup()
+                done = self.run_script("-Apply")
+                self.assertEqual(done.returncode, 1, done.stdout)
+                self.assertIn("cannot tell if it is quiet", done.stdout)
+                self.assertIn(words, done.stdout)
+                self.assertEqual(self.env("rh_api.env")["PRO_RH_API_KEY"], OLD["rh"])    # nothing changed
+                self.assertNotIn("env", self.steps())
+        # -Force is the owner's explicit override
+        forced = self.run_script("-Apply", "-Force")
+        self.assertEqual(forced.returncode, 0, forced.stdout)
+
+    def test_a_stopped_prometheus_api_has_no_jobs_to_lose_and_no_timers_need_no_clock(self) -> None:
+        # no active timer: an old systemd is irrelevant; the Prometheus API not running: no health check to fail
+        self.sim.set(systemd=232, health_down=True)
+        self.sim.unit("prometheus-api.service", active=False)
+        done = self.run_script("-Apply")
+        self.assertNotIn("cannot tell if it is quiet", done.stdout)
+        self.assertIn("a quiet moment to restart", done.stdout)
+
+    # ---- review 3, finding 4: what the VPS's Prometheus may be missing -------------------------------
+    def test_the_undeployed_pantheon_commits_are_listed(self) -> None:
+        dry = self.run_script()
+        self.assertEqual(dry.returncode, 0, dry.stdout + dry.stderr)
+        for h in ("2a6fe2a", "0ad778e", "46aa96d", "1e52cd3"):                  # embedded (this repo has none of them)
+            self.assertIn(h, dry.stdout)
+        self.assertIn("the list embedded in this script", dry.stdout)
+        # computed from git when the repo can say: last deploy A .. the reviewed base (C's parent B)
+        git = self.run_script("-PromLastDeployed", self.prom_last)
+        self.assertEqual(git.returncode, 0, git.stdout + git.stderr)
+        self.assertIn("B undeployed thing", git.stdout)
+        self.assertIn("from git", git.stdout)
+        self.assertNotIn("1e52cd3", git.stdout)
+        self.assertNotIn("A last deploy", git.stdout)
+        self.assertIn("which none of these change", git.stdout)
+        # ... and it says when one of them changes webapp.py itself
+        older = self.run_script("-PromLastDeployed", self.prom_older)
+        self.assertIn("A last deploy", older.stdout)
+        self.assertIn("some of these change webapp.py itself", older.stdout)
+        # the drift warning points at the same list
+        (self.vps / "prometheus").mkdir(exist_ok=True)
+        (self.vps / "prometheus" / "webapp.py").write_bytes(b"# not main's\n")
+        self.sim.set(prom_prev=False, prom_read=False)
+        drift = self.run_script("-Apply", "-PromLastDeployed", self.prom_last)
+        self.assertIn("is not main's version", drift.stdout)
+        self.assertGreaterEqual(drift.stdout.count("B undeployed thing"), 2)
+
+    # ---- review 3, findings 1 and 5: ONE rollback rule for all three APIs -------------------------------
+    def test_a_late_restart_failure_rolls_all_three_back_together(self) -> None:
+        for failing in ("pro-robinhood-api.service", "prometheus-api.service", "mrcrab-api.service"):
+            with self.subTest(failing=failing):
+                self.sim.unit(failing, fail_restart=True)
+                done = self.run_script("-Apply")
+                self.assertEqual(done.returncode, 1, done.stdout)
+                self.assertIn("did not come back after its restart", done.stdout)
+                self.assert_rolled_back(done)
+                self.assertIn("for all three APIs", done.stdout)
+                self.assertEqual(self.sim.running_env("prometheus-api.service")["PROM_API_KEY"], OLD["prom"])
+                self.assertEqual(self.sim.running_env("mrcrab-api.service")["KARKINOS_API_KEY"], OLD["kark"])
+                for unit in ("pro-robinhood-api.service", "prometheus-api.service", "mrcrab-api.service"):
+                    self.assertTrue(self.sim.state()["units"][unit]["active"], unit)
+                self.assertFalse((self.state / "secrets" / "proteus-read-key.txt").exists())   # nothing shipped
+                self.sim.unit(failing, fail_restart=False)
+
+    def test_once_the_keys_are_shipped_a_failure_never_rolls_them_back(self) -> None:
+        self.apply_ok()
+        keys = self.keys()
+        near = str(int(time.time()) + 3600)
+        f = self.vps / "rh_api.env"
+        f.write_text(f.read_text(encoding="utf-8").replace(self.env("rh_api.env")["PRO_RH_API_KEY_PREVIOUS_UNTIL"], near), encoding="utf-8")
+        self.sim.unit("pro-robinhood-api.service", fail_restart=True)       # the refresh restart fails
+        before = self.steps().count("restore")
+        done = self.run_script("-Apply")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("failed forward", done.stdout)
+        self.assertNotIn("rolled back on the VPS", done.stdout)
+        self.assertEqual(self.steps().count("restore"), before)             # no restore step at all
+        rh = self.env("rh_api.env")
+        self.assertEqual(rh["PRO_RH_API_KEY"], keys["rh_full"])              # the phone's new key is still THE key
+        self.assertEqual(rh["PRO_RH_API_KEY_PREVIOUS"], OLD["rh"])           # and the old one still valid
+        self.assertTrue(int(rh["PRO_RH_API_KEY_PREVIOUS_UNTIL"]) > time.time() + 6.9 * 86400)   # the deadline refreshed
+        self.assertEqual(self.env("pro.env")["PROM_API_KEY"], keys["prom"])
+        self.assertEqual(self.env("mrcrab.env")["KARKINOS_API_KEY"], keys["kark"])
+        self.assertTrue((self.state / "secrets" / "proteus-read-key.txt").exists())
+
+    def test_either_mark_alone_is_enough_to_forbid_a_rollback(self) -> None:
+        """Only the phone's mark, only this machine's mark: no rollback. Neither: the rollback."""
+        self.apply_ok()
+        state_file = self.state / "vault" / "vps-lockdown.json"
+        full = json.loads(state_file.read_text(encoding="utf-8-sig"))
+        self.assertTrue(full["done"]["phone"] and full["done"]["local"])
+        for keep, forward in ((("phone",), True), (("local",), True), ((), False)):
+            with self.subTest(marks=keep):
+                doc = json.loads(state_file.read_text(encoding="utf-8-sig"))
+                for mark in ("phone", "local"):
+                    doc["done"].pop(mark, None)
+                    if mark in keep:
+                        doc["done"][mark] = True
+                state_file.write_text(json.dumps(doc), encoding="utf-8")
+                env = self.env("rh_api.env")
+                near = str(int(time.time()) + 3600)
+                f = self.vps / "rh_api.env"
+                f.write_text(f.read_text(encoding="utf-8").replace(env["PRO_RH_API_KEY_PREVIOUS_UNTIL"], near), encoding="utf-8")
+                self.sim.unit("pro-robinhood-api.service", fail_restart=True)
+                done = self.run_script("-Apply")
+                self.assertEqual(done.returncode, 1, done.stdout)
+                if forward:
+                    self.assertIn("failed forward", done.stdout, done.stdout[-1800:])
+                    self.assertNotIn("rolled back on the VPS", done.stdout)
+                    self.assertEqual(self.env("rh_api.env")["PRO_RH_API_KEY"], full["keys"]["rh_full"])
+                else:
+                    self.assertIn("rolled back on the VPS for all three APIs", done.stdout)
+                    self.assertEqual(self.env("rh_api.env")["PRO_RH_API_KEY"], OLD["rh"])
+                self.sim.unit("pro-robinhood-api.service", fail_restart=False, active=True, failed=False)
+                self.sim.boot_units()                                  # a process again (the failed one had none)
+
+    def test_a_failed_verification_after_the_keys_shipped_fails_forward_too(self) -> None:
+        self.apply_ok()
+        keys = self.keys()
+        real = self.apis.judge
+        self.apis.judge = lambda api, key, write: True if (api == "rh" and write) else real(api, key, write)
+        done = self.run_script("-Apply")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("failed forward", done.stdout)
+        self.assertNotIn("restore", self.steps())
+        self.assertEqual(self.env("rh_api.env")["PRO_RH_API_KEY"], keys["rh_full"])
+        self.assertEqual(self.env("rh_api.env")["PRO_RH_API_KEY_PREVIOUS"], OLD["rh"])
+
     # ---- D4: root's sshd config must not move ---------------------------------------------------------
     def test_a_match_block_that_would_change_roots_sshd_config_is_put_back(self) -> None:
         self.sim.set(root_drift=True)
@@ -772,6 +920,32 @@ class RemoteHalf(unittest.TestCase):
                          (["prometheus-execute.service"], ["mrcrab-t2.timer"], 1, False))
         self.sim.set(units={}, sched={}, jobs_running=0)
         self.assertTrue(self.r.step_guard({"services": ["prometheus-execute.service"], "timers": ["mrcrab-t2.timer"], "jobs_port": 8001})["safe"])
+
+    def test_the_guard_fails_closed(self) -> None:
+        """Not knowing is not idle: an unreadable timer or an unanswered health check is unsafe."""
+        self.r.NOW = lambda: 1_800_000_000
+        far = 1_800_000_000 + 6 * 3600                 # the 13:15 Prometheus scan: outside the NY window
+        ask = {"services": [], "timers": ["prometheus-scan.timer"], "jobs_port": 8001, "jobs_unit": "prometheus-api.service"}
+        self.sim.set(sched={"prometheus-scan.timer": far}, jobs_running=0)
+        self.sim.boot_units()
+        ok = self.r.step_guard(ask)
+        self.assertEqual((ok["safe"], ok["unknown"], ok["jobs_running"]), (True, [], 0))
+        for name, flags in (("old systemd", {"systemd": 232}), ("show errors", {"show_fail": True}),
+                            ("unparseable date", {"show_junk": True}), ("health down", {"health_down": True}),
+                            ("health without jobs_running", {"health_junk": True})):
+            self.sim.set(systemd=255, show_fail=False, show_junk=False, health_down=False, health_junk=False)
+            self.sim.set(**flags)
+            g = self.r.step_guard(ask)
+            self.assertFalse(g["safe"], name)
+            self.assertEqual(len(g["unknown"]), 1, (name, g["unknown"]))
+        # a Prometheus API that is not running has no jobs to lose: not unknown
+        self.sim.set(systemd=255, show_fail=False, show_junk=False, health_down=True)
+        self.sim.unit("prometheus-api.service", active=False)
+        g = self.r.step_guard(ask)
+        self.assertEqual((g["safe"], g["unknown"], g["jobs_running"]), (True, [], 0))
+        # no active timer: an old systemd is irrelevant
+        self.sim.set(sched={}, systemd=232)
+        self.assertTrue(self.r.step_guard(ask)["safe"])
 
     def test_tailscale_reports_key_expiry_of_the_vps_and_the_phones(self) -> None:
         self.sim.set(ts_state="Running", ts_key_expiry="2027-01-01T00:00:00Z", phone_expiry="2027-02-01T00:00:00Z")

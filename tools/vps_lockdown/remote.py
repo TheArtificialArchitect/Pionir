@@ -661,35 +661,71 @@ def _http_json(url: str):
 HTTP_JSON = _http_json
 
 
+UNIX_TIMESTAMP_SYSTEMD = 247     # `systemctl show --timestamp=unix` exists from this version
+
+
+def _systemd_version():
+    code, out = _run(["systemctl", "--version"])
+    m = re.match(r"systemd (\d+)", out or "")
+    return int(m.group(1)) if code == 0 and m else None
+
+
 def step_guard(p: dict) -> dict:
     """Busy right now? A trading job running (its service unit active), a timer about to
     fire one (within 15 min), or Prometheus's API with background jobs in flight
-    (/api/health jobs_running - unauthenticated, loopback)."""
-    busy, due = [], []
+    (/api/health jobs_running - unauthenticated, loopback).
+
+    Fails CLOSED: an active timer whose next run cannot be read (systemd older than 247 has
+    no --timestamp=unix, an errored or unparseable answer), and a running Prometheus API
+    that does not say how many jobs it has, are reported in `unknown` and make the moment
+    unsafe. Not knowing is never the same as idle."""
+    busy, due, unknown = [], [], []
     for unit in p.get("services", []):
         if UNIT_RE.fullmatch(unit):
             state = _run(["systemctl", "is-active", unit])[1].strip()
             if state in ("active", "activating", "reloading"):
                 busy.append(unit)
     now = NOW()
+    version = None
+    version_read = False
     for timer in p.get("timers", []):
         if not re.fullmatch(r"[a-z0-9][a-z0-9@_.-]*\.timer", timer):
             continue
         if _run(["systemctl", "is-active", timer])[1].strip() != "active":
             continue
-        raw = _run(["systemctl", "show", timer, "-p", "NextElapseUSecRealtime", "--value", "--timestamp=unix"])[1].strip()
+        if not version_read:
+            version, version_read = _systemd_version(), True
+        if version is None or version < UNIX_TIMESTAMP_SYSTEMD:
+            unknown.append(f"{timer}: cannot tell when it fires (systemd "
+                           f"{version if version is not None else 'version unknown'} cannot print unix timestamps)")
+            continue
+        code, out = _run(["systemctl", "show", timer, "-p", "NextElapseUSecRealtime", "--value", "--timestamp=unix"])
+        raw = (out or "").strip()
         m = re.fullmatch(r"@(\d+)", raw)
+        if code != 0 or not (m or raw in ("", "n/a")):
+            unknown.append(f"{timer}: its next run could not be read")
+            continue
         if m and 0 <= int(m.group(1)) - now <= 15 * 60:
             due.append({"timer": timer, "in_s": int(int(m.group(1)) - now)})
     jobs = None
     port = p.get("jobs_port")
     if port:
-        try:
-            jobs = int(HTTP_JSON(f"http://127.0.0.1:{int(port)}/api/health").get("jobs_running", 0))
-        except Exception:  # noqa: BLE001 - not answering: no jobs to lose
-            jobs = None
-    return {"step": "guard", "busy": busy, "due": due, "jobs_running": jobs,
-            "safe": not busy and not due and not jobs}
+        api_unit = p.get("jobs_unit")
+        if (api_unit and UNIT_RE.fullmatch(api_unit)
+                and _run(["systemctl", "is-active", api_unit])[1].strip() not in ("active", "activating", "reloading")):
+            jobs = 0                       # the API is not running: no jobs in flight to lose
+        else:
+            try:
+                doc = HTTP_JSON(f"http://127.0.0.1:{int(port)}/api/health")
+                raw_jobs = doc.get("jobs_running") if isinstance(doc, dict) else None
+                if isinstance(raw_jobs, int) and not isinstance(raw_jobs, bool) and raw_jobs >= 0:
+                    jobs = raw_jobs
+            except Exception:  # noqa: BLE001 - not answering is not the same as no jobs
+                jobs = None
+            if jobs is None:
+                unknown.append("the Prometheus API is running but did not say how many jobs are in flight (/api/health)")
+    return {"step": "guard", "busy": busy, "due": due, "unknown": unknown, "jobs_running": jobs,
+            "safe": not busy and not due and not unknown and not jobs}
 
 
 def step_ping(p: dict) -> dict:

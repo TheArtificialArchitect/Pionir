@@ -26,6 +26,7 @@ from pionir.adapters.proteus import (
     parse_status,
     read_tunnel_health,
     status_script,
+    TS_READER,
     tailnet_key_view,
 )
 
@@ -189,10 +190,69 @@ class TailnetKeyExpiryTests(unittest.TestCase):
                                      tunnel_health=lambda port: "200", clock=lambda: self.NOW)
             self.assertTrue(adapter.plane()["tailnet"]["alarm"])
             self.assertIn("not on the tailnet", adapter.status()["tailnet"]["state"])
+            # doctor (offline) reads the RECORD, and a record is never shown as fine
             record.write_text(json.dumps({"ipv4": "100.64.0.7", "key_expiry": None}), encoding="utf-8")
-            self.assertEqual(adapter.status()["tailnet"]["state"], "key expiry disabled (as recorded by the lockdown)")
+            recorded = adapter.status()["tailnet"]
+            self.assertEqual(recorded["state"], "UNVERIFIED - key expiry disabled (as recorded by the lockdown); "
+                                                "only a live read of the VPS confirms it")
+            self.assertFalse(recorded["verified"])
+            self.assertIn("unverified", recorded["phone_state"])
             record.write_text(json.dumps({"ipv4": "100.64.0.7", "key_expiry": self._iso(3)}), encoding="utf-8")
             self.assertTrue(adapter.status()["tailnet"]["alarm"])
+
+    def _plane(self, out: str, returncode: int = 0) -> dict:
+        with tempfile.TemporaryDirectory() as tmp:
+            record = Path(tmp) / "vps-tailnet.json"
+            record.write_text(json.dumps({"ipv4": "100.64.0.7", "key_expiry": None}), encoding="utf-8")
+            settings = ProteusSettings(host="vps.test", key_file=Path("C:/k"), tailnet_file=record)
+            ssh = lambda argv, timeout: ProcessResult(returncode=returncode, stdout=out, stderr="")  # noqa: E731
+            adapter = ProteusAdapter(settings, runner=ssh, peter_health=lambda: True,
+                                     tunnel_health=lambda port: "200", clock=lambda: self.NOW)
+            return adapter.plane()["tailnet"]
+
+    def test_the_phones_key_expiry_alarms_too(self) -> None:
+        fine = self._plane(f"ts_key_expiry none\nts_peer android none pixel\n")
+        self.assertEqual((fine["alarm"], fine["phone_alarm"], fine["verified"]), (False, False, True))
+        self.assertEqual(fine["phone_state"], "pixel: key expiry disabled")
+        soon = self._plane(f"ts_key_expiry none\nts_peer android {self._iso(5)} pixel\n")
+        self.assertTrue(soon["alarm"] and soon["phone_alarm"])
+        self.assertIn("key expires in 5 days", soon["phone_state"])
+        self.assertIn("Your phone (pixel)", soon["message"])
+        self.assertIn("the phone (pixel)", soon["message"])
+        self.assertIn("independent STOP route", soon["message"])
+        self.assertFalse(soon["key_expiry"])  # the VPS's own key is fine; only the phone alarms
+        gone = self._plane("ts_key_expiry none\nts_peer ios expired iphone\n")
+        self.assertTrue(gone["phone_alarm"])
+        self.assertIn("EXPIRED", gone["phone_state"])
+        # a far phone key warns without alarming; the VPS alarming does not blame the phone
+        far = self._plane(f"ts_key_expiry {self._iso(3)}\nts_peer android {self._iso(90)} pixel\n")
+        self.assertTrue(far["alarm"])
+        self.assertFalse(far["phone_alarm"])
+        # no phone on the tailnet is said, not silently fine
+        self.assertIn("no phone seen", self._plane("ts_key_expiry none\n")["phone_state"])
+
+    def test_a_failed_live_read_falls_back_to_unverified_never_fine(self) -> None:
+        for out, rc in (("", 255), ("ts_key_expiry none\n", 255), ("ts_key_expiry unknown\n", 0)):
+            view = self._plane(out, rc)
+            self.assertFalse(view["verified"], (out, rc))
+            self.assertTrue(view["state"].startswith("UNVERIFIED"), view["state"])
+            self.assertNotIn("phones", {k for k, v in view.items() if v})
+
+    def test_the_remote_reader_reports_the_vps_and_only_phone_peers(self) -> None:
+        import subprocess
+        import sys as _sys
+        doc = {"Self": {"HostName": "proteus-vps", "KeyExpiry": "2027-05-05T00:00:00Z"},
+               "Peer": {"a": {"HostName": "pixel 7; rm -rf", "OS": "android", "KeyExpiry": "2027-01-02T03:04:05Z"},
+                        "b": {"HostName": "desk", "OS": "windows", "KeyExpiry": "2027-01-01T00:00:00Z"},
+                        "c": {"HostName": "iph", "OS": "iOS", "Expired": True}}}
+        run = subprocess.run([_sys.executable, "-c", TS_READER], input=json.dumps(doc), capture_output=True, text=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        lines = run.stdout.splitlines()
+        self.assertEqual(lines[0], "ts_key_expiry 2027-05-05T00:00:00Z")
+        self.assertEqual(sorted(lines[1:]), ["ts_peer android 2027-01-02T03:04:05Z pixel_7__rm_-rf", "ts_peer ios expired iph"])
+        peers = parse_status(run.stdout)["tailnet_phones"]
+        self.assertEqual([p["name"] for p in peers], ["pixel_7__rm_-rf", "iph"])
+        self.assertNotIn("'", TS_READER)  # it sits in single quotes on the remote shell
 
 
 LAUNCHER_SCENE = r"""

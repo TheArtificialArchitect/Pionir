@@ -118,7 +118,14 @@ class Sim:
             s["timers"][unit] = {"active": True, "script": a[-1],
                                  "on_active": next(x for x in a if x.startswith("--on-active="))}
             return 0, ""
+        if a == ["systemctl", "--version"]:
+            return 0, f"systemd {s.get('systemd', 255)} (255.4-1ubuntu8)\n+PAM +AUDIT\n"
         if a[:2] == ["systemctl", "show"]:
+            if a[4:5] == ["NextElapseUSecRealtime"]:
+                if s.get("show_fail"):
+                    return 1, ""
+                if s.get("show_junk"):
+                    return 0, "Tue 2026-09-29 13:15:00 UTC\n"       # what an old systemd prints (no unix stamps)
             return self._show(s, a[2], a[4])
         if a[:2] == ["systemctl", "is-active"]:
             name = a[2]
@@ -328,7 +335,14 @@ def install(remote, root) -> Sim:
         assert re.fullmatch(r"https://pkgs\.tailscale\.com/stable/ubuntu/noble\.(noarmor\.gpg|tailscale-keyring\.list)", url), url
         return b"\x99fakekey" if url.endswith(".gpg") else TS_LIST_OK.encode()
     remote._fetch = fetch
-    remote.HTTP_JSON = lambda url: {"status": "ok", "jobs_running": sim.state().get("jobs_running", 0)}
+    def http_json(url: str):
+        s = sim.state()
+        if s.get("health_down"):
+            raise OSError("connection refused")
+        if s.get("health_junk"):
+            return {"status": "ok"}                                  # answers, but without jobs_running
+        return {"status": "ok", "jobs_running": s.get("jobs_running", 0)}
+    remote.HTTP_JSON = http_json
     keyring = root / "keyrings" / "tailscale-archive-keyring.gpg"
     real_open, real_chmod = open, os.chmod
 

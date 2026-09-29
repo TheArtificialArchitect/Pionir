@@ -73,6 +73,9 @@ param(
     [string]$PromCommit = "dd67d84399dec11e384d08dc2294a855b1327b1e",
     [string]$PromSha256 = "c546a44d68886e614fc488d7f3d85d9ed2b5912ca9e0dd43d8effa102ed5aeab",
     [string]$PromBaseSha256 = "cd372269bef4dba35a1609cd3e30ba61780389b420d0c7d5e58fa2c8c7ae066a",
+    # the last commit of pantheon main that was really deployed to the VPS ("Pay off the deploy debt", af9d872):
+    # what main gained after it, up to the reviewed base, is listed as not on the VPS
+    [string]$PromLastDeployed = "af9d87272fa61628b347015bc3ad1879730d3845",
     [string]$ServerBaseSha256 = "4041b9902c5b1145451a2a6bde9992d2f62b283d35ed3e8a71f2c27431cbb96c",
     [switch]$AllowServerDrift,
     # restarts wait for a quiet moment: outside US market hours and with no trading job
@@ -259,21 +262,51 @@ function Assert-SafeToRestart([string]$why) {
     # runs or is about to (prometheus-{scan,entry,review,execute}, mrcrab cycles), not while
     # Prometheus has background jobs in flight. -Force overrides; the next safe time is said.
     $w = Get-MarketWindow (Get-NowUtc)
-    $g = Invoke-Remote @{ step = "guard"
+    $req = @{ step = "guard"
         services = @("prometheus-scan.service", "prometheus-entry.service", "prometheus-review.service", "prometheus-execute.service",
                      "mrcrab@t1.service", "mrcrab@research.service", "mrcrab@t2.service", "mrcrab@t3.service")
         timers = @("prometheus-scan.timer", "prometheus-entry.timer", "prometheus-review.timer", "prometheus-execute.timer",
-                   "mrcrab-t1.timer", "mrcrab-research.timer", "mrcrab-t2.timer", "mrcrab-t3.timer")
-        jobs_port = 8001 }
+                   "mrcrab-t1.timer", "mrcrab-research.timer", "mrcrab-t2.timer", "mrcrab-t3.timer") }
+    if ($promUnit) { $req.jobs_port = 8001; $req.jobs_unit = [string]$promUnit }   # no Prometheus API: no jobs to lose
+    $g = Invoke-Remote $req
     $reasons = @()
     if ($w.Open) { $reasons += ("the US market is open (it is {0:HH:mm} in New York; next safe {1:u}, {2:HH:mm} here)" -f $w.NowEt, $w.NextSafeUtc, $w.NextSafeUtc.ToLocalTime()) }
     foreach ($u in @($g.busy)) { if ($u) { $reasons += "$u is running now (wait for it to finish)" } }
     foreach ($d in @($g.due)) { if ($d) { $reasons += ("{0} fires in {1} s (run this after it has)" -f $d.timer, $d.in_s) } }
     if ($g.jobs_running) { $reasons += ("Prometheus has {0} background job(s) in flight (/api/health); wait for them" -f $g.jobs_running) }
+    # not knowing is not the same as idle: an unreadable timer or an unanswered health check blocks too
+    foreach ($x in @($g.unknown)) { if ($x) { $reasons += ("cannot tell if it is quiet - $x") } }
+    if ($null -eq $g.safe) { $reasons += "the guard on the VPS gave no answer" }
     if (-not $reasons.Count) { Say "a quiet moment to restart: market closed, no trading job running or due"; return }
     foreach ($r in $reasons) { Warn $r }
     if ($Force) { Warn "-Force: restarting anyway ($why)"; return }
     Stop-Here "not restarting $why now - nothing was changed. Run it again then (or -Force)."
+}
+function Show-PromUndeployed([string]$intro) {
+    # pantheon main commits after the last real deploy: computed from git (last deployed .. the
+    # reviewed base = the pinned commit's parent); a fixed list when the repo cannot say
+    $lines = @()
+    if ($gitExe -and (Test-Path -LiteralPath $PantheonRepo)) {
+        $r = Invoke-Native $gitExe @("-C", $PantheonRepo, "log", "--format=%h %s", "--reverse", ($PromLastDeployed + ".." + $PromCommit + "~1")) "" 60
+        if ($r.Code -eq 0) { $lines = @($r.Out -split "`r?`n" | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() }) }
+    }
+    $from = "git"
+    if (-not $lines.Count) {
+        $from = "the list embedded in this script (pantheon is not readable here)"
+        $lines = @("2a6fe2a Prometheus: observe Peter's derived signals (observational-only)",
+                   "0ad778e Prometheus: schedule the equities scan (droplet timer)",
+                   "46aa96d Prometheus: backfill open theses for held Robinhood positions (no orders, no arming)",
+                   "1e52cd3 Prometheus review: gate the live sell pass behind an explicit arm file")
+    }
+    Warn ("{0} ({1} commit(s) on pantheon main after its last deploy {2}; from {3}):" -f $intro, $lines.Count, $PromLastDeployed.Substring(0, 7), $from)
+    foreach ($l in $lines) { Say ("      " + $l) }
+    $touchesWebapp = $false
+    if ($from -eq "git") {
+        $d = Invoke-Native $gitExe @("-C", $PantheonRepo, "diff", "--name-only", $PromLastDeployed, ($PromCommit + "~1"), "--", "bots/prometheus/src/prometheus/webapp.py") "" 60
+        $touchesWebapp = ($d.Code -ne 0) -or [bool]$d.Out.Trim()
+    }
+    if ($touchesWebapp) { Warn "      some of these change webapp.py itself: the VPS's webapp.py may not be main's (the sha256 base check decides)." }
+    else { Say "      This script ships ONE file (webapp.py), which none of these change; it does NOT ship them. Whether the VPS has them is not known from here." }
 }
 function Get-Fingerprint([string]$value) {
     if (-not $value) { return "" }
@@ -420,6 +453,7 @@ $promPinOk = $false
 if (-not $promBytes) { Warn "pantheon $($PromCommit.Substring(0, 7)) is not in ${PantheonRepo}: Prometheus's auth change cannot be deployed from here (fetch pantheon's read-key branch)" }
 elseif ((Get-Sha256Hex $promBytes) -ne $PromSha256.ToLower()) { Warn "bots/prometheus/src/prometheus/webapp.py at $($PromCommit.Substring(0, 7)) does not have the pinned sha256: not deployed" }
 else { $promPinOk = $true; Say ("Prometheus file: pantheon {0} webapp.py (sha256 {1}...), onto main's webapp.py only" -f $PromCommit.Substring(0, 7), $PromSha256.Substring(0, 12)) }
+Show-PromUndeployed "not on the VPS unless deployed some other way"
 if (-not $serverWhy) { Say ("server file: trading-bot-app {0} server/robinhood_read_api.py (sha256 {1}...)" -f $ServerCommit.Substring(0, 7), $ServerSha256.Substring(0, 12)) }
 elseif ($Apply -and -not $FinishRotation) { Stop-Here $serverWhy }
 else { Warn $serverWhy }
@@ -511,6 +545,37 @@ function Close-PublicPorts($tailnet) {
     elseif (Test-RemotePort $tailnet.ipv4 8000) { Say ("{0}:8000 answers over the tailnet" -f $tailnet.ipv4) }
     else { Warn ("{0}:8000 did not answer from this machine (is Tailscale running here?) - your phone check is what counts" -f $tailnet.ipv4) }
     if (-not $script:failures) { Set-StateField "ports_closed" $stamp }
+}
+
+function Test-KeysShipped {
+    # true once this rotation's NEW keys have left the VPS: the phone's GitHub secrets are set ([p]
+    # marked "phone") or this machine's key files were written ([f] marked "local"). From then on a
+    # rollback of the VPS would kill the very key the phone or the desktop now holds.
+    $s = Load-State
+    return [bool]($s -and $s.done -and ($s.done.phone -or $s.done.local))
+}
+function Undo-Rotation([string]$failedUnit, [string]$prefix) {
+    # ONE rule for all three APIs, so they never end up on different sides of the rotation:
+    #  - nothing has left the VPS yet: every env file goes back to its pre-rotation backup and every
+    #    unit that was running is restarted onto it (the failed unit also gets its server file back)
+    #  - the new keys HAVE left: FAIL FORWARD. Keep the new keys and the previous ones (still valid until
+    #    their deadline; every re-run refreshes a deadline that is less than a day away), change nothing more.
+    if (Test-KeysShipped) {
+        Warn ("{0}the new keys are already on the phone's build and/or this machine, so they are NOT rolled back (that would lock those out): every API keeps its new keys AND the previous ones." -f $prefix)
+        if ($failedUnit) { Warn ("{0} is down or not verified: read journalctl -u {0} on the VPS and fix it (the rollback commands in [h] are for a human decision, not needed for the phone)." -f $failedUnit) }
+        Stop-Here "failed forward: nothing was rolled back. Fix what the red lines say, then run -Apply again (same keys; it restarts what is stale, refreshes a previous-key deadline that is near, and verifies)."
+    }
+    Warn ("{0}not verified: rolling every API back to its pre-rotation env (this rotation's backups)" -f $prefix)
+    foreach ($unit in @($unitFiles.Keys)) {
+        $files = @($unitFiles[$unit] | Where-Object { $_ })
+        if ($unit -ne $failedUnit) { $files = @($files | Where-Object { $_ -like "*.env" }) }
+        if (-not $files.Count) { continue }
+        $ro = Try-Remote @{ step = "restore"; stamp = $stamp; unit = $unit; files = $files; was_active = [bool]$unitWasActive[$unit] }
+        if ($ro) { Say ("{0}: restored ({1}); active {2}" -f $unit, ((@($ro.restored)) -join ", "), $ro.active) }
+        else { Warn "$unit : the rollback could not be done - restore by hand (see [h])" }
+    }
+    if ($failedUnit) { Warn ("{0}: read journalctl -u {0} before running -Apply again" -f $failedUnit) }
+    Stop-Here "the rotation is rolled back on the VPS for all three APIs (same keys are used when you run -Apply again). Nothing was written here or sent to the phone."
 }
 
 if ($FinishRotation) {
@@ -730,7 +795,7 @@ if ($Apply -and $rotate) {
         if ($pd -and ($pd.deployed -or $pd.unchanged)) {
             if ($pd.deployed) { Say "$($pd.path) replaced (the auth change only); backup $($pd.backup)"; $deployedProm = $true }
             $promPrev = $true; $promRead = $true
-        } else { Warn "Prometheus's webapp.py on the VPS is not main's version (or could not be replaced): its auth change is NOT deployed and its key is NOT rotated. Compare it with pantheon main, deploy Prometheus with its own script, then run this again (or -AllowServerDrift)." }
+        } else { Warn "Prometheus's webapp.py on the VPS is not main's version (or could not be replaced): its auth change is NOT deployed and its key is NOT rotated. Compare it with pantheon main (the commits it may be missing are listed below), deploy Prometheus with its own script, then run this again (or -AllowServerDrift)."; Show-PromUndeployed "the VPS's Prometheus may be missing" }
     }
     Mark "deploy"
 } elseif ($Apply) { Say "no rotation: not deployed" }
@@ -806,6 +871,7 @@ if ($Apply -and $rotate) {
         if ($promRead) { $pk += "PROM_READ_KEY" }
         $units[$promUnit] = @{ keys = $pk; force = $deployedProm }
         $unitFiles[$promUnit] = @($promEnv)
+        if ($deployedProm -and $promScript) { $unitFiles[$promUnit] = @($promEnv, $promScript) }
     }
     if ($karkUnit) {
         $kk = @("KARKINOS_API_KEY")
@@ -815,16 +881,15 @@ if ($Apply -and $rotate) {
     }
     $rs = Invoke-Remote @{ step = "restart"; units = $units }
     $running = @{}
+    foreach ($u in $rs.units) { $unitWasActive[$u.unit] = [bool]$u.was_active }   # all of them, before any rollback needs them
     foreach ($u in $rs.units) {
         $running[$u.unit] = ($u.state -eq "active")
-        $unitWasActive[$u.unit] = [bool]$u.was_active
         if ($u.armed_mismatch) { Stop-Here ("{0}: real-money orders differ between the running process and its configuration: NOT restarted. Decide first (Pionir proteus.rh_orders_off / on), then run again." -f $u.unit) }
         if (-not $u.was_active) { Warn ("{0}: {1} - {2}" -f $u.unit, $u.state, $u.note); continue }
         if ($u.current) { Say ("{0}: already running with its current keys (no restart)" -f $u.unit) }
         elseif (-not $u.restarted) {
             Bad ("{0} did not come back after its restart (state {1})" -f $u.unit, $u.state)
-            $ro = Invoke-Remote @{ step = "restore"; stamp = $stamp; unit = $u.unit; files = @($unitFiles[$u.unit] | Where-Object { $_ }); was_active = $true }
-            Stop-Here ("{0}: restored {1} from this run's backups and started it again (active: {2}). The rotation is on hold: read journalctl -u {0}, fix, run -Apply again." -f $u.unit, ((@($ro.restored)) -join ", "), $ro.active)
+            Undo-Rotation $u.unit ("{0}: " -f $u.unit)
         } else { Say ("{0}: restarted; orders armed {1} -> {2}" -f $u.unit, $u.orders_armed_before, $u.orders_armed_after) }
         if (@($u.env_missing).Count) { Bad ("{0} runs without {1}" -f $u.unit, ((@($u.env_missing)) -join ", ")) }
         if (@($u.env_stale).Count) { Bad ("{0} runs with an old value of {1}" -f $u.unit, ((@($u.env_stale)) -join ", ")) }
@@ -871,18 +936,9 @@ if ($Apply -and $rotate) {
     $eVerified = ($script:failures -eq $failBefore)
     if ($eVerified) { Mark "deployed_restart"; Say "verified" }
     else {
-        # ANY verification failure: every env file back to its pre-rotation backup and every
-        # unit that was running restarted onto it - the phone's key (the live one before this
-        # run) works again, whatever else went wrong
-        Warn "not verified: rolling the keys back on the VPS (env files from this rotation's backups)"
-        foreach ($unit in @($unitFiles.Keys)) {
-            $envOnly = @($unitFiles[$unit] | Where-Object { $_ -and $_ -like "*.env" })
-            if (-not $envOnly.Count) { continue }
-            $ro = Try-Remote @{ step = "restore"; stamp = $stamp; unit = $unit; files = $envOnly; was_active = [bool]$unitWasActive[$unit] }
-            if ($ro) { Say ("{0}: env restored ({1}); active {2}" -f $unit, ((@($ro.restored)) -join ", "), $ro.active) }
-            else { Warn "$unit : the rollback could not be done - restore by hand (see [h])" }
-        }
-        Stop-Here "the rotation is rolled back on the VPS (same keys are used when you run -Apply again). Nothing was written here or sent to the phone."
+        # ANY verification failure: one rule for all three APIs (Undo-Rotation): back to the
+        # pre-rotation env when nothing has left the VPS, forward (keys kept) when it has
+        Undo-Rotation "" ""
     }
 } elseif (-not $Apply) {
     Would "restart a unit only when its RUNNING keys differ from its env files (or the server file is new): try-restart, a stopped unit stays stopped"

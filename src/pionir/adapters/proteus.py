@@ -174,6 +174,19 @@ def _choice(payload: Mapping[str, Any], key: str, allowed: Sequence[str], *,
     return [raw]
 
 
+# Run on the VPS over `tailscale status --json`: its own node-key expiry and every phone peer's
+# ("none" = key expiry disabled; "expired" = flagged expired with no date). It sits inside single
+# quotes in the remote shell, so it must hold none.
+TS_READER = (
+    'import json,sys;d=json.load(sys.stdin);s=d.get("Self") or {};'
+    'e=lambda n:n.get("KeyExpiry") or ("expired" if n.get("Expired") else "none");'
+    'print("ts_key_expiry",e(s));'
+    '[print("ts_peer",str(n.get("OS")).lower(),e(n),"".join(c if c.isalnum() or c in "-_." else "_" for c in str(n.get("HostName") or "phone"))[:40])'
+    ' for n in (d.get("Peer") or {}).values() if str(n.get("OS")).lower() in ("android","ios")]'
+)
+assert "'" not in TS_READER
+
+
 # ---- the remote commands: constants, or built only from the tables above -------------------
 def status_script(settings: ProteusSettings) -> str:
     units = " ".join(_unit(u, STATUS_UNITS) for u in STATUS_UNITS)
@@ -195,9 +208,9 @@ def status_script(settings: ProteusSettings) -> str:
         "else echo 'signals_age none'; fi; "
         # the VPS's Tailscale node key: once the public ports close, the tailnet is the phone's
         # only road to the APIs - an expiring key would cut it (none = expiry disabled)
-        "if command -v tailscale >/dev/null 2>&1; then printf 'ts_key_expiry %s\\n' \"$(tailscale status --json 2>/dev/null "
-        "| python3 -c 'import json,sys; s=(json.load(sys.stdin).get(\"Self\") or {}); print(s.get(\"KeyExpiry\") or \"none\")' "
-        "2>/dev/null || echo unknown)\"; else echo 'ts_key_expiry absent'; fi; "
+        # (and every phone peer's: the phone's own key is its road to the APIs too)
+        f"if command -v tailscale >/dev/null 2>&1; then out=$(tailscale status --json 2>/dev/null | python3 -c '{TS_READER}' "
+        "2>/dev/null) && printf '%s\\n' \"$out\" || echo 'ts_key_expiry unknown'; else echo 'ts_key_expiry absent'; fi; "
         "systemctl list-timers --all --no-pager --no-legend 'mrcrab-*' 'prometheus-*' 2>/dev/null | sed 's/^/timer /'"
     )
 
@@ -275,6 +288,11 @@ def parse_status(text: str) -> dict[str, Any]:
             out["rh_orders_dropin"] = rest == "present"
         elif head == "ts_key_expiry":
             out["tailnet_key_expiry"] = rest[:40] or "unknown"
+        elif head == "ts_peer":
+            bits = rest.split()
+            peers = out.setdefault("tailnet_phones", [])
+            if len(bits) >= 3 and len(peers) < 8:
+                peers.append({"os": bits[0][:16], "key_expiry": bits[1][:40], "name": bits[2][:40]})
         elif head == "signals_age":
             out["vps_signals_age_s"] = int(rest) if rest.isdigit() else None
         elif head == "timer":
@@ -448,13 +466,19 @@ class ProteusAdapter:
                 "tailnet": self._recorded_tailnet()}
 
     def _recorded_tailnet(self) -> dict[str, Any]:
-        """The VPS's tailnet key expiry as the lockdown recorded it (offline; the plane reads
-        it live)."""
+        """The tailnet key expiry as the lockdown last RECORDED it (offline; the plane reads it
+        live). Never shown as fine: a record cannot know that expiry was disabled (or came back)
+        since, so it reads UNVERIFIED until a live read of the VPS succeeds. An alarm the record
+        raises stays raised (the safe direction)."""
         try:
             doc = json.loads(self.settings.tailnet_file.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
-            return {"state": "not on the tailnet (tools\\vps-lockdown.ps1 -Apply puts it there)", "alarm": False}
-        return tailnet_key_view(doc.get("key_expiry") or "none", self._clock(), recorded=True)
+            return {"state": "not on the tailnet (tools\\vps-lockdown.ps1 -Apply puts it there)", "alarm": False,
+                    "verified": False}
+        view = tailnet_key_view(doc.get("key_expiry") or "none", self._clock(), recorded=True)
+        return {**view, "verified": False, "phones": [],
+                "state": "UNVERIFIED - " + view["state"] + "; only a live read of the VPS confirms it",
+                "phone_state": "unverified: the phone's key is only visible in a live read of the VPS"}
 
     def plane(self) -> dict[str, Any]:
         """The whole plane in one read: one ssh round trip plus the local side."""
@@ -470,9 +494,10 @@ class ProteusAdapter:
         doc["peter"] = {"healthy": self._peter_health(), "url": self.settings.peter_url,
                         "signals_age_s": _age(self.settings.peter_signals, self._clock())}
         doc["tunnel"] = self.tunnel()
-        live = (doc.get("vps") or {}).get("tailnet_key_expiry")
-        doc["tailnet"] = (tailnet_key_view(live, self._clock()) if live not in (None, "unknown")
-                          else self._recorded_tailnet())
+        vps_doc = doc.get("vps") or {}
+        live = vps_doc.get("tailnet_key_expiry") if vps_doc.get("ok") else None
+        doc["tailnet"] = (tailnet_plane(live, vps_doc.get("tailnet_phones") or [], self._clock())
+                          if live not in (None, "unknown") else self._recorded_tailnet())
         if self.local_status is not None:
             try:
                 doc.update(dict(self.local_status()))
@@ -504,17 +529,25 @@ STOP_ROUTE_NOTE = ("Pionir's brakes (proteus.kill, stop_timer, stop_service, rh_
                    "an independent STOP route that does not need the tailnet")
 
 
-def tailnet_key_view(expiry: str | None, now: float, *, recorded: bool = False) -> dict[str, Any]:
-    """The VPS's Tailscale node-key expiry, judged: 'none' is expiry disabled (as it must be
-    once the tailnet is the phone's only road); a date is a warning, and an ALARM from
-    TAILNET_ALARM_DAYS days ahead."""
+def tailnet_key_view(expiry: str | None, now: float, *, recorded: bool = False,
+                     who: str = "the VPS", fix: str = "proteus-vps") -> dict[str, Any]:
+    """A Tailscale node-key expiry, judged: 'none' is expiry disabled (as it must be once the
+    tailnet is the phone's only road); a date is a warning, and an ALARM from
+    TAILNET_ALARM_DAYS days ahead. `who` names the machine ("the VPS", "your phone (pixel)")."""
     from datetime import datetime
 
     where = " (as recorded by the lockdown)" if recorded else ""
+    lead = who[:1].upper() + who[1:]
+    how = ("disable key expiry for " + fix + " (https://login.tailscale.com/admin/machines -> " + fix +
+           " -> ... -> Disable key expiry). ")
     if expiry in (None, "", "none"):
         return {"state": "key expiry disabled" + where, "key_expiry": None, "alarm": False}
     if expiry == "absent":
         return {"state": "Tailscale is not installed on the VPS", "key_expiry": None, "alarm": False}
+    if expiry == "expired":
+        return {"state": "EXPIRED (Tailscale flags the key expired)" + where, "key_expiry": None, "alarm": True,
+                "message": lead + "'s Tailscale key has EXPIRED and it is cut off from the tailnet - "
+                           + how + STOP_ROUTE_NOTE + "."}
     try:
         when = datetime.fromisoformat(str(expiry).replace("Z", "+00:00")).timestamp()
     except ValueError:
@@ -523,10 +556,34 @@ def tailnet_key_view(expiry: str | None, now: float, *, recorded: bool = False) 
     alarm = days <= TAILNET_ALARM_DAYS
     return {"state": ("EXPIRED" if days < 0 else f"key expires in {days} days") + where,
             "key_expiry": str(expiry), "days_left": days, "alarm": alarm,
-            "message": ("the VPS's Tailscale key expires " + str(expiry) + ": after the public ports close the "
-                        "tailnet is the phone's only road to STOP - disable key expiry for proteus-vps "
-                        "(https://login.tailscale.com/admin/machines -> proteus-vps -> ... -> Disable key "
-                        "expiry). " + STOP_ROUTE_NOTE + ".")}
+            "message": (lead + "'s Tailscale key expires " + str(expiry) + ": after the public ports close the "
+                        "tailnet is the phone's only road to STOP - " + how + STOP_ROUTE_NOTE + ".")}
+
+
+def tailnet_plane(vps_expiry: str, phones: Sequence[Mapping[str, Any]], now: float) -> dict[str, Any]:
+    """The plane's tailnet block from a LIVE read: the VPS's key (the top-level fields, as
+    before) and every phone peer's. The phone's key is its own road to the APIs, so its expiry
+    alarms exactly like the VPS's; the block's `alarm` is true if either does."""
+    view = tailnet_key_view(vps_expiry, now)
+    messages = [view["message"]] if view.get("alarm") and view.get("message") else []
+    alarm = bool(view.get("alarm"))
+    phone_alarm = False
+    rows: list[dict[str, Any]] = []
+    for phone in phones:
+        name = str(phone.get("name") or "phone")[:40]
+        judged = tailnet_key_view(str(phone.get("key_expiry") or "none"), now,
+                                  who=f"your phone ({name})", fix=f"the phone ({name})")
+        rows.append({"name": name, "os": str(phone.get("os") or "")[:16], **judged})
+        if judged.get("alarm"):
+            alarm = phone_alarm = True
+            messages.append(str(judged.get("message") or judged["state"]))
+    phone_state = ("; ".join(f"{r['name']}: {r['state']}" for r in rows) if rows else
+                   "no phone seen on the tailnet (sign in to Tailscale on it)")
+    out: dict[str, Any] = {**view, "verified": True, "phones": rows, "phone_state": phone_state,
+                      "phone_alarm": phone_alarm, "alarm": alarm}
+    if messages:
+        out["message"] = " | ".join(messages)
+    return out
 
 
 def read_tunnel_health(local_port: int) -> str:
