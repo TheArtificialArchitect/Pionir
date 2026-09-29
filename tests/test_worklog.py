@@ -9,7 +9,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 from pionir import worklog
@@ -525,6 +525,35 @@ class AggregatesTests(WorkTestCase):
         self.log.start_timer("Day job")
         self.clock.advance(hours=13)
         self.assertTrue(self.log.aggregates()["stale_timer"])
+
+
+
+class OddInputTests(WorkTestCase):
+    def test_a_time_out_of_range_is_refused_not_an_overflow(self) -> None:
+        for text in ("9999-12-31T23:59:59-23:59", "0001-01-01T00:00:00+23:59", "9999-12-31T23:59:59Z",
+                     "1969-12-31T23:59:59Z", "2101-01-01T00:00:00Z"):
+            for naive_ok in (True, False):
+                with self.assertRaises(WorkError) as raised:
+                    worklog.parse_ts(text, self.log.zone, allow_naive=naive_ok)
+                self.assertEqual(raised.exception.code, "bad_input", text)
+        with self.assertRaises(WorkError):
+            worklog.parse_ts("9999-12-31T23:59:59", self.log.zone)          # naive, local
+        with self.assertRaises(WorkError):
+            worklog.parse_ts(datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone(timedelta(hours=-23, minutes=-59))),
+                             self.log.zone)
+        ok = worklog.parse_ts("2026-03-08T14:30:00+02:00", self.log.zone)
+        self.assertEqual(worklog.iso(ok), "2026-03-08T12:30:00Z")
+
+    def test_lookalike_digits_are_not_ids(self) -> None:
+        for odd in ("²", "١", "１", " ² "):
+            with self.assertRaises(WorkError) as raised:
+                WorkLog._int_id(odd, "session")
+            self.assertEqual(raised.exception.code, "bad_input")
+            with self.assertRaises(WorkError) as raised:       # a name that is not there, never a ValueError
+                self.log.start_timer(odd)
+            self.assertEqual(raised.exception.code, "not_found")
+        self.assertEqual(WorkLog._int_id(" 12 ", "session"), 12)
+        self.assertEqual(self.log.start_timer(str(self.day["id"]))["job"], "Day job")   # an ascii id still finds it
 
 
 if __name__ == "__main__":

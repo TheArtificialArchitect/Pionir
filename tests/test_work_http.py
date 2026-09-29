@@ -333,6 +333,32 @@ class WorkOverHttp(unittest.TestCase):
         self.assertNotIn(secret, json.dumps(out))
         self.assertNotIn(secret.encode(), self.db.read_bytes())
 
+    def test_lookalike_digits_and_extreme_times_are_a_400_never_a_500(self) -> None:
+        self.job()
+        added = self.ok("POST", "/api/work/session", {"job": "Data Annotation", "start": _z(timedelta(hours=-3)),
+                                                     "end": _z(timedelta(hours=-2))})["session"]
+        for bad_id in ("%C2%B2", "%D9%A1", "%EF%BC%91", "%E2%82%82"):      # superscript two, Arabic-Indic one, ...
+            for route in ("session", "log"):
+                out = self.bad(400, "DELETE", f"/api/work/{route}?id={bad_id}")
+                self.assertEqual(out["error"], "bad request")
+                self.assertNotIn("Traceback", json.dumps(out))
+            self.bad(400, "GET", f"/api/work/sessions?limit={bad_id}")
+        self.assertEqual(self.ok("DELETE", f"/api/work/session?id={added['id']}")["session"]["id"], added["id"])
+        extreme = ("9999-12-31T23:59:59-23:59", "0001-01-01T00:00:00+23:59", "2999-01-01T00:00:00Z",
+                   "1969-12-31T23:59:59Z")
+        for ts in extreme:
+            self.bad(400, "POST", "/api/work/session", {"job": "Data Annotation", "start": ts, "end": _z(timedelta())})
+            self.bad(400, "POST", "/api/work/session", {"job": "Data Annotation", "start": _z(timedelta(hours=-1)),
+                                                         "end": ts})
+            self.bad(400, "POST", "/api/work/log", {"job": "Data Annotation", "kind": "payout", "text": "x",
+                                                     "amount_cents": 100, "ts": ts})
+        self.ok("POST", "/api/work/timer/start", {"job": "Data Annotation"})
+        self.bad(400, "POST", "/api/work/timer/stop", {"job": "Data Annotation", "end": extreme[0]})
+        self.bad(404, "POST", "/api/work/timer/stop", {"job": "²"})     # not an id: a name that is not there
+        for query in ("from=9999-12-31T23%3A59%3A59-23%3A59", "to=9999-12-31T23%3A59%3A59-23%3A59"):
+            status, _ = self.signed("GET", f"/api/work/sessions?{query}")
+            self.assertEqual(status, 400, query)
+
 
 def workapi_max() -> int:
     from pionir import workapi

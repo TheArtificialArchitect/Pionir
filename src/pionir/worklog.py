@@ -100,6 +100,11 @@ def iso(dt: datetime) -> str:
     return dt.astimezone(UTC).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _ascii_digits(text: str) -> bool:
+    """Digits int() will take: str.isdigit() also passes "²" and other scripts' digits."""
+    return text.isascii() and text.isdigit()
+
+
 def from_iso(text: str) -> datetime:
     return datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
 
@@ -142,13 +147,28 @@ class Zone:
             return self.local_to_utc(datetime.combine(day, dtime(1, 0)))
 
 
+_RANGE_MSG = "time is out of range (years 1970 to 2100)"
+
+
+def _in_range(dt: datetime) -> datetime:
+    """UTC, whole seconds, and a sane year: an extreme offset overflows astimezone, and a
+    year-9999 time would overflow every later sum."""
+    try:
+        utc = dt.astimezone(UTC).replace(microsecond=0)
+    except (OverflowError, ValueError) as exc:
+        raise WorkError("bad_input", _RANGE_MSG) from exc
+    if not 1970 <= utc.year <= 2100:
+        raise WorkError("bad_input", _RANGE_MSG)
+    return utc
+
+
 def parse_ts(value: Any, zone: Zone, *, allow_naive: bool = True) -> datetime:
     """An aware UTC datetime from ISO text (or an aware datetime). Naive text is local time
     when allowed - the CLI's way - and refused otherwise (the HTTP door's)."""
     if isinstance(value, datetime):
         if value.tzinfo is None:
             raise WorkError("bad_input", "time needs a zone")
-        return value.astimezone(UTC).replace(microsecond=0)
+        return _in_range(value)
     if not isinstance(value, str) or not value.strip() or len(value) > 40:
         raise WorkError("bad_input", "time must be ISO text like 2026-03-08T14:30:00Z")
     text = value.strip()
@@ -160,8 +180,11 @@ def parse_ts(value: Any, zone: Zone, *, allow_naive: bool = True) -> datetime:
     if parsed.tzinfo is None:
         if not allow_naive:
             raise WorkError("bad_input", "time needs a zone (end it with Z or an offset)")
-        return zone.local_to_utc(parsed)
-    return parsed.astimezone(UTC)
+        try:
+            return _in_range(zone.local_to_utc(parsed))
+        except OverflowError as exc:
+            raise WorkError("bad_input", _RANGE_MSG) from exc
+    return _in_range(parsed)
 
 
 def parse_cents(value: Any, *, what: str = "amount") -> int:
@@ -217,7 +240,7 @@ def _clean_name(value: Any) -> str:
     name = " ".join(value.split())
     if not name or len(name) > NAME_CAP:
         raise WorkError("bad_input", f"job name must be 1-{NAME_CAP} characters")
-    if _CONTROL.search(name) or name.isdigit():
+    if _CONTROL.search(name) or _ascii_digits(name):
         raise WorkError("bad_input", "job name cannot be only digits or hold control characters")
     if secretscrub.scrub_text(name) != name:
         raise WorkError("bad_input", "job name looks like a secret")
@@ -374,7 +397,7 @@ class WorkLog:
     def _job(self, con: sqlite3.Connection, ref: Any) -> sqlite3.Row:
         if isinstance(ref, bool) or ref is None:
             raise WorkError("bad_input", "which job?")
-        if isinstance(ref, int) or (isinstance(ref, str) and ref.strip().isdigit()):
+        if isinstance(ref, int) or (isinstance(ref, str) and _ascii_digits(ref.strip())):
             row = con.execute("SELECT * FROM jobs WHERE id=?", (int(ref),)).fetchone()
         elif isinstance(ref, str) and ref.strip() and len(ref) <= NAME_CAP * 2:
             row = con.execute("SELECT * FROM jobs WHERE name=? COLLATE NOCASE",
@@ -611,7 +634,7 @@ class WorkLog:
 
     @staticmethod
     def _int_id(value: Any, what: str) -> int:
-        if isinstance(value, bool) or not isinstance(value, (int, str)) or not str(value).strip().isdigit() \
+        if isinstance(value, bool) or not isinstance(value, (int, str)) or not _ascii_digits(str(value).strip()) \
                 or len(str(value).strip()) > 12:
             raise WorkError("bad_input", f"{what} id must be a number")
         return int(str(value).strip())

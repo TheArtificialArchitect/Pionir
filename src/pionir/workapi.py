@@ -80,7 +80,7 @@ def _one(query: Mapping[str, list[str]], key: str) -> str | None:
 def _int(text: str | None, key: str) -> int | None:
     if text is None or text == "":
         return None
-    if not text.isdigit() or len(text) > 9:
+    if not (text.isascii() and text.isdigit()) or len(text) > 9:
         raise BadRequest(f"{key} must be a number")
     return int(text)
 
@@ -102,9 +102,7 @@ def _job(body: Mapping[str, Any], key: str = "job") -> Any:
 
 
 def _body(raw: bytes, allowed: set[str]) -> dict[str, Any]:
-    if len(raw) > MAX_BODY:
-        raise BadRequest("body is too large")
-    try:
+    try:  # the size cap is server.py's: it answers 413 before the body is read
         doc = json.loads(raw.decode("utf-8")) if raw else {}
     except (ValueError, UnicodeDecodeError) as error:
         raise BadRequest("body is not JSON") from error
@@ -148,6 +146,8 @@ def serve(method: str, path_info: str, query_string: str, raw: bytes, *, client:
         return 400, {"error": "bad request", "reason": str(error)}, None
     except WorkError as error:
         return _STATUS.get(error.code, 400), {"error": error.code, "reason": str(error)}, None
+    except (ValueError, OverflowError):  # a parse that slipped past its own checks is still the caller's
+        return 400, {"error": "bad request", "reason": "a value is out of range or malformed"}, None
     except sqlite3.Error as error:
         return 503, {"error": "store unavailable", "reason": type(error).__name__}, None
     return status, secretscrub.scrub_value(doc, known()), detail

@@ -223,6 +223,9 @@ def _run(args: argparse.Namespace, log: WorkLog, say: Callable[[str], None]) -> 
         if args.note is not None:
             kw["note"] = args.note
         s = log.stop_timer(job, **kw)
+        if s["seconds"] > 8 * 3600:
+            say(f"Warning: that timer ran {hms(s['seconds'])} - was it left on? "
+                "Check the start and end below.")
         say(f"Stopped {s['job']}: {hms(s['seconds'])} ({s['start_ts']} to {s['end_ts']})")
     elif cmd == "status":
         _status(log, say)

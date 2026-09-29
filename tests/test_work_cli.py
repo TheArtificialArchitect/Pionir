@@ -158,6 +158,41 @@ class WorkCli(unittest.TestCase):
         self.assertIn("8:00:00", self.ok("stop", "Day job", "--end", end))
         self.assertIsInstance(worklog_for(settings), WorkLog)
 
+    def test_stopping_a_long_forgotten_timer_warns_at_over_eight_hours(self) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from pionir.config import PionirSettings
+        from pionir.worklog import worklog_for
+
+        self.ok("jobs", "add", "Day job", "--rate", "20")
+        settings = PionirSettings.from_environment()
+        worklog_for(settings, clock=lambda: datetime.now(UTC) - timedelta(hours=9)).start_timer("Day job")
+        out = self.ok("stop", "Day job")                           # 9h: under the 12h wall, over the 8h warning
+        self.assertIn("Warning", out)
+        self.assertIn("left on", out)
+        self.assertIn("Stopped Day job", out)
+        # a 14h-old timer closed with an explicit end that makes a 10h session warns too
+        self.ok("jobs", "add", "Other job", "--rate", "20")
+        old = datetime.now(UTC) - timedelta(hours=14)
+        worklog_for(settings, clock=lambda: old).start_timer("Other job")
+        end = (old + timedelta(hours=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        out = self.ok("stop", "Other job", "--end", end)
+        self.assertIn("Warning", out)
+        self.assertIn("10:00:00", out)
+
+    def test_an_ordinary_stop_does_not_warn(self) -> None:
+        from datetime import UTC, datetime, timedelta
+
+        from pionir.config import PionirSettings
+        from pionir.worklog import worklog_for
+
+        self.ok("jobs", "add", "Day job", "--rate", "20")
+        settings = PionirSettings.from_environment()
+        worklog_for(settings, clock=lambda: datetime.now(UTC) - timedelta(hours=3)).start_timer("Day job")
+        out = self.ok("stop", "Day job")
+        self.assertNotIn("Warning", out)
+        self.assertIn("Stopped Day job", out)
+
 
 if __name__ == "__main__":
     unittest.main()
