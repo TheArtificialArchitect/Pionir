@@ -234,7 +234,11 @@ class RecallBeforeActTests(unittest.TestCase):
         out = self.app.run_task("test.fail_read", {"content": "parse the widget manifest"},
                                 wait=30)
         self.assertIn("lessons", out)
-        self.assertIn("widget manifest", out["lessons"][0]["text"])
+        lesson = out["lessons"][0]
+        # structured, fenced as untrusted data - there is no plain "text" to splice
+        self.assertNotIn("text", lesson)
+        self.assertIn("test.fail_read", lesson["untrusted_text"])
+        self.assertNotIn("widget", lesson["untrusted_text"])
         # and the repeat was counted on the one lesson, not written as another
         self.assertGreaterEqual(out["lessons"][0]["seen"], 1)
         lessons = self.app.runtime.cortex.memories(LESSONS_NAMESPACE)

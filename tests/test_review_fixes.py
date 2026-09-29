@@ -182,9 +182,12 @@ class FailureLessonTests(unittest.TestCase):
 
     def test_a_failed_task_leaves_a_lesson_that_lessons_for_recalls(self) -> None:
         self.app.run_task("test.fail_read", {"content": "parse the widget manifest"}, wait=30)
-        lessons = self.app.runtime.cortex.lessons_for("parse the widget manifest")
+        # recalled by the capability, not the request: a lesson holds structural
+        # facts only (test_memory_live.LessonPrivacyTests), never the caller's words
+        lessons = self.app.runtime.cortex.lessons_for("flake test.fail_read")
         self.assertTrue(lessons)
         self.assertIn("fail", lessons[0].text.lower())
+        self.assertNotIn("widget", lessons[0].text)
 
 
 class RateLimitedErrorTests(unittest.TestCase):

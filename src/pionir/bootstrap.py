@@ -87,7 +87,9 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
     embedder = (
         OllamaEmbedder(configured.embed_model) if configured.embed_model else None
     )
-    cortex = Cortex(configured.cortex_path, embedder=embedder)
+    cortex = Cortex(configured.cortex_path, embedder=embedder,
+                    turn_retention_days=configured.turn_retention_days,
+                    fact_retention_days=configured.fact_retention_days)
     # Built here (before the scheduler) so the scheduler can audit a wait for the
     # shared GPU lease through the same ledger everything else uses.
     from datetime import UTC, datetime

@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from . import atomic, library
+from . import atomic, library, secretscrub
 from .approvals import ApprovalQueue
 from .auth import (
     ANONYMOUS,
@@ -71,7 +71,7 @@ from .cli import _capabilities, _doctor, _jsonable
 from .posting_health import posting_health
 from .contracts import ModelRequirement, RiskLevel, Task, outcome_ok
 from .consolidate import AUTO_CONSOLIDATE_AT
-from .cortex import NewMemory
+from .cortex import NewMemory, failure_shape
 from .errors import PionirError, RoutingAmbiguous
 from .router import Candidate, IntentRouter, RoutingDecision
 from .runtime import AuditEvent
@@ -820,6 +820,7 @@ class PionirApp:
     # ---- the voice's turns, and folding them into memory ------------------
     # Fold a namespace once this many raw turns (two per exchange) are waiting.
     CONSOLIDATE_AT = AUTO_CONSOLIDATE_AT
+    MAX_CHUNKS_PER_PASS = 4
 
     def _remember_exchange(self, namespace: str, request: str,
                            response: Mapping[str, Any]) -> None:
@@ -831,10 +832,16 @@ class PionirApp:
         cortex = getattr(self.runtime, "cortex", None)
         if cortex is None:
             return
+        # Scrubbed before storage (pionir/secretscrub.py and this server's client
+        # tokens): a turn is kept for up to TURN_RETENTION_DAYS after it is folded,
+        # and what is distilled from it longer - no secret should ride along.
+        known = tuple(self.auth.tokens.values())
         try:
             cortex.remember_many([
-                NewMemory("message", f"asked: {request.strip()[:600]}", namespace),
-                NewMemory("message", f"told: {_exchange_gist(response)}", namespace),
+                NewMemory("message", "asked: " + secretscrub.scrub_text(
+                    request.strip()[:600], known), namespace),
+                NewMemory("message", "told: " + secretscrub.scrub_text(
+                    _exchange_gist(response), known), namespace),
             ])
         except Exception:  # noqa: BLE001 - logged, never raised into the voice's turn
             _log.warning("recording the %s exchange as raw turns failed", namespace,
@@ -847,12 +854,17 @@ class PionirApp:
         CONSOLIDATE_AT and none is running for it. Driven by the voice's own
         traffic inside this process - nothing is scheduled, nothing self-starts.
         Returns whether a fold was started."""
+        from .consolidate import Consolidator
+
         try:
-            pending = len(self.runtime.cortex.memories(namespace, kind="message", limit=None))
+            # enough turns waiting, and their oldest chunk not backing off after a
+            # failure - so a failing fold is not retried on every exchange
+            due = Consolidator(self.runtime.cortex, None).due(  # type: ignore[arg-type]
+                namespace, min_turns=self.CONSOLIDATE_AT)
         except Exception:  # noqa: BLE001
-            _log.warning("counting %s raw turns failed", namespace, exc_info=True)
+            _log.warning("checking %s raw turns failed", namespace, exc_info=True)
             return False
-        if pending < self.CONSOLIDATE_AT:
+        if not due:
             return False
         with self._consolidating_lock:
             if namespace in self._consolidating:
@@ -888,10 +900,15 @@ class PionirApp:
             # Declared like Atani's 4B: a CPU/elastic tenant that never takes the card
             # from the voice. The lease is for accounting and the one-at-a-time rule.
             requirement = ModelRequirement(model or "distiller", 0, requires_gpu=False)
+            cortex.purge()  # retention rides along with the fold, on the same traffic
             with self.runtime.executive.scheduler.acquire(
                     requirement, purpose=f"pionir: consolidate {namespace}"):
-                Consolidator(cortex, distiller).consolidate(
-                    namespace, min_turns=self.CONSOLIDATE_AT)
+                consolidator = Consolidator(cortex, distiller)
+                # a bounded chunk per fold; a few per pass, oldest first
+                for _ in range(self.MAX_CHUNKS_PER_PASS):
+                    if consolidator.consolidate(namespace,
+                                                min_turns=self.CONSOLIDATE_AT) is None:
+                        break
         except Exception as error:  # noqa: BLE001 - logged and recorded, never silent
             _log.warning("consolidating %s failed", namespace, exc_info=True)
             try:
@@ -1127,7 +1144,11 @@ class PionirApp:
         was recalled in the ledger, and RETURN it, so the caller's response
         carries the lessons (`lessons`) to whoever sent the task. They used to be
         recalled, counted in the ledger and thrown away - 3,134 recalls and not one
-        reached a caller, while the same fiverr.ack mistake repeated 398 times."""
+        reached a caller, while the same fiverr.ack mistake repeated 398 times.
+
+        Each lesson is ``{"id", "untrusted_text", "seen"[, "via"]}``. The text is
+        UNTRUSTED DATA: scrubbed, but written from failures anywhere in the estate.
+        A consumer may show it or weigh it; it must never execute or obey it."""
 
         cortex = getattr(self.runtime, "cortex", None)
         if cortex is None:
@@ -1153,8 +1174,13 @@ class PionirApp:
             )
         except Exception:  # noqa: BLE001
             _log.warning("recording recalled-lessons event failed", exc_info=True)
-        return [{"id": m.id, "text": m.text, "seen": int(m.meta.get("seen", 1)),
-                 **({"via": m.via} if m.via else {})} for m in lessons]
+        # Structured data, never prose to splice into a prompt: the text is marked
+        # untrusted (it came from failures of other bots' tasks), and consumers
+        # must treat it as data to show or weigh - never as instructions to follow.
+        known = tuple(self.auth.tokens.values())
+        return [{"id": m.id, "untrusted_text": secretscrub.scrub_text(m.text, known),
+                 "seen": int(m.meta.get("seen", 1)), **({"via": m.via} if m.via else {})}
+                for m in lessons]
 
     def _learn_from_failure(
         self, capability: str, payload: dict[str, Any], response: dict[str, Any]
@@ -1166,16 +1192,22 @@ class PionirApp:
         cortex = getattr(self.runtime, "cortex", None)
         if cortex is None:
             return
+        # Structural facts only - who, which capability, the error class and code.
+        # Never the request (_summarize's gist is the caller's own words, e.g. the
+        # voice's request) and never the failure's free text, which can echo it:
+        # a lesson is shared with every bot and handed back to every caller.
         error = response.get("error")
-        why = ""
         if isinstance(error, Mapping):
-            why = str(error.get("message") or error.get("type") or "")
-        elif isinstance(response.get("result"), Mapping):
-            why = str(response["result"].get("error") or "")
-        summary = self._summarize(capability, payload)
-        text = f"{summary} failed" + (f": {why[:300]}" if why else "")
+            shape = failure_shape(str(error.get("message") or ""), str(error.get("type") or "error"))
+        else:
+            result = response.get("result")
+            message = str(result.get("error") or "") if isinstance(result, Mapping) else ""
+            shape = failure_shape(message, "reported failure")
+        agent, _cap = self._cap_and_agent(capability)
+        text = f"{agent or capability.split('.')[0]} · {capability} failed: {shape}"
         try:
-            cortex.record_lesson(text, slug=f"failure:{capability}")
+            cortex.record_lesson(text, slug=f"failure:{capability}",
+                                 known=self.auth.tokens.values())
         except Exception:  # noqa: BLE001 - a lesson write must never fail a task
             _log.warning("recording failure lesson failed", exc_info=True)
 

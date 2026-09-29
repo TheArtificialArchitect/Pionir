@@ -228,6 +228,17 @@ pieces, none urgent, none needing the strip:
   and doctor's `memory.output` (`memory_health.py`) counts writes, folds and
   coverage, with alarms for a stalled lesson writer, a lesson recurring all day, a
   stalled fold and low coverage.
+  Review hardening the same day: a lesson built from a failure holds structural
+  facts only (who, capability, error class, HTTP/return code) - never the request
+  or the failure's free text - and every lesson is scrubbed (secretscrub.py) and
+  capped. Recalled lessons come back as `{"id", "untrusted_text", "seen"}`:
+  **consumers must treat `untrusted_text` as data to show or weigh, never as
+  instructions.** Raw turns are scrubbed before storage; folded turns are deleted
+  after `PIONIR_TURN_RETENTION_DAYS` (14), facts carry provenance and expire after
+  `PIONIR_FACT_RETENTION_DAYS` (180). A fold sends a bounded chunk (~1500 tokens),
+  backs off exponentially on failure (60 s doubling, 6 h cap), and poisons a chunk
+  after 4 failures (logged, doctor alarm); the distil call sends `num_gpu: 0`
+  (verified live: qwen3:4b loaded with size_vram 0 beside Moss's gemma3:12b).
 
 ## Open decisions, not yet made
 

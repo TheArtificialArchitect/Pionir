@@ -104,6 +104,16 @@ def _optional_url(name: str, default: str | None) -> str | None:
     return raw
 
 
+def _days_from_env(name: str, default: float) -> float:
+    """A positive number of days from the environment, else the default."""
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        value = float(raw) if raw else default
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def _embed_model_from_env(default: str = "nomic-embed-text") -> str | None:
     """PIONIR_EMBED_MODEL: a model name, or "" / "off" / "none" to disable
     hybrid recall entirely. Unset keeps the default (embeddings on, fail-open)."""
@@ -288,6 +298,11 @@ class PionirSettings:
     # that can chat: the embed model above cannot, and defaulting to it meant
     # consolidation silently never happened. PIONIR_DISTIL_MODEL overrides.
     distil_model: str = "qwen3:4b-instruct-2507-q4_K_M"
+    # Retention for the memory store (days): folded raw turns are DELETED this long
+    # after they were written, distilled facts this long after they were distilled.
+    # PIONIR_TURN_RETENTION_DAYS / PIONIR_FACT_RETENTION_DAYS override.
+    turn_retention_days: float = 14.0
+    fact_retention_days: float = 180.0
     # Resident models the scheduler must never evict to make room - the voice's
     # model above all, since Galatea never takes the shared lock and an eviction
     # mid-sentence cuts her off. PIONIR_PROTECTED_MODELS is a comma list; set it
@@ -606,6 +621,10 @@ class PionirSettings:
             embed_model=_embed_model_from_env(),
             distil_model=(os.environ.get("PIONIR_DISTIL_MODEL") or "").strip()
             or _declared("distil_model"),
+            turn_retention_days=_days_from_env("PIONIR_TURN_RETENTION_DAYS",
+                                                _declared("turn_retention_days")),
+            fact_retention_days=_days_from_env("PIONIR_FACT_RETENTION_DAYS",
+                                                _declared("fact_retention_days")),
             protected_models=_protected_models_from_env(_declared("protected_models")),
             specialists_file=(
                 Path(os.environ["PIONIR_SPECIALISTS_FILE"])

@@ -16,10 +16,11 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Callable, Protocol, Sequence
 
 from .cortex import Cortex
 
@@ -31,6 +32,17 @@ DEFAULT_MIN_TURNS = 6
 # The server folds a namespace on its own traffic once this many raw turns wait
 # (two per exchange of the voice's, so every six exchanges).
 AUTO_CONSOLIDATE_AT = 12
+# One fold sends at most this many tokens of turns (about 4 characters a token),
+# oldest first; a backlog bigger than that is folded a chunk at a time. Sending the
+# whole backlog could outgrow the distil model's context and then never succeed.
+CHUNK_TOKENS = 1500
+_CHARS_PER_TOKEN = 4
+# A chunk that failed is not retried until this backoff has passed, doubling with
+# each failure of the same chunk up to the cap; after POISON_AFTER failures its
+# turns are poisoned (retired, logged, alarmed) instead of being retried forever.
+BACKOFF_FIRST_SECONDS = 60.0
+BACKOFF_MAX_SECONDS = 6 * 3600.0
+POISON_AFTER = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,27 +68,67 @@ class Consolidation:
 class Consolidator:
     """Folds a namespace's raw turns into an episode + facts, then retires them."""
 
-    def __init__(self, cortex: Cortex, distiller: Distiller) -> None:
+    def __init__(self, cortex: Cortex, distiller: Distiller, *,
+                 chunk_tokens: int = CHUNK_TOKENS,
+                 clock: Callable[[], float] = time.time) -> None:
         self.cortex = cortex
         self.distiller = distiller
+        self.chunk_tokens = chunk_tokens
+        self._clock = clock
+
+    @staticmethod
+    def backoff_seconds(failures: int) -> float:
+        """How long after its last failure a chunk that failed ``failures`` times waits."""
+        if failures <= 0:
+            return 0.0
+        return min(BACKOFF_MAX_SECONDS, BACKOFF_FIRST_SECONDS * 2 ** (failures - 1))
+
+    def _chunk(self, turns: list) -> list:
+        """The oldest turns that fit the token budget - always at least one."""
+        budget = self.chunk_tokens * _CHARS_PER_TOKEN
+        chunk, used = [], 0
+        for m in turns:
+            if chunk and used + len(m.text) + 1 > budget:
+                break
+            chunk.append(m)
+            used += len(m.text) + 1
+        return chunk
+
+    def due(self, namespace: str, *, min_turns: int = DEFAULT_MIN_TURNS) -> bool:
+        """Whether a fold would be attempted now: enough turns wait, and their
+        oldest chunk is not backing off after a failure. Cheap - no model."""
+        turns = self.cortex.memories(namespace, kind="message", limit=None)
+        if len(turns) < min_turns:
+            return False
+        failures, last_at = self.cortex.chunk_failures(namespace, self._chunk(turns)[0].id)
+        return not (failures and last_at is not None
+                    and self._clock() < last_at + self.backoff_seconds(failures))
 
     def consolidate(
         self, namespace: str, *, min_turns: int = DEFAULT_MIN_TURNS
     ) -> Consolidation | None:
-        # limit=None: every un-consolidated turn, not the first thousand - a long
-        # conversation folded in batches would otherwise summarise the oldest
-        # thousand and retire only those, leaving the rest to a later pass at best.
+        """Fold the OLDEST chunk of a namespace's waiting turns (bounded by
+        ``chunk_tokens``) into one episode + facts. None when there is not enough
+        to fold, the chunk is backing off after a failure, or the distiller
+        declined or failed (logged, recorded, turns kept; poisoned after
+        POISON_AFTER failures of the same chunk). Call again for the next chunk."""
         turns = self.cortex.memories(namespace, kind="message", limit=None)
         if len(turns) < min_turns:
             return None
-        texts = [m.text for m in turns]
+        chunk = self._chunk(turns)
+        chunk_start = chunk[0].id
+        failures, last_at = self.cortex.chunk_failures(namespace, chunk_start)
+        if failures and last_at is not None \
+                and self._clock() < last_at + self.backoff_seconds(failures):
+            return None
+        texts = [m.text for m in chunk]
         try:
             distilled = self.distiller.distill(texts)
         except Exception as error:  # noqa: BLE001 - distilling is fail-open by contract
             # Fail-open, not fail-silent: logged and written to the attempt log.
             why = f"{type(error).__name__}: {error}"
             _log.warning("consolidating %s: the distiller failed (%s); turns kept", namespace, why)
-            self.cortex.note_consolidation(namespace, "failed", detail=why)
+            self._failed(namespace, chunk, "failed", why, failures + 1)
             return None
         # No usable summary: leave the turns untouched to try again later. Losing
         # them because the model hiccuped would be the opposite of the point.
@@ -84,7 +136,7 @@ class Consolidator:
             reason = getattr(self.distiller, "last_error", None) or "no usable summary"
             _log.warning("consolidating %s: the distiller declined (%s); turns kept",
                          namespace, reason)
-            self.cortex.note_consolidation(namespace, "declined", detail=reason)
+            self._failed(namespace, chunk, "declined", reason, failures + 1)
             return None
 
         # One transaction: the episode and facts are written and the raw turns
@@ -93,16 +145,31 @@ class Consolidator:
         # halfway, leaving the summary AND its turns both live in recall.
         episode_id, fact_ids = self.cortex.fold(
             namespace,
-            [m.id for m in turns],
+            [m.id for m in chunk],
             distilled.summary.strip(),
             [fact for fact in distilled.facts if fact.strip()],
-            meta={"folded_turns": len(turns)},
+            meta={"folded_turns": len(chunk),
+                  "distiller": str(getattr(self.distiller, "model", "") or "")},
         )
         self.cortex.note_consolidation(
-            namespace, "folded", episode_id=episode_id, folded=len(turns),
-            detail=f"{len(fact_ids)} facts",
+            namespace, "folded", episode_id=episode_id, folded=len(chunk),
+            detail=f"{len(fact_ids)} facts", chunk_start=chunk_start,
         )
-        return Consolidation(episode_id, tuple(fact_ids), len(turns))
+        return Consolidation(episode_id, tuple(fact_ids), len(chunk))
+
+    def _failed(self, namespace: str, chunk: list, outcome: str, why: str,
+                failures: int) -> None:
+        self.cortex.note_consolidation(namespace, outcome, detail=why,
+                                       chunk_start=chunk[0].id)
+        if failures >= POISON_AFTER:
+            ids = [m.id for m in chunk]
+            self.cortex.poison(namespace, ids, f"{failures} failed folds: {why}")
+            self.cortex.note_consolidation(
+                namespace, "poisoned", folded=len(ids), chunk_start=chunk[0].id,
+                detail=f"{len(ids)} turns after {failures} failed folds: {why}")
+            _log.error("consolidating %s: chunk of %d turns from #%d failed %d times; "
+                       "poisoned (retired, not retried): %s",
+                       namespace, len(ids), chunk[0].id, failures, why)
 
 
 class OllamaDistiller:
@@ -126,13 +193,18 @@ class OllamaDistiller:
         model: str,
         base_url: str = "http://127.0.0.1:11434",
         timeout_seconds: int = 120,
+        opener=None,
     ) -> None:
         self._model = model
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout_seconds
-        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        self._opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}))
         # Why the last distill declined, for the Consolidator's attempt log.
         self.last_error: str | None = None
+
+    @property
+    def model(self) -> str:
+        return self._model
 
     def distill(self, turns: Sequence[str]) -> Distilled | None:
         transcript = "\n".join(turns)
@@ -145,7 +217,10 @@ class OllamaDistiller:
                 ],
                 "stream": False,
                 "format": "json",
-                "options": {"temperature": 0.2},
+                # num_gpu 0: Ollama places no layer on the card, so a fold can never
+                # evict or crowd the voice's resident model. The lease Pionir takes
+                # for it is bookkeeping; this is what actually keeps it off the GPU.
+                "options": {"temperature": 0.2, "num_gpu": 0},
             }
         ).encode("utf-8")
         request = urllib.request.Request(

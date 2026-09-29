@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import array
 import functools
+import hashlib
 import json
 import logging
 import urllib.error
@@ -49,6 +50,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol, Sequence
+
+from . import secretscrub
 
 _log = logging.getLogger(__name__)
 
@@ -112,9 +115,19 @@ CREATE TABLE IF NOT EXISTS consolidations (
     outcome    TEXT    NOT NULL,
     episode_id INTEGER,
     folded     INTEGER NOT NULL DEFAULT 0,
-    detail     TEXT
+    detail     TEXT,
+    chunk_start INTEGER
 );
 """
+
+# A lesson is shared with every bot, so it holds at most this much text, scrubbed.
+LESSON_MAX_CHARS = 300
+# Retention (days): folded or poisoned raw turns are DELETED this long after they
+# were written; a distilled fact expires this long after it was distilled.
+TURN_RETENTION_DAYS = 14.0
+FACT_RETENTION_DAYS = 180.0
+# How many pre-migration backups to keep beside the store.
+_KEEP_BACKUPS = 3
 
 # Schema/data migrations, tracked in PRAGMA user_version. 1 = collapse duplicate
 # lessons (the 2026-09-28 flood: 800 live lessons, 6 distinct texts).
@@ -125,6 +138,32 @@ _BURST_SECONDS = 86400.0
 
 _ID_RUN = re.compile(r"\b(?:[0-9a-f]{8,}(?:-[0-9a-f]{4,})*|\d{5,})\b")
 _SPACE = re.compile(r"\s+")
+
+
+_HTTP_CODE = re.compile(r"\bHTTP\s*(\d{3})\b", re.IGNORECASE)
+_RETURN_CODE = re.compile(r"\breturn\s?code\W{0,3}(-?\d+)", re.IGNORECASE)
+
+
+def failure_shape(message: str | None, error_type: str | None = None) -> str:
+    """The structural facts of a failure - its error class and any HTTP status or
+    return code - and NONE of its free text. A failure message can echo the
+    request that caused it (a person's words, a secret) and a lesson is shared
+    with every bot and handed back to every caller, so a lesson built from a
+    failure is built from this, never from the message itself."""
+    parts = [error_type] if error_type else []
+    text = message or ""
+    if (code := _HTTP_CODE.search(text)) is not None:
+        parts.append(f"HTTP {code.group(1)}")
+    if (code := _RETURN_CODE.search(text)) is not None:
+        parts.append(f"returncode {code.group(1)}")
+    return ", ".join(parts) or "no detail"
+
+
+def scrub_lesson(text: str, known: Iterable[str] = ()) -> str:
+    """A lesson's text as it may be stored: secrets redacted, one line, capped."""
+    one_line = _SPACE.sub(" ", (text or "").strip())
+    clean = secretscrub.scrub_text(one_line, known)
+    return clean if len(clean) <= LESSON_MAX_CHARS else clean[: LESSON_MAX_CHARS - 1] + "…"
 
 
 def lesson_key(text: str) -> str:
@@ -318,10 +357,14 @@ class Cortex:
     embedding model, if any, runs in its own process (Ollama) - never in here."""
 
     def __init__(
-        self, path: str | Path, *, now=time.time, embedder: Embedder | None = None
+        self, path: str | Path, *, now=time.time, embedder: Embedder | None = None,
+        turn_retention_days: float = TURN_RETENTION_DAYS,
+        fact_retention_days: float = FACT_RETENTION_DAYS,
     ) -> None:
         self._now = now
         self.embedder = embedder
+        self.turn_retention_days = float(turn_retention_days)
+        self.fact_retention_days = float(fact_retention_days)
         self.path = Path(path)
         if self.path.parent and str(self.path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -344,6 +387,10 @@ class Cortex:
         self.migration_error: str | None = None
         self.migration_backup: str | None = None
         self._migrate()
+        try:
+            self.purge()
+        except Exception:  # noqa: BLE001 - retention is housekeeping, never fatal
+            _log.warning("cortex retention purge failed at open", exc_info=True)
 
     # ------------------------------------------------------------------ write
     @_synchronized
@@ -515,28 +562,37 @@ class Cortex:
             "INSERT INTO memories(ts,namespace,kind,text,salience,slug,links,meta) "
             "VALUES(?,?,?,?,?,?,?,?)"
         )
+        now = self._now()
+        # Provenance: every episode and fact says where it came from - which
+        # namespace, which turns - and a fact says when it expires (purge()).
+        source = {"source": "consolidation", "namespace": namespace,
+                  "from_turns": [min(ids), max(ids)] if ids else [], **(meta or {})}
         try:
             episode_id = self._db.execute(
                 sql,
-                (self._now(), namespace, "episode", text,
+                (now, namespace, "episode", text,
                  float(KIND_SALIENCE.get("episode", _DEFAULT_SALIENCE)),
-                 None, "[]", json.dumps(meta or {})),
+                 None, "[]", json.dumps(source)),
             ).lastrowid
+            fact_meta = json.dumps({**source, "episode_id": episode_id,
+                                    "expires_ts": now + self.fact_retention_days * 86400})
             fact_ids = [
                 self._db.execute(
                     sql,
-                    (self._now(), namespace, "fact", fact,
-                     float(KIND_SALIENCE.get("fact", _DEFAULT_SALIENCE)), None, "[]", "{}"),
+                    (now, namespace, "fact", fact,
+                     float(KIND_SALIENCE.get("fact", _DEFAULT_SALIENCE)), None, "[]",
+                     fact_meta),
                 ).lastrowid
                 for fact in kept
             ]
             if ids:
                 marks = ",".join("?" * len(ids))
                 self._db.execute(
-                    f"UPDATE memories SET active=0 "
+                    f"UPDATE memories SET active=0, "
+                    f"meta=json_set(meta, '$.folded_into', ?) "
                     f"WHERE namespace=? AND kind='message' AND active=1 "
                     f"AND id IN ({marks})",
-                    [namespace, *ids],
+                    [episode_id, namespace, *ids],
                 )
             self._db.commit()
         except Exception:
@@ -824,6 +880,7 @@ class Cortex:
         links: Sequence[str] = (),
         salience: float = 8.0,
         meta: dict[str, Any] | None = None,
+        known: Iterable[str] = (),
     ) -> int:
         """Write a lesson into the shared `lessons` namespace - a mistake, a
         correction, a "this failed before and here is why". High salience by
@@ -836,8 +893,12 @@ class Cortex:
         lessons with 6 distinct texts (398 copies each of two fiverr.ack
         failures), which drowned every recall in copies of one mistake. The
         count is itself the signal: a lesson that keeps recurring is a mistake
-        being recalled and not heeded (doctor alerts on it)."""
-        clean = (text or "").strip()
+        being recalled and not heeded (doctor alerts on it).
+
+        Every bot reads a lesson and callers get it back, so whatever the writer
+        passed is scrubbed (pionir/secretscrub.py, plus `known` secret values) and
+        capped at LESSON_MAX_CHARS here, whoever the writer is."""
+        clean = scrub_lesson(text, known)
         if not clean:
             raise ValueError("a memory needs text")
         key = lesson_key(clean)
@@ -895,17 +956,71 @@ class Cortex:
     @_synchronized
     def note_consolidation(
         self, namespace: str, outcome: str, *, episode_id: int | None = None,
-        folded: int = 0, detail: str | None = None,
+        folded: int = 0, detail: str | None = None, chunk_start: int | None = None,
     ) -> None:
-        """Log one consolidation attempt - folded, declined, deferred, failed -
-        so 'does consolidation ever run?' has an answer in the store itself."""
+        """Log one consolidation attempt - folded, declined, deferred, failed,
+        poisoned - so 'does consolidation ever run?' has an answer in the store."""
         self._db.execute(
-            "INSERT INTO consolidations(ts,namespace,outcome,episode_id,folded,detail) "
-            "VALUES(?,?,?,?,?,?)",
+            "INSERT INTO consolidations(ts,namespace,outcome,episode_id,folded,detail,"
+            "chunk_start) VALUES(?,?,?,?,?,?,?)",
             (self._now(), namespace, outcome, episode_id, int(folded),
-             (detail or "")[:300] or None),
+             (detail or "")[:300] or None, chunk_start),
         )
         self._db.commit()
+
+    @_synchronized
+    def chunk_failures(self, namespace: str, chunk_start: int) -> tuple[int, float | None]:
+        """(failed or declined attempts at the chunk starting at this turn, when
+        the last one was) - what the Consolidator's backoff and poisoning read."""
+        row = self._db.execute(
+            "SELECT COUNT(*), MAX(ts) FROM consolidations WHERE namespace=? AND chunk_start=? "
+            "AND outcome IN ('failed','declined')",
+            (namespace, chunk_start),
+        ).fetchone()
+        return int(row[0]), row[1]
+
+    @_synchronized
+    def poison(self, namespace: str, ids: Sequence[int], reason: str) -> int:
+        """Retire raw turns that failed to fold too often: out of every later
+        chunk (so one bad chunk cannot block the rest forever) and out of recall,
+        marked `poisoned`, and deleted with the folded ones at retention."""
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        cur = self._db.execute(
+            f"UPDATE memories SET active=0, meta=json_set(meta, '$.poisoned', ?) "
+            f"WHERE namespace=? AND kind='message' AND active=1 AND id IN ({marks})",
+            [reason[:200], namespace, *ids],
+        )
+        self._db.commit()
+        return cur.rowcount
+
+    @_synchronized
+    def purge(self) -> dict[str, int]:
+        """Retention, as DELETEs (not retirement): folded or poisoned raw turns
+        older than turn_retention_days, and facts past their expires_ts - with
+        their vectors. Unfolded turns are kept: they are still waiting."""
+        now = self._now()
+        cutoff = now - self.turn_retention_days * 86400
+        turns = [r[0] for r in self._db.execute(
+            "SELECT id FROM memories WHERE kind='message' AND active=0 AND ts < ? AND "
+            "(json_extract(meta, '$.folded_into') IS NOT NULL "
+            " OR json_extract(meta, '$.poisoned') IS NOT NULL)", (cutoff,))]
+        facts = [r[0] for r in self._db.execute(
+            "SELECT id FROM memories WHERE kind='fact' "
+            "AND json_extract(meta, '$.expires_ts') IS NOT NULL "
+            "AND json_extract(meta, '$.expires_ts') < ?", (now,))]
+        gone = turns + facts
+        for start in range(0, len(gone), 500):
+            batch = gone[start:start + 500]
+            marks = ",".join("?" * len(batch))
+            self._db.execute(f"DELETE FROM vectors WHERE memory_id IN ({marks})", batch)
+            self._db.execute(f"DELETE FROM memories WHERE id IN ({marks})", batch)
+        self._db.commit()
+        if gone:
+            _log.info("cortex retention: deleted %d raw turns, %d expired facts",
+                      len(turns), len(facts))
+        return {"turns": len(turns), "facts": len(facts)}
 
     # ----------------------------------------------------------------- output
     @_synchronized
@@ -956,6 +1071,10 @@ class Cortex:
         last_attempt = self._db.execute(
             "SELECT ts, namespace, outcome, detail FROM consolidations ORDER BY id DESC LIMIT 1"
         ).fetchone()
+        poisoned = self._db.execute(
+            "SELECT COUNT(*) FROM consolidations WHERE outcome='poisoned' AND ts >= ?",
+            (since,),
+        ).fetchone()[0]
         active = self._db.execute("SELECT COUNT(*) FROM memories WHERE active=1").fetchone()[0]
         coverage = None
         if self.embedder is not None:
@@ -973,6 +1092,7 @@ class Cortex:
             "raw_turns_pending": pending,
             "last_consolidation": dict(last_folded) if last_folded else None,
             "last_consolidation_attempt": dict(last_attempt) if last_attempt else None,
+            "poisoned_chunks": poisoned,
             "embed_coverage_pct": coverage,
             "migration_error": self.migration_error,
         }
@@ -1013,15 +1133,7 @@ class Cortex:
         dupes = {key: rows for key, rows in groups.items() if len(rows) > 1}
         if not dupes:
             return 0
-        backup = self.path.with_name(
-            f"{self.path.stem}.pre-lesson-dedupe-{int(self._now())}{self.path.suffix}"
-        )
-        target = sqlite3.connect(str(backup))
-        try:
-            self._db.backup(target)
-        finally:
-            target.close()
-        self.migration_backup = str(backup)
+        self.migration_backup = str(self._backup("pre-lesson-dedupe"))
         retired = 0
         for rows in dupes.values():
             keep, rest = rows[0], rows[1:]
@@ -1042,8 +1154,42 @@ class Cortex:
                                  (json.dumps(rmeta), r["id"]))
                 retired += 1
         _log.warning("cortex: collapsed %d duplicate lessons into %d (backup %s)",
-                     retired, len(dupes), backup)
+                     retired, len(dupes), self.migration_backup)
         return retired
+
+    def _backup(self, tag: str) -> Path:
+        """Copy the store (sqlite online backup) to `<stem>.<tag>-<ts>.db`. A copy
+        whose bytes match the newest existing one is not kept twice, and only the
+        newest _KEEP_BACKUPS are kept - a migration that keeps failing (the store
+        locked by the server at every start) must not stack a 3.5 MB copy per start."""
+        pattern = f"{self.path.stem}.{tag}-*{self.path.suffix}"
+
+        def stamp(p: Path) -> int:
+            try:
+                return int(p.stem.rsplit("-", 1)[1])
+            except (IndexError, ValueError):
+                return 0
+
+        existing = sorted(self.path.parent.glob(pattern), key=stamp)
+        fresh = self.path.with_name(f"{self.path.stem}.{tag}-{int(self._now())}{self.path.suffix}")
+        target = sqlite3.connect(str(fresh))
+        try:
+            self._db.backup(target)
+        finally:
+            target.close()
+        digest = hashlib.sha256(fresh.read_bytes()).hexdigest()
+        newest = existing[-1] if existing else None
+        if (newest is not None and newest != fresh
+                and hashlib.sha256(newest.read_bytes()).hexdigest() == digest):
+            fresh.unlink()
+            return newest
+        kept = sorted({*existing, fresh}, key=stamp)
+        for old in kept[:-_KEEP_BACKUPS]:
+            try:
+                old.unlink()
+            except OSError:
+                _log.warning("could not remove old backup %s", old)
+        return fresh
 
     @_synchronized
     def undo_lesson_dedupe(self) -> int:

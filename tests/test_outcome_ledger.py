@@ -142,7 +142,7 @@ class OutcomeLedgerTests(unittest.TestCase):
             )
         self.assertIs(executive.circuit("daedalus").snapshot().state, CircuitState.OPEN)
         self.assertEqual(len(lessons), 1)
-        self.assertIn("specialist reported returncode=2", lessons[0])
+        self.assertIn("specialist reported failure, returncode 2", lessons[0])
         with self.assertRaises(CircuitOpen):
             executive.execute(Task("code.solve", {}))
         self.assertEqual(adapter.calls, 3)

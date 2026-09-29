@@ -74,6 +74,7 @@ def memory_health(cortex: Any, events: Iterable[Mapping[str, Any]], *, now: floa
             if out["last_consolidation_attempt"] else None
         ),
         "embed_coverage_pct": out["embed_coverage_pct"],
+        "poisoned_chunks_24h": out.get("poisoned_chunks", 0),
     }
     alerts: list[str] = []
     notes: list[str] = []
@@ -97,6 +98,10 @@ def memory_health(cortex: Any, events: Iterable[Mapping[str, Any]], *, now: floa
                     if attempt else "never attempted")
             alerts.append(f"MEMORY: consolidation stalled - {pending['turns']} raw turns in "
                           f"'{ns}' waiting {waited / 3600:.0f} h ({last})")
+    if out.get("poisoned_chunks"):
+        alerts.append(f"MEMORY: {out['poisoned_chunks']} chunk(s) of raw turns failed to fold "
+                      "too often in 24 h and were poisoned (retired unfolded) - check the "
+                      "distil model")
     if stats.get("embed_model"):
         if stats.get("embed_paused_s", 0) > 0:
             alerts.append(f"MEMORY: the embedder is paused for {stats['embed_paused_s']:.0f} s "
