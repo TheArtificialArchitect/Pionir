@@ -566,6 +566,7 @@ function Undo-Rotation([string]$failedUnit, [string]$prefix) {
         Stop-Here "failed forward: nothing was rolled back. Fix what the red lines say, then run -Apply again (same keys; it restarts what is stale, refreshes a previous-key deadline that is near, and verifies)."
     }
     Warn ("{0}not verified: rolling every API back to its pre-rotation env (this rotation's backups)" -f $prefix)
+    Say "a rollback NEVER disarms real-money orders that the live env file had already armed: PRO_RH_ORDERS_ENABLED keeps its live value (and a unit whose orders switch moved is not restarted)"
     foreach ($unit in @($unitFiles.Keys)) {
         $files = @($unitFiles[$unit] | Where-Object { $_ })
         if ($unit -ne $failedUnit) { $files = @($files | Where-Object { $_ -like "*.env" }) }

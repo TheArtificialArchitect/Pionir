@@ -639,7 +639,7 @@ def step_restore(p: dict) -> dict:
     """A unit that was running did not come back after its restart (or the rotation is being
     undone): put its files back from this stamp's backups. `was_active` false restores the files
     ONLY and never restarts (nothing may restart a unit whose orders switch has moved);
-    `keep_live` names keep their live values in the restored files."""
+    `keep_live` names keep their live values in the restored .env files (never in any other file)."""
     stamp, unit = str(p["stamp"]), str(p["unit"])
     if not re.fullmatch(r"\d{8}T\d{6}Z", stamp) or not UNIT_RE.fullmatch(unit):
         return {"step": "restore", "error": "bad stamp or unit"}
@@ -650,7 +650,10 @@ def step_restore(p: dict) -> dict:
             st = os.stat(path)
             with open(bak, "rb") as fh:
                 data = fh.read()
-            if p.get("keep_live"):
+            if p.get("keep_live") and str(path).endswith(".env"):
+                # ONLY real env files: a .py (or anything else) can hold a column-0 line that merely
+                # LOOKS like an assignment (a docstring line naming PRO_RH_ORDERS_ENABLED=1) and must
+                # come back byte for byte
                 with open(path, "rb") as fh:
                     data = keep_live(data, fh.read(), p["keep_live"])
             tmp = path + ".pionir-tmp"

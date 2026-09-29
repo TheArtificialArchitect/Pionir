@@ -718,6 +718,8 @@ class LockdownRuns(unittest.TestCase):
         self.assertEqual(done.returncode, 1, done.stdout)
         self.assertIn("real-money orders differ", done.stdout)
         self.assertIn("rolled back on the VPS for all three APIs", done.stdout)
+        # Ian is told, at the restore step, that a rollback never disarms orders the live file had armed
+        self.assertIn("a rollback NEVER disarms real-money orders", done.stdout)
         for f, name, old in (("rh_api.env", "PRO_RH_API_KEY", OLD["rh"]), ("pro.env", "PROM_API_KEY", OLD["prom"]),
                              ("mrcrab.env", "KARKINOS_API_KEY", OLD["kark"])):
             self.assertEqual(self.env(f)[name], old, f)
@@ -1172,6 +1174,33 @@ class RemoteHalf(unittest.TestCase):
         self.r.step_restore({"stamp": "20260928T000001Z", "unit": "pro-robinhood-api.service", "was_active": False,
                              "files": [str(f).replace(os.sep, "/")], "keep_live": ["PRO_RH_ORDERS_ENABLED", "NOT_SET_ANYWHERE"]})
         self.assertEqual(f.read_bytes(), Path(str(f) + ".bak-pionir-20260928T000001Z").read_bytes())
+
+    def test_restore_never_rewrites_a_py_file_that_has_an_env_looking_line(self) -> None:
+        self._units()
+        posix = lambda f: str(f).replace(os.sep, "/")
+        stamp = "20260928T000002Z"
+        py = self.dir / "robinhood_read_api.py"
+        line = "PRO_RH_ORDERS_ENABLED=1 is set in the environment to arm real-money orders."
+        old = f'"""The read API.\n{line}\n"""\nimport os\nORDERS = os.environ.get("PRO_RH_ORDERS_ENABLED") == "1"\n'
+        py.write_text(old, encoding="utf-8", newline="")
+        Path(str(py) + ".bak-pionir-" + stamp).write_text(old, encoding="utf-8", newline="")
+        # a later pin reflowed that docstring line, so the live .py no longer has a line that looks like an assignment
+        py.write_text(old.replace(line, "Real-money orders are armed by setting the environment."), encoding="utf-8", newline="")
+        env = self.dir / "rh_api.env"
+        self.r.update_env_file(str(env), {"PRO_RH_API_KEY": "n" * 43}, {"PRO_RH_API_KEY": "PRO_RH_API_KEY_PREVIOUS"}, [], stamp)
+        env.write_text(env.read_text(encoding="utf-8").replace("PRO_RH_ORDERS_ENABLED=0", "PRO_RH_ORDERS_ENABLED=1"), encoding="utf-8")
+        out = self.r.step_restore({"stamp": stamp, "unit": "pro-robinhood-api.service", "was_active": False,
+                                   "files": [posix(env), posix(py)], "keep_live": ["PRO_RH_ORDERS_ENABLED"]})
+        self.assertEqual(out["restored"], [posix(env), posix(py)])
+        self.assertEqual(py.read_bytes(), old.encode("utf-8"))          # byte for byte: no live line appended
+        compile(py.read_text(encoding="utf-8"), str(py), "exec")       # and the restored server still compiles
+        # the env file, through the same call, still keeps the live switch
+        self.assertEqual(self.r.parse_env(env.read_text(encoding="utf-8"))["PRO_RH_ORDERS_ENABLED"], "1")
+        # and a .py whose docstring line the live file still has is no different: never rewritten
+        py.write_text(old.replace("The read API.", "The read API, later pin."), encoding="utf-8", newline="")
+        self.r.step_restore({"stamp": stamp, "unit": "pro-robinhood-api.service", "was_active": False,
+                             "files": [posix(py)], "keep_live": ["PRO_RH_ORDERS_ENABLED"]})
+        self.assertEqual(py.read_bytes(), old.encode("utf-8"))
 
     # ---- the firewall
     def test_prepare_only_permits_and_arm_schedules_the_revert_first(self) -> None:
