@@ -11,7 +11,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from . import benchmark, bridge_auth, bryofeed, recallcheck, routecheck
+from . import benchmark, bridge_auth, bryofeed, recallcheck, routecheck, workcli
 from .batching import DigestSettings, approval_level, batch_condition
 from .bootstrap import PionirRuntime, build_runtime
 from .config import PionirSettings
@@ -255,6 +255,7 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also run the probes through the local embedder to show the hybrid lift",
     )
+    workcli.add_parsers(commands)
     return parser
 
 
@@ -822,6 +823,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print({"status": "ok", "directory": str(bridge_auth.secrets_dir()), "tokens": made,
                 "open_bridges": bridge_auth.open_bridges(made)})
         return 0
+    if args.command == "work":
+        # Its own database, opened directly: no runtime, no server, no network.
+        return workcli.run(args, PionirSettings.from_environment())
     if args.command == "bryo-feed":
         # A standalone poller: it reads the running server over HTTP and needs no
         # runtime of its own (no Cortex, no GPU lock), so it short-circuits here.

@@ -12,6 +12,7 @@ license = { text = "Proprietary" }
 authors = [{ name = "Ian Lee" }]
 dependencies = [
   "pillow>=10.1",  # social/card.py draws the Instagram card (variable-font axes need 10.1+)
+  "tzdata; sys_platform == 'win32'",  # worklog.py: zoneinfo has no zone database on Windows
 ]
 
 [project.optional-dependencies]

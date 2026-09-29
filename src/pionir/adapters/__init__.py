@@ -15,6 +15,7 @@ from .owner import OwnerNotifyAdapter, OwnerNotifySettings
 from .products import ProductAdapter, ProductSettings
 from .stdio_json import StdioJsonAdapter, StdioJsonSettings, load_stdio_adapters
 from .voodoo_status import VoodooStatusAdapter, VoodooStatusSettings
+from .work_summary import WorkSummaryAdapter, WorkSummarySettings
 
 __all__ = [
     "AtaniCliAdapter",
@@ -47,5 +48,7 @@ __all__ = [
     "StdioJsonSettings",
     "VoodooStatusAdapter",
     "VoodooStatusSettings",
+    "WorkSummaryAdapter",
+    "WorkSummarySettings",
     "load_stdio_adapters",
 ]

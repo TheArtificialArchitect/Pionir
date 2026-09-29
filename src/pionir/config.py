@@ -138,6 +138,9 @@ def _protected_models_from_env(default: tuple[str, ...]) -> tuple[str, ...]:
 @dataclass(frozen=True, slots=True)
 class PionirSettings:
     state_root: Path = field(default_factory=_default_state_root)
+    # The IANA zone the work log's days and weeks are measured in (PIONIR_WORK_TZ); None is
+    # the machine's own zone.
+    work_tz: str | None = None
     total_vram_mb: int = 12_288
     # The observed idle floor on the target workstation, not an estimate.
     # See docs/PHASE0_BENCHMARK.md; ResourceBudget carries the same figure.
@@ -461,6 +464,11 @@ class PionirSettings:
         return self.state_root / "cortex" / "memory.db"
 
     @property
+    def worklog_path(self) -> Path:
+        """The work log (hours and pay): its own file, never the memory db (worklog.py)."""
+        return self.state_root / "worklog" / "worklog.db"
+
+    @property
     def resource_budget(self) -> ResourceBudget:
         return ResourceBudget(
             total_vram_mb=self.total_vram_mb,
@@ -647,4 +655,5 @@ class PionirSettings:
                 if (os.environ.get("PIONIR_PROTEUS_SSH_KEY") or "").strip()
                 else None
             ),
+            work_tz=(os.environ.get("PIONIR_WORK_TZ") or "").strip() or None,
         )

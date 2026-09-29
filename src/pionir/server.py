@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from . import atomic, library, secretscrub
+from . import atomic, library, secretscrub, workapi
 from .approvals import ApprovalQueue
 from .auth import (
     ANONYMOUS,
@@ -379,6 +379,24 @@ class PionirApp:
         self._consolidating: set[str] = set()
         self._consolidating_lock = threading.Lock()
         self._consolidation_thread: threading.Thread | None = None
+
+    # ---- the work log: the owner's hours and pay -----------------------------
+    def worklog(self) -> Any:
+        """The work log (pionir/worklog.py) at this runtime's state root: its own file, never
+        the memory db. Built per call - it holds no connection - so a test's temp state root
+        and a moved PIONIR_STATE_ROOT are both honoured."""
+        from .worklog import worklog_for
+        return worklog_for(self.runtime.settings, known=lambda: self.auth.tokens.values())
+
+    def audit_work(self, client: str, detail: str) -> None:
+        """One ledger line per successful work-log write: which route and which ids - never
+        a note, a rate or an amount (the ledger is metadata-only)."""
+        try:
+            self.runtime.executive.audit_sink.record(AuditEvent(
+                event_type="work.write", task_id=uuid.uuid4(), agent_id=client,
+                occurred_at=datetime.now(UTC), detail=detail))
+        except Exception:  # noqa: BLE001 - the write is done; say the ledger missed it
+            _log.warning("recording a work-log write failed", exc_info=True)
 
     # ---- proteus: the trading plane, read ------------------------------
     def proteus_view(self, *, refresh: Callable[[Callable[[], None]], None] | None = None,
@@ -1493,6 +1511,9 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
             if route.path.startswith("/api/library/"):
                 self._library(route)
                 return
+            if route.path.startswith("/api/work/"):
+                self._work(route)
+                return
             try:
                 if route.path == "/api/state":
                     self._send(app.state())
@@ -1555,6 +1576,63 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                 known=lambda: app.auth.tokens.values())
             self._send(document, status)
 
+        def _work(self, route: Any) -> None:
+            """The work log (pionir/workapi.py): the owner's surfaces only - Pionir Desktop
+            signed, or the dashboard's session - for reads AND writes. A write's body is read
+            first (bounded: a bigger one is refused unread) because a signature covers it."""
+            method = self.command
+            head = self.headers
+            raw = b""
+            if method != "GET":
+                try:
+                    length = int(head.get("Content-Length") or 0)
+                except ValueError:
+                    length = -1
+                if length < 0 or length > workapi.MAX_BODY:
+                    self._drain()
+                    self.close_connection = True
+                    self._send({"error": "too large", "reason": "the body is over "
+                                f"{workapi.MAX_BODY} bytes"}, 413)
+                    return
+                raw = self.rfile.read(length) if length > 0 else b""
+            if any(head.get(h) is not None for h in SIGN_HEADERS):
+                client, refused = app.auth.from_signed(
+                    head.get("X-Pionir-Client"), method, self.path, head.get("X-Pionir-Ts"),
+                    head.get("X-Pionir-Nonce"), head.get("X-Pionir-Sig"), body=raw)
+            else:
+                client, refused = app.auth.from_headers(head.get("Authorization"),
+                                                        head.get("Cookie"),
+                                                        head.get(PROOF_HEADER))
+            try:
+                log = app.worklog()
+                status, document, detail = workapi.serve(
+                    method, route.path, route.query, raw, client=client, refused=refused,
+                    log=log, known=lambda: app.auth.tokens.values())
+            except Exception as error:  # noqa: BLE001 - never a stack trace to a client
+                _log.warning("work log request failed: %s", type(error).__name__)
+                self._send({"error": "work log unavailable", "reason": type(error).__name__}, 500)
+                return
+            if detail is not None and status == 200 and client is not None:
+                app.audit_work(client, detail)
+            self._send(document, status)
+
+        def do_DELETE(self) -> None:
+            route = urlparse(self.path)
+            refused = _host_allowed(self.headers, bind_host)
+            host_header = self.headers.get("Host") or ""
+            origin = self.headers.get("Origin")
+            if refused is None and origin is not None                     and origin.strip().lower() != f"http://{host_header.strip()}".lower():
+                refused = "origin does not match host"
+            if refused is not None:
+                self._drain()
+                self._send({"error": "forbidden", "reason": refused}, 403)
+                return
+            if route.path.startswith("/api/work/"):
+                self._work(route)
+                return
+            self._drain()
+            self._send({"error": "not found"}, 404)
+
         def _caller(self, path: str, raw: bytes | None = None) -> tuple[str | None, int, str]:
             """Who is POSTing, or (None, status, why) to refuse it. A credential that is
             present must be right; none at all is ``anonymous``, served only in the
@@ -1608,6 +1686,9 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                         app.auth.tokens.get("dashboard"), body.get("nonce"), body.get("ts"),
                         self.headers.get("X-Pionir-Sign"), self.server.server_address[1])
                 self._send(out if out else {"error": "refused"}, 200 if out else 403)
+                return
+            if route.path.startswith("/api/work/"):
+                self._work(route)
                 return
             if route.path not in _POST_ROUTES:
                 self._drain()

@@ -40,6 +40,7 @@ EXPECTED = {
     "executive.atani_run": ("card", None),
     "manager.atani_manage": ("card", None),
     "organism.bryo_status": ("auto", None),
+    "work.summary": ("auto", None),
     "client.orders": ("auto", None),
     "client.email": ("card", None),
     "client.find_report": ("card", None),

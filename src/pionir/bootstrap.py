@@ -31,6 +31,8 @@ from .adapters import (
     ProductAdapter,
     VoodooStatusAdapter,
     VoodooStatusSettings,
+    WorkSummaryAdapter,
+    WorkSummarySettings,
     load_stdio_adapters,
 )
 from .adapters.clients import client_settings
@@ -159,6 +161,10 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
 
         runtime.register(ProteusAdapter(ProteusSettings(
             host=configured.proteus_host, key_file=configured.proteus_ssh_key)))
+    # The owner's hours and pay (worklog.py): Moss reads totals through work.summary. Its own
+    # file, opened only when a work.summary task runs or doctor asks - nothing at boot.
+    runtime.register(WorkSummaryAdapter(WorkSummarySettings(
+        path=configured.worklog_path, zone=configured.work_tz)))
     if configured.bryo_status_command is not None:
         runtime.register(
             BryoStatusAdapter(
