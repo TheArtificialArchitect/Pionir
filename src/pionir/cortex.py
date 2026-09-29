@@ -126,6 +126,8 @@ LESSON_MAX_CHARS = 300
 # were written; a distilled fact expires this long after it was distilled.
 TURN_RETENTION_DAYS = 14.0
 FACT_RETENTION_DAYS = 180.0
+# Retention never runs further ahead of the store's newest write than this.
+_PURGE_CLOCK_SLACK = 86400.0
 # How many pre-migration backups to keep beside the store.
 _KEEP_BACKUPS = 3
 
@@ -969,15 +971,36 @@ class Cortex:
         self._db.commit()
 
     @_synchronized
-    def chunk_failures(self, namespace: str, chunk_start: int) -> tuple[int, float | None]:
-        """(failed or declined attempts at the chunk starting at this turn, when
-        the last one was) - what the Consolidator's backoff and poisoning read."""
+    def chunk_failures(
+        self, namespace: str, chunk_start: int
+    ) -> tuple[int, float | None, int]:
+        """(every failed attempt at the chunk starting at this turn, when the last
+        one was, how many were NON-transient) - backoff reads the first two, and
+        poisoning only the third: a model that was merely away never poisons."""
         row = self._db.execute(
-            "SELECT COUNT(*), MAX(ts) FROM consolidations WHERE namespace=? AND chunk_start=? "
-            "AND outcome IN ('failed','declined')",
+            "SELECT COUNT(*), MAX(ts), "
+            "SUM(CASE WHEN outcome IN ('failed','declined') THEN 1 ELSE 0 END) "
+            "FROM consolidations WHERE namespace=? AND chunk_start=? "
+            "AND outcome IN ('failed','declined','unavailable')",
             (namespace, chunk_start),
         ).fetchone()
-        return int(row[0]), row[1]
+        return int(row[0]), row[1], int(row[2] or 0)
+
+    @_synchronized
+    def fold_nothing(self, namespace: str, ids: Sequence[int]) -> int:
+        """The distiller found nothing worth keeping: mark these turns folded with
+        no episode (folded_into 0), so they leave the backlog and are deleted at
+        retention like any folded turn."""
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        cur = self._db.execute(
+            f"UPDATE memories SET active=0, meta=json_set(meta, '$.folded_into', 0) "
+            f"WHERE namespace=? AND kind='message' AND active=1 AND id IN ({marks})",
+            [namespace, *ids],
+        )
+        self._db.commit()
+        return cur.rowcount
 
     @_synchronized
     def poison(self, namespace: str, ids: Sequence[int], reason: str) -> int:
@@ -999,8 +1022,22 @@ class Cortex:
     def purge(self) -> dict[str, int]:
         """Retention, as DELETEs (not retirement): folded or poisoned raw turns
         older than turn_retention_days, and facts past their expires_ts - with
-        their vectors. Unfolded turns are kept: they are still waiting."""
+        their vectors. Unfolded turns are kept: they are still waiting.
+
+        Guarded against a clock jumping forward: "now" for retention is never more
+        than a day past the newest thing the store itself recorded (a memory or a
+        consolidation attempt). A wall clock that leapt ahead cannot expire facts
+        early; retention only advances as the store's own writes corroborate it."""
         now = self._now()
+        newest = self._db.execute(
+            "SELECT MAX(t) FROM (SELECT MAX(ts) AS t FROM memories "
+            "UNION ALL SELECT MAX(ts) FROM consolidations)").fetchone()[0]
+        if newest is None:
+            return {"turns": 0, "facts": 0}
+        if now > newest + _PURGE_CLOCK_SLACK:
+            _log.warning("cortex retention: the clock reads %.0f s past the store's newest "
+                         "write; retention uses the store's time instead", now - newest)
+            now = newest + _PURGE_CLOCK_SLACK
         cutoff = now - self.turn_retention_days * 86400
         turns = [r[0] for r in self._db.execute(
             "SELECT id FROM memories WHERE kind='message' AND active=0 AND ts < ? AND "
@@ -1066,11 +1103,19 @@ class Cortex:
         }
         last_folded = self._db.execute(
             "SELECT ts, namespace, episode_id, folded FROM consolidations "
-            "WHERE outcome='folded' ORDER BY id DESC LIMIT 1"
+            "WHERE outcome IN ('folded','empty') ORDER BY id DESC LIMIT 1"
         ).fetchone()
         last_attempt = self._db.execute(
             "SELECT ts, namespace, outcome, detail FROM consolidations ORDER BY id DESC LIMIT 1"
         ).fetchone()
+        streak = 0
+        for row in self._db.execute(
+            "SELECT outcome FROM consolidations WHERE outcome NOT IN ('deferred','off') "
+            "ORDER BY id DESC LIMIT 100"
+        ):
+            if row["outcome"] != "unavailable":
+                break
+            streak += 1
         poisoned = self._db.execute(
             "SELECT COUNT(*) FROM consolidations WHERE outcome='poisoned' AND ts >= ?",
             (since,),
@@ -1093,6 +1138,7 @@ class Cortex:
             "last_consolidation": dict(last_folded) if last_folded else None,
             "last_consolidation_attempt": dict(last_attempt) if last_attempt else None,
             "poisoned_chunks": poisoned,
+            "unavailable_streak": streak,
             "embed_coverage_pct": coverage,
             "migration_error": self.migration_error,
         }

@@ -29,6 +29,8 @@ LESSON_STALL_FAILURES = 3
 RECURRENCE_ALARM = 20
 # Raw turns past the fold threshold and waiting longer than this: stalled.
 CONSOLIDATION_STALL_SECONDS = 6 * 3600.0
+# This many fold attempts in a row finding the distil model away: alarm.
+UNAVAILABLE_ALARM = 3
 # Below this share of active memories with a vector, recall is partly lexical.
 EMBED_COVERAGE_FLOOR = 95.0
 
@@ -98,6 +100,10 @@ def memory_health(cortex: Any, events: Iterable[Mapping[str, Any]], *, now: floa
                     if attempt else "never attempted")
             alerts.append(f"MEMORY: consolidation stalled - {pending['turns']} raw turns in "
                           f"'{ns}' waiting {waited / 3600:.0f} h ({last})")
+    if out.get("unavailable_streak", 0) >= UNAVAILABLE_ALARM:
+        alerts.append(f"MEMORY: the distil model has been unavailable for the last "
+                      f"{out['unavailable_streak']} fold attempts - folding is backing off "
+                      "(turns kept, never poisoned for this)")
     if out.get("poisoned_chunks"):
         alerts.append(f"MEMORY: {out['poisoned_chunks']} chunk(s) of raw turns failed to fold "
                       "too often in 24 h and were poisoned (retired unfolded) - check the "

@@ -45,6 +45,22 @@ BACKOFF_MAX_SECONDS = 6 * 3600.0
 POISON_AFTER = 4
 
 
+class DistillUnavailable(Exception):
+    """The distil model could not be reached or did not answer in time (connection
+    refused, timeout, HTTP 5xx). Transient: the chunk backs off and is retried,
+    with a capped delay and a doctor alarm while it lasts - but it is never
+    poisoned, since nothing is wrong with the turns themselves."""
+
+
+def is_transient(error: BaseException) -> bool:
+    """A failure of the model's availability, not of the turns or the output."""
+    if isinstance(error, DistillUnavailable):
+        return True
+    if isinstance(error, urllib.error.HTTPError):
+        return error.code >= 500
+    return isinstance(error, (urllib.error.URLError, TimeoutError, ConnectionError, OSError))
+
+
 @dataclass(frozen=True, slots=True)
 class Distilled:
     """What a distiller returns: one summary of the turns, and any durable facts
@@ -100,7 +116,7 @@ class Consolidator:
         turns = self.cortex.memories(namespace, kind="message", limit=None)
         if len(turns) < min_turns:
             return False
-        failures, last_at = self.cortex.chunk_failures(namespace, self._chunk(turns)[0].id)
+        failures, last_at, _bad = self.cortex.chunk_failures(namespace, self._chunk(turns)[0].id)
         return not (failures and last_at is not None
                     and self._clock() < last_at + self.backoff_seconds(failures))
 
@@ -117,7 +133,7 @@ class Consolidator:
             return None
         chunk = self._chunk(turns)
         chunk_start = chunk[0].id
-        failures, last_at = self.cortex.chunk_failures(namespace, chunk_start)
+        failures, last_at, bad = self.cortex.chunk_failures(namespace, chunk_start)
         if failures and last_at is not None \
                 and self._clock() < last_at + self.backoff_seconds(failures):
             return None
@@ -127,17 +143,35 @@ class Consolidator:
         except Exception as error:  # noqa: BLE001 - distilling is fail-open by contract
             # Fail-open, not fail-silent: logged and written to the attempt log.
             why = f"{type(error).__name__}: {error}"
+            if is_transient(error):
+                # The model is away (timeout, refused, 5xx): back off, alarm while it
+                # lasts, never poison - the turns are fine.
+                _log.warning("consolidating %s: the distil model is unavailable (%s); "
+                             "turns kept, backing off", namespace, why)
+                self.cortex.note_consolidation(namespace, "unavailable", detail=why,
+                                               chunk_start=chunk_start)
+                return None
             _log.warning("consolidating %s: the distiller failed (%s); turns kept", namespace, why)
-            self._failed(namespace, chunk, "failed", why, failures + 1)
+            self._failed(namespace, chunk, "failed", why, bad + 1)
             return None
-        # No usable summary: leave the turns untouched to try again later. Losing
-        # them because the model hiccuped would be the opposite of the point.
-        if distilled is None or not distilled.summary.strip():
-            reason = getattr(self.distiller, "last_error", None) or "no usable summary"
+        # Unusable output (not the JSON asked for): a non-transient failure of this
+        # chunk - retried with backoff, poisoned after POISON_AFTER.
+        if distilled is None:
+            reason = getattr(self.distiller, "last_error", None) or "no usable output"
             _log.warning("consolidating %s: the distiller declined (%s); turns kept",
                          namespace, reason)
-            self._failed(namespace, chunk, "declined", reason, failures + 1)
+            self._failed(namespace, chunk, "declined", reason, bad + 1)
             return None
+        # An EMPTY summary is the distiller's valid answer "nothing worth keeping"
+        # (the prompt asks for exactly that): a successful fold with no episode.
+        # The turns are marked folded (and deleted at retention) - not a failure,
+        # so it neither backs off the next chunk nor ever poisons this one.
+        if not distilled.summary.strip():
+            self.cortex.fold_nothing(namespace, [m.id for m in chunk])
+            self.cortex.note_consolidation(namespace, "empty", folded=len(chunk),
+                                           detail="nothing worth keeping",
+                                           chunk_start=chunk_start)
+            return Consolidation(0, (), len(chunk))
 
         # One transaction: the episode and facts are written and the raw turns
         # retired (soft-deleted, still recoverable) together, or not at all. An
@@ -231,11 +265,17 @@ class OllamaDistiller:
         )
         try:
             with self._opener.open(request, timeout=self._timeout) as response:
-                document = json.loads(response.read().decode("utf-8"))
+                raw = response.read()
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            self.last_error = f"{self._model}: {type(error).__name__}: {error}"[:300]
+            if is_transient(error):
+                raise DistillUnavailable(self.last_error) from error
+            return None  # a 4xx: the request itself was refused - not transient
+        try:
+            document = json.loads(raw.decode("utf-8"))
             content = document["message"]["content"]
             parsed = json.loads(content)
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError,
-                TypeError) as error:
+        except (ValueError, KeyError, TypeError) as error:
             self.last_error = f"{self._model}: {type(error).__name__}: {error}"[:300]
             return None
         if not isinstance(parsed, dict) or not isinstance(parsed.get("summary"), str):

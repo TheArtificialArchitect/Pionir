@@ -239,6 +239,10 @@ pieces, none urgent, none needing the strip:
   backs off exponentially on failure (60 s doubling, 6 h cap), and poisons a chunk
   after 4 failures (logged, doctor alarm); the distil call sends `num_gpu: 0`
   (verified live: qwen3:4b loaded with size_vram 0 beside Moss's gemma3:12b).
+  Re-review: an empty summary is a fold with no episode (never a failure); only
+  bad output poisons - an unavailable model (timeout, refused, 5xx) backs off to
+  the 6 h cap with a doctor alarm and never poisons; retention's "now" is clamped
+  to a day past the store's newest write, so a clock jump cannot purge early.
 
 ## Open decisions, not yet made
 

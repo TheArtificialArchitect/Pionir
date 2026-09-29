@@ -30,6 +30,8 @@ from pionir.bootstrap import build_runtime
 from pionir.config import PionirSettings
 from pionir.consolidate import (
     BACKOFF_FIRST_SECONDS,
+    BACKOFF_MAX_SECONDS,
+    DistillUnavailable,
     POISON_AFTER,
     Consolidator,
     Distilled,
@@ -180,17 +182,41 @@ class TurnScrubAndRetentionTests(unittest.TestCase):
         self.assertEqual(fact.meta["episode_id"], outcome.episode_id)
         self.assertEqual(fact.meta["namespace"], "voice")
         self.assertEqual(fact.meta["expires_ts"], clock() + 180 * 86400)
+        # (each step writes something, as live traffic does: retention only
+        # advances as far as the store's own writes corroborate the clock)
         clock.t += 13 * 86400
+        c.remember("note", "day 13")
         self.assertEqual(c.purge(), {"turns": 0, "facts": 0})
         clock.t += 2 * 86400
+        c.remember("note", "day 15")
         self.assertEqual(c.purge()["turns"], 6)
         rows = c._db.execute("SELECT COUNT(*) FROM memories WHERE kind='message'").fetchone()[0]
         self.assertEqual(rows, 1)                     # deleted, not retired
         self.assertIsNotNone(c.get(waiting))          # an unfolded turn is kept
         clock.t += 170 * 86400
+        c.remember("note", "day 185")
         self.assertEqual(c.purge()["facts"], 1)
         self.assertIsNone(c.get(outcome.fact_ids[0]))
         self.assertIsNotNone(c.get(outcome.episode_id))
+
+
+    def test_a_clock_jumping_forward_cannot_purge_early(self) -> None:
+        clock = _Clock()
+        c = Cortex(":memory:", now=clock, fact_retention_days=180)
+        for i in range(6):
+            c.remember("message", f"turn {i}", namespace="voice")
+
+        class D:
+            def distill(self, turns):
+                return Distilled("they talked", ("the sky is blue",))
+
+        outcome = Consolidator(c, D(), clock=clock).consolidate("voice")
+        clock.t += 400 * 86400                         # the wall clock leaps a year
+        with self.assertLogs("pionir.cortex", level="WARNING"):
+            self.assertEqual(c.purge(), {"turns": 0, "facts": 0})
+        self.assertIsNotNone(c.get(outcome.fact_ids[0]))
+        self.assertEqual(len(c._db.execute(
+            "SELECT id FROM memories WHERE kind='message'").fetchall()), 6)
 
 
 # -------------------------------------------------------------- MED: fold
@@ -254,6 +280,88 @@ class FoldBoundsTests(unittest.TestCase):
         clock.t += 10 ** 6
         self.assertIsNone(con.consolidate("voice"))
         self.assertEqual(len(rec.calls), POISON_AFTER)
+
+    def test_nothing_worth_keeping_is_a_fold_not_a_failure(self) -> None:
+        clock = _Clock()
+        c = Cortex(":memory:", now=clock)
+        for i in range(12):
+            c.remember("message", f"ok {i}", namespace="voice")
+
+        class Empty:
+            calls = 0
+
+            def distill(self, turns):
+                Empty.calls += 1
+                return Distilled("")
+
+        con = Consolidator(c, Empty(), chunk_tokens=1, clock=clock)   # a turn a chunk
+        for _ in range(POISON_AFTER + 2):
+            self.assertIsNotNone(con.consolidate("voice", min_turns=1))
+        # every attempt folded a chunk straight away: no backoff, nothing poisoned
+        self.assertEqual(Empty.calls, POISON_AFTER + 2)
+        self.assertEqual(c.memories("voice", kind="episode"), [])
+        self.assertEqual(c.output()["poisoned_chunks"], 0)
+        self.assertIsNotNone(c.output()["last_consolidation"])   # it counts as a fold
+        folded = c._db.execute("SELECT COUNT(*) FROM memories WHERE kind='message' AND "
+                               "json_extract(meta, '$.folded_into') = 0").fetchone()[0]
+        self.assertEqual(folded, POISON_AFTER + 2)
+        self.assertEqual(memory_health(c, [], now=clock())["alerts"], [])
+
+    def test_an_unavailable_model_backs_off_with_a_cap_and_never_poisons(self) -> None:
+        clock = _Clock()
+        c = Cortex(":memory:", now=clock)
+        for i in range(6):
+            c.remember("message", f"turn {i}", namespace="voice")
+
+        class Away:
+            calls = 0
+
+            def distill(self, turns):
+                Away.calls += 1
+                raise DistillUnavailable("qwen3: timed out")
+
+        con = Consolidator(c, Away(), clock=clock)
+        with self.assertLogs("pionir.consolidate", level="WARNING"):
+            for _ in range(POISON_AFTER * 3):
+                clock.t += BACKOFF_MAX_SECONDS + 1     # the cap: never longer than this
+                self.assertIsNone(con.consolidate("voice"))
+        self.assertEqual(Away.calls, POISON_AFTER * 3)
+        self.assertEqual(len(c.memories("voice", kind="message")), 6)   # never poisoned
+        self.assertEqual(c.output()["poisoned_chunks"], 0)
+        alerts = memory_health(c, [], now=clock())["alerts"]
+        self.assertTrue(any("unavailable" in a for a in alerts), alerts)
+
+    def test_only_non_transient_failures_count_toward_poisoning(self) -> None:
+        clock = _Clock()
+        c = Cortex(":memory:", now=clock)
+        for i in range(6):
+            c.remember("message", f"turn {i}", namespace="voice")
+
+        class Flaky:
+            calls = 0
+
+            def distill(self, turns):
+                Flaky.calls += 1
+                if Flaky.calls < POISON_AFTER:
+                    raise DistillUnavailable("timed out")
+                raise RuntimeError("bad output")
+
+        con = Consolidator(c, Flaky(), clock=clock)
+        with self.assertLogs("pionir.consolidate", level="WARNING"):
+            for _ in range(POISON_AFTER):
+                clock.t += BACKOFF_MAX_SECONDS + 1
+                con.consolidate("voice")
+        # POISON_AFTER failures in all, but only one was the turns' fault
+        self.assertEqual(Flaky.calls, POISON_AFTER)
+        self.assertEqual(len(c.memories("voice", kind="message")), 6)
+
+    def test_the_ollama_distiller_calls_a_timeout_transient(self) -> None:
+        class Opener:
+            def open(self, request, timeout=None):
+                raise TimeoutError("timed out")
+
+        with self.assertRaises(DistillUnavailable):
+            OllamaDistiller("m", opener=Opener()).distill(["a"])
 
     def test_the_distil_request_keeps_the_model_off_the_gpu(self) -> None:
         sent: list[dict] = []
