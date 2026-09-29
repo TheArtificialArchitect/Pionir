@@ -1560,6 +1560,25 @@ def _start_pulse(app: PionirApp) -> tuple[threading.Thread | None, threading.Eve
     return thread, stop
 
 
+def gate_scheduler(settings: Any, voice: Callable[[], Any], *, evict: Callable[[str], None],
+                   rewarm: Callable[[str], None], loaded: Callable[[], list[str]]) -> Any:
+    """The Ollama gate's scheduler: the executive's lock, budget and protected models, a short
+    wait for the lock, and an unload that asks the voice again right before her model goes
+    (guarded_evictor) - never the raw unload."""
+    from .ollama_gate import guarded_evictor
+    from .scheduler import ModelLeaseScheduler
+    from .shared_gpu import SharedGpuLock
+
+    return ModelLeaseScheduler(
+        settings.resource_budget, shared_gpu_lock=SharedGpuLock(settings.gpu_lock_path),
+        # her model goes only if she is provably idle at the moment of the unload
+        evict_to_fit=settings.evict_to_fit,
+        evictor=guarded_evictor(evict, voice, settings.protected_models),
+        loaded_probe=loaded, protected_models=settings.protected_models, rewarmer=rewarm,
+        lock_wait_seconds=20.0, lock_poll_seconds=2.0,
+    )
+
+
 def _start_ollama_gate(runtime: PionirRuntime) -> tuple[Any, str]:
     """Start the Ollama gate on PIONIR_OLLAMA_GATE_PORT (default 8774; "0"/"off" leaves it
     off). Its GPU arbiter has its own scheduler on the SAME shared lock, budget, protected
@@ -1568,10 +1587,7 @@ def _start_ollama_gate(runtime: PionirRuntime) -> tuple[Any, str]:
     adapter. PIONIR_OLLAMA_GATE_MODE=cpu runs every call on the CPU and never touches the
     card; PIONIR_OLLAMA_GATE_MODELS widens the allowlist (comma list)."""
     from .benchmark import read_loaded_models, unload, warm
-    from .ollama_gate import (GATE_PORT, PETER_MODEL, GpuArbiter, OllamaGate, guarded_evictor,
-                              voice_probe)
-    from .scheduler import ModelLeaseScheduler
-    from .shared_gpu import SharedGpuLock
+    from .ollama_gate import GATE_PORT, PETER_MODEL, GpuArbiter, OllamaGate, voice_probe
 
     raw = (os.environ.get("PIONIR_OLLAMA_GATE_PORT") or str(GATE_PORT)).strip().lower()
     if raw in {"", "0", "off", "none", "false"}:
@@ -1585,15 +1601,8 @@ def _start_ollama_gate(runtime: PionirRuntime) -> tuple[Any, str]:
                                      detail=detail))
 
     voice = voice_probe(runtime.adapters.get("galatea"))
-    scheduler = ModelLeaseScheduler(
-        settings.resource_budget, shared_gpu_lock=SharedGpuLock(settings.gpu_lock_path),
-        # her model goes only if she is provably idle at the moment of the unload
-        evict_to_fit=settings.evict_to_fit,
-        evictor=guarded_evictor(unload, voice, settings.protected_models),
-        loaded_probe=lambda: [item.name for item in read_loaded_models()],
-        protected_models=settings.protected_models, rewarmer=warm,
-        lock_wait_seconds=20.0, lock_poll_seconds=2.0,
-    )
+    scheduler = gate_scheduler(settings, voice, evict=unload, rewarm=warm,
+                               loaded=lambda: [item.name for item in read_loaded_models()])
     models = [m.strip() for m in (os.environ.get("PIONIR_OLLAMA_GATE_MODELS") or PETER_MODEL)
               .split(",") if m.strip()]
     try:

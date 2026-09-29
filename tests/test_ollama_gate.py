@@ -476,3 +476,28 @@ class AbandonedCallTests(unittest.TestCase):
         self.assertIn(b"504", reply)
         self.assertLess(took, 3.0)                        # not the 900 s it used to hold
         self.assertTrue(self._wait(lambda: _SlowOllama.hung_up == ["slow"]))
+
+
+class ServerWiringTests(unittest.TestCase):
+    """The scheduler the server builds for the gate must unload through guarded_evictor:
+    wired to the raw unload, a voice busy at that moment would lose her model."""
+
+    def test_the_gate_scheduler_asks_the_voice_before_every_protected_unload(self) -> None:
+        from pionir.config import PionirSettings
+        from pionir.server import gate_scheduler
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = PionirSettings(state_root=Path(tmp), embed_model=None)
+            card = _Card([VOICE, "other:latest"])
+            busy = {"idle": False}
+            scheduler = gate_scheduler(settings, lambda: busy["idle"], evict=card.unload,
+                                       rewarm=card.warm, loaded=card.loaded)
+            with self.assertRaises(Exception):
+                scheduler.evictor(VOICE)                  # busy right now: her model stays
+            scheduler.evictor("other:latest")             # anything unprotected just goes
+            self.assertEqual(card.unloaded, ["other:latest"])
+            busy["idle"] = True
+            scheduler.evictor(VOICE)
+            self.assertEqual(card.unloaded, ["other:latest", VOICE])
+            self.assertIn("gemma3:12b", scheduler.protected_models)
+            self.assertEqual(scheduler.lock_wait_seconds, 20.0)
