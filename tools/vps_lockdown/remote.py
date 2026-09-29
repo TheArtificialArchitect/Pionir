@@ -130,8 +130,13 @@ def _write_private(path: str, data: bytes, mode: int, uid: int | None, gid: int 
         os.chown(path, uid, gid)
 
 
+MIN_DEADLINE_S = 24 * 3600          # a previous key's deadline is never written closer than this
+NOW = time.time
+
+
 def update_env_file(path: str, sets: dict[str, str], keep_previous: dict[str, str],
-                    unset: list[str], stamp: str, plain: dict[str, str] | None = None) -> dict:
+                    unset: list[str], stamp: str, plain: dict[str, str] | None = None,
+                    previous_days: int | None = None) -> dict:
     """Set/unset names in an env file, keeping every other line as it was. The first time
     for this stamp the file is backed up to <path>.bak-pionir-<stamp> (0600, never
     overwritten, so it always holds the content from before this rotation).
@@ -139,7 +144,12 @@ def update_env_file(path: str, sets: dict[str, str], keep_previous: dict[str, st
     keep_previous {CUR: PREV}: when CUR changes, PREV := the value CUR has NOW - the live
     key, the one the phone holds - always overwriting an older PREV. An empty CUR is
     refused: rotating it would drop the key the phone uses. When CUR already has the new
-    value (a re-run) PREV is left as it is. `plain` values are not keys (a deadline)."""
+    value (a re-run) PREV is left as it is. `plain` values are not keys.
+
+    previous_days: each kept previous PREV gets PREV_UNTIL = now + that many days, computed
+    HERE on the server's clock when the rotation happens - and recomputed on a re-run
+    whenever the deadline on file is missing or less than 24 h ahead, so a run resumed days
+    later never writes (or keeps) a deadline that is already past or about to pass."""
     plain = dict(plain or {})
     if not os.path.isfile(path):
         return {"path": path, "error": "missing"}
@@ -165,6 +175,21 @@ def update_env_file(path: str, sets: dict[str, str], keep_previous: dict[str, st
         if not current.get(cur):
             return {"path": path, "error": f"{cur} is empty here: refusing to rotate it (the phone's key is unknown)"}
         sets[prev] = current[cur]
+    if previous_days is not None:
+        if not isinstance(previous_days, int) or not 1 <= previous_days <= 14:
+            return {"path": path, "error": "previous_days must be 1-14"}
+        now = int(NOW())
+        for cur, prev in keep_previous.items():
+            has_prev = prev in sets or bool(current.get(prev))
+            if not has_prev:
+                continue
+            name = f"{prev}_UNTIL"
+            try:
+                on_file = int(current.get(name, ""))
+            except ValueError:
+                on_file = 0
+            if prev in sets or on_file < now + MIN_DEADLINE_S or on_file > now + 14 * 86400:
+                sets[name] = str(now + previous_days * 86400)
     sets.update(plain)
     backup = f"{path}.bak-pionir-{stamp}"
     if not os.path.exists(backup):
@@ -197,7 +222,8 @@ def update_env_file(path: str, sets: dict[str, str], keep_previous: dict[str, st
     final = parse_env(_read(path))
     return {"path": path, "backup": backup, "changed": changed, "unset": removed,
             "names": sorted(final),
-            "previous_fp": {prev: fingerprint(final[prev]) for prev in keep_previous.values() if final.get(prev)}}
+            "previous_fp": {prev: fingerprint(final[prev]) for prev in keep_previous.values() if final.get(prev)},
+            "until": {f"{prev}_UNTIL": final.get(f"{prev}_UNTIL") for prev in keep_previous.values() if final.get(f"{prev}_UNTIL")}}
 
 
 def step_env(p: dict) -> dict:
@@ -205,7 +231,7 @@ def step_env(p: dict) -> dict:
     if not re.fullmatch(r"\d{8}T\d{6}Z?", stamp):
         return {"step": "env", "error": "bad stamp"}
     files = [update_env_file(f["path"], f.get("set", {}), f.get("keep_previous", {}),
-                             f.get("unset", []), stamp, f.get("plain", {})) for f in p["files"]]
+                             f.get("unset", []), stamp, f.get("plain", {}), f.get("previous_days")) for f in p["files"]]
     return {"step": "env", "files": files, "ok": all("error" not in f for f in files)}
 
 
@@ -410,6 +436,8 @@ def install_sshd_block(user: str, opens: list[str]) -> dict:
     in sshd_config.d when sshd_config includes it, else between markers at the END of
     sshd_config. sshd -t first and the effective config (sshd -T -C user=...) must say
     exactly SSHD_WANT, or the old file is put back and nothing is reloaded."""
+    root_argv = ["sshd", "-T", "-C", "user=root,host=pionir,addr=127.0.0.1"]
+    root_before = _run(root_argv)
     main = _read(SSHD_MAIN)
     use_dropin = bool(re.search(r"(?m)^\s*Include\s+/etc/ssh/sshd_config\.d/\*\.conf\s*$", main))
     target = SSHD_DROPIN if use_dropin else SSHD_MAIN
@@ -441,6 +469,9 @@ def install_sshd_block(user: str, opens: list[str]) -> dict:
         return {"error": "sshd -t rejected the Match block: put back, nothing reloaded"}
     code, eff = _run(["sshd", "-T", "-C", f"user={user},host=pionir,addr=127.0.0.1"])
     ok, bad = sshd_effective_ok(eff, opens) if code == 0 else (False, ["sshd -T failed"])
+    root_after = _run(root_argv)
+    if root_before[0] != 0 or root_after != root_before:
+        ok, bad = False, bad + ["root's own effective sshd config would change"]
     if not ok:
         if changed:
             put_back()
@@ -499,6 +530,9 @@ def step_deploy(p: dict) -> dict:
         if word.encode() not in content:
             return {"step": "deploy", "error": f"the new file lacks {word}"}
     path = p.get("path")
+    if path and not (str(path).startswith("/") and posixpath.basename(str(path)) == p["name"]):
+        if not str(path).replace("\\", "/").endswith("/" + p["name"]):
+            return {"step": "deploy", "error": "the target is not the named file"}
     if not path:
         unit = p["unit"]
         if not UNIT_RE.fullmatch(unit):
@@ -511,8 +545,14 @@ def step_deploy(p: dict) -> dict:
     except SyntaxError as error:
         return {"step": "deploy", "error": f"does not compile: line {error.lineno}"}
     with open(path, "rb") as fh:
-        if hashlib.sha256(fh.read()).hexdigest() == p["sha256"]:
-            return {"step": "deploy", "path": path, "deployed": False, "unchanged": True}
+        running = hashlib.sha256(fh.read()).hexdigest()
+    if running == p["sha256"]:
+        return {"step": "deploy", "path": path, "deployed": False, "unchanged": True}
+    bases = [b for b in p.get("base_sha256", []) if b]
+    if bases and running not in bases and not p.get("allow_drift"):
+        # the file on the VPS is not the one the reviewed change was made against: putting
+        # the new one there would ship every other difference too
+        return {"step": "deploy", "error": f"{path} is not the reviewed base version (it has changes the review did not see): nothing replaced", "drift": True}
     st = os.stat(path)
     backup = f"{path}.bak-pionir-{p['stamp']}"
     if not os.path.exists(backup):
@@ -598,14 +638,58 @@ def step_restore(p: dict) -> dict:
             _write_private(tmp, data, st.st_mode, getattr(st, "st_uid", None), getattr(st, "st_gid", None))
             os.replace(tmp, path)
             restored.append(path)
-    _run(["systemctl", "restart", unit], timeout=60)
+    if p.get("was_active", True):
+        _run(["systemctl", "restart", unit], timeout=60)
     state = ""
     for _ in range(30):
         SLEEP(0.5)
         state = _run(["systemctl", "is-active", unit])[1].strip()
-        if state == "active":
+        if state == "active" or not p.get("was_active", True):
             break
     return {"step": "restore", "unit": unit, "restored": restored, "active": state == "active"}
+
+
+# ---- D3: is now a safe moment to restart? --------------------------------------------------------
+def _http_json(url: str):
+    import urllib.request
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(url, timeout=5) as response:
+        return json.loads(response.read(65536))
+
+
+HTTP_JSON = _http_json
+
+
+def step_guard(p: dict) -> dict:
+    """Busy right now? A trading job running (its service unit active), a timer about to
+    fire one (within 15 min), or Prometheus's API with background jobs in flight
+    (/api/health jobs_running - unauthenticated, loopback)."""
+    busy, due = [], []
+    for unit in p.get("services", []):
+        if UNIT_RE.fullmatch(unit):
+            state = _run(["systemctl", "is-active", unit])[1].strip()
+            if state in ("active", "activating", "reloading"):
+                busy.append(unit)
+    now = NOW()
+    for timer in p.get("timers", []):
+        if not re.fullmatch(r"[a-z0-9][a-z0-9@_.-]*\.timer", timer):
+            continue
+        if _run(["systemctl", "is-active", timer])[1].strip() != "active":
+            continue
+        raw = _run(["systemctl", "show", timer, "-p", "NextElapseUSecRealtime", "--value", "--timestamp=unix"])[1].strip()
+        m = re.fullmatch(r"@(\d+)", raw)
+        if m and 0 <= int(m.group(1)) - now <= 15 * 60:
+            due.append({"timer": timer, "in_s": int(int(m.group(1)) - now)})
+    jobs = None
+    port = p.get("jobs_port")
+    if port:
+        try:
+            jobs = int(HTTP_JSON(f"http://127.0.0.1:{int(port)}/api/health").get("jobs_running", 0))
+        except Exception:  # noqa: BLE001 - not answering: no jobs to lose
+            jobs = None
+    return {"step": "guard", "busy": busy, "due": due, "jobs_running": jobs,
+            "safe": not busy and not due and not jobs}
 
 
 def step_ping(p: dict) -> dict:
@@ -682,7 +766,13 @@ def tailscale_state() -> dict:
     url = s.get("AuthURL") or None
     if url and not re.fullmatch(r"https://login\.tailscale\.com/[A-Za-z0-9/_-]{1,200}", url):
         url = None                          # only ever show Tailscale's own login link
+    mobiles = []
+    for peer in (s.get("Peer") or {}).values():
+        if str(peer.get("OS", "")).lower() in ("android", "ios"):
+            mobiles.append({"name": str(peer.get("HostName") or peer.get("DNSName") or "?")[:64],
+                            "os": str(peer.get("OS"))[:16], "key_expiry": peer.get("KeyExpiry") or None})
     return {"state": s.get("BackendState") or ("unknown" if code == 0 else "not running"),
+            "key_expiry": me.get("KeyExpiry") or None, "mobiles": mobiles,
             "auth_url": url, "ipv4": ips[0] if ips else None,
             "dns_name": (me.get("DNSName") or "").rstrip(".") or None,
             "hostname": me.get("HostName") or None,
@@ -869,6 +959,7 @@ def step_nginx_disable(p: dict) -> dict:
 
 STEPS = {"discover": step_discover, "tunnel_user": step_tunnel_user, "deploy": step_deploy,
          "env": step_env, "restart": step_restart, "restore": step_restore, "ping": step_ping,
+         "guard": step_guard,
          "tailscale_install": step_tailscale_install, "tailscale_up": step_tailscale_up,
          "tailscale_status": step_tailscale_status, "fw_prepare": step_fw_prepare,
          "fw_arm": step_fw_arm, "fw_confirm": step_fw_confirm, "nginx_disable": step_nginx_disable}

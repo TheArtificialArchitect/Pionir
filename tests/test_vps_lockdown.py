@@ -53,6 +53,10 @@ OLD = {"rh": "oldRobinhoodFullKey_" + "a" * 24, "prom": "oldPrometheusKey_" + "b
 PUB = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTests0123456789abcdefghijklmnopq pionir-tunnel"
 SERVER = ("import os\nREAD = os.environ.get('PRO_RH_READ_KEY')\n"
           "UNTIL = os.environ.get('PRO_RH_API_KEY_PREVIOUS_UNTIL')\n").encode()
+OLD_SERVER = b"OLD = True\n"
+WEBAPP_BASE = b"# prometheus webapp, main\nKEY = 'PROM_API_KEY'\n"
+WEBAPP_NEW = b"# prometheus webapp, read-key\nKEYS = ('PROM_API_KEY', 'PROM_READ_KEY', 'PROM_API_KEY_PREVIOUS_UNTIL')\n"
+SUNDAY = "2026-09-27T16:00:00Z"            # outside US market hours
 REMOTE_CMD = "python3 -c 'import sys,base64;exec(base64.b64decode(sys.stdin.readline().lstrip(chr(65279))))'"
 TAILNET_ALLOW = ("allow", "in", "on", "tailscale0", "to", "any", "port", "8000:8002", "proto", "tcp")
 
@@ -119,6 +123,7 @@ if step == "discover":
             "orders_armed": running.get("PRO_RH_ORDERS_ENABLED") == "1" if running else None,
             "orders_configured": conf.get("PRO_RH_ORDERS_ENABLED") == "1"}),
         "prometheus": api("PROM_API_KEY", "prometheus-api.service", {
+            "script": os.path.join(vps, "prometheus", "webapp.py").replace(os.sep, "/") if os.path.exists(os.path.join(vps, "prometheus", "webapp.py")) else None,
             "read_key_support": st.get("prom_read", True), "previous_key_support": st.get("prom_prev", True)}),
         "karkinos": api("KARKINOS_API_KEY", "mrcrab-api.service", {
             "read_key_support": False, "previous_key_support": st.get("kark_prev", True)})},
@@ -135,7 +140,7 @@ elif step == "tunnel_user":
         out = {"step": "tunnel_user", "user": payload["user"], "created": True, "forwarding_allowed": True,
                "authorized_keys": "/home/%s/.ssh/authorized_keys" % payload["user"], "allowusers": None, **sshd}
 else:
-    if step == "deploy":                  # a Windows temp path is no absolute POSIX ExecStart path
+    if step == "deploy" and payload["name"] == "robinhood_read_api.py":   # a Windows temp path is no POSIX ExecStart path
         payload["path"] = os.path.join(vps, "robinhood_read_api.py").replace(os.sep, "/")
     out = r.STEPS[step](payload)
 print(json.dumps(out))
@@ -235,7 +240,7 @@ class LockdownRuns(unittest.TestCase):
         (self.vps / "rh_api.env").write_text(f"# the RH API\nPRO_RH_API_KEY={OLD['rh']}\nPRO_RH_ORDERS_ENABLED=0\n", encoding="utf-8")
         (self.vps / "pro.env").write_text(f"PROM_API_KEY={OLD['prom']}\nALPACA_BASE_URL=https://paper-api.alpaca.markets\n", encoding="utf-8")
         (self.vps / "mrcrab.env").write_text(f"export KARKINOS_API_KEY=\"{OLD['kark']}\"\nMRCRAB_MODE=paper\n", encoding="utf-8")
-        (self.vps / "robinhood_read_api.py").write_text("OLD = True\n", encoding="utf-8")
+        (self.vps / "robinhood_read_api.py").write_bytes(OLD_SERVER)
         self.sim = vpsfake.Sim(self.vps)
         vpsfake.install(load_remote(), self.vps)      # lays out the fake droplet's directories
         (self.vps / "sites-enabled" / "trading-bot").write_text("server { listen 80; location / { proxy_pass http://127.0.0.1:8000; } }\n", encoding="utf-8")
@@ -261,6 +266,17 @@ class LockdownRuns(unittest.TestCase):
         self.deploy_key.write_text("FAKE ROOT KEY", encoding="ascii")
         self.log = self.tmp / "log.jsonl"
         self.extra_env = {}
+        self.now_args = ["-NowUtc", SUNDAY]
+        # a pantheon repo with the reviewed webapp.py (the fake VPS runs main's, or none)
+        self.pantheon = self.tmp / "pantheon"
+        web = self.pantheon / "bots" / "prometheus" / "src" / "prometheus"
+        web.mkdir(parents=True)
+        (web / "webapp.py").write_bytes(WEBAPP_NEW)
+        pg = ["git", "-C", str(self.pantheon), "-c", "user.email=t@t", "-c", "user.name=t", "-c", "core.autocrlf=false"]
+        subprocess.run(pg[:3] + ["init", "-q"], check=True)
+        subprocess.run(pg + ["add", "."], check=True)
+        subprocess.run(pg + ["commit", "-q", "-m", "x"], check=True)
+        self.prom_commit = subprocess.run(pg[:3] + ["rev-parse", "HEAD"], capture_output=True, text=True, check=True).stdout.strip()
         self.apis = StandIns(self.vps)
         self.addCleanup(lambda: self.apis.close())
 
@@ -274,7 +290,10 @@ class LockdownRuns(unittest.TestCase):
             ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
              "-StateRoot", str(self.state), "-DeployKey", str(self.deploy_key), "-ServerRepo", str(self.repo),
              "-ServerCommit", self.commit, "-ServerSha256", sha or self.sha, "-VpsHost", "vps.test",
-             "-VerifyPortBase", str(self.apis.base), "-PollSeconds", "0", "-SkipTailnetProbe", *args],
+             "-VerifyPortBase", str(self.apis.base), "-PollSeconds", "0", "-SkipTailnetProbe",
+             "-ServerBaseSha256", hashlib.sha256(OLD_SERVER).hexdigest(), "-PantheonRepo", str(self.pantheon),
+             "-PromCommit", self.prom_commit, "-PromSha256", hashlib.sha256(WEBAPP_NEW).hexdigest(),
+             "-PromBaseSha256", hashlib.sha256(WEBAPP_BASE).hexdigest(), *self.now_args, *args],
             input=stdin, capture_output=True, text=True, timeout=400, env=env)
 
     # ---- reading what happened
@@ -470,6 +489,7 @@ class LockdownRuns(unittest.TestCase):
         self.assertEqual(done.returncode, 1)
         self.assertIn("COULD open a listener on the VPS", done.stdout)
         self.assertFalse((self.state / "secrets" / "proteus-read-key.txt").exists())
+        self.assert_rolled_back(done)
 
     def test_a_check_that_answers_wrong_fails_the_run_and_nothing_ships(self) -> None:
         # a Robinhood API that lets the READ key write: never called done
@@ -480,6 +500,99 @@ class LockdownRuns(unittest.TestCase):
         self.assertRegex(done.stdout, r"BAD\s+robinhood POST /never with the READ key \(must be refused\)\s+-> 400 \(want 401\)")
         self.assertFalse((self.state / "secrets" / "proteus-read-key.txt").exists())
         self.assertFalse([c for c in self.calls() if c["tool"] == "gh"])
+        self.assert_rolled_back(done)
+
+    def assert_rolled_back(self, done) -> None:
+        """ANY [e] failure: every env file back to before the rotation, the units on it."""
+        self.assertIn("the rotation is rolled back on the VPS", done.stdout)
+        for f, name, old in (("rh_api.env", "PRO_RH_API_KEY", OLD["rh"]), ("pro.env", "PROM_API_KEY", OLD["prom"]),
+                             ("mrcrab.env", "KARKINOS_API_KEY", OLD["kark"])):
+            self.assertEqual(self.env(f)[name], old, f)
+            self.assertNotIn(name + "_PREVIOUS", self.env(f))
+        self.assertEqual(self.sim.running_env("pro-robinhood-api.service")["PRO_RH_API_KEY"], OLD["rh"])
+        self.assertTrue(self.apis.judge("rh", OLD["rh"], True))            # the phone's key works
+
+    # ---- D1: a run resumed days later never writes a dead deadline -------------------------------
+    def test_a_run_resumed_days_later_computes_its_deadline_then(self) -> None:
+        self.sim.set(ts_polls_to_login=10 ** 6)
+        stopped = self.run_script("-Apply", "-LoginWaitMinutes", "0")
+        self.assertEqual(stopped.returncode, 1)
+        self.assertIn("no login within", stopped.stdout)
+        self.assertEqual(self.env("rh_api.env")["PRO_RH_API_KEY"], OLD["rh"])     # stopped at [t]: nothing rotated
+        state = json.loads((self.state / "vault" / "vps-lockdown.json").read_text(encoding="utf-8-sig"))
+        self.assertNotIn("previous_until", state)                                 # no deadline decided at [a]
+        self.sim.set(ts_polls_to_login=0, ts_state="NoState", ts_polls=0)
+        self.apply_ok()
+        until = int(self.env("rh_api.env")["PRO_RH_API_KEY_PREVIOUS_UNTIL"])
+        self.assertTrue(time.time() + 6.9 * 86400 < until < time.time() + 7.1 * 86400)
+
+    def test_a_deadline_less_than_a_day_ahead_is_recomputed_on_a_rerun(self) -> None:
+        self.apply_ok()
+        f = self.vps / "rh_api.env"
+        env = self.env("rh_api.env")
+        near = str(int(time.time()) + 3600)
+        f.write_text(f.read_text(encoding="utf-8").replace(env["PRO_RH_API_KEY_PREVIOUS_UNTIL"], near), encoding="utf-8")
+        again = self.apply_ok()
+        until = int(self.env("rh_api.env")["PRO_RH_API_KEY_PREVIOUS_UNTIL"])
+        self.assertTrue(time.time() + 6.9 * 86400 < until)
+        self.assertEqual(self.sim.running_env("pro-robinhood-api.service")["PRO_RH_API_KEY_PREVIOUS_UNTIL"], str(until))
+        self.assertRegex(again.stdout, r"ok\s+robinhood GET /status with the phone's current key")
+
+    # ---- D3: one reviewed file onto its reviewed base; restarts only at a quiet moment ---------------
+    def test_the_prometheus_auth_change_is_deployed_as_one_file_onto_mains(self) -> None:
+        (self.vps / "prometheus").mkdir()
+        (self.vps / "prometheus" / "webapp.py").write_bytes(WEBAPP_BASE)
+        self.sim.set(prom_prev=False, prom_read=False)            # the VPS runs main's webapp.py
+        self.apply_ok()
+        self.assertEqual((self.vps / "prometheus" / "webapp.py").read_bytes(), WEBAPP_NEW)
+        self.assertEqual(self.env("pro.env")["PROM_API_KEY"], self.keys()["prom"])        # now rotated, with grace
+        self.assertEqual(self.sim.state()["units"]["prometheus-api.service"].get("restarts"), 1)
+
+    def test_a_drifted_file_on_the_vps_is_never_replaced(self) -> None:
+        (self.vps / "prometheus").mkdir()
+        (self.vps / "prometheus" / "webapp.py").write_bytes(b"# someone's undeployed-elsewhere edit\n")
+        self.sim.set(prom_prev=False, prom_read=False)
+        done = self.apply_ok()
+        self.assertEqual((self.vps / "prometheus" / "webapp.py").read_bytes(), b"# someone's undeployed-elsewhere edit\n")
+        self.assertIn("is not main's version", done.stdout)
+        self.assertEqual(self.env("pro.env")["PROM_API_KEY"], OLD["prom"])
+        (self.vps / "robinhood_read_api.py").write_bytes(b"DRIFTED = 1\n")
+        fresh = self.run_script("-Apply", "-NewRotation")
+        self.assertEqual(fresh.returncode, 1)
+        self.assertIn("is not the reviewed base version", fresh.stdout)
+        self.assertEqual((self.vps / "robinhood_read_api.py").read_bytes(), b"DRIFTED = 1\n")
+
+    def test_no_restart_while_the_market_is_open_or_a_job_runs(self) -> None:
+        self.now_args = ["-NowUtc", "2026-09-29T15:00:00Z"]        # Tuesday 11:00 in New York
+        done = self.run_script("-Apply")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("the US market is open", done.stdout)
+        self.assertIn("next safe 2026-09-29 20:00:00Z", done.stdout)
+        self.assertNotIn("deploy", self.steps())
+        self.assertEqual(self.env("rh_api.env")["PRO_RH_API_KEY"], OLD["rh"])
+        self.now_args = ["-NowUtc", SUNDAY]
+        for setup, words in ((lambda: self.sim.unit("prometheus-execute.service", active=True), "prometheus-execute.service is running now"),
+                             (lambda: self.sim.set(sched={"prometheus-entry.timer": int(time.time()) + 300}), "prometheus-entry.timer fires in"),
+                             (lambda: self.sim.set(jobs_running=2), "2 background job(s) in flight")):
+            self.sim.set(units={}, sched={}, jobs_running=0)
+            self.sim.boot_units()
+            setup()
+            done = self.run_script("-Apply")
+            self.assertEqual(done.returncode, 1, words)
+            self.assertIn(words, done.stdout)
+            self.assertEqual(self.env("rh_api.env")["PRO_RH_API_KEY"], OLD["rh"])
+        forced = self.run_script("-Apply", "-Force")
+        self.assertEqual(forced.returncode, 0, forced.stdout)
+        self.assertIn("-Force: restarting anyway", forced.stdout)
+
+    # ---- D4: root's sshd config must not move ---------------------------------------------------------
+    def test_a_match_block_that_would_change_roots_sshd_config_is_put_back(self) -> None:
+        self.sim.set(root_drift=True)
+        done = self.run_script("-Apply")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("root's own effective sshd config would change", done.stdout)
+        self.assertFalse((self.vps / "ssh" / "sshd_config.d" / "60-pionir-tunnel.conf").exists())
+        self.assertEqual(self.sim.state()["reloads"], 0)
 
     # ---- -FinishRotation ------------------------------------------------------------------------
     def test_finish_asks_first(self) -> None:
@@ -533,6 +646,32 @@ class LockdownRuns(unittest.TestCase):
         self.assertNotIn("fw_confirm", self.steps())
         timer = next(iter(self.sim.state()["timers"].values()))
         self.assertTrue(timer["active"])                                               # it will put ufw back
+
+    def test_no_port_closes_while_a_tailnet_key_can_expire(self) -> None:
+        self.apply_ok()
+        for field, words in (("ts_key_expiry", "the VPS (proteus-vps): its key expires"), ("phone_expiry", "your android (pixel): its key expires")):
+            self.sim.set(ts_key_expiry=None, phone_expiry=None)
+            self.sim.set(**{field: "2027-03-01T00:00:00Z"})
+            done = self.run_script("-FinishRotation", "-Apply", stdin="yes\n")
+            self.assertEqual(done.returncode, 1, done.stdout)
+            self.assertIn(words, done.stdout)
+            self.assertIn("Disable key expiry", done.stdout)
+            self.assertIn("independent STOP route", done.stdout)
+            self.assertFalse(any(s.startswith("fw_") for s in self.steps()))
+            self.assertFalse(self.sim.state()["ufw_active"])
+        self.sim.set(ts_key_expiry=None, phone_expiry=None)
+        ok = self.run_script("-FinishRotation", "-Apply", stdin="yes\n")
+        self.assertEqual(ok.returncode, 0, ok.stdout)
+        self.assertIn("key expiry is off for the VPS and your phone", ok.stdout)
+
+    def test_finish_waits_for_a_quiet_moment_too(self) -> None:
+        self.apply_ok()
+        self.now_args = ["-NowUtc", "2026-09-29T15:00:00Z"]        # Tuesday 11:00 in New York
+        done = self.run_script("-FinishRotation", "-Apply", stdin="yes\n")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("the US market is open", done.stdout)
+        self.assertIn("PRO_RH_API_KEY_PREVIOUS", self.env("rh_api.env"))           # nothing restarted or removed
+        self.assertFalse(any(s.startswith("fw_") for s in self.steps()))
 
     def test_keep_public_ports(self) -> None:
         self.apply_ok()
@@ -588,6 +727,61 @@ class RemoteHalf(unittest.TestCase):
         self.assertIn("is empty here", self.r.update_env_file(str(g), {"K": new}, {"K": "K_PREV"}, [], "20260928T000000Z")["error"])
         self.assertEqual(g.read_text(encoding="utf-8"), "K=\n")
 
+    def test_the_deadline_is_set_at_rotation_and_never_left_near(self) -> None:
+        f = self.dir / "d.env"
+        f.write_text("K=live-value-00000000000000000000000000000\n", encoding="utf-8")
+        self.r.NOW = lambda: 1_800_000_000
+        self.r.update_env_file(str(f), {"K": "N" * 43}, {"K": "K_PREV"}, [], "20260928T000000Z", previous_days=7)
+        self.assertEqual(self.r.parse_env(f.read_text(encoding="utf-8"))["K_PREV_UNTIL"], str(1_800_000_000 + 7 * 86400))
+        # a re-run six days later: 1 day left - kept
+        self.r.NOW = lambda: 1_800_000_000 + 5 * 86400
+        self.r.update_env_file(str(f), {"K": "N" * 43}, {"K": "K_PREV"}, [], "20260928T000000Z", previous_days=7)
+        self.assertEqual(self.r.parse_env(f.read_text(encoding="utf-8"))["K_PREV_UNTIL"], str(1_800_000_000 + 7 * 86400))
+        # eight days later: past - recomputed from now, never written dead
+        self.r.NOW = lambda: 1_800_000_000 + 8 * 86400
+        self.r.update_env_file(str(f), {"K": "N" * 43}, {"K": "K_PREV"}, [], "20260928T000000Z", previous_days=7)
+        self.assertEqual(self.r.parse_env(f.read_text(encoding="utf-8"))["K_PREV_UNTIL"], str(1_800_000_000 + 15 * 86400))
+        self.assertIn("error", self.r.update_env_file(str(f), {"K": "N" * 43}, {"K": "K_PREV"}, [], "20260928T000000Z", previous_days=30))
+
+    def test_deploy_only_onto_the_reviewed_base(self) -> None:
+        import base64
+        target = self.dir / "webapp.py"
+        new = b"KEY = 'PROM_READ_KEY'\n"
+
+        def pay(**kw):
+            p = {"content_b64": base64.b64encode(new).decode(), "sha256": hashlib.sha256(new).hexdigest(), "name": "webapp.py",
+                 "path": str(target).replace(os.sep, "/"), "stamp": "20260928T000000Z", "must_contain": ["PROM_READ_KEY"],
+                 "base_sha256": [hashlib.sha256(b"BASE\n").hexdigest()]}
+            p.update(kw)
+            return p
+        target.write_bytes(b"DRIFT\n")
+        self.assertTrue(self.r.step_deploy(pay())["drift"])
+        self.assertEqual(target.read_bytes(), b"DRIFT\n")
+        self.assertTrue(self.r.step_deploy(pay(allow_drift=True))["deployed"])
+        target.write_bytes(b"BASE\n")
+        self.assertTrue(self.r.step_deploy(pay())["deployed"])
+        self.assertIn("error", self.r.step_deploy(pay(path="/etc/passwd")))
+
+    def test_the_guard(self) -> None:
+        self.r.NOW = lambda: 1_800_000_000
+        self.sim.unit("prometheus-execute.service", active=True)
+        self.sim.set(sched={"mrcrab-t2.timer": 1_800_000_000 + 600, "prometheus-scan.timer": 1_800_000_000 + 3600}, jobs_running=1)
+        g = self.r.step_guard({"services": ["prometheus-execute.service", "prometheus-scan.service"],
+                               "timers": ["mrcrab-t2.timer", "prometheus-scan.timer", "prometheus-entry.timer"], "jobs_port": 8001})
+        self.assertEqual((g["busy"], [d["timer"] for d in g["due"]], g["jobs_running"], g["safe"]),
+                         (["prometheus-execute.service"], ["mrcrab-t2.timer"], 1, False))
+        self.sim.set(units={}, sched={}, jobs_running=0)
+        self.assertTrue(self.r.step_guard({"services": ["prometheus-execute.service"], "timers": ["mrcrab-t2.timer"], "jobs_port": 8001})["safe"])
+
+    def test_tailscale_reports_key_expiry_of_the_vps_and_the_phones(self) -> None:
+        self.sim.set(ts_state="Running", ts_key_expiry="2027-01-01T00:00:00Z", phone_expiry="2027-02-01T00:00:00Z")
+        st = self.r.tailscale_state()
+        self.assertEqual(st["key_expiry"], "2027-01-01T00:00:00Z")
+        self.assertEqual(st["mobiles"], [{"name": "pixel", "os": "android", "key_expiry": "2027-02-01T00:00:00Z"}])
+        self.sim.set(ts_key_expiry=None, phone_expiry=None)
+        st = self.r.tailscale_state()
+        self.assertEqual((st["key_expiry"], st["mobiles"][0]["key_expiry"]), (None, None))
+
     def test_env_backups_once_and_junk_refused(self) -> None:
         f = self.dir / "c.env"
         f.write_text("A=old-value-000000000000000000000000000000\n", encoding="utf-8")
@@ -623,6 +817,11 @@ class RemoteHalf(unittest.TestCase):
         # the effective config would still allow -R: put back, not reloaded
         self.sim.set(sshd_ok=True, sshd_effective="allowtcpforwarding yes\npermitlisten any\n")
         self.assertIn("permitlisten", self.r.install_sshd_block("pionir-tunnel", opens)["error"])
+        self.assertFalse(Path(self.r.SSHD_DROPIN).exists())
+        self.assertEqual(self.sim.state()["reloads"], 1)
+        # root's own effective config would move: put back, not reloaded
+        self.sim.set(sshd_effective="follow", root_drift=True)
+        self.assertIn("root's own effective sshd config would change", self.r.install_sshd_block("pionir-tunnel", opens)["error"])
         self.assertFalse(Path(self.r.SSHD_DROPIN).exists())
         self.assertEqual(self.sim.state()["reloads"], 1)
 

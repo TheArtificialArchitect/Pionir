@@ -23,7 +23,10 @@ from pionir.adapters.proteus import (
     TUNNEL_PORTS,
     ProteusAdapter,
     ProteusSettings,
+    parse_status,
     read_tunnel_health,
+    status_script,
+    tailnet_key_view,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -150,6 +153,46 @@ class PlaneTunnelTests(unittest.TestCase):
         self.assertNotIn("DEFAULT_HOST", body)
         self.assertNotIn("settings.host", body)
         self.assertNotIn("x-api-key", body.lower())
+
+
+class TailnetKeyExpiryTests(unittest.TestCase):
+    """Once the public ports close the tailnet is the phone's only road to STOP: the VPS's
+    Tailscale key expiry is shown, and alarms from 14 days ahead."""
+    NOW = 1_800_000_000.0
+
+    def _iso(self, days: float) -> str:
+        from datetime import UTC, datetime
+        return datetime.fromtimestamp(self.NOW + days * 86400, UTC).isoformat().replace("+00:00", "Z")
+
+    def test_the_judgement(self) -> None:
+        self.assertEqual(tailnet_key_view("none", self.NOW), {"state": "key expiry disabled", "key_expiry": None, "alarm": False})
+        far = tailnet_key_view(self._iso(60), self.NOW)
+        self.assertEqual((far["days_left"], far["alarm"]), (60, False))
+        self.assertIn("Disable key expiry", far["message"])
+        self.assertIn("independent STOP route", far["message"])
+        self.assertTrue(tailnet_key_view(self._iso(14), self.NOW)["alarm"])
+        self.assertFalse(tailnet_key_view(self._iso(15), self.NOW)["alarm"])
+        gone = tailnet_key_view(self._iso(-1), self.NOW)
+        self.assertTrue(gone["alarm"])
+        self.assertTrue(gone["state"].startswith("EXPIRED"))
+        self.assertTrue(tailnet_key_view("garbage", self.NOW)["alarm"])
+
+    def test_the_plane_reads_it_live_and_doctor_from_the_record(self) -> None:
+        self.assertIn("ts_key_expiry", status_script(ProteusSettings(host="vps.test")))
+        self.assertEqual(parse_status("ts_key_expiry 2027-01-01T00:00:00Z\n")["tailnet_key_expiry"], "2027-01-01T00:00:00Z")
+        with tempfile.TemporaryDirectory() as tmp:
+            record = Path(tmp) / "vps-tailnet.json"
+            settings = ProteusSettings(host="vps.test", key_file=Path("C:/k"), tailnet_file=record)
+            out = f"ts_key_expiry {self._iso(10)}\n"
+            ssh = lambda argv, timeout: ProcessResult(returncode=0, stdout=out, stderr="")  # noqa: E731
+            adapter = ProteusAdapter(settings, runner=ssh, peter_health=lambda: True,
+                                     tunnel_health=lambda port: "200", clock=lambda: self.NOW)
+            self.assertTrue(adapter.plane()["tailnet"]["alarm"])
+            self.assertIn("not on the tailnet", adapter.status()["tailnet"]["state"])
+            record.write_text(json.dumps({"ipv4": "100.64.0.7", "key_expiry": None}), encoding="utf-8")
+            self.assertEqual(adapter.status()["tailnet"]["state"], "key expiry disabled (as recorded by the lockdown)")
+            record.write_text(json.dumps({"ipv4": "100.64.0.7", "key_expiry": self._iso(3)}), encoding="utf-8")
+            self.assertTrue(adapter.status()["tailnet"]["alarm"])
 
 
 LAUNCHER_SCENE = r"""

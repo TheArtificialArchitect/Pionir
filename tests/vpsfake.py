@@ -122,6 +122,8 @@ class Sim:
             return self._show(s, a[2], a[4])
         if a[:2] == ["systemctl", "is-active"]:
             name = a[2]
+            if name in s.get("sched", {}):
+                return 0, "active\n"
             if name.endswith(".timer"):
                 t = s["timers"].get(name[:-6])
                 return (0, "active\n") if t and t["active"] else (3, "inactive\n")
@@ -163,6 +165,12 @@ class Sim:
         if a == ["sshd", "-t"]:
             return (0, "") if s["sshd_ok"] else (255, "")
         if a[:3] == ["sshd", "-T", "-C"]:
+            if a[3].startswith("user=root,"):
+                base = "permitrootlogin prohibit-password\nallowtcpforwarding yes\n"
+                dropin = self.root / "ssh" / "sshd_config.d" / "60-pionir-tunnel.conf"
+                if s.get("root_drift") and dropin.exists():
+                    base += "permittty no\n"
+                return 0, base
             return 0, self._sshd_effective(s)
         if a == ["sshd", "-T"]:
             return 0, "allowtcpforwarding yes\n"
@@ -171,6 +179,8 @@ class Sim:
         return 127, ""
 
     def _show(self, s: dict, unit: str, prop: str) -> tuple[int, str]:
+        if prop == "NextElapseUSecRealtime":
+            return 0, f"@{s.get('sched', {}).get(unit, 0)}\n"
         u = s["units"].get(unit, {})
         if prop == "MainPID":
             return 0, f"{u.get('pid', 0)}\n"
@@ -246,12 +256,16 @@ class Sim:
                     s["ts_state"] = "Running"
                     (self.root / "net").mkdir(exist_ok=True)
                     (self.root / "net" / "tailscale0").write_text("up")
-            doc = {"BackendState": s["ts_state"], "Self": {}}
+            doc = {"BackendState": s["ts_state"], "Self": {}, "Peer": {
+                "nodekey:phone": {"HostName": "pixel", "OS": "android", **({"KeyExpiry": s["phone_expiry"]} if s.get("phone_expiry") else {})},
+                "nodekey:pc": {"HostName": "desktop", "OS": "windows", "KeyExpiry": "2027-01-01T00:00:00Z"}}}
             if s["ts_state"] == "NeedsLogin":
                 doc["AuthURL"] = "https://login.tailscale.com/a/pionirtest123"
             if s["ts_state"] == "Running":
                 doc["Self"] = {"HostName": "proteus-vps", "DNSName": "proteus-vps.tail1234.ts.net.",
                                "TailscaleIPs": ["100.64.0.7", "fd7a:115c:a1e0::7"]}
+                if s.get("ts_key_expiry"):
+                    doc["Self"]["KeyExpiry"] = s["ts_key_expiry"]
             return 0, json.dumps(doc)
         return 1, ""
 
@@ -314,6 +328,7 @@ def install(remote, root) -> Sim:
         assert re.fullmatch(r"https://pkgs\.tailscale\.com/stable/ubuntu/noble\.(noarmor\.gpg|tailscale-keyring\.list)", url), url
         return b"\x99fakekey" if url.endswith(".gpg") else TS_LIST_OK.encode()
     remote._fetch = fetch
+    remote.HTTP_JSON = lambda url: {"status": "ok", "jobs_running": sim.state().get("jobs_running", 0)}
     keyring = root / "keyrings" / "tailscale-archive-keyring.gpg"
     real_open, real_chmod = open, os.chmod
 

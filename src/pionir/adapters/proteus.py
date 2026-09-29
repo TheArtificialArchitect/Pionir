@@ -28,7 +28,11 @@ This machine reaches the three read APIs ONLY through the SSH tunnel (scripts\\v
 a pane of the stack: loopback 18000-18002 -> the droplet's 8000-8002, on a restricted key that
 can do nothing but forward). ``plane()`` reports it (``tunnel``: each API's unauthenticated
 /health through its loopback end); nothing here ever uses the public plain-HTTP ports.
-tools\\vps-lockdown.ps1 sets the tunnel up and rotates the keys.
+tools\\vps-lockdown.ps1 sets the tunnel up and rotates the keys. Once it has closed 8000-8002
+to the internet, the phone reaches the APIs only over the tailnet - so the plane (and doctor,
+from the lockdown's record) reports the VPS's Tailscale key expiry and raises an ALARM from 14
+days ahead. The brakes here run over ssh :22 and never need the tailnet: an independent STOP
+route.
 
 Everything that crosses to the VPS is an argv list (``ssh -i KEY -o BatchMode=yes ...
 root@HOST <remote>``) run without a local shell; the remote command is assembled only from
@@ -113,6 +117,8 @@ class ProteusSettings:
         "prometheus-running": r"C:\src\pantheon\bots\prometheus\scripts\Deploy-PrometheusRunning.ps1",
     })
     # the local side, read by status
+    # what tools\vps-lockdown.ps1 recorded about the VPS on the tailnet (not secret)
+    tailnet_file: Path = field(default_factory=lambda: Path.home() / ".pionir" / "config" / "vps-tailnet.json")
     peter_url: str = "http://127.0.0.1:8790"
     peter_signals: Path = Path(r"C:\src\The-Web\data\signals.json")
 
@@ -187,6 +193,11 @@ def status_script(settings: ProteusSettings) -> str:
         f"if [ -e {RH_DROPIN} ]; then echo 'rh_dropin present'; else echo 'rh_dropin absent'; fi; "
         f"if [ -e {SIGNALS_REMOTE} ]; then printf 'signals_age %s\\n' \"$(( $(date +%s) - $(stat -c %Y {SIGNALS_REMOTE}) ))\"; "
         "else echo 'signals_age none'; fi; "
+        # the VPS's Tailscale node key: once the public ports close, the tailnet is the phone's
+        # only road to the APIs - an expiring key would cut it (none = expiry disabled)
+        "if command -v tailscale >/dev/null 2>&1; then printf 'ts_key_expiry %s\\n' \"$(tailscale status --json 2>/dev/null "
+        "| python3 -c 'import json,sys; s=(json.load(sys.stdin).get(\"Self\") or {}); print(s.get(\"KeyExpiry\") or \"none\")' "
+        "2>/dev/null || echo unknown)\"; else echo 'ts_key_expiry absent'; fi; "
         "systemctl list-timers --all --no-pager --no-legend 'mrcrab-*' 'prometheus-*' 2>/dev/null | sed 's/^/timer /'"
     )
 
@@ -262,6 +273,8 @@ def parse_status(text: str) -> dict[str, Any]:
             out["rh_orders_armed"] = None if rest in ("unknown", "stopped") else rest.strip() not in ("", "0")
         elif head == "rh_dropin":
             out["rh_orders_dropin"] = rest == "present"
+        elif head == "ts_key_expiry":
+            out["tailnet_key_expiry"] = rest[:40] or "unknown"
         elif head == "signals_age":
             out["vps_signals_age_s"] = int(rest) if rest.isdigit() else None
         elif head == "timer":
@@ -431,7 +444,17 @@ class ProteusAdapter:
         """The health contract ``pionir doctor`` calls on every adapter: offline on purpose
         (no ssh, no port) - doctor runs often and in tests. ``plane()`` is the real read."""
         return {"host": self.settings.host, "key_file_present": self.settings.key_path.exists(),
-                "capabilities": len(CAPABILITIES), "arming": sorted(ARMING)}
+                "capabilities": len(CAPABILITIES), "arming": sorted(ARMING),
+                "tailnet": self._recorded_tailnet()}
+
+    def _recorded_tailnet(self) -> dict[str, Any]:
+        """The VPS's tailnet key expiry as the lockdown recorded it (offline; the plane reads
+        it live)."""
+        try:
+            doc = json.loads(self.settings.tailnet_file.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            return {"state": "not on the tailnet (tools\\vps-lockdown.ps1 -Apply puts it there)", "alarm": False}
+        return tailnet_key_view(doc.get("key_expiry") or "none", self._clock(), recorded=True)
 
     def plane(self) -> dict[str, Any]:
         """The whole plane in one read: one ssh round trip plus the local side."""
@@ -447,6 +470,9 @@ class ProteusAdapter:
         doc["peter"] = {"healthy": self._peter_health(), "url": self.settings.peter_url,
                         "signals_age_s": _age(self.settings.peter_signals, self._clock())}
         doc["tunnel"] = self.tunnel()
+        live = (doc.get("vps") or {}).get("tailnet_key_expiry")
+        doc["tailnet"] = (tailnet_key_view(live, self._clock()) if live not in (None, "unknown")
+                          else self._recorded_tailnet())
         if self.local_status is not None:
             try:
                 doc.update(dict(self.local_status()))
@@ -471,6 +497,36 @@ class ProteusAdapter:
         state = "up" if up else ("down" if all(a["health"].startswith("down") for a in apis.values())
                                  else "partial")
         return {"state": state, "apis": apis}
+
+
+TAILNET_ALARM_DAYS = 14
+STOP_ROUTE_NOTE = ("Pionir's brakes (proteus.kill, stop_timer, stop_service, rh_orders_off) go over ssh :22 - "
+                   "an independent STOP route that does not need the tailnet")
+
+
+def tailnet_key_view(expiry: str | None, now: float, *, recorded: bool = False) -> dict[str, Any]:
+    """The VPS's Tailscale node-key expiry, judged: 'none' is expiry disabled (as it must be
+    once the tailnet is the phone's only road); a date is a warning, and an ALARM from
+    TAILNET_ALARM_DAYS days ahead."""
+    from datetime import datetime
+
+    where = " (as recorded by the lockdown)" if recorded else ""
+    if expiry in (None, "", "none"):
+        return {"state": "key expiry disabled" + where, "key_expiry": None, "alarm": False}
+    if expiry == "absent":
+        return {"state": "Tailscale is not installed on the VPS", "key_expiry": None, "alarm": False}
+    try:
+        when = datetime.fromisoformat(str(expiry).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return {"state": f"key expiry unreadable: {str(expiry)[:40]}", "key_expiry": None, "alarm": True}
+    days = int((when - now) // 86400)
+    alarm = days <= TAILNET_ALARM_DAYS
+    return {"state": ("EXPIRED" if days < 0 else f"key expires in {days} days") + where,
+            "key_expiry": str(expiry), "days_left": days, "alarm": alarm,
+            "message": ("the VPS's Tailscale key expires " + str(expiry) + ": after the public ports close the "
+                        "tailnet is the phone's only road to STOP - disable key expiry for proteus-vps "
+                        "(https://login.tailscale.com/admin/machines -> proteus-vps -> ... -> Disable key "
+                        "expiry). " + STOP_ROUTE_NOTE + ".")}
 
 
 def read_tunnel_health(local_port: int) -> str:

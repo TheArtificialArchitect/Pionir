@@ -66,6 +66,19 @@ param(
     [string]$ServerCommit = "b7fea86d51216c71aad893e8755ee3a5d723d96a",
     [string]$ServerSha256 = "19dfc7fa62838e38a5843711c41afa7ad33af298cac31346cbabcc423b07abb3",
     [int]$PreviousDays = 7,
+    # the Prometheus auth change is deployed as ONE file too (never the tree deploy, which
+    # would ship every undeployed change on pantheon main): pantheon read-key's webapp.py,
+    # only onto the reviewed base (main's webapp.py); same rule for the Robinhood file
+    [string]$PantheonRepo = "C:\src\pantheon",
+    [string]$PromCommit = "dd67d84399dec11e384d08dc2294a855b1327b1e",
+    [string]$PromSha256 = "c546a44d68886e614fc488d7f3d85d9ed2b5912ca9e0dd43d8effa102ed5aeab",
+    [string]$PromBaseSha256 = "cd372269bef4dba35a1609cd3e30ba61780389b420d0c7d5e58fa2c8c7ae066a",
+    [string]$ServerBaseSha256 = "4041b9902c5b1145451a2a6bde9992d2f62b283d35ed3e8a71f2c27431cbb96c",
+    [switch]$AllowServerDrift,
+    # restarts wait for a quiet moment: outside US market hours and with no trading job
+    # running or about to run; -Force overrides (Ian's call)
+    [switch]$Force,
+    [string]$NowUtc = "",
     [string]$PhoneRepo = "PreShotCome/trading-bot-app",
     [int]$VerifyPortBase = 18100,
     [string]$TailnetHostname = "proteus-vps",
@@ -226,6 +239,42 @@ function Get-Sha256Hex([byte[]]$bytes) {
     try { return ([BitConverter]::ToString($h.ComputeHash($bytes))).Replace("-", "").ToLower() } finally { $h.Dispose() }
 }
 # the remote half's fingerprint(): compares keys without ever showing one
+function Get-NowUtc {
+    if ($NowUtc) { return [DateTimeOffset]::Parse($NowUtc).UtcDateTime }   # tests only
+    return [DateTime]::UtcNow
+}
+# US equity market hours: 09:30-16:00 America/New_York, Monday-Friday (holidays not needed)
+function Get-MarketWindow([DateTime]$utc) {
+    $tz = [TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
+    $et = [TimeZoneInfo]::ConvertTimeFromUtc($utc, $tz)
+    $weekday = $et.DayOfWeek -ne [DayOfWeek]::Saturday -and $et.DayOfWeek -ne [DayOfWeek]::Sunday
+    $open = $et.Date.AddHours(9.5); $close = $et.Date.AddHours(16)
+    $inHours = $weekday -and $et -ge $open -and $et -lt $close
+    $nextSafeEt = $et
+    if ($inHours) { $nextSafeEt = $close }
+    return [pscustomobject]@{ Open = $inHours; NowEt = $et; NextSafeUtc = [TimeZoneInfo]::ConvertTimeToUtc([DateTime]::SpecifyKind($nextSafeEt, [DateTimeKind]::Unspecified), $tz) }
+}
+function Assert-SafeToRestart([string]$why) {
+    # before any restart of a trading unit: not while the US market is open, not while a job
+    # runs or is about to (prometheus-{scan,entry,review,execute}, mrcrab cycles), not while
+    # Prometheus has background jobs in flight. -Force overrides; the next safe time is said.
+    $w = Get-MarketWindow (Get-NowUtc)
+    $g = Invoke-Remote @{ step = "guard"
+        services = @("prometheus-scan.service", "prometheus-entry.service", "prometheus-review.service", "prometheus-execute.service",
+                     "mrcrab@t1.service", "mrcrab@research.service", "mrcrab@t2.service", "mrcrab@t3.service")
+        timers = @("prometheus-scan.timer", "prometheus-entry.timer", "prometheus-review.timer", "prometheus-execute.timer",
+                   "mrcrab-t1.timer", "mrcrab-research.timer", "mrcrab-t2.timer", "mrcrab-t3.timer")
+        jobs_port = 8001 }
+    $reasons = @()
+    if ($w.Open) { $reasons += ("the US market is open (it is {0:HH:mm} in New York; next safe {1:u}, {2:HH:mm} here)" -f $w.NowEt, $w.NextSafeUtc, $w.NextSafeUtc.ToLocalTime()) }
+    foreach ($u in @($g.busy)) { if ($u) { $reasons += "$u is running now (wait for it to finish)" } }
+    foreach ($d in @($g.due)) { if ($d) { $reasons += ("{0} fires in {1} s (run this after it has)" -f $d.timer, $d.in_s) } }
+    if ($g.jobs_running) { $reasons += ("Prometheus has {0} background job(s) in flight (/api/health); wait for them" -f $g.jobs_running) }
+    if (-not $reasons.Count) { Say "a quiet moment to restart: market closed, no trading job running or due"; return }
+    foreach ($r in $reasons) { Warn $r }
+    if ($Force) { Warn "-Force: restarting anyway ($why)"; return }
+    Stop-Here "not restarting $why now - nothing was changed. Run it again then (or -Force)."
+}
 function Get-Fingerprint([string]$value) {
     if (-not $value) { return "" }
     return (Get-Sha256Hex ([Text.Encoding]::UTF8.GetBytes("pionir-lockdown:" + $value))).Substring(0, 16)
@@ -363,6 +412,14 @@ else {
     $serverText = [Text.Encoding]::UTF8.GetString($serverBytes)
     if (-not ($serverText.Contains("PRO_RH_READ_KEY") -and $serverText.Contains("PRO_RH_API_KEY_PREVIOUS_UNTIL"))) { $serverWhy = "the pinned file lacks the read key or the previous-key deadline" }
 }
+$promBytes = $null
+if ($gitExe -and (Test-Path -LiteralPath $PantheonRepo)) {
+    $promBytes = Get-NativeBytes $gitExe @("-C", $PantheonRepo, "cat-file", "blob", ($PromCommit + ":bots/prometheus/src/prometheus/webapp.py"))
+}
+$promPinOk = $false
+if (-not $promBytes) { Warn "pantheon $($PromCommit.Substring(0, 7)) is not in ${PantheonRepo}: Prometheus's auth change cannot be deployed from here (fetch pantheon's read-key branch)" }
+elseif ((Get-Sha256Hex $promBytes) -ne $PromSha256.ToLower()) { Warn "bots/prometheus/src/prometheus/webapp.py at $($PromCommit.Substring(0, 7)) does not have the pinned sha256: not deployed" }
+else { $promPinOk = $true; Say ("Prometheus file: pantheon {0} webapp.py (sha256 {1}...), onto main's webapp.py only" -f $PromCommit.Substring(0, 7), $PromSha256.Substring(0, 12)) }
 if (-not $serverWhy) { Say ("server file: trading-bot-app {0} server/robinhood_read_api.py (sha256 {1}...)" -f $ServerCommit.Substring(0, 7), $ServerSha256.Substring(0, 12)) }
 elseif ($Apply -and -not $FinishRotation) { Stop-Here $serverWhy }
 else { Warn $serverWhy }
@@ -488,6 +545,7 @@ if ($FinishRotation) {
 
     Step "finish-2" "end the rotation window: the previous Robinhood key stops working"
     if ($rotationOpen) {
+        Assert-SafeToRestart "the APIs to drop the previous keys"
         $rot = $state.rotated
         if (-not $rot) { $rot = [pscustomobject]@{ rh = $true; prom = $false; kark = $false } }
         $fl = @(@{ path = $rhEnv; unset = @("PRO_RH_API_KEY_PREVIOUS", "PRO_RH_API_KEY_PREVIOUS_UNTIL") })
@@ -533,7 +591,22 @@ if ($FinishRotation) {
     $state = Load-State
     if ($KeepPublicPorts) { Warn "-KeepPublicPorts: 8000-8002 stay open to the internet" }
     elseif ($state.ports_closed) { Say ("closed on {0}; checking again from here" -f $state.ports_closed); foreach ($port in 8000, 8001, 8002) { if (Test-RemotePort $VpsHost $port) { Bad ("{0}:{1} answers from the internet again" -f $VpsHost, $port) } } }
-    else { Close-PublicPorts $tailnet }
+    else {
+        # After this the tailnet is the phone's ONLY way to the APIs: a node key that expires
+        # would cut it off. Refuse while the VPS's (or a phone's) key can expire.
+        $ts = Invoke-Remote @{ step = "tailscale_status" }
+        $expiring = @()
+        if ($ts.key_expiry) { $expiring += ("the VPS (proteus-vps): its key expires {0}" -f $ts.key_expiry) }
+        foreach ($m in @($ts.mobiles)) { if ($m -and $m.key_expiry) { $expiring += ("your {0} ({1}): its key expires {2}" -f $m.os, $m.name, $m.key_expiry) } }
+        if ($expiring.Count) {
+            foreach ($e in $expiring) { Warn $e }
+            Say "Turn key expiry off for each: https://login.tailscale.com/admin/machines -> the machine's row (proteus-vps, then your phone) -> the ... menu -> Disable key expiry."
+            Say "Then run this again. (Pionir's ssh brakes - proteus.kill / stop_service over :22 - stay an independent STOP route that does not need the tailnet.)"
+            Stop-Here "not closing 8000-8002 while a key on the phone's only route can expire"
+        }
+        Say "Tailscale key expiry is off for the VPS and your phone"
+        Close-PublicPorts $tailnet
+    }
 
     Step "finish-4" "nginx sites that forward to the APIs"
     $state = Load-State
@@ -549,6 +622,7 @@ if ($FinishRotation) {
     Write-Host ""
     if ($script:failures) { Write-Host ("  {0} step(s) FAILED - read the red lines above; run -FinishRotation -Apply again once fixed." -f $script:failures) -ForegroundColor Red; exit 1 }
     Write-Host "  finished: the phone reads over the tailnet, the old key is dead, and 8000-8002 are closed to the internet." -ForegroundColor Green
+    Write-Host "  An independent STOP route that needs no tailnet: Pionir's brakes over ssh :22 (proteus.kill, stop_timer, stop_service, rh_orders_off)." -ForegroundColor Green
     Write-Host ("  rollback of the firewall, if ever needed: ssh -i {0} root@{1} `"sh /root/.pionir-ufw-{2}/revert.sh`"" -f $DeployKey, $VpsHost, $state.ports_closed) -ForegroundColor DarkGray
     exit 0
 }
@@ -564,11 +638,10 @@ if ($state -and $state.keys) {
     $rotate = $false
 } else {
     if ($Apply) {
-        $until = [DateTimeOffset]::UtcNow.AddDays($PreviousDays).ToUnixTimeSeconds()
-        $state = [ordered]@{ stamp = $stamp; previous_until = [string]$until; keys = [ordered]@{ rh_full = (New-Key); rh_read = (New-Key); prom = (New-Key); prom_read = (New-Key); kark = (New-Key) }; done = [ordered]@{} }
+        $state = [ordered]@{ stamp = $stamp; keys = [ordered]@{ rh_full = (New-Key); rh_read = (New-Key); prom = (New-Key); prom_read = (New-Key); kark = (New-Key) }; done = [ordered]@{} }
         Save-State $state
         $state = Load-State
-        Say ("made 5 new keys (32 random bytes each, 43 urlsafe characters) -> {0} (owner-only); the old keys die on the VPS at {1:u} at the latest" -f $stateFile, [DateTimeOffset]::FromUnixTimeSeconds([int64]$state.previous_until).UtcDateTime)
+        Say ("made 5 new keys (32 random bytes each, 43 urlsafe characters) -> {0} (owner-only)" -f $stateFile)
     } else { Would "make 5 keys (Robinhood full + READ, Prometheus full + READ, Karkinos): 32 random bytes, urlsafe, 43 chars; keep them in $stateFile; the old keys stay valid $PreviousDays days at most (server-enforced)" }
 }
 if ($state -and $state.keys) { $script:secrets = @($state.keys.rh_full, $state.keys.rh_read, $state.keys.prom, $state.keys.prom_read, $state.keys.kark) }
@@ -625,11 +698,12 @@ if ($Apply) {
     }
     if (-not $up.ipv4) { Stop-Here "Tailscale runs on the VPS but reported no 100.x address" }
     $prev = $tailnet
-    $tailnet = [ordered]@{ hostname = $up.hostname; ipv4 = $up.ipv4; dns_name = $up.dns_name; recorded = (Get-Date).ToUniversalTime().ToString("o") }
+    $tailnet = [ordered]@{ hostname = $up.hostname; ipv4 = $up.ipv4; dns_name = $up.dns_name; key_expiry = $up.key_expiry; recorded = (Get-Date).ToUniversalTime().ToString("o") }
     if ($prev -and $prev.phone_build_host) { $tailnet.phone_build_host = $prev.phone_build_host }
     Save-Tailnet $tailnet
     $tailnet = Read-Tailnet
     Say ("on the tailnet: {0} ({1}) -> {2}" -f $tailnet.ipv4, $tailnet.dns_name, $TailnetFile)
+    if ($tailnet.key_expiry) { Warn ("the VPS's Tailscale key expires {0}: disable key expiry for proteus-vps (and your phone) at https://login.tailscale.com/admin/machines before -FinishRotation closes the public ports" -f $tailnet.key_expiry) }
 } else {
     Would "install Tailscale from pkgs.tailscale.com's apt repository for the VPS's distro (/etc/os-release) - not curl|sh"
     Would "tailscale up --ssh=false --hostname=$TailnetHostname --accept-dns=false; show you the login link; wait until BackendState=Running"
@@ -639,13 +713,32 @@ if ($Apply) {
 # ---- [c] deploy the server change -------------------------------------------------------------
 Step "c" "deploy robinhood_read_api.py (read key + a previous key that dies at a deadline)"
 $deployed = $false
+$deployedProm = $false
 if ($Apply -and $rotate) {
+    Assert-SafeToRestart "the Robinhood and Prometheus APIs"
+    $bases = @(); if (-not $AllowServerDrift) { $bases = @($ServerBaseSha256.ToLower()) }
     $dep = Invoke-Remote @{ step = "deploy"; unit = $rhUnit; name = "robinhood_read_api.py"; stamp = $stamp; sha256 = $ServerSha256.ToLower()
-                            content_b64 = [Convert]::ToBase64String($serverBytes); must_contain = @("PRO_RH_READ_KEY", "PRO_RH_API_KEY_PREVIOUS_UNTIL") }
+                            content_b64 = [Convert]::ToBase64String($serverBytes); must_contain = @("PRO_RH_READ_KEY", "PRO_RH_API_KEY_PREVIOUS_UNTIL")
+                            base_sha256 = $bases; path = $rhScript }
     if ($dep.unchanged) { Say "$($dep.path) is already this version" } else { Say "$($dep.path) replaced; backup $($dep.backup)"; $deployed = $true }
+    $promScript = $null
+    if ($disc -and $disc.apis.prometheus.script) { $promScript = [string]$disc.apis.prometheus.script }
+    if ($promPinOk -and $promScript -and -not $promPrev) {
+        $pb = @(); if (-not $AllowServerDrift) { $pb = @($PromBaseSha256.ToLower()) }
+        $pd = Try-Remote @{ step = "deploy"; name = "webapp.py"; path = $promScript; stamp = $stamp; sha256 = $PromSha256.ToLower()
+                            content_b64 = [Convert]::ToBase64String($promBytes); must_contain = @("PROM_READ_KEY", "PROM_API_KEY_PREVIOUS_UNTIL"); base_sha256 = $pb }
+        if ($pd -and ($pd.deployed -or $pd.unchanged)) {
+            if ($pd.deployed) { Say "$($pd.path) replaced (the auth change only); backup $($pd.backup)"; $deployedProm = $true }
+            $promPrev = $true; $promRead = $true
+        } else { Warn "Prometheus's webapp.py on the VPS is not main's version (or could not be replaced): its auth change is NOT deployed and its key is NOT rotated. Compare it with pantheon main, deploy Prometheus with its own script, then run this again (or -AllowServerDrift)." }
+    }
     Mark "deploy"
 } elseif ($Apply) { Say "no rotation: not deployed" }
-else { Would "put trading-bot-app $($ServerCommit.Substring(0, 7)):server/robinhood_read_api.py (sha256-checked) over $rhScript on the VPS (backup .bak-pionir-<stamp>, compile check, same owner/mode)" }
+else {
+    Would "wait for a quiet moment first: outside 09:30-16:00 New York Mon-Fri, no prometheus-{scan,entry,review,execute} / mrcrab job running or due in 15 min, no Prometheus job in flight (-Force overrides)"
+    Would "put trading-bot-app $($ServerCommit.Substring(0, 7)):server/robinhood_read_api.py (sha256-checked) over $rhScript - only if the running file is main's (the reviewed base); backup, compile check, same owner/mode"
+    Would "put pantheon $($PromCommit.Substring(0, 7)):webapp.py (sha256-checked) over the VPS's prometheus/webapp.py - only if that is main's version (never the tree deploy)"
+}
 
 # ---- [d] the env files ----------------------------------------------------------------------
 Step "d" "rotate the keys in the env files (values over ssh stdin)"
@@ -660,15 +753,14 @@ if ($oldKeys.kark -and $oldKeys.kark -eq $state.keys.kark) { $oldKeys.kark = "" 
 $rotated = @{ rh = $true; prom = ($promPrev -and [bool]$promEnv); kark = ($karkPrev -and [bool]$karkEnv) }
 $files = @()
 if ($rotate) {
-    $until = [string]$state.previous_until
     $files += @{ path = $rhEnv; set = @{ PRO_RH_API_KEY = $state.keys.rh_full; PRO_RH_READ_KEY = $state.keys.rh_read }
-                 keep_previous = @{ PRO_RH_API_KEY = "PRO_RH_API_KEY_PREVIOUS" }; plain = @{ PRO_RH_API_KEY_PREVIOUS_UNTIL = $until } }
-    $pf = @{ path = $promEnv; set = @{}; keep_previous = @{}; plain = @{} }
-    if ($rotated.prom) { $pf.set.PROM_API_KEY = $state.keys.prom; $pf.keep_previous.PROM_API_KEY = "PROM_API_KEY_PREVIOUS"; $pf.plain.PROM_API_KEY_PREVIOUS_UNTIL = $until }
+                 keep_previous = @{ PRO_RH_API_KEY = "PRO_RH_API_KEY_PREVIOUS" }; previous_days = $PreviousDays }
+    $pf = @{ path = $promEnv; set = @{}; keep_previous = @{}; previous_days = $PreviousDays }
+    if ($rotated.prom) { $pf.set.PROM_API_KEY = $state.keys.prom; $pf.keep_previous.PROM_API_KEY = "PROM_API_KEY_PREVIOUS" }
     elseif ($promEnv -and $disc) { Warn "Prometheus: its server has no grace window yet (pantheon branch read-key, deployed with its Deploy script) - PROM_API_KEY is NOT rotated, so the phone keeps working" }
     if ($promRead -and $promEnv) { $pf.set.PROM_READ_KEY = $state.keys.prom_read }
     if ($pf.set.Count) { $files += $pf }
-    if ($rotated.kark) { $files += @{ path = $karkEnv; set = @{ KARKINOS_API_KEY = $state.keys.kark }; keep_previous = @{ KARKINOS_API_KEY = "KARKINOS_API_KEY_PREVIOUS" }; plain = @{ KARKINOS_API_KEY_PREVIOUS_UNTIL = $until } } }
+    if ($rotated.kark) { $files += @{ path = $karkEnv; set = @{ KARKINOS_API_KEY = $state.keys.kark }; keep_previous = @{ KARKINOS_API_KEY = "KARKINOS_API_KEY_PREVIOUS" }; previous_days = $PreviousDays } }
     elseif ($karkEnv -and $disc) { Warn "Karkinos: its server has no grace window yet (Mr-Crab branch grace) - KARKINOS_API_KEY is NOT rotated, so the phone keeps working" }
 }
 $phoneKeyOk = $null
@@ -677,6 +769,7 @@ if ($Apply -and $rotate) {
     foreach ($f in $envr.files) {
         if ($f.error) { Bad ("{0}: {1}" -f $f.path, $f.error); continue }
         Say ("{0}: changed [{1}]; backup {2}" -f $f.path, ((@($f.changed)) -join ", "), $f.backup)
+        foreach ($pr in @($f.until.PSObject.Properties)) { if ($pr) { Say ("  {0}: the previous key dies at {1:u} (the VPS's clock)" -f $pr.Name, [DateTimeOffset]::FromUnixTimeSeconds([int64]$pr.Value).UtcDateTime) } }
         if ($f.path -eq $rhEnv) {
             $kept = $f.previous_fp.PRO_RH_API_KEY_PREVIOUS
             if (-not $kept) { Bad "PRO_RH_API_KEY_PREVIOUS is not set: the phone's current key would be dead" }
@@ -704,13 +797,14 @@ if ($Apply -and $rotate) {
     $rhKeys = @("PRO_RH_API_KEY", "PRO_RH_READ_KEY", "PRO_RH_API_KEY_PREVIOUS", "PRO_RH_API_KEY_PREVIOUS_UNTIL")
     $units = @{}
     $units[$rhUnit] = @{ keys = $rhKeys; force = ($deployed -or -not (Done "deployed_restart")) }
+    $unitWasActive = @{}
     $unitFiles = @{}
     $unitFiles[$rhUnit] = @($rhEnv, $rhScript)
     if ($promUnit) {
         $pk = @("PROM_API_KEY")
         if ($rotated.prom) { $pk += @("PROM_API_KEY_PREVIOUS", "PROM_API_KEY_PREVIOUS_UNTIL") }
         if ($promRead) { $pk += "PROM_READ_KEY" }
-        $units[$promUnit] = @{ keys = $pk }
+        $units[$promUnit] = @{ keys = $pk; force = $deployedProm }
         $unitFiles[$promUnit] = @($promEnv)
     }
     if ($karkUnit) {
@@ -723,12 +817,13 @@ if ($Apply -and $rotate) {
     $running = @{}
     foreach ($u in $rs.units) {
         $running[$u.unit] = ($u.state -eq "active")
+        $unitWasActive[$u.unit] = [bool]$u.was_active
         if ($u.armed_mismatch) { Stop-Here ("{0}: real-money orders differ between the running process and its configuration: NOT restarted. Decide first (Pionir proteus.rh_orders_off / on), then run again." -f $u.unit) }
         if (-not $u.was_active) { Warn ("{0}: {1} - {2}" -f $u.unit, $u.state, $u.note); continue }
         if ($u.current) { Say ("{0}: already running with its current keys (no restart)" -f $u.unit) }
         elseif (-not $u.restarted) {
             Bad ("{0} did not come back after its restart (state {1})" -f $u.unit, $u.state)
-            $ro = Invoke-Remote @{ step = "restore"; stamp = $stamp; unit = $u.unit; files = @($unitFiles[$u.unit] | Where-Object { $_ }) }
+            $ro = Invoke-Remote @{ step = "restore"; stamp = $stamp; unit = $u.unit; files = @($unitFiles[$u.unit] | Where-Object { $_ }); was_active = $true }
             Stop-Here ("{0}: restored {1} from this run's backups and started it again (active: {2}). The rotation is on hold: read journalctl -u {0}, fix, run -Apply again." -f $u.unit, ((@($ro.restored)) -join ", "), $ro.active)
         } else { Say ("{0}: restarted; orders armed {1} -> {2}" -f $u.unit, $u.orders_armed_before, $u.orders_armed_after) }
         if (@($u.env_missing).Count) { Bad ("{0} runs without {1}" -f $u.unit, ((@($u.env_missing)) -join ", ")) }
@@ -775,6 +870,20 @@ if ($Apply -and $rotate) {
     }
     $eVerified = ($script:failures -eq $failBefore)
     if ($eVerified) { Mark "deployed_restart"; Say "verified" }
+    else {
+        # ANY verification failure: every env file back to its pre-rotation backup and every
+        # unit that was running restarted onto it - the phone's key (the live one before this
+        # run) works again, whatever else went wrong
+        Warn "not verified: rolling the keys back on the VPS (env files from this rotation's backups)"
+        foreach ($unit in @($unitFiles.Keys)) {
+            $envOnly = @($unitFiles[$unit] | Where-Object { $_ -and $_ -like "*.env" })
+            if (-not $envOnly.Count) { continue }
+            $ro = Try-Remote @{ step = "restore"; stamp = $stamp; unit = $unit; files = $envOnly; was_active = [bool]$unitWasActive[$unit] }
+            if ($ro) { Say ("{0}: env restored ({1}); active {2}" -f $unit, ((@($ro.restored)) -join ", "), $ro.active) }
+            else { Warn "$unit : the rollback could not be done - restore by hand (see [h])" }
+        }
+        Stop-Here "the rotation is rolled back on the VPS (same keys are used when you run -Apply again). Nothing was written here or sent to the phone."
+    }
 } elseif (-not $Apply) {
     Would "restart a unit only when its RUNNING keys differ from its env files (or the server file is new): try-restart, a stopped unit stays stopped"
     Would "never restart one whose running PRO_RH_ORDERS_ENABLED differs from its configuration (that would arm/disarm): stop and ask"
@@ -881,6 +990,7 @@ $unitList = (@($rhUnit, $promUnit, $karkUnit) | Where-Object { $_ }) -join " "
 Say "1. the VPS, as root (ssh -i $DeployKey root@$VpsHost):"
 foreach ($e in $envList) { Say ("     cp -p {0}{1} {0}" -f $e, $bk) }
 Say ("     cp -p {0}{1} {0}      (the server file)" -f $rhScript, $bk)
+Say "     cp -p <prometheus/webapp.py>$bk <prometheus/webapp.py>   (if [c] replaced it: the path it printed)"
 Say ("     systemctl try-restart {0}" -f $unitList)
 Say "2. this machine's key files:  Copy-Item $vaultDir\backup-$stamp\* $secretsDir\"
 Say ("3. the phone: Get-Content -Raw $vaultDir\backup-$stamp\proteus-api-key.txt | gh secret set PRO_RH_API_KEY --repo {0}  (and PROM_API_KEY, KARKINOS_API_KEY from the same folder), then gh workflow run build.yml --repo {0} --ref main" -f $PhoneRepo)
