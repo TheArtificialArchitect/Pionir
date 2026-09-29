@@ -190,7 +190,7 @@ class GateOverHttp(unittest.TestCase):
 
     def test_no_tasking_client_can_approve_or_deny(self) -> None:
         aid = self._parked()
-        for client in ("crew", "galatea", "atani", "desktop"):
+        for client in ("crew", "galatea", "atani"):
             for path in ("/api/approvals/approve", "/api/approvals/deny"):
                 status, out = self.post(path, {"id": aid}, client)
                 self.assertEqual(status, 403, (client, path, out))
@@ -226,6 +226,124 @@ class GateOverHttp(unittest.TestCase):
         self.assertEqual((status, out["status"]), (200, "denied"), out)
         self.assertEqual(self.spec.ran, [])
 
+    # ---- 2b. Pionir Desktop: the owner's console, signed, never a bearer --------------
+    def signed(self, path: str, body: dict | None, client: str = "desktop", *,
+               token: str | None = None, ts: float | None = None, nonce: str | None = None,
+               sign_path: str | None = None, sign_body: bytes | None = None,
+               **extra: str):
+        """POST `body` to `path`, signed as `client` (with its own token unless `token`)."""
+        import secrets as _secrets
+        import time as _time
+        data = json.dumps(body).encode("utf-8") if body is not None else b""
+        stamp = str(int(ts if ts is not None else _time.time()))
+        once = nonce or _secrets.token_hex(16)
+        key = token if token is not None else self.app.auth.tokens[client]
+        sig = auth.request_sig(key, "POST", sign_path or path, stamp, once,
+                               data if sign_body is None else sign_body)
+        headers = {"X-Pionir-Client": client, "X-Pionir-Ts": stamp, "X-Pionir-Nonce": once,
+                   "X-Pionir-Sig": sig, **extra}
+        status, document, _ = self._raw("POST", path, body, headers)
+        return status, document
+
+    def test_the_desktop_approves_signed_and_the_run_has_exactly_the_recorded_permission(self) -> None:
+        aid = self._parked("galatea")
+        status, out = self.signed("/api/approvals/approve", {"id": aid})
+        self.assertIn(status, (200, 202), out)
+        self.assertTrue(self.app.jobs.wait(out["task_id"], 30))
+        self.assertEqual(len(self.spec.ran), 1)
+        # the recorded permission, and the proof the owner said yes (never a power)
+        self.assertEqual(self.spec.ran[0].granted_permissions,
+                         frozenset({"gate.run", OWNER_APPROVED_GRANT}))
+        self.assertEqual(self.app.approvals.get(aid)["status"], "approved")
+
+    def test_the_desktop_denies_signed(self) -> None:
+        aid = self._parked()
+        status, out = self.signed("/api/approvals/deny", {"id": aid})
+        self.assertEqual((status, out["status"]), (200, "denied"), out)
+        self.assertEqual(self.spec.ran, [])
+
+    def test_the_desktop_token_as_a_bearer_is_refused_everywhere(self) -> None:
+        aid = self._parked()
+        for path, body in (("/api/approvals/approve", {"id": aid}), ("/api/approvals/deny", {"id": aid}),
+                           ("/api/task", {"capability": "gate.read", "payload": {}}),
+                           ("/api/intent", {"request": "hm"})):
+            status, out = self.post(path, body, "desktop")
+            self.assertEqual(status, 401, (path, out))
+        self.assertEqual(self.app.approvals.get(aid)["status"], "pending")
+        self.assertEqual(self.spec.ran, [])
+
+    def test_a_bad_signature_never_approves(self) -> None:
+        import time as _time
+        aid = self._parked()
+        body = {"id": aid}
+        tries = {
+            "another client's token": dict(token=self.app.auth.tokens["phone"]),
+            "a made-up token": dict(token=WRONG),
+            "stale": dict(ts=_time.time() - 120),
+            "from the future": dict(ts=_time.time() + 120),
+            "from before this server started": dict(ts=self.app.auth.booted - 5),
+            "another path signed": dict(sign_path="/api/approvals/deny"),
+            "another body signed": dict(sign_body=json.dumps({"id": "other"}).encode()),
+            "short nonce": dict(nonce="abc"),
+        }
+        for why, kw in tries.items():
+            status, out = self.signed("/api/approvals/approve", body, **kw)
+            self.assertEqual(status, 401, (why, out))
+        # signed as a client that may not approve: authenticated, then refused
+        status, out = self.signed("/api/approvals/approve", body, "crew")
+        self.assertEqual(status, 403, out)
+        # an unknown client name
+        status, out = self.signed("/api/approvals/approve", body, "desktop", **{"X-Pionir-Client": "ghost"})
+        self.assertEqual(status, 401, out)
+        self.assertEqual(self.app.approvals.get(aid)["status"], "pending")
+        self.assertEqual(self.spec.ran, [])
+
+    def test_a_signed_request_is_taken_once(self) -> None:
+        aid = self._parked()
+        status, out = self.signed("/api/approvals/deny", {"id": aid}, nonce="n" * 32)
+        self.assertEqual(status, 200, out)
+        aid2 = self._parked()
+        status, out = self.signed("/api/approvals/deny", {"id": aid2}, nonce="n" * 32)
+        self.assertEqual(status, 401, out)
+        self.assertEqual(out["reason"], "replayed signature")
+        self.assertEqual(self.app.approvals.get(aid2)["status"], "pending")
+
+    def test_the_nonce_cache_fails_closed_when_full_of_live_nonces(self) -> None:
+        now = [1000.0]
+        a = ClientAuth({"desktop": "d" * 43}, _clock=lambda: now[0])
+        with mock.patch.object(auth, "_MAX_NONCES", 2):
+            self.assertTrue(a._nonce_fresh("a" * 16))
+            self.assertTrue(a._nonce_fresh("b" * 16))
+            self.assertFalse(a._nonce_fresh("c" * 16))          # full of live ones: refuse
+            self.assertFalse(a._nonce_fresh("a" * 16))          # and never forget one
+            now[0] += 4 * auth.SIGN_WINDOW + 1
+            self.assertTrue(a._nonce_fresh("c" * 16))           # the dead ones make room
+        # over HTTP: a full cache refuses a good signature rather than risk a replay
+        aid = self._parked()
+        with mock.patch.object(auth, "_MAX_NONCES", 0):
+            status, out = self.signed("/api/approvals/deny", {"id": aid})
+        self.assertEqual(status, 401, out)
+        self.assertEqual(self.app.approvals.get(aid)["status"], "pending")
+
+    def test_the_desktop_cannot_approve_what_it_parked(self) -> None:
+        status, out = self.signed("/api/task", {"capability": "gate.privileged", "payload": {}})
+        self.assertEqual((status, out["status"]), (200, "pending_approval"), out)
+        aid = out["approval_id"]
+        self.assertEqual(self.app.approvals.get(aid)["requester"], "desktop")
+        status, out = self.signed("/api/approvals/approve", {"id": aid})
+        self.assertEqual(status, 403, out)
+        self.assertEqual(out["error"]["type"], "SelfApproval")
+        self.assertEqual(self.spec.ran, [])
+
+    def test_the_desktop_asks_pionir_like_the_dashboard(self) -> None:
+        status, out = self.signed("/api/task", {"capability": "gate.read", "payload": {}})
+        self.assertEqual(status, 200, out)
+        self.assertTrue(out["ok"], out)
+        # asserted permissions are ignored for it too: a privileged ask parks
+        status, out = self.signed("/api/task", {**ATTACK})
+        self.assertEqual(out["status"], "pending_approval", out)
+        self.assertEqual(self.ran("coding.daedalus_solve"), [])
+
     # ---- 3. in-process approval (the Discord gate) -----------------------------------
     def test_in_process_approval_runs_with_the_recorded_permission(self) -> None:
         aid = self._parked("atani")
@@ -243,13 +361,13 @@ class GateOverHttp(unittest.TestCase):
             status, out = self.post("/api/task", read, client)
             self.assertEqual(status, 200, (client, out))
             self.assertTrue(out["ok"], (client, out))
-        for client in ("desktop", "phone"):
+        for client in ("phone",):
             status, out = self.post("/api/task", read, client)
             self.assertEqual(status, 403, (client, out))
-        for client in ("crew", "atani", "desktop", "phone"):
+        for client in ("crew", "atani", "phone"):
             status, out = self.post("/api/intent", {"request": "hm"}, client)
             self.assertEqual(status, 403, (client, out))
-        for client in ("crew", "galatea", "atani", "desktop", "phone"):
+        for client in ("crew", "galatea", "atani", "phone"):
             status, out = self.post("/api/route", {"request": "hm", "execute": False}, client)
             self.assertEqual(status, 403, (client, out))
         self.assertEqual(len(self.spec.ran), 4)
@@ -643,7 +761,7 @@ class InProcessRules(unittest.TestCase):
 
     def test_only_the_owner_surfaces_approve(self) -> None:
         aid = self.app.run_task("gate.privileged", {}, client="atani")["approval_id"]
-        for client in ("crew", "galatea", "atani", "desktop", auth.ANONYMOUS):
+        for client in ("crew", "galatea", "atani", auth.ANONYMOUS):
             self.assertEqual(self.app.approve(aid, approver=client)["error"]["type"],
                              "Forbidden", client)
             self.assertEqual(self.app.deny(aid, approver=client)["error"]["type"],

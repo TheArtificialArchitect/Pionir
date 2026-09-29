@@ -89,9 +89,16 @@ Loopback is not an identity: any local process can reach `127.0.0.1:8780`. So
   port, so the cookie alone is refused) - set by the one-time sign-in link a launcher
   opens (`/?code=...`, 60 s, used once; `pionir/signin.py`). The token itself is never
   in a URL, a cookie or on a command line.
-- Approve / deny / the digest request are the owner's alone: only `dashboard` and
-  `phone` (Galatea's phone glass relays with it), and never for an item that client
-  parked. Code, not config, decides that.
+- Approve / deny / the digest request are the owner's alone: only `dashboard`, `phone`
+  (Galatea's phone glass relays with it) and `desktop` (Pionir Desktop, the owner's
+  console on this PC), and never for an item that client parked. Code, not config,
+  decides that.
+- `desktop` never sends its token: it SIGNS each POST (`X-Pionir-Client`, `X-Pionir-Ts`,
+  `X-Pionir-Nonce`, `X-Pionir-Sig` = HMAC-SHA256 of its token over `pionir-request`,
+  method, path+query, time, nonce and the body's sha256; `auth.request_sig`). A
+  signature is good for 30 seconds, once, and never from before Pionir started, so a
+  squatter on :8780 while Pionir is down captures nothing it can use. Its token as a
+  bearer is refused.
 - What each client may call is a grant table: the code default in `auth.DEFAULT_GRANTS`,
   narrowed per client by an optional `<state_root>/auth/grants.json`. No grant holds a
   privileged permission (`auth.GRANTABLE_PERMISSIONS` is empty - the hook the Daedalus

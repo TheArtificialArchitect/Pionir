@@ -104,6 +104,16 @@ def _optional_url(name: str, default: str | None) -> str | None:
     return raw
 
 
+def _days_from_env(name: str, default: float) -> float:
+    """A positive number of days from the environment, else the default."""
+    raw = (os.environ.get(name) or "").strip()
+    try:
+        value = float(raw) if raw else default
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 def _embed_model_from_env(default: str = "nomic-embed-text") -> str | None:
     """PIONIR_EMBED_MODEL: a model name, or "" / "off" / "none" to disable
     hybrid recall entirely. Unset keeps the default (embeddings on, fail-open)."""
@@ -128,6 +138,9 @@ def _protected_models_from_env(default: tuple[str, ...]) -> tuple[str, ...]:
 @dataclass(frozen=True, slots=True)
 class PionirSettings:
     state_root: Path = field(default_factory=_default_state_root)
+    # The IANA zone the work log's days and weeks are measured in (PIONIR_WORK_TZ); None is
+    # the machine's own zone.
+    work_tz: str | None = None
     total_vram_mb: int = 12_288
     # The observed idle floor on the target workstation, not an estimate.
     # See docs/PHASE0_BENCHMARK.md; ResourceBudget carries the same figure.
@@ -288,6 +301,11 @@ class PionirSettings:
     # that can chat: the embed model above cannot, and defaulting to it meant
     # consolidation silently never happened. PIONIR_DISTIL_MODEL overrides.
     distil_model: str = "qwen3:4b-instruct-2507-q4_K_M"
+    # Retention for the memory store (days): folded raw turns are DELETED this long
+    # after they were written, distilled facts this long after they were distilled.
+    # PIONIR_TURN_RETENTION_DAYS / PIONIR_FACT_RETENTION_DAYS override.
+    turn_retention_days: float = 14.0
+    fact_retention_days: float = 180.0
     # Resident models the scheduler must never evict to make room - the voice's
     # model above all, since Galatea never takes the shared lock and an eviction
     # mid-sentence cuts her off. PIONIR_PROTECTED_MODELS is a comma list; set it
@@ -444,6 +462,11 @@ class PionirSettings:
     @property
     def cortex_path(self) -> Path:
         return self.state_root / "cortex" / "memory.db"
+
+    @property
+    def worklog_path(self) -> Path:
+        """The work log (hours and pay): its own file, never the memory db (worklog.py)."""
+        return self.state_root / "worklog" / "worklog.db"
 
     @property
     def resource_budget(self) -> ResourceBudget:
@@ -606,6 +629,10 @@ class PionirSettings:
             embed_model=_embed_model_from_env(),
             distil_model=(os.environ.get("PIONIR_DISTIL_MODEL") or "").strip()
             or _declared("distil_model"),
+            turn_retention_days=_days_from_env("PIONIR_TURN_RETENTION_DAYS",
+                                                _declared("turn_retention_days")),
+            fact_retention_days=_days_from_env("PIONIR_FACT_RETENTION_DAYS",
+                                                _declared("fact_retention_days")),
             protected_models=_protected_models_from_env(_declared("protected_models")),
             specialists_file=(
                 Path(os.environ["PIONIR_SPECIALISTS_FILE"])
@@ -628,4 +655,5 @@ class PionirSettings:
                 if (os.environ.get("PIONIR_PROTEUS_SSH_KEY") or "").strip()
                 else None
             ),
+            work_tz=(os.environ.get("PIONIR_WORK_TZ") or "").strip() or None,
         )

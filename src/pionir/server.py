@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from . import atomic
+from . import atomic, library, secretscrub, workapi
 from .approvals import ApprovalQueue
 from .auth import (
     ANONYMOUS,
@@ -46,6 +46,7 @@ from .auth import (
     PROOF_HEADER,
     ROUTE,
     SESSION_COOKIE,
+    SIGN_HEADERS,
     TASK,
     ClientAuth,
     Unauthenticated,
@@ -68,7 +69,9 @@ from .signin import NotGalatea, SigninCodes, galatea_ticket
 from .bootstrap import PionirRuntime
 from .cli import _capabilities, _doctor, _jsonable
 from .posting_health import posting_health
-from .contracts import RiskLevel, Task, outcome_ok
+from .contracts import ModelRequirement, RiskLevel, Task, outcome_ok
+from .consolidate import AUTO_CONSOLIDATE_AT
+from .cortex import NewMemory, failure_shape
 from .errors import PionirError, RoutingAmbiguous
 from .router import Candidate, IntentRouter, RoutingDecision
 from .runtime import AuditEvent
@@ -307,6 +310,28 @@ def _candidate_json(candidate: Candidate) -> dict[str, Any]:
     }
 
 
+def _exchange_gist(response: Mapping[str, Any]) -> str:
+    """One line of what an intent came back with, for the voice's raw turn."""
+    status = str(response.get("status") or "")
+    head = status + (f" by {response['agent_id']}" if response.get("agent_id") else "")
+    text = ""
+    error, result = response.get("error"), response.get("result")
+    if isinstance(error, Mapping):
+        text = str(error.get("message") or error.get("type") or "")
+    elif isinstance(result, Mapping):
+        for key in ("reply", "answer", "summary", "message", "text", "output", "error"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value.strip()
+                break
+        else:
+            text = json.dumps(result, default=str)[:600]
+    elif isinstance(result, str):
+        text = result.strip()
+    text = text or str(response.get("question") or response.get("note") or "")
+    return (head or "answered") + (f": {text[:600]}" if text else "")
+
+
 def _product_gist(payload: Mapping[str, Any]) -> str:
     """"Post Guard 1.0.0 ($19.00) - post-guard" for a product listing's payload."""
     words = [" ".join(str(payload["name"]).split())]
@@ -348,6 +373,30 @@ class PionirApp:
         self._proteus_snapshot: dict[str, Any] | None = None
         self._proteus_at: float | None = None
         self._proteus_busy = False
+        # Folding the voice's raw turns into episodes (_consolidate). None builds an
+        # OllamaDistiller from settings.distil_model at fold time; a test injects a fake.
+        self.distiller: Any = None
+        self._consolidating: set[str] = set()
+        self._consolidating_lock = threading.Lock()
+        self._consolidation_thread: threading.Thread | None = None
+
+    # ---- the work log: the owner's hours and pay -----------------------------
+    def worklog(self) -> Any:
+        """The work log (pionir/worklog.py) at this runtime's state root: its own file, never
+        the memory db. Built per call - it holds no connection - so a test's temp state root
+        and a moved PIONIR_STATE_ROOT are both honoured."""
+        from .worklog import worklog_for
+        return worklog_for(self.runtime.settings, known=lambda: self.auth.tokens.values())
+
+    def audit_work(self, client: str, detail: str) -> None:
+        """One ledger line per successful work-log write: which route and which ids - never
+        a note, a rate or an amount (the ledger is metadata-only)."""
+        try:
+            self.runtime.executive.audit_sink.record(AuditEvent(
+                event_type="work.write", task_id=uuid.uuid4(), agent_id=client,
+                occurred_at=datetime.now(UTC), detail=detail))
+        except Exception:  # noqa: BLE001 - the write is done; say the ledger missed it
+            _log.warning("recording a work-log write failed", exc_info=True)
 
     # ---- proteus: the trading plane, read ------------------------------
     def proteus_view(self, *, refresh: Callable[[Callable[[], None]], None] | None = None,
@@ -690,12 +739,16 @@ class PionirApp:
         decision = self.router.classify(request)
         base = {"decision": _decision_json(decision)}
         body = {"request": request}
+        # The voice's exchanges are raw turns in her own namespace (per bot, never
+        # the shared lessons one), which consolidation folds into episodes + facts.
+        namespace = client if client and client != ANONYMOUS else "voice"
 
         def settle(response: dict[str, Any]) -> dict[str, Any]:
             # No work to run: the answer is the decision itself. Still a job, so
             # the record of what the voice asked and what she was told persists.
             record = self.jobs.create("intent", body)
             self.jobs.finish(record["task_id"], _job_status(response), result=response)
+            self._remember_exchange(namespace, request, response)
             return {**response, "task_id": record["task_id"]}
 
         def run(capability: str, permissions: frozenset[str]) -> dict[str, Any]:
@@ -703,11 +756,13 @@ class PionirApp:
             # An unauthenticated caller (the compatibility window) gets none of them.
             if client == ANONYMOUS and (permissions or self._privileged(capability)):
                 raise Unauthenticated(f"{capability} is privileged; send your client token")
-            return self._submit(
-                "intent", body,
-                lambda: self._run_intent(capability, {"content": request}, permissions, decision),
-                wait, known=base,
-            )
+            def work() -> dict[str, Any]:
+                response = self._run_intent(
+                    capability, {"content": request}, permissions, decision)
+                self._remember_exchange(namespace, request, response)
+                return response
+
+            return self._submit("intent", body, work, wait, known=base)
 
         if not decision.resolved:
             if _NAMES_A_DOER.search(request):
@@ -749,6 +804,8 @@ class PionirApp:
         return None
 
     def _run_intent(self, capability, payload, permissions, decision, *, planned=False):
+        # Recall-before-act on the voice's seam too, not only on /api/task.
+        lessons = self._recall_lessons(capability, payload)
         try:
             # routing_detail: the ledger's task.routed event carries the router's
             # confidence and runner-up, as it does for `pionir route`.
@@ -757,12 +814,16 @@ class PionirApp:
                 routing_detail=decision.audit_detail(),
             )
         except Exception as error:  # noqa: BLE001 - returned to the voice as data
-            return {
+            response = {
                 "decision": _decision_json(decision),
                 "status": "error",
                 "error": {"type": type(error).__name__, "message": str(error)},
             }
-        return {
+            if lessons:
+                response["lessons"] = lessons
+            self._learn_from_failure(capability, payload, response)
+            return response
+        response = {
             "decision": _decision_json(decision),
             "status": "planned" if planned else "done",
             "planned": planned,
@@ -770,6 +831,112 @@ class PionirApp:
             "result": _jsonable(result.output),
             "evidence": list(result.evidence),
         }
+        if lessons:
+            response["lessons"] = lessons
+        return response
+
+    # ---- the voice's turns, and folding them into memory ------------------
+    # Fold a namespace once this many raw turns (two per exchange) are waiting.
+    CONSOLIDATE_AT = AUTO_CONSOLIDATE_AT
+    MAX_CHUNKS_PER_PASS = 4
+
+    def _remember_exchange(self, namespace: str, request: str,
+                           response: Mapping[str, Any]) -> None:
+        """Write one exchange - what was asked, what came back - as two raw
+        `message` turns in the asker's own namespace, then fold the namespace if
+        enough have piled up. Nothing wrote a raw turn before this: the store held
+        lessons only, and consolidation had nothing to fold and never ran.
+        Best-effort, logged: memory never fails the voice's request."""
+        cortex = getattr(self.runtime, "cortex", None)
+        if cortex is None:
+            return
+        # Scrubbed before storage (pionir/secretscrub.py and this server's client
+        # tokens): a turn is kept for up to TURN_RETENTION_DAYS after it is folded,
+        # and what is distilled from it longer - no secret should ride along.
+        known = tuple(self.auth.tokens.values())
+        try:
+            cortex.remember_many([
+                NewMemory("message", "asked: " + secretscrub.scrub_text(
+                    request.strip()[:600], known), namespace),
+                NewMemory("message", "told: " + secretscrub.scrub_text(
+                    _exchange_gist(response), known), namespace),
+            ])
+        except Exception:  # noqa: BLE001 - logged, never raised into the voice's turn
+            _log.warning("recording the %s exchange as raw turns failed", namespace,
+                         exc_info=True)
+            return
+        self._maybe_consolidate(namespace)
+
+    def _maybe_consolidate(self, namespace: str) -> bool:
+        """Start one background fold of ``namespace`` when its backlog reached
+        CONSOLIDATE_AT and none is running for it. Driven by the voice's own
+        traffic inside this process - nothing is scheduled, nothing self-starts.
+        Returns whether a fold was started."""
+        from .consolidate import Consolidator
+
+        try:
+            # enough turns waiting, and their oldest chunk not backing off after a
+            # failure - so a failing fold is not retried on every exchange
+            due = Consolidator(self.runtime.cortex, None).due(  # type: ignore[arg-type]
+                namespace, min_turns=self.CONSOLIDATE_AT)
+        except Exception:  # noqa: BLE001
+            _log.warning("checking %s raw turns failed", namespace, exc_info=True)
+            return False
+        if not due:
+            return False
+        with self._consolidating_lock:
+            if namespace in self._consolidating:
+                return False
+            self._consolidating.add(namespace)
+        thread = threading.Thread(target=self._consolidate, args=(namespace,),
+                                  name=f"pionir-consolidate-{namespace}", daemon=True)
+        self._consolidation_thread = thread
+        thread.start()
+        return True
+
+    def _consolidate(self, namespace: str) -> None:
+        """One fold, under a lease for the distil model like any model work, and
+        yielding to Bryo when he advises deferring heavy work. Every outcome lands
+        in the store's consolidation log, so doctor can say when it last ran."""
+        from .consolidate import Consolidator, OllamaDistiller
+
+        cortex = self.runtime.cortex
+        try:
+            model = self.runtime.settings.distil_model
+            distiller = self.distiller
+            if distiller is None:
+                if not model:
+                    cortex.note_consolidation(namespace, "off", detail="no distil model set")
+                    return
+                distiller = OllamaDistiller(model)
+            reading = self.runtime.executive.body_reading()
+            if (reading is not None and getattr(reading, "alive", False) is True
+                    and getattr(reading, "defer_heavy_work", False) is True):
+                cortex.note_consolidation(namespace, "deferred",
+                                          detail=str(getattr(reading, "detail", "bryo")))
+                return
+            # Declared like Atani's 4B: a CPU/elastic tenant that never takes the card
+            # from the voice. The lease is for accounting and the one-at-a-time rule.
+            requirement = ModelRequirement(model or "distiller", 0, requires_gpu=False)
+            cortex.purge()  # retention rides along with the fold, on the same traffic
+            with self.runtime.executive.scheduler.acquire(
+                    requirement, purpose=f"pionir: consolidate {namespace}"):
+                consolidator = Consolidator(cortex, distiller)
+                # a bounded chunk per fold; a few per pass, oldest first
+                for _ in range(self.MAX_CHUNKS_PER_PASS):
+                    if consolidator.consolidate(namespace,
+                                                min_turns=self.CONSOLIDATE_AT) is None:
+                        break
+        except Exception as error:  # noqa: BLE001 - logged and recorded, never silent
+            _log.warning("consolidating %s failed", namespace, exc_info=True)
+            try:
+                cortex.note_consolidation(namespace, "failed",
+                                          detail=f"{type(error).__name__}: {error}")
+            except Exception:  # noqa: BLE001
+                _log.warning("recording the failed consolidation failed", exc_info=True)
+        finally:
+            with self._consolidating_lock:
+                self._consolidating.discard(namespace)
 
     def _cap_and_agent(self, name: str):
         for manifest in self.runtime.executive.registry.manifests():
@@ -962,13 +1129,15 @@ class PionirApp:
         *, deferrable: bool = False,
     ) -> dict[str, Any]:
         """The synchronous core: run it now, on this thread, and report as data."""
-        self._recall_lessons(capability, payload)
+        lessons = self._recall_lessons(capability, payload)
         try:
             result = self.runtime.executive.execute(
                 Task(capability, payload, frozenset(granted)), deferrable=deferrable
             )
         except Exception as error:  # noqa: BLE001 - returned as data
             response = {"ok": False, "error": {"type": type(error).__name__, "message": str(error)}}
+            if lessons:
+                response["lessons"] = lessons
             self._learn_from_failure(capability, payload, response)
             return response
         # The adapter can return normally and still carry a failing verdict; the
@@ -982,26 +1151,34 @@ class PionirApp:
             "result": _jsonable(result.output),
             "evidence": list(result.evidence),
         }
+        if lessons:
+            response["lessons"] = lessons
         if not ok:
             self._learn_from_failure(capability, payload, response)
         return response
 
-    def _recall_lessons(self, capability: str, payload: dict[str, Any]) -> None:
-        """Consult the shared lessons namespace before tasking a doer, and note
-        what was recalled in the ledger, so a mistake learned once is in front of
-        the next similar action (the recall-before-act hook, previously only wired
-        into the CLI)."""
+    def _recall_lessons(self, capability: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """Consult the shared lessons namespace before tasking a doer, note what
+        was recalled in the ledger, and RETURN it, so the caller's response
+        carries the lessons (`lessons`) to whoever sent the task. They used to be
+        recalled, counted in the ledger and thrown away - 3,134 recalls and not one
+        reached a caller, while the same fiverr.ack mistake repeated 398 times.
+
+        Each lesson is ``{"id", "untrusted_text", "seen"[, "via"]}``. The text is
+        UNTRUSTED DATA: scrubbed, but written from failures anywhere in the estate.
+        A consumer may show it or weigh it; it must never execute or obey it."""
 
         cortex = getattr(self.runtime, "cortex", None)
         if cortex is None:
-            return
+            return []
         context = self._summarize(capability, payload)
         try:
             lessons = cortex.lessons_for(context)
         except Exception:  # noqa: BLE001 - memory must never fail a task
-            return
+            _log.warning("recalling lessons for %s failed", capability, exc_info=True)
+            return []
         if not lessons:
-            return
+            return []
         try:
             self.runtime.executive.audit_sink.record(
                 AuditEvent(
@@ -1009,11 +1186,19 @@ class PionirApp:
                     task_id=uuid.uuid4(),
                     agent_id=capability.split(".")[0],
                     occurred_at=datetime.now(UTC),
-                    detail=f"capability={capability} lessons={len(lessons)}",
+                    detail=(f"capability={capability} lessons={len(lessons)} "
+                            f"ids={','.join(str(m.id) for m in lessons)}"),
                 )
             )
         except Exception:  # noqa: BLE001
             _log.warning("recording recalled-lessons event failed", exc_info=True)
+        # Structured data, never prose to splice into a prompt: the text is marked
+        # untrusted (it came from failures of other bots' tasks), and consumers
+        # must treat it as data to show or weigh - never as instructions to follow.
+        known = tuple(self.auth.tokens.values())
+        return [{"id": m.id, "untrusted_text": secretscrub.scrub_text(m.text, known),
+                 "seen": int(m.meta.get("seen", 1)), **({"via": m.via} if m.via else {})}
+                for m in lessons]
 
     def _learn_from_failure(
         self, capability: str, payload: dict[str, Any], response: dict[str, Any]
@@ -1025,16 +1210,22 @@ class PionirApp:
         cortex = getattr(self.runtime, "cortex", None)
         if cortex is None:
             return
+        # Structural facts only - who, which capability, the error class and code.
+        # Never the request (_summarize's gist is the caller's own words, e.g. the
+        # voice's request) and never the failure's free text, which can echo it:
+        # a lesson is shared with every bot and handed back to every caller.
         error = response.get("error")
-        why = ""
         if isinstance(error, Mapping):
-            why = str(error.get("message") or error.get("type") or "")
-        elif isinstance(response.get("result"), Mapping):
-            why = str(response["result"].get("error") or "")
-        summary = self._summarize(capability, payload)
-        text = f"{summary} failed" + (f": {why[:300]}" if why else "")
+            shape = failure_shape(str(error.get("message") or ""), str(error.get("type") or "error"))
+        else:
+            result = response.get("result")
+            message = str(result.get("error") or "") if isinstance(result, Mapping) else ""
+            shape = failure_shape(message, "reported failure")
+        agent, _cap = self._cap_and_agent(capability)
+        text = f"{agent or capability.split('.')[0]} · {capability} failed: {shape}"
         try:
-            cortex.record_lesson(text, slug=f"failure:{capability}")
+            cortex.record_lesson(text, slug=f"failure:{capability}",
+                                 known=self.auth.tokens.values())
         except Exception:  # noqa: BLE001 - a lesson write must never fail a task
             _log.warning("recording failure lesson failed", exc_info=True)
 
@@ -1249,18 +1440,29 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                     break
                 length -= len(chunk)
 
-        def _body(self) -> dict[str, Any] | None:
+        def _raw_body(self) -> bytes | None:
+            """The request body's bytes (what a signature's body hash covers), or None
+            when it is too large or its length is not a number."""
             try:
                 length = int(self.headers.get("Content-Length") or 0)
             except ValueError:
                 return None
             if length <= 0:
-                return {}
+                return b""
             if length > MAX_REQUEST_BYTES:
                 self._drain()
                 return None
+            return self.rfile.read(length)
+
+        def _body(self, raw: bytes | None = None) -> dict[str, Any] | None:
+            if raw is None:
+                raw = self._raw_body()
+                if raw is None:
+                    return None
+            if not raw:
+                return {}
             try:
-                document = json.loads(self.rfile.read(length).decode("utf-8"))
+                document = json.loads(raw.decode("utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError):
                 return None
             return document if isinstance(document, dict) else None
@@ -1306,6 +1508,12 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if route.path.startswith("/api/library/"):
+                self._library(route)
+                return
+            if route.path.startswith("/api/work/"):
+                self._work(route)
+                return
             try:
                 if route.path == "/api/state":
                     self._send(app.state())
@@ -1344,13 +1552,102 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
             except Exception as error:  # noqa: BLE001
                 self._send({"error": type(error).__name__, "message": str(error)}, 500)
 
-        def _caller(self, path: str) -> tuple[str | None, int, str]:
+        def _library(self, route: Any) -> None:
+            """The Library (pionir/library.py): the owner's surfaces read Pionir's memory,
+            read-only. Unlike /api/state it needs the caller to prove who it is - signed
+            (the desktop) or the dashboard's session."""
+            head = self.headers
+            if any(head.get(h) is not None for h in SIGN_HEADERS):
+                client, refused = app.auth.from_signed(
+                    head.get("X-Pionir-Client"), "GET", self.path, head.get("X-Pionir-Ts"),
+                    head.get("X-Pionir-Nonce"), head.get("X-Pionir-Sig"), body=b"")
+            else:
+                client, refused = app.auth.from_headers(head.get("Authorization"),
+                                                        head.get("Cookie"),
+                                                        head.get(PROOF_HEADER))
+            cortex = getattr(app.runtime, "cortex", None)
+            path = getattr(cortex, "path", None)
+            status, document = library.serve(
+                route.path, route.query, client=client, refused=refused,
+                # the file and its embedder only: the Library reads on its own read-only
+                # connection and never takes the live store's lock
+                store=lambda: (Path(path) if path is not None else None,
+                               getattr(cortex, "embedder", None)),
+                known=lambda: app.auth.tokens.values())
+            self._send(document, status)
+
+        def _work(self, route: Any) -> None:
+            """The work log (pionir/workapi.py): the owner's surfaces only - Pionir Desktop
+            signed, or the dashboard's session - for reads AND writes. A write's body is read
+            first (bounded: a bigger one is refused unread) because a signature covers it."""
+            method = self.command
+            head = self.headers
+            raw = b""
+            if method != "GET":
+                try:
+                    length = int(head.get("Content-Length") or 0)
+                except ValueError:
+                    length = -1
+                if length < 0 or length > workapi.MAX_BODY:
+                    self._drain()
+                    self.close_connection = True
+                    self._send({"error": "too large", "reason": "the body is over "
+                                f"{workapi.MAX_BODY} bytes"}, 413)
+                    return
+                raw = self.rfile.read(length) if length > 0 else b""
+            if any(head.get(h) is not None for h in SIGN_HEADERS):
+                client, refused = app.auth.from_signed(
+                    head.get("X-Pionir-Client"), method, self.path, head.get("X-Pionir-Ts"),
+                    head.get("X-Pionir-Nonce"), head.get("X-Pionir-Sig"), body=raw)
+            else:
+                client, refused = app.auth.from_headers(head.get("Authorization"),
+                                                        head.get("Cookie"),
+                                                        head.get(PROOF_HEADER))
+            try:
+                log = app.worklog()
+                status, document, detail = workapi.serve(
+                    method, route.path, route.query, raw, client=client, refused=refused,
+                    log=log, known=lambda: app.auth.tokens.values())
+            except Exception as error:  # noqa: BLE001 - never a stack trace to a client
+                _log.warning("work log request failed: %s", type(error).__name__)
+                self._send({"error": "work log unavailable", "reason": type(error).__name__}, 500)
+                return
+            if detail is not None and status == 200 and client is not None:
+                app.audit_work(client, detail)
+            self._send(document, status)
+
+        def do_DELETE(self) -> None:
+            route = urlparse(self.path)
+            refused = _host_allowed(self.headers, bind_host)
+            host_header = self.headers.get("Host") or ""
+            origin = self.headers.get("Origin")
+            if refused is None and origin is not None                     and origin.strip().lower() != f"http://{host_header.strip()}".lower():
+                refused = "origin does not match host"
+            if refused is not None:
+                self._drain()
+                self._send({"error": "forbidden", "reason": refused}, 403)
+                return
+            if route.path.startswith("/api/work/"):
+                self._work(route)
+                return
+            self._drain()
+            self._send({"error": "not found"}, 404)
+
+        def _caller(self, path: str, raw: bytes | None = None) -> tuple[str | None, int, str]:
             """Who is POSTing, or (None, status, why) to refuse it. A credential that is
             present must be right; none at all is ``anonymous``, served only in the
-            compatibility window and never for the approval routes."""
-            client, refused = app.auth.from_headers(self.headers.get("Authorization"),
-                                                    self.headers.get("Cookie"),
-                                                    self.headers.get(PROOF_HEADER))
+            compatibility window and never for the approval routes. ``raw`` is the body
+            of a SIGNED request (pionir/auth.py request_sig): its signature is its only
+            credential, checked over exactly these bytes."""
+            if raw is not None:
+                head = self.headers
+                client, refused = app.auth.from_signed(
+                    head.get("X-Pionir-Client"), self.command, self.path, head.get("X-Pionir-Ts"),
+                    head.get("X-Pionir-Nonce"), head.get("X-Pionir-Sig"), body=raw)
+            else:
+                client, refused = app.auth.from_headers(self.headers.get("Authorization"),
+                                                        self.headers.get("Cookie"),
+                                                        self.headers.get(PROOF_HEADER))
             if refused is not None:
                 return None, 401, refused
             needed = _POST_ROUTES[path]
@@ -1390,17 +1687,28 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                         self.headers.get("X-Pionir-Sign"), self.server.server_address[1])
                 self._send(out if out else {"error": "refused"}, 200 if out else 403)
                 return
+            if route.path.startswith("/api/work/"):
+                self._work(route)
+                return
             if route.path not in _POST_ROUTES:
                 self._drain()
                 self._send({"error": "not found"}, 404)
                 return
-            client, status, why = self._caller(route.path)
+            # a signed request: read its body first - the signature covers those bytes
+            raw = None
+            if any(self.headers.get(h) is not None for h in SIGN_HEADERS):
+                raw = self._raw_body()
+                if raw is None:
+                    self._send({"error": "bad body"}, 400)
+                    return
+            client, status, why = self._caller(route.path, raw)
             if client is None:
-                self._drain()
+                if raw is None:
+                    self._drain()
                 self._send({"error": "unauthorized" if status == 401 else "forbidden",
                             "reason": why}, status)
                 return
-            body = self._body()
+            body = self._body(raw)
             if body is None:
                 self._send({"error": "bad json"}, 400)
                 return
@@ -1532,6 +1840,25 @@ def _start_pulse(app: PionirApp) -> tuple[threading.Thread | None, threading.Eve
     return thread, stop
 
 
+def gate_scheduler(settings: Any, voice: Callable[[], Any], *, evict: Callable[[str], None],
+                   rewarm: Callable[[str], None], loaded: Callable[[], list[str]]) -> Any:
+    """The Ollama gate's scheduler: the executive's lock, budget and protected models, a short
+    wait for the lock, and an unload that asks the voice again right before her model goes
+    (guarded_evictor) - never the raw unload."""
+    from .ollama_gate import guarded_evictor
+    from .scheduler import ModelLeaseScheduler
+    from .shared_gpu import SharedGpuLock
+
+    return ModelLeaseScheduler(
+        settings.resource_budget, shared_gpu_lock=SharedGpuLock(settings.gpu_lock_path),
+        # her model goes only if she is provably idle at the moment of the unload
+        evict_to_fit=settings.evict_to_fit,
+        evictor=guarded_evictor(evict, voice, settings.protected_models),
+        loaded_probe=loaded, protected_models=settings.protected_models, rewarmer=rewarm,
+        lock_wait_seconds=20.0, lock_poll_seconds=2.0,
+    )
+
+
 def _start_ollama_gate(runtime: PionirRuntime) -> tuple[Any, str]:
     """Start the Ollama gate on PIONIR_OLLAMA_GATE_PORT (default 8774; "0"/"off" leaves it
     off). Its GPU arbiter has its own scheduler on the SAME shared lock, budget, protected
@@ -1541,8 +1868,6 @@ def _start_ollama_gate(runtime: PionirRuntime) -> tuple[Any, str]:
     card; PIONIR_OLLAMA_GATE_MODELS widens the allowlist (comma list)."""
     from .benchmark import read_loaded_models, unload, warm
     from .ollama_gate import GATE_PORT, PETER_MODEL, GpuArbiter, OllamaGate, voice_probe
-    from .scheduler import ModelLeaseScheduler
-    from .shared_gpu import SharedGpuLock
 
     raw = (os.environ.get("PIONIR_OLLAMA_GATE_PORT") or str(GATE_PORT)).strip().lower()
     if raw in {"", "0", "off", "none", "false"}:
@@ -1555,17 +1880,13 @@ def _start_ollama_gate(runtime: PionirRuntime) -> tuple[Any, str]:
                                      agent_id="ollama-gate", occurred_at=datetime.now(UTC),
                                      detail=detail))
 
-    scheduler = ModelLeaseScheduler(
-        settings.resource_budget, shared_gpu_lock=SharedGpuLock(settings.gpu_lock_path),
-        evict_to_fit=settings.evict_to_fit, evictor=unload,
-        loaded_probe=lambda: [item.name for item in read_loaded_models()],
-        protected_models=settings.protected_models, rewarmer=warm,
-        lock_wait_seconds=20.0, lock_poll_seconds=2.0,
-    )
+    voice = voice_probe(runtime.adapters.get("galatea"))
+    scheduler = gate_scheduler(settings, voice, evict=unload, rewarm=warm,
+                               loaded=lambda: [item.name for item in read_loaded_models()])
     models = [m.strip() for m in (os.environ.get("PIONIR_OLLAMA_GATE_MODELS") or PETER_MODEL)
               .split(",") if m.strip()]
     try:
-        arbiter = GpuArbiter(scheduler, voice_idle=voice_probe(runtime.adapters.get("galatea")),
+        arbiter = GpuArbiter(scheduler, voice_idle=voice,
                              mode=(os.environ.get("PIONIR_OLLAMA_GATE_MODE") or "auto").strip().lower(),
                              on_event=audit)
         gate = OllamaGate(models, port=int(raw), arbiter=arbiter)

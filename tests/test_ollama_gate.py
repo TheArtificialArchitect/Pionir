@@ -16,6 +16,7 @@ ephemeral port. Each test names the behaviour it pins; reverting it fails the te
 import json
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -25,6 +26,7 @@ from pathlib import Path
 from pionir.errors import AdapterUnavailable, ResourceUnavailable
 from pionir.ollama_gate import (
     PETER_MODEL,
+    guarded_evictor,
     GpuArbiter,
     OllamaGate,
     on_cpu,
@@ -313,6 +315,8 @@ class HttpTests(unittest.TestCase):
             doc = json.loads(resp.read())
         self.assertEqual(doc["models"], [PETER_MODEL])
         self.assertEqual(doc["arbiter"]["counts"]["cpu"], 1)
+        self.assertEqual((doc["arbiter"]["last"]["where"], doc["arbiter"]["last"]["model"]),
+                         ("cpu", PETER_MODEL))
 
 
 class VoiceProbeTests(unittest.TestCase):
@@ -332,8 +336,13 @@ class VoiceProbeTests(unittest.TestCase):
 
     def test_yielding_absent_busy_and_unknown(self) -> None:
         probe = lambda answer: voice_probe(self._Adapter(answer))()  # noqa: E731
-        self.assertIs(probe({"gpu": {"yielding": True}}), True)
-        self.assertIs(probe({"gpu": {"yielding": False}}), False)
+        self.assertIs(probe({"gpu": {"yielding": True, "in_flight": 0}}), True)
+        self.assertIs(probe({"gpu": {"yielding": False, "in_flight": 0}}), False)
+        # yielding is set at the top of a tick that can still go on into a model call:
+        # while one is on the wire she is NOT idle, and a Galatea that cannot say is unknown
+        self.assertIs(probe({"gpu": {"yielding": True, "in_flight": 1}}), False)
+        self.assertIsNone(probe({"gpu": {"yielding": True}}))
+        self.assertIsNone(probe({"gpu": {"yielding": True, "in_flight": True}}))
         self.assertIs(probe(self._refused()), True)                     # not running at all
         self.assertIsNone(probe(AdapterUnavailable("timed out")))        # up but unreadable
         self.assertIsNone(probe({"status": "awake"}))                    # no gpu field
@@ -342,3 +351,153 @@ class VoiceProbeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecheckBeforeUnloadTests(unittest.TestCase):
+    """Her model goes only if she is idle AT THE MOMENT of the unload: a turn she started
+    after saying she yielded keeps it, and Peter goes to the CPU."""
+
+    def test_a_voice_busy_again_at_unload_time_keeps_her_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            card = _Card([VOICE])
+            answers = iter([True, False])           # idle when the lease settles, busy at unload
+            voice = lambda: next(answers)           # noqa: E731
+            scheduler = _scheduler(card, SharedGpuLock(Path(tmp) / "gpu.lock"))
+            scheduler.evictor = guarded_evictor(card.unload, voice, [VOICE])
+            clock = _Clock()
+            arbiter = GpuArbiter(scheduler, voice_idle=voice, clock=clock, sleep=clock.sleep,
+                                 confirm_seconds=5.0)
+            placement = arbiter.place(PETER_MODEL)
+            self.assertEqual(placement.where, "cpu")
+            self.assertEqual(card.unloaded, [])
+            self.assertIn(VOICE, card.resident)
+
+    def test_other_models_are_not_held_hostage_by_the_guard(self) -> None:
+        card = _Card(["some-model:latest"])
+        guarded_evictor(card.unload, lambda: False, [VOICE])("some-model:latest")
+        self.assertEqual(card.unloaded, ["some-model:latest"])
+
+
+class _SlowOllama(BaseHTTPRequestHandler):
+    """Answers only when released; records every request that reached it and whether the
+    gate hung up on it."""
+    started: list = []
+    hung_up: list = []
+    release = threading.Event()
+
+    def do_POST(self) -> None:  # noqa: N802
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+        type(self).started.append(body.get("prompt"))
+        import select as _select
+        while not type(self).release.wait(0.05):
+            r, _, _ = _select.select([self.connection], [], [], 0)
+            if r and self.connection.recv(1, __import__("socket").MSG_PEEK) == b"":
+                type(self).hung_up.append(body.get("prompt"))
+                return
+        data = json.dumps({"response": "ok"}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, *_a) -> None:
+        pass
+
+
+class AbandonedCallTests(unittest.TestCase):
+    """Peter gives up at 120 s. The gate must not keep his abandoned calls alive: the
+    upstream call is closed when he hangs up or his budget runs out, and a queued call
+    whose caller has gone is dropped before it ever reaches Ollama."""
+
+    def setUp(self) -> None:
+        _SlowOllama.started, _SlowOllama.hung_up = [], []
+        _SlowOllama.release = threading.Event()
+        self.upstream = ThreadingHTTPServer(("127.0.0.1", 0), _SlowOllama)
+        self.upstream.daemon_threads = True
+        threading.Thread(target=self.upstream.serve_forever, daemon=True).start()
+        self.up = f"http://127.0.0.1:{self.upstream.server_address[1]}"
+
+    def tearDown(self) -> None:
+        _SlowOllama.release.set()
+        self.gate.stop()
+        self.upstream.shutdown()
+        self.upstream.server_close()
+
+    def _gate(self, budget: float) -> OllamaGate:
+        self.gate = OllamaGate([PETER_MODEL], upstream=self.up, port=0, caller_budget=budget,
+                               watch_seconds=0.05)
+        self.gate.start()
+        return self.gate
+
+    def _call(self, prompt: str, timeout: float):
+        import socket as _socket
+        body = json.dumps({"model": PETER_MODEL, "prompt": prompt}).encode()
+        sock = _socket.create_connection(("127.0.0.1", self.gate.port), timeout=timeout)
+        sock.sendall(b"POST /api/generate HTTP/1.1\r\nHost: x\r\n"
+                     b"Content-Type: application/json\r\nContent-Length: " + str(len(body)).encode()
+                     + b"\r\n\r\n" + body)
+        return sock
+
+    def _wait(self, cond, seconds: float = 5.0) -> bool:
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if cond():
+                return True
+            time.sleep(0.02)
+        return cond()
+
+    def test_a_caller_that_hangs_up_is_aborted_upstream_and_the_queue_moves(self) -> None:
+        self._gate(budget=30)
+        first = self._call("first", 5)
+        self.assertTrue(self._wait(lambda: _SlowOllama.started == ["first"]))
+        queued = self._call("queued", 5)                  # waits its turn behind "first"
+        time.sleep(0.2)
+        queued.close()                                    # ...and gives up while queued
+        # dropped from the queue at once - not left waiting behind "first" for its turn
+        self.assertTrue(self._wait(lambda: self.gate.abandoned == 1, 2.0), self.gate.abandoned)
+        self.assertEqual(_SlowOllama.hung_up, [])
+        first.close()                                     # the first caller gives up too
+        self.assertTrue(self._wait(lambda: _SlowOllama.hung_up == ["first"]), _SlowOllama.hung_up)
+        self.assertTrue(self._wait(lambda: self.gate.abandoned == 2), self.gate.abandoned)
+        # the abandoned queued call never reached Ollama, and the gate is free again
+        _SlowOllama.release.set()
+        live = self._call("live", 5)
+        self.assertIn(b"200", live.recv(64))
+        live.close()
+        self.assertEqual(_SlowOllama.started, ["first", "live"])
+
+    def test_the_upstream_call_gets_no_more_than_the_callers_budget(self) -> None:
+        self._gate(budget=0.6)
+        t0 = time.monotonic()
+        caller = self._call("slow", 10)
+        reply = caller.recv(256)
+        took = time.monotonic() - t0
+        caller.close()
+        self.assertIn(b"504", reply)
+        self.assertLess(took, 3.0)                        # not the 900 s it used to hold
+        self.assertTrue(self._wait(lambda: _SlowOllama.hung_up == ["slow"]))
+
+
+class ServerWiringTests(unittest.TestCase):
+    """The scheduler the server builds for the gate must unload through guarded_evictor:
+    wired to the raw unload, a voice busy at that moment would lose her model."""
+
+    def test_the_gate_scheduler_asks_the_voice_before_every_protected_unload(self) -> None:
+        from pionir.config import PionirSettings
+        from pionir.server import gate_scheduler
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = PionirSettings(state_root=Path(tmp), embed_model=None)
+            card = _Card([VOICE, "other:latest"])
+            busy = {"idle": False}
+            scheduler = gate_scheduler(settings, lambda: busy["idle"], evict=card.unload,
+                                       rewarm=card.warm, loaded=card.loaded)
+            with self.assertRaises(Exception):
+                scheduler.evictor(VOICE)                  # busy right now: her model stays
+            scheduler.evictor("other:latest")             # anything unprotected just goes
+            self.assertEqual(card.unloaded, ["other:latest"])
+            busy["idle"] = True
+            scheduler.evictor(VOICE)
+            self.assertEqual(card.unloaded, ["other:latest", VOICE])
+            self.assertIn("gemma3:12b", scheduler.protected_models)
+            self.assertEqual(scheduler.lock_wait_seconds, 20.0)

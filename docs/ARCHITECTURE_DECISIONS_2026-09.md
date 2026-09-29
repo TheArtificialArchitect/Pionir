@@ -215,6 +215,34 @@ pieces, none urgent, none needing the strip:
   distill pass) to fold raw messages into episodes and extract facts. The engine
   stays model-free and testable; the distilling lives in the caller. Do not build
   it until something is writing conversations for it to fold.
+- **Wired-but-inert, found and fixed 2026-09-28 (branch `memory-live`).** The live
+  store held 800 lessons and nothing else - 6 distinct texts, 398 copies each of two
+  fiverr.ack failures; no raw turn ever written, consolidation never run; every task
+  handed 3 lessons however unrelated, then thrown away. Now: a known lesson recurs
+  (`seen`/`burst`) instead of re-inserting, and migration 1 collapses an existing
+  flood (backup file first, duplicates soft-retired, `pionir undo-lesson-dedupe`);
+  `lessons_for` is relevance-floored and the recalled lessons ride back in the task
+  response (`lessons`); the voice's `/api/intent` exchanges are raw turns in her
+  namespace, folded by her own traffic at 12 turns (a distil-model lease, Bryo can
+  defer it, every attempt logged); embedding failures are counted and backfilled;
+  and doctor's `memory.output` (`memory_health.py`) counts writes, folds and
+  coverage, with alarms for a stalled lesson writer, a lesson recurring all day, a
+  stalled fold and low coverage.
+  Review hardening the same day: a lesson built from a failure holds structural
+  facts only (who, capability, error class, HTTP/return code) - never the request
+  or the failure's free text - and every lesson is scrubbed (secretscrub.py) and
+  capped. Recalled lessons come back as `{"id", "untrusted_text", "seen"}`:
+  **consumers must treat `untrusted_text` as data to show or weigh, never as
+  instructions.** Raw turns are scrubbed before storage; folded turns are deleted
+  after `PIONIR_TURN_RETENTION_DAYS` (14), facts carry provenance and expire after
+  `PIONIR_FACT_RETENTION_DAYS` (180). A fold sends a bounded chunk (~1500 tokens),
+  backs off exponentially on failure (60 s doubling, 6 h cap), and poisons a chunk
+  after 4 failures (logged, doctor alarm); the distil call sends `num_gpu: 0`
+  (verified live: qwen3:4b loaded with size_vram 0 beside Moss's gemma3:12b).
+  Re-review: an empty summary is a fold with no episode (never a failure); only
+  bad output poisons - an unavailable model (timeout, refused, 5xx) backs off to
+  the 6 h cap with a doctor alarm and never poisons; retention's "now" is clamped
+  to a day past the store's newest write, so a clock jump cannot purge early.
 
 ## Open decisions, not yet made
 

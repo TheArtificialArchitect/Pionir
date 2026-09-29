@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 from uuid import UUID
 
+from .cortex import failure_shape
 from .contracts import (
     AgentManifest,
     Task,
@@ -167,7 +168,7 @@ class Executive:
             elif not isinstance(error, CircuitOpen):
                 # A rejected call holds no probe slot, so there is nothing to return.
                 self._count_failure(
-                    circuit, route.agent_id, f"{type(error).__name__}: {error}"
+                    circuit, route.agent_id, failure_shape(str(error), type(error).__name__)
                 )
             self._record("task.failed", task, route.agent_id, type(error).__name__)
             raise
@@ -193,15 +194,19 @@ class Executive:
             self._record("task.failed", task, route.agent_id, f"refused: {reason}")
             # A refusal may teach a lesson ("this doer refuses X"), but never the
             # circuit-trip lesson - that would falsely blame a working doer.
+            # Structural only (failure_shape): the refusal's own words can echo
+            # the request, and a lesson is shared with every bot.
             self._record_lesson(
-                f"{route.agent_id} refused a task (policy/germline, not a fault): {reason}"
+                f"{route.agent_id} refused a task {task.capability} (policy/germline, "
+                f"not a fault): {failure_shape(reason, 'refused')}"
             )
             return result
         if kind == "failed":
             # A real failure of the doer: it counts toward the circuit and the
             # ledger says task.failed with the reason.
             reason = outcome_failure_reason(result.output)
-            self._count_failure(circuit, route.agent_id, f"specialist reported {reason}")
+            self._count_failure(circuit, route.agent_id,
+                                failure_shape(reason, "specialist reported failure"))
             self._record("task.failed", task, route.agent_id, reason)
             return result
 

@@ -11,7 +11,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from . import benchmark, bridge_auth, bryofeed, recallcheck, routecheck
+from . import benchmark, bridge_auth, bryofeed, recallcheck, routecheck, workcli
 from .batching import DigestSettings, approval_level, batch_condition
 from .bootstrap import PionirRuntime, build_runtime
 from .config import PionirSettings
@@ -237,6 +237,11 @@ def _parser() -> argparse.ArgumentParser:
         "reindex-memory",
         help="embed any memories that lack a vector for the current model (hybrid recall backfill)",
     )
+    commands.add_parser(
+        "undo-lesson-dedupe",
+        help="reverse the duplicate-lesson collapse: re-activate every lesson it retired "
+             "(the pre-dedupe backup beside memory.db is the other way back)",
+    )
     rc = commands.add_parser(
         "recall-check",
         help=(
@@ -250,6 +255,7 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also run the probes through the local embedder to show the hybrid lift",
     )
+    workcli.add_parsers(commands)
     return parser
 
 
@@ -363,9 +369,26 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
         # Counts, not a health verdict. An empty store here is honest - ready and
         # unused, not broken - and distinguishing that from a store that recalls
         # nothing because it is broken is exactly the wired-but-inert check (3.1).
-        "memory": runtime.cortex.stats(),
+        "memory": {**runtime.cortex.stats(), "output": _memory_output(runtime)},
         "specialists": specialists,
     }
+
+
+def _memory_output(runtime: PionirRuntime) -> dict[str, Any]:
+    """What memory has DONE lately, with its stall alarms (memory_health.py) - the
+    counts above only say what is in the store, which looked healthy while nothing
+    but duplicate lessons was ever written."""
+    import time
+
+    from .memory_health import memory_health
+
+    sink = runtime.executive.audit_sink
+    try:
+        events = sink.recent(2000) if hasattr(sink, "recent") else []
+        return memory_health(runtime.cortex, events, now=time.time())
+    except Exception as error:  # noqa: BLE001 - doctor reports, it does not fail
+        return {"alerts": [f"MEMORY: its output could not be read: "
+                           f"{type(error).__name__}: {error}"]}
 
 
 def _declared_models(runtime: PionirRuntime) -> list[dict[str, Any]]:
@@ -657,6 +680,10 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
                 }
             )
         return 0
+    if args.command == "undo-lesson-dedupe":
+        _print({"restored_lessons": runtime.cortex.undo_lesson_dedupe(),
+                "stats": runtime.cortex.stats()})
+        return 0
     if args.command == "reindex-memory":
         filled = runtime.cortex.reindex()
         _print({"reindexed": filled, "stats": runtime.cortex.stats()})
@@ -796,6 +823,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print({"status": "ok", "directory": str(bridge_auth.secrets_dir()), "tokens": made,
                 "open_bridges": bridge_auth.open_bridges(made)})
         return 0
+    if args.command == "work":
+        # Its own database, opened directly: no runtime, no server, no network.
+        return workcli.run(args, PionirSettings.from_environment())
     if args.command == "bryo-feed":
         # A standalone poller: it reads the running server over HTTP and needs no
         # runtime of its own (no Cortex, no GPU lock), so it short-circuits here.

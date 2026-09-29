@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import array
 import functools
+import hashlib
 import json
 import logging
 import urllib.error
@@ -49,6 +50,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol, Sequence
+
+from . import secretscrub
 
 _log = logging.getLogger(__name__)
 
@@ -77,6 +80,12 @@ _DEFAULT_SALIENCE = 4.0
 # mistake learned once is recalled by all of them (docs/ARCHITECTURE_DECISIONS).
 LESSONS_NAMESPACE = "lessons"
 
+# The cosine a lesson needs, with no shared word, to count as relevant to what is
+# about to happen. Measured on the live store 2026-09-28 (nomic-embed-text): the
+# best UNRELATED lesson for any capability scored 0.47-0.57; the related ones
+# 0.60-0.87, and those also shared a word.
+LESSON_MIN_SIMILARITY = 0.6
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,7 +108,72 @@ CREATE TABLE IF NOT EXISTS vectors (
     vec       BLOB NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_vec_model ON vectors(model);
+CREATE TABLE IF NOT EXISTS consolidations (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         REAL    NOT NULL,
+    namespace  TEXT    NOT NULL,
+    outcome    TEXT    NOT NULL,
+    episode_id INTEGER,
+    folded     INTEGER NOT NULL DEFAULT 0,
+    detail     TEXT,
+    chunk_start INTEGER
+);
 """
+
+# A lesson is shared with every bot, so it holds at most this much text, scrubbed.
+LESSON_MAX_CHARS = 300
+# Retention (days): folded or poisoned raw turns are DELETED this long after they
+# were written; a distilled fact expires this long after it was distilled.
+TURN_RETENTION_DAYS = 14.0
+FACT_RETENTION_DAYS = 180.0
+# Retention never runs further ahead of the store's newest write than this.
+_PURGE_CLOCK_SLACK = 86400.0
+# How many pre-migration backups to keep beside the store.
+_KEEP_BACKUPS = 3
+
+# Schema/data migrations, tracked in PRAGMA user_version. 1 = collapse duplicate
+# lessons (the 2026-09-28 flood: 800 live lessons, 6 distinct texts).
+_SCHEMA_VERSION = 1
+
+# How long a burst of recurrences of one lesson is counted together (seconds).
+_BURST_SECONDS = 86400.0
+
+_ID_RUN = re.compile(r"\b(?:[0-9a-f]{8,}(?:-[0-9a-f]{4,})*|\d{5,})\b")
+_SPACE = re.compile(r"\s+")
+
+
+_HTTP_CODE = re.compile(r"\bHTTP\s*(\d{3})\b", re.IGNORECASE)
+_RETURN_CODE = re.compile(r"\breturn\s?code\W{0,3}(-?\d+)", re.IGNORECASE)
+
+
+def failure_shape(message: str | None, error_type: str | None = None) -> str:
+    """The structural facts of a failure - its error class and any HTTP status or
+    return code - and NONE of its free text. A failure message can echo the
+    request that caused it (a person's words, a secret) and a lesson is shared
+    with every bot and handed back to every caller, so a lesson built from a
+    failure is built from this, never from the message itself."""
+    parts = [error_type] if error_type else []
+    text = message or ""
+    if (code := _HTTP_CODE.search(text)) is not None:
+        parts.append(f"HTTP {code.group(1)}")
+    if (code := _RETURN_CODE.search(text)) is not None:
+        parts.append(f"returncode {code.group(1)}")
+    return ", ".join(parts) or "no detail"
+
+
+def scrub_lesson(text: str, known: Iterable[str] = ()) -> str:
+    """A lesson's text as it may be stored: secrets redacted, one line, capped."""
+    one_line = _SPACE.sub(" ", (text or "").strip())
+    clean = secretscrub.scrub_text(one_line, known)
+    return clean if len(clean) <= LESSON_MAX_CHARS else clean[: LESSON_MAX_CHARS - 1] + "…"
+
+
+def lesson_key(text: str) -> str:
+    """What makes two lessons the same lesson: the text, case- and space-folded,
+    with long id-like runs (event ids, uuids, timestamps) blanked. Short numbers
+    stay - HTTP 400 and HTTP 500 are different lessons."""
+    folded = _SPACE.sub(" ", (text or "").strip().casefold())
+    return _ID_RUN.sub("#", folded)
 
 _WORD = re.compile(r"[a-z0-9']+")
 _STOP = frozenset(
@@ -204,6 +278,64 @@ def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     return dot / math.sqrt(na * nb)
 
 
+def bm25_scored(q: list[str], candidates: list[Any]) -> list[tuple[float, Any]]:
+    """Raw BM25 score per candidate row that matches at least one query term. Pure: a
+    function of the rows given, so a reader on its own connection ranks exactly as
+    ``Cortex.recall`` does (pionir/library.py) without taking the live store's lock."""
+    toks = [tokens(c["text"]) for c in candidates]
+    n = len(candidates)
+    if not n:
+        return []
+    avgdl = sum(len(t) for t in toks) / n or 1.0
+    df: Counter = Counter()
+    for t in toks:
+        df.update(set(t))
+    k1, b = 1.5, 0.75
+    scored: list[tuple[float, Any]] = []
+    for row, t in zip(candidates, toks):
+        if not t:
+            continue
+        tf = Counter(t)
+        s = 0.0
+        for term in q:
+            f = tf.get(term)
+            if not f:
+                continue
+            idf = math.log(1 + (n - df[term] + 0.5) / (df[term] + 0.5))
+            s += idf * f * (k1 + 1) / (f + k1 * (1 - b + b * len(t) / avgdl))
+        if s > 0:
+            scored.append((s, row))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored
+
+
+def recency_weight(row: Any, now: float) -> float:
+    age_days = max(0.0, (now - row["ts"]) / 86400)
+    recency = 0.6 + 0.4 * math.exp(-age_days / 45)
+    return recency * (0.5 + row["salience"] / 12)
+
+
+def weight_lexical(lexical: list[tuple[float, Any]], now: float) -> list[tuple[float, Any]]:
+    """The lexical-only ranking: BM25 x recency x salience."""
+    scored = [(s * recency_weight(row, now), row) for s, row in lexical]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored
+
+
+def fuse(lexical: list[tuple[float, Any]], semantic: list[tuple[float, Any]],
+         now: float) -> list[tuple[float, Any]]:
+    """Reciprocal-rank fusion of the two rankings, then the recency/salience weight."""
+    fused: dict[int, dict] = {}
+    for rankings in (lexical, semantic):
+        for i, (_, row) in enumerate(rankings):
+            slot = fused.setdefault(row["id"], {"row": row, "rrf": 0.0})
+            slot["rrf"] += 1.0 / (RRF_K + i + 1)
+    scored = [(slot["rrf"] * recency_weight(slot["row"], now), slot["row"])
+              for slot in fused.values()]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored
+
+
 def _synchronized(method):
     """Hold the cortex lock for a whole public method.
 
@@ -227,10 +359,14 @@ class Cortex:
     embedding model, if any, runs in its own process (Ollama) - never in here."""
 
     def __init__(
-        self, path: str | Path, *, now=time.time, embedder: Embedder | None = None
+        self, path: str | Path, *, now=time.time, embedder: Embedder | None = None,
+        turn_retention_days: float = TURN_RETENTION_DAYS,
+        fact_retention_days: float = FACT_RETENTION_DAYS,
     ) -> None:
         self._now = now
         self.embedder = embedder
+        self.turn_retention_days = float(turn_retention_days)
+        self.fact_retention_days = float(fact_retention_days)
         self.path = Path(path)
         if self.path.parent and str(self.path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -245,6 +381,18 @@ class Cortex:
         self._db.row_factory = sqlite3.Row
         self._db.executescript(_SCHEMA)
         self._db.commit()
+        # Fail-open is not fail-silent: every swallowed embedding failure is
+        # counted and its last reason kept, so stats() and doctor can say why
+        # recall went lexical instead of it just quietly happening.
+        self.embed_failures = 0
+        self.last_embed_error: str | None = None
+        self.migration_error: str | None = None
+        self.migration_backup: str | None = None
+        self._migrate()
+        try:
+            self.purge()
+        except Exception:  # noqa: BLE001 - retention is housekeeping, never fatal
+            _log.warning("cortex retention purge failed at open", exc_info=True)
 
     # ------------------------------------------------------------------ write
     @_synchronized
@@ -306,16 +454,38 @@ class Cortex:
         self._embed_and_store(ids, [r[3] for r in rows])
         return ids
 
-    def _embed_and_store(self, ids: Sequence[int], texts: Sequence[str]) -> int:
+    def _embed_failed(self, why: str, *, log: bool = True) -> None:
+        self.embed_failures += 1
+        self.last_embed_error = why[:300]
+        if log:
+            _log.warning("embedding failed (%s); recall stays lexical for it", why)
+
+    def _embed_and_store(
+        self, ids: Sequence[int], texts: Sequence[str], *, backfill: bool = True
+    ) -> int:
         """Embed these texts and store their vectors. Returns how many landed;
-        0 on any failure, which is not an error - recall falls back to lexical."""
+        0 on any failure, which is not an error - recall falls back to lexical -
+        but it is counted and logged (stats: embed_failures, last_embed_error).
+
+        On success it also backfills a small batch of older rows that have no
+        vector (written while the embedder was down). Without this they stayed
+        lexical-only until someone ran `pionir reindex-memory` by hand, and
+        coverage would decay silently after every Ollama outage."""
         if self.embedder is None or not ids:
             return 0
         try:
             vecs = self.embedder.embed(list(texts))
-        except Exception:  # noqa: BLE001 - embedding is fail-open by contract
+        except Exception as error:  # noqa: BLE001 - embedding is fail-open by contract
+            self._embed_failed(f"{type(error).__name__}: {error}")
             return 0
         if not vecs or len(vecs) != len(ids):
+            paused = getattr(self.embedder, "paused_for", None)
+            is_paused = callable(paused) and paused() > 0
+            # A paused embedder already logged its outage once; do not log per write.
+            self._embed_failed(
+                "embedder paused" if is_paused else "embedder returned no usable vectors",
+                log=not is_paused,
+            )
             return 0
         model = self.embedder.model
         self._db.executemany(
@@ -323,6 +493,19 @@ class Cortex:
             [(mid, model, _pack(vec)) for mid, vec in zip(ids, vecs)],
         )
         self._db.commit()
+        if backfill:
+            missing = list(
+                self._db.execute(
+                    "SELECT m.id AS id, m.text AS text FROM memories m "
+                    "LEFT JOIN vectors v ON v.memory_id = m.id AND v.model = ? "
+                    "WHERE m.active = 1 AND v.memory_id IS NULL ORDER BY m.id DESC LIMIT 32",
+                    (model,),
+                )
+            )
+            if missing:
+                self._embed_and_store(
+                    [r["id"] for r in missing], [r["text"] for r in missing], backfill=False
+                )
         return len(ids)
 
     @_synchronized
@@ -345,7 +528,9 @@ class Cortex:
         done = 0
         for start in range(0, len(rows), 64):
             batch = rows[start : start + 64]
-            done += self._embed_and_store([r["id"] for r in batch], [r["text"] for r in batch])
+            done += self._embed_and_store(
+                [r["id"] for r in batch], [r["text"] for r in batch], backfill=False
+            )
         return done
 
     @_synchronized
@@ -379,28 +564,37 @@ class Cortex:
             "INSERT INTO memories(ts,namespace,kind,text,salience,slug,links,meta) "
             "VALUES(?,?,?,?,?,?,?,?)"
         )
+        now = self._now()
+        # Provenance: every episode and fact says where it came from - which
+        # namespace, which turns - and a fact says when it expires (purge()).
+        source = {"source": "consolidation", "namespace": namespace,
+                  "from_turns": [min(ids), max(ids)] if ids else [], **(meta or {})}
         try:
             episode_id = self._db.execute(
                 sql,
-                (self._now(), namespace, "episode", text,
+                (now, namespace, "episode", text,
                  float(KIND_SALIENCE.get("episode", _DEFAULT_SALIENCE)),
-                 None, "[]", json.dumps(meta or {})),
+                 None, "[]", json.dumps(source)),
             ).lastrowid
+            fact_meta = json.dumps({**source, "episode_id": episode_id,
+                                    "expires_ts": now + self.fact_retention_days * 86400})
             fact_ids = [
                 self._db.execute(
                     sql,
-                    (self._now(), namespace, "fact", fact,
-                     float(KIND_SALIENCE.get("fact", _DEFAULT_SALIENCE)), None, "[]", "{}"),
+                    (now, namespace, "fact", fact,
+                     float(KIND_SALIENCE.get("fact", _DEFAULT_SALIENCE)), None, "[]",
+                     fact_meta),
                 ).lastrowid
                 for fact in kept
             ]
             if ids:
                 marks = ",".join("?" * len(ids))
                 self._db.execute(
-                    f"UPDATE memories SET active=0 "
+                    f"UPDATE memories SET active=0, "
+                    f"meta=json_set(meta, '$.folded_into', ?) "
                     f"WHERE namespace=? AND kind='message' AND active=1 "
                     f"AND id IN ({marks})",
-                    [namespace, *ids],
+                    [episode_id, namespace, *ids],
                 )
             self._db.commit()
         except Exception:
@@ -426,6 +620,7 @@ class Cortex:
         kinds: Sequence[str] | None = None,
         budget_chars: int | None = None,
         expand_links: bool = False,
+        min_similarity: float | None = None,
     ) -> list[Memory]:
         """The heart of it: the memories most relevant to `query`, newest-weighted.
 
@@ -444,7 +639,12 @@ class Cortex:
         `expand_links` follows one hop of `[[slug]]` links from the direct hits
         and appends the memories they point at - a lesson that references another
         lesson pulls it in too. Expansion stays inside the same namespace scope,
-        so it can never surface one bot's private memory in another's recall."""
+        so it can never surface one bot's private memory in another's recall.
+
+        `min_similarity` makes the result a relevance answer rather than a ranked
+        list: a memory then qualifies only on a lexical hit or a cosine of at least
+        this much. Without it the semantic side scores EVERY candidate above zero,
+        so a recall always returns k memories however unrelated they are."""
         q = tokens(query)
         if not q:
             return []
@@ -455,6 +655,8 @@ class Cortex:
         now = self._now()
         lexical = self._bm25_scored(q, candidates)
         semantic = self._semantic_scored(query, candidates)
+        if min_similarity is not None:
+            semantic = [(s, row) for s, row in semantic if s >= min_similarity]
         if semantic:
             ranked = self._fuse(lexical, semantic, now)
         else:
@@ -514,29 +716,7 @@ class Cortex:
         self, q: list[str], candidates: list[sqlite3.Row]
     ) -> list[tuple[float, sqlite3.Row]]:
         """Raw BM25 score per candidate that matches at least one query term."""
-        toks = [tokens(c["text"]) for c in candidates]
-        n = len(candidates)
-        avgdl = sum(len(t) for t in toks) / n or 1.0
-        df: Counter = Counter()
-        for t in toks:
-            df.update(set(t))
-        k1, b = 1.5, 0.75
-        scored: list[tuple[float, sqlite3.Row]] = []
-        for row, t in zip(candidates, toks):
-            if not t:
-                continue
-            tf = Counter(t)
-            s = 0.0
-            for term in q:
-                f = tf.get(term)
-                if not f:
-                    continue
-                idf = math.log(1 + (n - df[term] + 0.5) / (df[term] + 0.5))
-                s += idf * f * (k1 + 1) / (f + k1 * (1 - b + b * len(t) / avgdl))
-            if s > 0:
-                scored.append((s, row))
-        scored.sort(key=lambda pair: pair[0], reverse=True)
-        return scored
+        return bm25_scored(q, candidates)
 
     def _semantic_scored(
         self, query: str, candidates: list[sqlite3.Row]
@@ -549,7 +729,8 @@ class Cortex:
             return []
         try:
             embedded = self.embedder.embed([query])
-        except Exception:  # noqa: BLE001 - fail-open
+        except Exception as error:  # noqa: BLE001 - fail-open, but counted and logged
+            self._embed_failed(f"query: {type(error).__name__}: {error}")
             return []
         if not embedded:
             return []
@@ -572,18 +753,14 @@ class Cortex:
         return scored
 
     def _weight(self, row: sqlite3.Row, now: float) -> float:
-        age_days = max(0.0, (now - row["ts"]) / 86400)
-        recency = 0.6 + 0.4 * math.exp(-age_days / 45)
-        return recency * (0.5 + row["salience"] / 12)
+        return recency_weight(row, now)
 
     def _weight_lexical(
         self, lexical: list[tuple[float, sqlite3.Row]], now: float
     ) -> list[tuple[float, sqlite3.Row]]:
         """The lexical-only path, scored exactly as before: BM25 x recency x
         salience. Kept identical so recall is unchanged where no embedder runs."""
-        scored = [(s * self._weight(row, now), row) for s, row in lexical]
-        scored.sort(key=lambda pair: pair[0], reverse=True)
-        return scored
+        return weight_lexical(lexical, now)
 
     def _fuse(
         self,
@@ -593,17 +770,7 @@ class Cortex:
     ) -> list[tuple[float, sqlite3.Row]]:
         """Reciprocal-rank fusion of the two rankings, then the recency/salience
         weight. Rank, not raw score, because BM25 and cosine are not comparable."""
-        fused: dict[int, dict] = {}
-        for rankings in (lexical, semantic):
-            for i, (_, row) in enumerate(rankings):
-                slot = fused.setdefault(row["id"], {"row": row, "rrf": 0.0})
-                slot["rrf"] += 1.0 / (RRF_K + i + 1)
-        scored = [
-            (slot["rrf"] * self._weight(slot["row"], now), slot["row"])
-            for slot in fused.values()
-        ]
-        scored.sort(key=lambda pair: pair[0], reverse=True)
-        return scored
+        return fuse(lexical, semantic, now)
 
     @_synchronized
     def memories(
@@ -663,6 +830,9 @@ class Cortex:
             # >0 while the embedder is paused after a timeout: recall is lexical only
             "embed_paused_s": round(paused(), 1) if callable(paused := getattr(
                 self.embedder, "paused_for", None)) else 0.0,
+            # Swallowed-but-counted embedding failures since this process started.
+            "embed_failures": self.embed_failures,
+            "last_embed_error": self.last_embed_error,
         }
 
     @_synchronized
@@ -712,20 +882,60 @@ class Cortex:
         links: Sequence[str] = (),
         salience: float = 8.0,
         meta: dict[str, Any] | None = None,
+        known: Iterable[str] = (),
     ) -> int:
         """Write a lesson into the shared `lessons` namespace - a mistake, a
         correction, a "this failed before and here is why". High salience by
         default, because a lesson is meant to outrank ordinary recall when it is
-        relevant. Every bot reads this namespace; that is the whole point."""
+        relevant. Every bot reads this namespace; that is the whole point.
+
+        A lesson already known (same `lesson_key`) is not written again: the
+        existing one's recurrence count goes up and its id is returned. Every
+        failure used to insert a fresh row - 2026-09-28 the store held 800 live
+        lessons with 6 distinct texts (398 copies each of two fiverr.ack
+        failures), which drowned every recall in copies of one mistake. The
+        count is itself the signal: a lesson that keeps recurring is a mistake
+        being recalled and not heeded (doctor alerts on it).
+
+        Every bot reads a lesson and callers get it back, so whatever the writer
+        passed is scrubbed (pionir/secretscrub.py, plus `known` secret values) and
+        capped at LESSON_MAX_CHARS here, whoever the writer is."""
+        clean = scrub_lesson(text, known)
+        if not clean:
+            raise ValueError("a memory needs text")
+        key = lesson_key(clean)
+        for row in self._db.execute(
+            "SELECT id, text, meta FROM memories "
+            "WHERE namespace=? AND kind='lesson' AND active=1 ORDER BY id",
+            (LESSONS_NAMESPACE,),
+        ):
+            if lesson_key(row["text"]) == key:
+                self._recur(row["id"], json.loads(row["meta"] or "{}"))
+                return int(row["id"])
         return self.remember(
             "lesson",
-            text,
+            clean,
             namespace=LESSONS_NAMESPACE,
             salience=salience,
             slug=slug,
             links=links,
-            meta=meta,
+            meta={**(meta or {}), "seen": 1, "last_seen": self._now(),
+                  "burst_start": self._now(), "burst": 0},
         )
+
+    def _recur(self, memory_id: int, meta: dict[str, Any]) -> None:
+        """One more sighting of a known lesson: total count, last seen, and
+        `burst` - recurrences within 24 h of `burst_start` (what doctor's
+        recurrence alarm reads)."""
+        now = self._now()
+        meta["seen"] = int(meta.get("seen", 1)) + 1
+        meta["last_seen"] = now
+        if now - float(meta.get("burst_start", 0.0)) > _BURST_SECONDS:
+            meta["burst_start"], meta["burst"] = now, 1
+        else:
+            meta["burst"] = int(meta.get("burst", 0)) + 1
+        self._db.execute("UPDATE memories SET meta=? WHERE id=?", (json.dumps(meta), memory_id))
+        self._db.commit()
 
     @_synchronized
     def lessons_for(self, context: str, k: int = 3) -> list[Memory]:
@@ -733,10 +943,315 @@ class Cortex:
         happen. Call it with the intent - the task, the plan, the thing being
         considered - and heed what comes back before doing it. Scoped to the
         shared lessons namespace and link-expanded, so a lesson pulls in the
-        related ones it points at."""
+        related ones it points at.
+
+        Relevance-floored: a lesson comes back only on a shared word or a strong
+        semantic match (LESSON_MIN_SIMILARITY). Unfloored, the embedding side made
+        every lesson a candidate, so every task was handed three lessons - a
+        client.orders poll was 'reminded' of fiverr.ack failures 1,600 times."""
         return self.recall(
-            context, k=k, namespace=LESSONS_NAMESPACE, expand_links=True
+            context, k=k, namespace=LESSONS_NAMESPACE, expand_links=True,
+            min_similarity=LESSON_MIN_SIMILARITY,
         )
+
+    # ---------------------------------------------------------- consolidation
+    @_synchronized
+    def note_consolidation(
+        self, namespace: str, outcome: str, *, episode_id: int | None = None,
+        folded: int = 0, detail: str | None = None, chunk_start: int | None = None,
+    ) -> None:
+        """Log one consolidation attempt - folded, declined, deferred, failed,
+        poisoned - so 'does consolidation ever run?' has an answer in the store."""
+        self._db.execute(
+            "INSERT INTO consolidations(ts,namespace,outcome,episode_id,folded,detail,"
+            "chunk_start) VALUES(?,?,?,?,?,?,?)",
+            (self._now(), namespace, outcome, episode_id, int(folded),
+             (detail or "")[:300] or None, chunk_start),
+        )
+        self._db.commit()
+
+    @_synchronized
+    def chunk_failures(
+        self, namespace: str, chunk_start: int
+    ) -> tuple[int, float | None, int]:
+        """(every failed attempt at the chunk starting at this turn, when the last
+        one was, how many were NON-transient) - backoff reads the first two, and
+        poisoning only the third: a model that was merely away never poisons."""
+        row = self._db.execute(
+            "SELECT COUNT(*), MAX(ts), "
+            "SUM(CASE WHEN outcome IN ('failed','declined') THEN 1 ELSE 0 END) "
+            "FROM consolidations WHERE namespace=? AND chunk_start=? "
+            "AND outcome IN ('failed','declined','unavailable')",
+            (namespace, chunk_start),
+        ).fetchone()
+        return int(row[0]), row[1], int(row[2] or 0)
+
+    @_synchronized
+    def fold_nothing(self, namespace: str, ids: Sequence[int]) -> int:
+        """The distiller found nothing worth keeping: mark these turns folded with
+        no episode (folded_into 0), so they leave the backlog and are deleted at
+        retention like any folded turn."""
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        cur = self._db.execute(
+            f"UPDATE memories SET active=0, meta=json_set(meta, '$.folded_into', 0) "
+            f"WHERE namespace=? AND kind='message' AND active=1 AND id IN ({marks})",
+            [namespace, *ids],
+        )
+        self._db.commit()
+        return cur.rowcount
+
+    @_synchronized
+    def poison(self, namespace: str, ids: Sequence[int], reason: str) -> int:
+        """Retire raw turns that failed to fold too often: out of every later
+        chunk (so one bad chunk cannot block the rest forever) and out of recall,
+        marked `poisoned`, and deleted with the folded ones at retention."""
+        if not ids:
+            return 0
+        marks = ",".join("?" * len(ids))
+        cur = self._db.execute(
+            f"UPDATE memories SET active=0, meta=json_set(meta, '$.poisoned', ?) "
+            f"WHERE namespace=? AND kind='message' AND active=1 AND id IN ({marks})",
+            [reason[:200], namespace, *ids],
+        )
+        self._db.commit()
+        return cur.rowcount
+
+    @_synchronized
+    def purge(self) -> dict[str, int]:
+        """Retention, as DELETEs (not retirement): folded or poisoned raw turns
+        older than turn_retention_days, and facts past their expires_ts - with
+        their vectors. Unfolded turns are kept: they are still waiting.
+
+        Guarded against a clock jumping forward: "now" for retention is never more
+        than a day past the newest thing the store itself recorded (a memory or a
+        consolidation attempt). A wall clock that leapt ahead cannot expire facts
+        early; retention only advances as the store's own writes corroborate it."""
+        now = self._now()
+        newest = self._db.execute(
+            "SELECT MAX(t) FROM (SELECT MAX(ts) AS t FROM memories "
+            "UNION ALL SELECT MAX(ts) FROM consolidations)").fetchone()[0]
+        if newest is None:
+            return {"turns": 0, "facts": 0}
+        if now > newest + _PURGE_CLOCK_SLACK:
+            _log.warning("cortex retention: the clock reads %.0f s past the store's newest "
+                         "write; retention uses the store's time instead", now - newest)
+            now = newest + _PURGE_CLOCK_SLACK
+        cutoff = now - self.turn_retention_days * 86400
+        turns = [r[0] for r in self._db.execute(
+            "SELECT id FROM memories WHERE kind='message' AND active=0 AND ts < ? AND "
+            "(json_extract(meta, '$.folded_into') IS NOT NULL "
+            " OR json_extract(meta, '$.poisoned') IS NOT NULL)", (cutoff,))]
+        facts = [r[0] for r in self._db.execute(
+            "SELECT id FROM memories WHERE kind='fact' "
+            "AND json_extract(meta, '$.expires_ts') IS NOT NULL "
+            "AND json_extract(meta, '$.expires_ts') < ?", (now,))]
+        gone = turns + facts
+        for start in range(0, len(gone), 500):
+            batch = gone[start:start + 500]
+            marks = ",".join("?" * len(batch))
+            self._db.execute(f"DELETE FROM vectors WHERE memory_id IN ({marks})", batch)
+            self._db.execute(f"DELETE FROM memories WHERE id IN ({marks})", batch)
+        self._db.commit()
+        if gone:
+            _log.info("cortex retention: deleted %d raw turns, %d expired facts",
+                      len(turns), len(facts))
+        return {"turns": len(turns), "facts": len(facts)}
+
+    # ----------------------------------------------------------------- output
+    @_synchronized
+    def output(self, *, window_seconds: float = 86400.0) -> dict[str, Any]:
+        """What the store has actually DONE lately, as opposed to what is in it:
+        writes per namespace in the window (new rows plus lesson recurrences),
+        the last write, raw turns waiting to be folded, the last consolidation,
+        and embedding coverage. Counts, for doctor's wired-but-inert alarms."""
+        now = self._now()
+        since = now - window_seconds
+        writes: dict[str, int] = {
+            row["namespace"]: row["c"]
+            for row in self._db.execute(
+                # A row retired as a duplicate is counted as its lesson's recurrence
+                # below, not again here; a turn retired by folding still counts.
+                "SELECT namespace, COUNT(*) AS c FROM memories WHERE ts >= ? "
+                "AND json_extract(meta, '$.merged_into') IS NULL GROUP BY namespace",
+                (since,),
+            )
+        }
+        recurring: list[dict[str, Any]] = []
+        last_write = self._db.execute("SELECT MAX(ts) FROM memories").fetchone()[0]
+        for row in self._db.execute(
+            "SELECT id, text, meta FROM memories WHERE kind='lesson' AND active=1"
+        ):
+            meta = json.loads(row["meta"] or "{}")
+            seen_at = float(meta.get("last_seen") or 0.0)
+            burst = int(meta.get("burst") or 0)
+            if seen_at < since or burst < 1:
+                continue
+            # A recurrence is a write too: it is the lesson being learned again.
+            last_write = max(last_write or 0.0, seen_at)
+            writes[LESSONS_NAMESPACE] = writes.get(LESSONS_NAMESPACE, 0) + burst
+            recurring.append({"id": row["id"], "recurred_24h": burst,
+                              "seen": int(meta.get("seen", 1)), "text": row["text"][:160]})
+        recurring.sort(key=lambda r: r["recurred_24h"], reverse=True)
+        pending = {
+            row["namespace"]: {"turns": row["c"], "oldest_ts": row["oldest"]}
+            for row in self._db.execute(
+                "SELECT namespace, COUNT(*) AS c, MIN(ts) AS oldest FROM memories "
+                "WHERE kind='message' AND active=1 GROUP BY namespace"
+            )
+        }
+        last_folded = self._db.execute(
+            "SELECT ts, namespace, episode_id, folded FROM consolidations "
+            "WHERE outcome IN ('folded','empty') ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        last_attempt = self._db.execute(
+            "SELECT ts, namespace, outcome, detail FROM consolidations ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        streak = 0
+        for row in self._db.execute(
+            "SELECT outcome FROM consolidations WHERE outcome NOT IN ('deferred','off') "
+            "ORDER BY id DESC LIMIT 100"
+        ):
+            if row["outcome"] != "unavailable":
+                break
+            streak += 1
+        poisoned = self._db.execute(
+            "SELECT COUNT(*) FROM consolidations WHERE outcome='poisoned' AND ts >= ?",
+            (since,),
+        ).fetchone()[0]
+        active = self._db.execute("SELECT COUNT(*) FROM memories WHERE active=1").fetchone()[0]
+        coverage = None
+        if self.embedder is not None:
+            embedded = self._db.execute(
+                "SELECT COUNT(*) FROM vectors v JOIN memories m ON m.id = v.memory_id "
+                "WHERE m.active = 1 AND v.model = ?",
+                (self.embedder.model,),
+            ).fetchone()[0]
+            coverage = round(100.0 * embedded / active, 1) if active else 100.0
+        return {
+            "window_s": window_seconds,
+            "writes": writes,
+            "last_write_ts": last_write,
+            "recurring_lessons": recurring[:5],
+            "raw_turns_pending": pending,
+            "last_consolidation": dict(last_folded) if last_folded else None,
+            "last_consolidation_attempt": dict(last_attempt) if last_attempt else None,
+            "poisoned_chunks": poisoned,
+            "unavailable_streak": streak,
+            "embed_coverage_pct": coverage,
+            "migration_error": self.migration_error,
+        }
+
+    # ------------------------------------------------------------- migrations
+    def _migrate(self) -> None:
+        """Bring an existing store up to _SCHEMA_VERSION. Never fatal: a store
+        that cannot migrate still opens and serves, and the reason is kept in
+        `migration_error` for doctor to shout about."""
+        if str(self.path) == ":memory:":
+            self._db.execute(f"PRAGMA user_version={_SCHEMA_VERSION}")
+            return
+        try:
+            version = self._db.execute("PRAGMA user_version").fetchone()[0]
+            if version < 1:
+                self._dedupe_lessons()
+                self._db.execute("PRAGMA user_version=1")
+                self._db.commit()
+        except Exception as error:  # noqa: BLE001 - surfaced, never fatal
+            self._db.rollback()
+            self.migration_error = f"{type(error).__name__}: {error}"[:300]
+            _log.error("cortex migration failed, store left as it was: %s", self.migration_error)
+
+    def _dedupe_lessons(self) -> int:
+        """Migration 1: collapse duplicate lessons into the oldest of each group.
+
+        Reversible twice over: the whole store is copied to a backup file first
+        (sqlite's online backup, consistent while another process has it open),
+        and the duplicates are only retired (active=0, meta.merged_into=<kept
+        id>), never deleted - `undo_lesson_dedupe()` puts them back."""
+        groups: dict[str, list[sqlite3.Row]] = {}
+        for row in self._db.execute(
+            "SELECT id, ts, text, meta FROM memories "
+            "WHERE namespace=? AND kind='lesson' AND active=1 ORDER BY id",
+            (LESSONS_NAMESPACE,),
+        ):
+            groups.setdefault(lesson_key(row["text"]), []).append(row)
+        dupes = {key: rows for key, rows in groups.items() if len(rows) > 1}
+        if not dupes:
+            return 0
+        self.migration_backup = str(self._backup("pre-lesson-dedupe"))
+        retired = 0
+        for rows in dupes.values():
+            keep, rest = rows[0], rows[1:]
+            meta = json.loads(keep["meta"] or "{}")
+            last = max(r["ts"] for r in rows)
+            # The recurrences in the last day of the flood stay counted, so doctor
+            # still says the mistake was repeating rather than going quiet about it.
+            recent = [r["ts"] for r in rows if r["ts"] >= last - _BURST_SECONDS]
+            meta.update({"seen": len(rows), "last_seen": last,
+                         "burst_start": min(recent), "burst": len(recent) - 1,
+                         "deduped": len(rest)})
+            self._db.execute("UPDATE memories SET meta=? WHERE id=?",
+                             (json.dumps(meta), keep["id"]))
+            for r in rest:
+                rmeta = json.loads(r["meta"] or "{}")
+                rmeta["merged_into"] = keep["id"]
+                self._db.execute("UPDATE memories SET active=0, meta=? WHERE id=?",
+                                 (json.dumps(rmeta), r["id"]))
+                retired += 1
+        _log.warning("cortex: collapsed %d duplicate lessons into %d (backup %s)",
+                     retired, len(dupes), self.migration_backup)
+        return retired
+
+    def _backup(self, tag: str) -> Path:
+        """Copy the store (sqlite online backup) to `<stem>.<tag>-<ts>.db`. A copy
+        whose bytes match the newest existing one is not kept twice, and only the
+        newest _KEEP_BACKUPS are kept - a migration that keeps failing (the store
+        locked by the server at every start) must not stack a 3.5 MB copy per start."""
+        pattern = f"{self.path.stem}.{tag}-*{self.path.suffix}"
+
+        def stamp(p: Path) -> int:
+            try:
+                return int(p.stem.rsplit("-", 1)[1])
+            except (IndexError, ValueError):
+                return 0
+
+        existing = sorted(self.path.parent.glob(pattern), key=stamp)
+        fresh = self.path.with_name(f"{self.path.stem}.{tag}-{int(self._now())}{self.path.suffix}")
+        target = sqlite3.connect(str(fresh))
+        try:
+            self._db.backup(target)
+        finally:
+            target.close()
+        digest = hashlib.sha256(fresh.read_bytes()).hexdigest()
+        newest = existing[-1] if existing else None
+        if (newest is not None and newest != fresh
+                and hashlib.sha256(newest.read_bytes()).hexdigest() == digest):
+            fresh.unlink()
+            return newest
+        kept = sorted({*existing, fresh}, key=stamp)
+        for old in kept[:-_KEEP_BACKUPS]:
+            try:
+                old.unlink()
+            except OSError:
+                _log.warning("could not remove old backup %s", old)
+        return fresh
+
+    @_synchronized
+    def undo_lesson_dedupe(self) -> int:
+        """Reverse migration 1: re-activate every lesson it retired. Returns how
+        many came back. (The pre-migration backup file is the other way back.)"""
+        rows = list(self._db.execute(
+            "SELECT id, meta FROM memories WHERE kind='lesson' AND active=0 "
+            "AND json_extract(meta, '$.merged_into') IS NOT NULL"
+        ))
+        for r in rows:
+            meta = json.loads(r["meta"])
+            meta.pop("merged_into", None)
+            self._db.execute("UPDATE memories SET active=1, meta=? WHERE id=?",
+                             (json.dumps(meta), r["id"]))
+        self._db.commit()
+        return len(rows)
 
 
 class OllamaEmbedder:

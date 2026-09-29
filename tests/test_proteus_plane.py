@@ -13,6 +13,7 @@ canned output - nothing reaches the VPS, Peter or any live port. What is pinned:
   adapter itself refuses a task that did not come through ``approve``.
 """
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,7 +44,7 @@ unit mrcrab-t1.timer active enabled
 unit prometheus-entry.timer inactive disabled
 kill karkinos absent
 kill prometheus present
-kill robinhood present
+kill prometheus-robinhood present
 api prometheus 200
 api karkinos 404
 api robinhood 000
@@ -57,17 +58,104 @@ timer Mon 2026-09-29 13:07:00 UTC 14h left - - mrcrab-t1.timer mrcrab@t1.service
 class _Ssh:
     """The fake runner: records every argv, answers from a script."""
 
-    def __init__(self, out: str = "", code: int = 0) -> None:
+    def __init__(self, out: str = "", code: int = 0, err: str = "") -> None:
         self.calls: list[list[str]] = []
-        self.out, self.code = out, code
+        self.out, self.code, self.err = out, code, err
 
     def __call__(self, argv, timeout):
         self.calls.append(list(argv))
-        return ProcessResult(returncode=self.code, stdout=self.out, stderr="")
+        return ProcessResult(returncode=self.code, stdout=self.out, stderr=self.err)
 
     @property
     def remotes(self) -> list[str]:
         return [argv[-1] for argv in self.calls]
+
+
+class FakeVps(_Ssh):
+    """A droplet in miniature: it runs the SHAPES of commands the adapter sends (systemctl
+    per unit, kill files under existing folders only, the orders drop-in and a restart) and
+    answers the read-back the way the real box would. Every exit code is 0, as `; ` chains
+    and loops make it - so only the read-back can tell a brake that worked from one that did
+    not. Knobs: `stuck` units refuse to change; `dirs` are the folders that exist;
+    `envfile_armed` is the unit's own EnvironmentFile setting the switch; `wrapper` makes
+    MainPID a shell rather than the python process."""
+
+    DIRS = {"/opt/mrcrab/Mr-Crab/controls", "/root/.pantheon/prometheus", "/root/.pantheon"}
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.units = {u: ["active", "enabled"] for u in (
+            "mrcrab-t1.timer", "mrcrab-research.timer", "mrcrab-t2.timer", "mrcrab-t3.timer",
+            "prometheus-api.service", "pro-robinhood-api.service")}
+        for t in ("prometheus-scan.timer", "prometheus-entry.timer", "prometheus-review.timer"):
+            self.units[t] = ["inactive", "disabled"]
+        self.stuck: set[str] = set()
+        self.dirs = set(self.DIRS)
+        self.readonly: set[str] = set()
+        self.files: set[str] = set()
+        self.dropin: str | None = None
+        self.envfile_armed = False
+        self.unset_ignored = False
+        self.wrapper = False
+        self.env_armed = False
+
+    def _restart(self) -> None:
+        if self.units["pro-robinhood-api.service"][0] != "active":
+            return
+        if self.dropin == "on":
+            self.env_armed = True
+        elif self.dropin == "off" and not self.unset_ignored:
+            self.env_armed = False
+        else:
+            self.env_armed = self.envfile_armed
+
+    def __call__(self, argv, timeout):
+        self.calls.append(list(argv))
+        cmd, out, err = argv[-1], [], []
+        for units, verb in re.findall(r'for [ts] in ([^;]+); do systemctl (disable --now|enable --now|stop|start) "\$[ts]"', cmd):
+            for u in units.split():
+                if u in self.stuck:
+                    err.append(f"Failed to {verb.split()[0]} {u}: Job failed")
+                    continue
+                if verb == "disable --now":
+                    self.units[u] = ["inactive", "disabled"]
+                elif verb == "enable --now":
+                    self.units[u] = ["active", "enabled"]
+                elif verb == "stop":
+                    self.units[u][0] = "inactive"
+                    if u == "pro-robinhood-api.service":
+                        self.env_armed = False
+                else:
+                    self.units[u][0] = "active"
+                    if u == "pro-robinhood-api.service":
+                        self._restart()
+        for parent, path in re.findall(r"if \[ -d (\S+) \]; then printf .*?> (\S+); fi", cmd):
+            if parent in self.dirs and parent not in self.readonly:
+                self.files.add(path)
+        for path in re.findall(r"rm -f (\S+?)(?:;| &&|$)", cmd):
+            if path.rsplit("/", 1)[0] not in self.readonly:
+                self.files.discard(path)
+        if r"\nEnvironment=PRO_RH_ORDERS_ENABLED=1\n' >" in cmd:
+            self.dropin = "on"
+        if r"\nUnsetEnvironment=PRO_RH_ORDERS_ENABLED\n' >" in cmd:
+            self.dropin = "off"
+        if "systemctl try-restart" in cmd:
+            self._restart()
+        for units in re.findall(r"for u in ([^;]+); do printf 'unit", cmd):
+            for u in units.split():
+                active, enabled = self.units.get(u, ["inactive", ""])
+                out.append(f"unit {u} {active} {enabled}")
+        for path, name, parent in re.findall(r"if \[ -f (\S+) \]; then echo 'kill (\S+) present'; elif \[ -d (\S+) \]", cmd):
+            out.append(f"kill {name} " + ("present" if path in self.files else
+                                          "absent" if parent in self.dirs else "noparent"))
+        if "MainPID --value" in cmd:
+            if self.units["pro-robinhood-api.service"][0] != "active":
+                out.append("rh_orders stopped")
+            elif self.wrapper:
+                out.append("rh_orders unverifiable: MainPID 77 is not the python robinhood_read_api.py process")
+            else:
+                out.append(f"rh_orders {1 if self.env_armed else 0}")
+        return ProcessResult(returncode=0, stdout="\n".join(out) + "\n", stderr="\n".join(err))
 
 
 def _adapter(ssh: _Ssh, tunnel=lambda port: "down", **kw) -> ProteusAdapter:
@@ -121,7 +209,7 @@ class DeclarationTests(unittest.TestCase):
 
 class WireTests(unittest.TestCase):
     def test_every_vps_call_is_an_argv_list_to_the_one_host(self) -> None:
-        ssh = _Ssh()
+        ssh = FakeVps()
         adapter = _adapter(ssh)
         adapter.execute(Task("proteus.kill", {"system": "all"}))
         adapter.execute(Task("proteus.stop_timer", {"timer": "prometheus-entry.timer"}))
@@ -135,8 +223,12 @@ class WireTests(unittest.TestCase):
         for path in ("/opt/mrcrab/Mr-Crab/controls/KILL", "/root/.pantheon/prometheus/HALT",
                      "/root/.pantheon/ROBINHOOD_KILL"):
             self.assertIn(f"> {path}", kill)
-        self.assertEqual(timer, "systemctl disable --now prometheus-entry.timer && "
-                                "systemctl is-active prometheus-entry.timer; true")
+            self.assertIn(f"if [ -f {path} ]", kill)          # and read back
+        self.assertIn('systemctl disable --now "$t"', timer)
+        self.assertIn("systemctl is-active", timer)
+        for cmd in (kill, timer):
+            self.assertNotIn("; true", cmd)                     # nothing hides a failure
+            self.assertNotIn("mkdir", cmd)                      # nothing invents a wrong path
         self.assertEqual(logs, "journalctl -u mrcrab@t2.service -n 40 --no-pager -o short-iso")
 
     def test_a_payload_can_only_choose_from_the_tables(self) -> None:
@@ -170,7 +262,7 @@ class WireTests(unittest.TestCase):
         self.assertEqual(doc["units"]["prometheus-entry.timer"], {"active": "inactive",
                                                                    "enabled": "disabled"})
         self.assertEqual(doc["kill_switches"], {"karkinos": False, "prometheus": True,
-                                                "robinhood": True})
+                                                "prometheus-robinhood": True})
         self.assertEqual(doc["apis"], {"prometheus": "200", "karkinos": "404", "robinhood": "000"})
         self.assertIs(doc["rh_orders_armed"], False)
         self.assertEqual(doc["vps_signals_age_s"], 212)
@@ -184,19 +276,126 @@ class WireTests(unittest.TestCase):
         _adapter(ssh).status()
         self.assertEqual(ssh.calls, [])
 
-    def test_orders_off_that_leaves_orders_armed_says_so(self) -> None:
-        out = _adapter(_Ssh("rh_orders 1\n")).execute(Task("proteus.rh_orders_off", {})).output
+
+
+class BrakeVerificationTests(unittest.TestCase):
+    """A brake reports success only when the state it read back PROVES it. Every command
+    exits 0 here (loops and `;` chains do) - the verdict must come from the read-back."""
+
+    def _run(self, vps, name, payload):
+        return _adapter(vps).execute(Task(name, payload)).output
+
+    def test_every_kill_switch_dropped_and_proven(self) -> None:
+        vps = FakeVps()
+        out = self._run(vps, "proteus.kill", {"system": "all"})
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(len(vps.files), 3)
+
+    def test_a_kill_switch_whose_folder_is_missing_fails_loudly_and_writes_nothing(self) -> None:
+        vps = FakeVps()
+        vps.dirs.discard("/root/.pantheon/prometheus")
+        out = self._run(vps, "proteus.kill", {"system": "all"})
         self.assertFalse(out["ok"])
-        self.assertIn("STILL armed", out["error"])
-        out = _adapter(_Ssh("rh_orders 0\n")).execute(Task("proteus.rh_orders_off", {})).output
-        self.assertTrue(out["ok"])
+        self.assertIn("prometheus kill switch: its folder does not exist", out["error"])
+        self.assertNotIn("/root/.pantheon/prometheus/HALT", vps.files)
+        self.assertIn("/opt/mrcrab/Mr-Crab/controls/KILL", vps.files)   # the others still dropped
+
+    def test_a_kill_switch_that_did_not_land_is_not_dropped(self) -> None:
+        vps = FakeVps()
+        vps.readonly.add("/root/.pantheon")               # the folder is there; the write fails
+        out = self._run(vps, "proteus.kill", {"system": "prometheus-robinhood"})
+        self.assertFalse(out["ok"])
+        self.assertIn("wanted present, read absent", out["error"])
+        vps.files.add("/opt/mrcrab/Mr-Crab/controls/KILL")
+        vps.readonly.add("/opt/mrcrab/Mr-Crab/controls")   # and a clear that does not clear
+        out = _adapter(vps).execute(Task("proteus.clear_kill", {"system": "karkinos"},
+                                         frozenset({OWNER_APPROVED_GRANT}))).output
+        self.assertFalse(out["ok"])
+        self.assertIn("wanted absent, read present", out["error"])
+
+    def test_orders_on_is_ok_only_when_the_running_process_has_them(self) -> None:
+        vps = FakeVps()
+        vps.units["pro-robinhood-api.service"][0] = "inactive"
+        out = _adapter(vps).execute(Task("proteus.rh_orders_on", {},
+                                         frozenset({OWNER_APPROVED_GRANT}))).output
+        self.assertFalse(out["ok"])
+        self.assertIn("not armed in a running process", out["error"])
+        vps.units["pro-robinhood-api.service"][0] = "active"
+        out = _adapter(vps).execute(Task("proteus.rh_orders_on", {},
+                                         frozenset({OWNER_APPROVED_GRANT}))).output
+        self.assertTrue(out["ok"], out)
+
+    def test_a_timer_that_will_not_stop_is_a_failed_brake_with_the_evidence(self) -> None:
+        vps = FakeVps()
+        vps.stuck.add("mrcrab-t2.timer")
+        out = self._run(vps, "proteus.stop_timer", {"timer": "all"})
+        self.assertFalse(out["ok"])
+        self.assertIn("mrcrab-t2.timer: still active", out["error"])
+        self.assertIn("Failed to disable mrcrab-t2.timer", out["stderr"])   # stderr is kept
+        self.assertEqual(vps.units["mrcrab-t1.timer"], ["inactive", "disabled"])   # the rest stopped
+        vps.stuck.clear()
+        self.assertTrue(self._run(vps, "proteus.stop_timer", {"timer": "all"})["ok"])
+
+    def test_a_disabled_but_running_or_stopped_but_enabled_timer_is_not_stopped(self) -> None:
+        for active, enabled, why in (("active", "disabled", "still active"),
+                                     ("inactive", "enabled", "still enabled")):
+            out = _adapter(_Ssh(f"unit mrcrab-t1.timer {active} {enabled}\n")).execute(
+                Task("proteus.stop_timer", {"timer": "mrcrab-t1.timer"})).output
+            self.assertFalse(out["ok"], (active, enabled))
+            self.assertIn(why, out["error"])
+
+    def test_a_service_that_will_not_stop_is_a_failed_brake(self) -> None:
+        vps = FakeVps()
+        vps.stuck.add("pro-robinhood-api.service")
+        out = self._run(vps, "proteus.stop_service", {"service": "pro-robinhood-api.service"})
+        self.assertFalse(out["ok"])
+        vps.stuck.clear()
+        self.assertTrue(self._run(vps, "proteus.stop_service", {"service": "all"})["ok"])
+
+    def test_no_read_back_is_no_success(self) -> None:
+        for name, payload in (("proteus.kill", {"system": "karkinos"}),
+                              ("proteus.stop_timer", {"timer": "mrcrab-t1.timer"}),
+                              ("proteus.stop_service", {"service": "prometheus-api.service"}),
+                              ("proteus.rh_orders_off", {})):
+            out = _adapter(_Ssh("")).execute(Task(name, payload)).output
+            self.assertFalse(out["ok"], name)
+            self.assertIn("NOT VERIFIED", out["error"])
+
+    def test_orders_off_wins_over_the_units_own_environment_file(self) -> None:
+        vps = FakeVps()
+        vps.envfile_armed = vps.env_armed = True
+        out = self._run(vps, "proteus.rh_orders_off", {})
+        self.assertTrue(out["ok"], out)
         self.assertIs(out["rh_orders_armed"], False)
+        self.assertEqual(vps.dropin, "off")                  # UnsetEnvironment=, not a removal
+
+    def test_orders_off_that_leaves_orders_armed_says_so(self) -> None:
+        vps = FakeVps()
+        vps.envfile_armed = vps.env_armed = vps.unset_ignored = True
+        out = self._run(vps, "proteus.rh_orders_off", {})
+        self.assertFalse(out["ok"])
+        self.assertIn("STILL ARMED", out["error"])
+        self.assertIn("proteus.stop_service", out["error"])
+
+    def test_a_wrapper_as_mainpid_is_cannot_verify_never_off(self) -> None:
+        vps = FakeVps()
+        vps.wrapper = True
+        out = self._run(vps, "proteus.rh_orders_off", {})
+        self.assertFalse(out["ok"])
+        self.assertIsNone(out["rh_orders_armed"])
+        self.assertIn("cannot verify", out["error"])
+        self.assertIsNone(parse_status("rh_orders unverifiable: MainPID 7 is a shell\n")["rh_orders_armed"])
+
+    def test_a_stopped_api_places_no_orders(self) -> None:
+        vps = FakeVps()
+        vps.units["pro-robinhood-api.service"][0] = "inactive"
+        self.assertTrue(self._run(vps, "proteus.rh_orders_off", {})["ok"])
 
 
 class ArmingGateTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        self.ssh = _Ssh("rh_orders 1\n")
+        self.ssh = FakeVps()
         self.app = _app(self._tmp.name, self.ssh)
 
     def tearDown(self) -> None:
@@ -204,7 +403,7 @@ class ArmingGateTests(unittest.TestCase):
         self._tmp.cleanup()
 
     ARM = [("proteus.arm_timer", {"timer": "prometheus-entry.timer"}),
-           ("proteus.clear_kill", {"system": "robinhood"}),
+           ("proteus.clear_kill", {"system": "prometheus-robinhood"}),
            ("proteus.rh_orders_on", {}),
            ("proteus.start_service", {"service": "pro-robinhood-api.service"}),
            ("proteus.deploy", {"deploy": "prometheus-running"})]
@@ -233,7 +432,7 @@ class ArmingGateTests(unittest.TestCase):
                 self.assertIn("owner's approval", out["refused"])
         self.assertEqual(self.ssh.calls, [])
         # ...a refusal is not a fault: the brakes behind the same circuit still work
-        out = executive.execute(Task("proteus.kill", {"system": "robinhood"})).output
+        out = executive.execute(Task("proteus.kill", {"system": "prometheus-robinhood"})).output
         self.assertTrue(out["ok"])
         self.assertEqual(len(self.ssh.calls), 1)
 
@@ -245,13 +444,15 @@ class ArmingGateTests(unittest.TestCase):
         done = self.app.approve(aid, wait=10)
         self.assertEqual(done["status"], "approved", done)
         self.assertEqual(len(self.ssh.calls), 1)
+        self.assertIs(self.ssh.env_armed, True)             # armed - and it was read back
         self.assertIn("PRO_RH_ORDERS_ENABLED=1", self.ssh.remotes[0])
         self.assertEqual(self.app.approve(aid, wait=1)["error"]["type"], "AlreadyResolved")
         self.assertEqual(len(self.ssh.calls), 1)
 
     def test_moss_cannot_approve_her_own_card(self) -> None:
         aid = self.app.run_task("proteus.rh_orders_on", {}, client="galatea")["approval_id"]
-        for who in ("galatea", "crew", "atani", "desktop"):
+        # only the owner's own surfaces approve (dashboard, phone, the desktop's owner console)
+        for who in ("galatea", "crew", "atani"):
             self.assertFalse(self.app.approve(aid, approver=who)["ok"], who)
         self.assertEqual(self.ssh.calls, [])
 
@@ -295,3 +496,75 @@ class ViewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MarkerStripTests(unittest.TestCase):
+    """run_task drops every approval.* marker a caller names, so only approve() can say the
+    owner said yes. Removing that strip must fail here, not only be caught by parking."""
+
+    class _Probe:
+        def __init__(self) -> None:
+            from pionir.contracts import AgentManifest, Capability
+            self.seen: list[frozenset[str]] = []
+            self._manifest = AgentManifest(agent_id="probe", version="test", capabilities=(
+                Capability(name="probe.look", description="look", routable=False),))
+
+        @property
+        def manifest(self):
+            return self._manifest
+
+        def execute(self, task):
+            from pionir.contracts import TaskResult
+            self.seen.append(task.granted_permissions)
+            return TaskResult(task_id=task.task_id, agent_id="probe", output={"ok": True})
+
+    def test_a_caller_named_marker_never_reaches_the_adapter(self) -> None:
+        from pionir.batching import APPROVAL_MARKERS
+        with tempfile.TemporaryDirectory() as tmp:
+            app = _app(tmp, FakeVps())
+            probe = self._Probe()
+            app.runtime.register(probe)
+            try:
+                out = app.run_task("probe.look", {}, permissions=["x.read", *sorted(APPROVAL_MARKERS)],
+                                   wait=10)
+                self.assertTrue(out["ok"], out)
+                self.assertEqual(probe.seen, [frozenset({"x.read"})])
+            finally:
+                app.runtime.cortex.close()
+
+
+class TheWebFactsTests(unittest.TestCase):
+    """The Web (Peter), as the desktop's court shows him: read from his own files."""
+
+    def test_last_cycle_signals_and_paper_books(self) -> None:
+        import json as _json
+        import sqlite3
+        from pionir.adapters.proteus import peter_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            sig = Path(tmp) / "signals.json"
+            sig.write_text(_json.dumps({"as_of": "2026-09-29T00:45:54+00:00", "equities": {
+                "AAPL": {"news": {"direction": "bearish", "conviction": 0.6, "summary": "legal risk",
+                                  "observed_at": "2026-09-29T00:27:17+00:00"}},
+                "TSM": {"news": {"direction": "bullish", "conviction": 0.8, "summary": "fab news",
+                                 "observed_at": "2026-09-29T00:40:00+00:00"}},
+                "KO": {"options": {"pc_oi_ratio": 0.7}}}, "crypto": {"BTC": {}}}), encoding="utf-8")
+            vault = Path(tmp) / "vault.sqlite"
+            con = sqlite3.connect(vault)
+            con.executescript("CREATE TABLE books (brain_id TEXT PRIMARY KEY, seeded TEXT);"
+                              "CREATE TABLE pnl (id INTEGER PRIMARY KEY, at TEXT, brain_id TEXT, "
+                              "equity TEXT, positions INTEGER);"
+                              "INSERT INTO books VALUES ('momentum', '5000');"
+                              "INSERT INTO pnl VALUES (1, 't1', 'momentum', '4900', 3);"
+                              "INSERT INTO pnl VALUES (2, 't2', 'momentum', '5100', 4);")
+            con.commit()
+            con.close()
+            facts = peter_facts(sig, vault)
+            self.assertEqual(facts["last_cycle_at"], "2026-09-29T00:45:54+00:00")
+            self.assertEqual(facts["signals"]["subjects"], 4)
+            self.assertEqual(facts["signals"]["directional"], 2)
+            self.assertEqual(facts["signals"]["latest"]["subject"], "TSM")
+            self.assertEqual(facts["pnl"], [{"brain": "momentum", "at": "t2", "equity": 5100.0,
+                                             "positions": 4, "return_pct": 2.0}])
+            missing = peter_facts(Path(tmp) / "nope.json", Path(tmp) / "nope.sqlite")
+            self.assertIn("signals_error", missing)
+            self.assertIn("pnl_error", missing)
