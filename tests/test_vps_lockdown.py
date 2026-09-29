@@ -51,8 +51,8 @@ remote = load_remote()
 OLD = {"rh": "oldRobinhoodFullKey_" + "a" * 24, "prom": "oldPrometheusKey_" + "b" * 24,
        "kark": "oldKarkinosKey_" + "c" * 24}
 PUB = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTests0123456789abcdefghijklmnopq pionir-tunnel"
-SERVER = ("import os\nREAD = os.environ.get('PRO_RH_READ_KEY')\n"
-          "UNTIL = os.environ.get('PRO_RH_API_KEY_PREVIOUS_UNTIL')\n").encode()
+SERVER = (b"import os\nREAD = os.environ.get('PRO_RH_READ_KEY')\n"
+          b"UNTIL = os.environ.get('PRO_RH_API_KEY_PREVIOUS_UNTIL')\n")
 OLD_SERVER = b"OLD = True\n"
 WEBAPP_BASE = b"# prometheus webapp, main\nKEY = 'PROM_API_KEY'\n"
 WEBAPP_NEW = b"# prometheus webapp, read-key\nKEYS = ('PROM_API_KEY', 'PROM_READ_KEY', 'PROM_API_KEY_PREVIOUS_UNTIL')\n"
@@ -143,6 +143,10 @@ else:
     if step == "deploy" and payload["name"] == "robinhood_read_api.py":   # a Windows temp path is no POSIX ExecStart path
         payload["path"] = os.path.join(vps, "robinhood_read_api.py").replace(os.sep, "/")
     out = r.STEPS[step](payload)
+if step == "env" and sim.state().get("orders_flip_after_env"):
+    _f = sim.state()["units"]["pro-robinhood-api.service"]["env_file"]      # somebody arms the orders switch
+    _t = open(_f, encoding="utf-8").read()                                 # while the rotation runs
+    open(_f, "w", encoding="utf-8").write(_t.replace("PRO_RH_ORDERS_ENABLED=0", "PRO_RH_ORDERS_ENABLED=1"))
 print(json.dumps(out))
 '''
 
@@ -302,7 +306,7 @@ class LockdownRuns(unittest.TestCase):
              "-ServerBaseSha256", hashlib.sha256(OLD_SERVER).hexdigest(), "-PantheonRepo", str(self.pantheon),
              "-PromCommit", self.prom_commit, "-PromSha256", hashlib.sha256(WEBAPP_NEW).hexdigest(),
              "-PromBaseSha256", hashlib.sha256(WEBAPP_BASE).hexdigest(), *self.now_args, *args],
-            input=stdin, capture_output=True, text=True, timeout=400, env=env)
+            input=stdin, capture_output=True, text=True, timeout=400, env=env, check=False)
 
     # ---- reading what happened
     def calls(self) -> list[dict]:
@@ -668,6 +672,81 @@ class LockdownRuns(unittest.TestCase):
                     self.assertTrue(self.sim.state()["units"][unit]["active"], unit)
                 self.assertFalse((self.state / "secrets" / "proteus-read-key.txt").exists())   # nothing shipped
                 self.sim.unit(failing, fail_restart=False)
+
+    def restarted(self, unit: str) -> bool:
+        return any(len(c) >= 3 and c[0] == "systemctl" and c[1] in ("restart", "try-restart") and c[2] == unit
+                   for c in self.sim.commands())
+
+    def test_an_env_file_error_after_d_rolls_every_file_back_and_restarts_nothing(self) -> None:
+        # the Robinhood file is refused (its live key is empty) but Prometheus's and Karkinos's were rotated
+        (self.vps / "rh_api.env").write_text("PRO_RH_API_KEY=\nPRO_RH_ORDERS_ENABLED=0\n", encoding="utf-8")
+        done = self.run_script("-Apply")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("PRO_RH_API_KEY is empty here", done.stdout)
+        self.assertIn("an env file was not updated as intended", done.stdout)
+        self.assertIn("rolled back on the VPS for all three APIs", done.stdout)
+        self.assertIn("restore", self.steps())
+        self.assertNotIn("restart", self.steps())
+        for f, name, old in (("pro.env", "PROM_API_KEY", OLD["prom"]), ("mrcrab.env", "KARKINOS_API_KEY", OLD["kark"])):
+            self.assertEqual(self.env(f)[name], old, f)
+            self.assertNotIn(name + "_PREVIOUS", self.env(f), f)
+            self.assertNotIn(name + "_PREVIOUS_UNTIL", self.env(f), f)
+        for unit in ("pro-robinhood-api.service", "prometheus-api.service", "mrcrab-api.service"):
+            self.assertFalse(self.restarted(unit), unit)                 # the rollback restarts nothing here either
+        self.assertFalse((self.state / "secrets" / "proteus-read-key.txt").exists())
+        self.assertIn("Nothing was written here", done.stdout)
+
+    def test_an_env_file_error_after_the_keys_shipped_fails_forward(self) -> None:
+        self.apply_ok()
+        keys = self.keys()
+        (self.vps / "rh_api.env").write_text("PRO_RH_API_KEY=\nPRO_RH_ORDERS_ENABLED=0\n", encoding="utf-8")
+        before = self.steps().count("restore")
+        done = self.run_script("-Apply")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("failed forward", done.stdout)
+        self.assertNotIn("rolled back on the VPS", done.stdout)
+        self.assertEqual(self.steps().count("restore"), before)
+        self.assertEqual(self.env("pro.env")["PROM_API_KEY"], keys["prom"])          # the new keys stay
+        self.assertEqual(self.env("mrcrab.env")["KARKINOS_API_KEY"], keys["kark"])
+        self.assertEqual(self.env("pro.env")["PROM_API_KEY_PREVIOUS"], OLD["prom"])  # with the previous ones
+
+    def test_an_armed_mismatch_after_d_rolls_back_without_touching_the_orders_switch(self) -> None:
+        rh = "pro-robinhood-api.service"
+        pid = self.sim.state()["units"][rh]["pid"]
+        self.sim.set(orders_flip_after_env=True)        # Ian arms the orders after the preflight, before the restart
+        done = self.run_script("-Apply")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("real-money orders differ", done.stdout)
+        self.assertIn("rolled back on the VPS for all three APIs", done.stdout)
+        for f, name, old in (("rh_api.env", "PRO_RH_API_KEY", OLD["rh"]), ("pro.env", "PROM_API_KEY", OLD["prom"]),
+                             ("mrcrab.env", "KARKINOS_API_KEY", OLD["kark"])):
+            self.assertEqual(self.env(f)[name], old, f)
+            self.assertNotIn(name + "_PREVIOUS", self.env(f), f)
+        # Ian's decision survives the rollback ...
+        self.assertEqual(self.env("rh_api.env")["PRO_RH_ORDERS_ENABLED"], "1")
+        # ... and the Robinhood API was never restarted (a restart would have ARMED real-money orders)
+        self.assertFalse(self.restarted(rh))
+        self.assertEqual(self.sim.state()["units"][rh]["pid"], pid)
+        self.assertEqual(self.sim.running_env(rh)["PRO_RH_ORDERS_ENABLED"], "0")
+        self.assertEqual(self.sim.running_env("prometheus-api.service")["PROM_API_KEY"], OLD["prom"])
+        self.assertTrue(self.sim.state()["units"]["prometheus-api.service"]["active"])
+        self.assertFalse((self.state / "secrets" / "proteus-read-key.txt").exists())
+
+    def test_an_armed_mismatch_after_the_keys_shipped_fails_forward(self) -> None:
+        self.apply_ok()
+        keys = self.keys()
+        rh = "pro-robinhood-api.service"
+        pid = self.sim.state()["units"][rh]["pid"]
+        before = self.steps().count("restore")
+        self.sim.set(orders_flip_after_env=True)
+        done = self.run_script("-Apply")
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("real-money orders differ", done.stdout)
+        self.assertIn("failed forward", done.stdout)
+        self.assertEqual(self.steps().count("restore"), before)
+        self.assertEqual(self.env("rh_api.env")["PRO_RH_API_KEY"], keys["rh_full"])
+        self.assertEqual(self.env("rh_api.env")["PRO_RH_API_KEY_PREVIOUS"], OLD["rh"])
+        self.assertEqual(self.sim.state()["units"][rh]["pid"], pid)
 
     def test_once_the_keys_are_shipped_a_failure_never_rolls_them_back(self) -> None:
         self.apply_ok()
@@ -1071,6 +1150,28 @@ class RemoteHalf(unittest.TestCase):
                                    "files": [str(f).replace(os.sep, "/")]})
         self.assertTrue(out["active"])
         self.assertEqual(self.r.parse_env(f.read_text(encoding="utf-8"))["PRO_RH_API_KEY"], "a")
+
+    def test_restore_keeps_a_live_orders_switch_and_can_restart_nothing(self) -> None:
+        self._units()
+        f = self.dir / "rh_api.env"
+        self.r.update_env_file(str(f), {"PRO_RH_API_KEY": "n" * 43}, {"PRO_RH_API_KEY": "PRO_RH_API_KEY_PREVIOUS"}, [], "20260928T000000Z")
+        f.write_text(f.read_text(encoding="utf-8").replace("PRO_RH_ORDERS_ENABLED=0", "PRO_RH_ORDERS_ENABLED=1"), encoding="utf-8")
+        pid = self.sim.state()["units"]["pro-robinhood-api.service"]["pid"]
+        out = self.r.step_restore({"stamp": "20260928T000000Z", "unit": "pro-robinhood-api.service", "was_active": False,
+                                   "files": [str(f).replace(os.sep, "/")], "keep_live": ["PRO_RH_ORDERS_ENABLED"]})
+        env = self.r.parse_env(f.read_text(encoding="utf-8"))
+        self.assertEqual((env["PRO_RH_API_KEY"], env["PRO_RH_ORDERS_ENABLED"]), ("a", "1"))
+        self.assertNotIn("PRO_RH_API_KEY_PREVIOUS", env)
+        self.assertTrue(out["restored"])
+        self.assertEqual(self.sim.state()["units"]["pro-robinhood-api.service"]["pid"], pid)
+        self.assertFalse(any(c[:2] == ["systemctl", "restart"] for c in self.sim.commands()))
+        # nothing moved: the restore is byte-for-byte the backup (even CRLF, even no final newline),
+        # and a name absent live stays absent
+        f.write_bytes(b"PRO_RH_API_KEY=a\r\nPRO_RH_ORDERS_ENABLED=0")
+        self.r.update_env_file(str(f), {"PRO_RH_API_KEY": "m" * 43}, {"PRO_RH_API_KEY": "PRO_RH_API_KEY_PREVIOUS"}, [], "20260928T000001Z")
+        self.r.step_restore({"stamp": "20260928T000001Z", "unit": "pro-robinhood-api.service", "was_active": False,
+                             "files": [str(f).replace(os.sep, "/")], "keep_live": ["PRO_RH_ORDERS_ENABLED", "NOT_SET_ANYWHERE"]})
+        self.assertEqual(f.read_bytes(), Path(str(f) + ".bak-pionir-20260928T000001Z").read_bytes())
 
     # ---- the firewall
     def test_prepare_only_permits_and_arm_schedules_the_revert_first(self) -> None:

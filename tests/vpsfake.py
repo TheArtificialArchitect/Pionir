@@ -76,7 +76,6 @@ class Sim:
         self.save(s)
 
     def _configured(self, u: dict) -> dict:
-        from importlib import util
         env = {}
         for w in shlex.split(u.get("environment", "")):
             k, _, v = w.partition("=")

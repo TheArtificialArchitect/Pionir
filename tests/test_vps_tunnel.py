@@ -20,13 +20,13 @@ from pathlib import Path
 from pionir.adapters._proc import ProcessResult
 from pionir.adapters.proteus import (
     DEFAULT_HOST,
+    TS_READER,
     TUNNEL_PORTS,
     ProteusAdapter,
     ProteusSettings,
     parse_status,
     read_tunnel_health,
     status_script,
-    TS_READER,
     tailnet_key_view,
 )
 
@@ -57,7 +57,7 @@ def _run_tunnel(tmp: Path, *extra: str, key: bool = True, code: int = 255) -> tu
         ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File",
          str(TUNNEL), "-KeyFile", str(keyfile), "-VpsHost", "vps.test",
          "-InitialDelaySeconds", "0.05", *extra],
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120, env=env)
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120, env=env, check=False)
     lines = log.read_text(encoding="ascii").splitlines() if log.exists() else []
     return done, lines
 
@@ -122,7 +122,7 @@ class TunnelShapeTests(unittest.TestCase):
 
 class PlaneTunnelTests(unittest.TestCase):
     def _plane(self, probe) -> dict:
-        ssh = lambda argv, timeout: ProcessResult(returncode=0, stdout="", stderr="")  # noqa: E731
+        ssh = lambda argv, timeout: ProcessResult(returncode=0, stdout="", stderr="")
         adapter = ProteusAdapter(ProteusSettings(host="vps.test", key_file=Path("C:/k")),
                                  runner=ssh, peter_health=lambda: True, tunnel_health=probe)
         return adapter.plane()["tunnel"]
@@ -185,7 +185,7 @@ class TailnetKeyExpiryTests(unittest.TestCase):
             record = Path(tmp) / "vps-tailnet.json"
             settings = ProteusSettings(host="vps.test", key_file=Path("C:/k"), tailnet_file=record)
             out = f"ts_key_expiry {self._iso(10)}\n"
-            ssh = lambda argv, timeout: ProcessResult(returncode=0, stdout=out, stderr="")  # noqa: E731
+            ssh = lambda argv, timeout: ProcessResult(returncode=0, stdout=out, stderr="")
             adapter = ProteusAdapter(settings, runner=ssh, peter_health=lambda: True,
                                      tunnel_health=lambda port: "200", clock=lambda: self.NOW)
             self.assertTrue(adapter.plane()["tailnet"]["alarm"])
@@ -205,13 +205,13 @@ class TailnetKeyExpiryTests(unittest.TestCase):
             record = Path(tmp) / "vps-tailnet.json"
             record.write_text(json.dumps({"ipv4": "100.64.0.7", "key_expiry": None}), encoding="utf-8")
             settings = ProteusSettings(host="vps.test", key_file=Path("C:/k"), tailnet_file=record)
-            ssh = lambda argv, timeout: ProcessResult(returncode=returncode, stdout=out, stderr="")  # noqa: E731
+            ssh = lambda argv, timeout: ProcessResult(returncode=returncode, stdout=out, stderr="")
             adapter = ProteusAdapter(settings, runner=ssh, peter_health=lambda: True,
                                      tunnel_health=lambda port: "200", clock=lambda: self.NOW)
             return adapter.plane()["tailnet"]
 
     def test_the_phones_key_expiry_alarms_too(self) -> None:
-        fine = self._plane(f"ts_key_expiry none\nts_peer android none pixel\n")
+        fine = self._plane("ts_key_expiry none\nts_peer android none pixel\n")
         self.assertEqual((fine["alarm"], fine["phone_alarm"], fine["verified"]), (False, False, True))
         self.assertEqual(fine["phone_state"], "pixel: key expiry disabled")
         soon = self._plane(f"ts_key_expiry none\nts_peer android {self._iso(5)} pixel\n")
@@ -228,8 +228,84 @@ class TailnetKeyExpiryTests(unittest.TestCase):
         far = self._plane(f"ts_key_expiry {self._iso(3)}\nts_peer android {self._iso(90)} pixel\n")
         self.assertTrue(far["alarm"])
         self.assertFalse(far["phone_alarm"])
-        # no phone on the tailnet is said, not silently fine
-        self.assertIn("no phone seen", self._plane("ts_key_expiry none\n")["phone_state"])
+        # no phone on the tailnet is said, not silently fine: a visible WARNING (not an alarm)
+        nobody = self._plane("ts_key_expiry none\n")
+        self.assertIn("no phone seen", nobody["phone_state"])
+        self.assertIn("STOP route", nobody["phone_warning"])
+        self.assertIn("unverifiable", nobody["phone_warning"])
+        self.assertIn("independent STOP route", nobody["phone_warning"])
+        self.assertFalse(nobody["alarm"] or nobody["phone_alarm"])
+        # ... and a phone that IS seen clears it
+        self.assertEqual(fine["phone_warning"], "")
+        self.assertEqual(far["phone_warning"], "")
+
+    def test_unknown_is_unverified_and_an_alarm_in_plane_and_doctor(self) -> None:
+        view = tailnet_key_view("unknown", self.NOW)
+        self.assertTrue(view["alarm"])
+        self.assertTrue(view["state"].startswith("UNVERIFIED"))
+        self.assertIn("independent STOP route", view["message"])
+        live = self._plane("ts_key_expiry unknown\n")
+        self.assertTrue(live["alarm"])
+        self.assertFalse(live["verified"])
+        self.assertTrue(live["state"].startswith("UNVERIFIED"), live["state"])
+        self.assertTrue(live["message"])
+        self.assertIn("unverified", live["phone_state"])
+        self.assertEqual(live["phone_warning"], "")  # nothing to say about a phone we could not look for
+        # doctor (offline): a record that says unknown alarms too - and is never shown as fine
+        with tempfile.TemporaryDirectory() as tmp:
+            record = Path(tmp) / "vps-tailnet.json"
+            record.write_text(json.dumps({"ipv4": "100.64.0.7", "key_expiry": "unknown"}), encoding="utf-8")
+            adapter = ProteusAdapter(ProteusSettings(host="vps.test", key_file=Path("C:/k"), tailnet_file=record),
+                                     runner=lambda argv, timeout: ProcessResult(returncode=1, stdout="", stderr=""),
+                                     peter_health=lambda: True, tunnel_health=lambda port: "200",
+                                     clock=lambda: self.NOW)
+            recorded = adapter.status()["tailnet"]
+            self.assertTrue(recorded["alarm"])
+            self.assertFalse(recorded["verified"])
+            self.assertTrue(recorded["state"].startswith("UNVERIFIED"))
+            self.assertNotIn("UNVERIFIED - UNVERIFIED", recorded["state"])
+
+    def _reader(self, doc: object) -> list[str]:
+        import subprocess
+        import sys as _sys
+        run = subprocess.run([_sys.executable, "-c", TS_READER], input=json.dumps(doc), capture_output=True, text=True, check=False)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return run.stdout.splitlines()
+
+    def test_only_a_running_node_with_a_self_entry_can_report_expiry_disabled(self) -> None:
+        peer = {"a": {"HostName": "pixel", "OS": "android"}}
+        me = {"HostName": "proteus-vps"}  # no KeyExpiry: expiry disabled - but only if Running
+        for name, doc in (
+            ("NeedsLogin", {"BackendState": "NeedsLogin", "Self": me, "Peer": peer}),
+            ("Stopped", {"BackendState": "Stopped", "Self": me, "Peer": peer}),
+            ("Starting", {"BackendState": "Starting", "Self": me, "Peer": peer}),
+            ("no state", {"Self": me, "Peer": peer}),
+            ("empty", {}),
+            ("running without Self", {"BackendState": "Running", "Peer": peer}),
+            ("running with an empty Self", {"BackendState": "Running", "Self": {}, "Peer": peer}),
+            ("running with a null Self", {"BackendState": "Running", "Self": None, "Peer": peer}),
+        ):
+            # exactly one line, "unknown", and no peers listed either
+            self.assertEqual(self._reader(doc), ["ts_key_expiry unknown"], name)
+        live = self._reader({"BackendState": "Running", "Self": me, "Peer": peer})
+        self.assertEqual(live, ["ts_key_expiry none", "ts_peer android none pixel"])
+        # and a non-JSON answer is a failed read (the remote shell then says unknown)
+        import subprocess
+        import sys as _sys
+        run = subprocess.run([_sys.executable, "-c", TS_READER], input="not json", capture_output=True, text=True, check=False)
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("|| echo 'ts_key_expiry unknown'", status_script(ProteusSettings(host="vps.test")))
+
+    def test_a_stopped_or_logged_out_vps_alarms_in_the_plane_end_to_end(self) -> None:
+        import subprocess
+        import sys as _sys
+        for state in ("NeedsLogin", "Stopped"):
+            doc = {"BackendState": state, "Self": {"HostName": "proteus-vps"}, "Peer": {}}
+            run = subprocess.run([_sys.executable, "-c", TS_READER], input=json.dumps(doc), capture_output=True, text=True, check=False)
+            view = self._plane(run.stdout)
+            self.assertTrue(view["alarm"], state)
+            self.assertFalse(view["verified"], state)
+            self.assertNotIn("expiry disabled", view["state"], state)
 
     def test_a_failed_live_read_falls_back_to_unverified_never_fine(self) -> None:
         for out, rc in (("", 255), ("ts_key_expiry none\n", 255), ("ts_key_expiry unknown\n", 0)):
@@ -241,11 +317,11 @@ class TailnetKeyExpiryTests(unittest.TestCase):
     def test_the_remote_reader_reports_the_vps_and_only_phone_peers(self) -> None:
         import subprocess
         import sys as _sys
-        doc = {"Self": {"HostName": "proteus-vps", "KeyExpiry": "2027-05-05T00:00:00Z"},
+        doc = {"BackendState": "Running", "Self": {"HostName": "proteus-vps", "KeyExpiry": "2027-05-05T00:00:00Z"},
                "Peer": {"a": {"HostName": "pixel 7; rm -rf", "OS": "android", "KeyExpiry": "2027-01-02T03:04:05Z"},
                         "b": {"HostName": "desk", "OS": "windows", "KeyExpiry": "2027-01-01T00:00:00Z"},
                         "c": {"HostName": "iph", "OS": "iOS", "Expired": True}}}
-        run = subprocess.run([_sys.executable, "-c", TS_READER], input=json.dumps(doc), capture_output=True, text=True)
+        run = subprocess.run([_sys.executable, "-c", TS_READER], input=json.dumps(doc), capture_output=True, text=True, check=False)
         self.assertEqual(run.returncode, 0, run.stderr)
         lines = run.stdout.splitlines()
         self.assertEqual(lines[0], "ts_key_expiry 2027-05-05T00:00:00Z")
@@ -299,7 +375,7 @@ class LauncherTests(unittest.TestCase):
             path.write_text(text[start:end] + LAUNCHER_SCENE, encoding="utf-8-sig")
             done = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
                                    "Bypass", "-File", str(path)], stdin=subprocess.DEVNULL,
-                                  capture_output=True, text=True, timeout=120)
+                                  capture_output=True, text=True, timeout=120, check=False)
         self.assertEqual(done.returncode, 0, done.stderr)
         rows = json.loads(done.stdout.strip().splitlines()[-1])
         # the wrapper a pane started is ours; one started by hand is not; an ssh is never

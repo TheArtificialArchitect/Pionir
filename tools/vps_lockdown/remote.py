@@ -75,7 +75,7 @@ def emit(obj: dict) -> None:
 
 def _run(argv: list[str], timeout: float = 30, env: dict | None = None) -> tuple[int, str]:
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env, check=False)
         return done.returncode, done.stdout
     except (OSError, subprocess.TimeoutExpired):
         return 127, ""
@@ -318,7 +318,7 @@ def _find_file(root: str, name: str, depth: int = 4) -> str | None:
 def step_discover(p: dict) -> dict:
     units = find_units()
     apis = {}
-    for api in MARKERS:
+    for api, marker in MARKERS.items():
         unit = units.get(api)
         info: dict = {"unit": unit}
         if unit:
@@ -332,7 +332,7 @@ def step_discover(p: dict) -> dict:
             info["env_names"] = sorted(set().union(*[set(parse_env(_read(f))) for f in env_files])) if env_files else []
             workdir = _show(unit, "WorkingDirectory")
             if api == "robinhood":
-                script = script_from_execstart(_show(unit, "ExecStart"), MARKERS[api], workdir)
+                script = script_from_execstart(_show(unit, "ExecStart"), marker, workdir)
                 info["script"] = script
                 text = _read(script) if script else ""
                 info["read_key_support"] = "PRO_RH_READ_KEY" in text
@@ -346,7 +346,7 @@ def step_discover(p: dict) -> dict:
                 info["read_key_support"] = "PROM_READ_KEY" in text
                 info["previous_key_support"] = "PROM_API_KEY_PREVIOUS_UNTIL" in text
             else:
-                script = script_from_execstart(_show(unit, "ExecStart"), MARKERS[api], workdir)
+                script = script_from_execstart(_show(unit, "ExecStart"), marker, workdir)
                 text = _read(script) if script else ""
                 info["script"] = script
                 info["read_key_support"] = False     # its only key opens GETs only already
@@ -446,7 +446,7 @@ def install_sshd_block(user: str, opens: list[str]) -> dict:
     if use_dropin:
         new = block
     else:
-        stripped = re.sub(re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n?", "", main, flags=re.S)
+        stripped = re.sub(re.escape(BEGIN) + r".*?" + re.escape(END) + r"\n?", "", main, flags=re.DOTALL)
         new = stripped.rstrip("\n") + "\n\n" + block
     if before == new:
         changed = False
@@ -476,9 +476,8 @@ def install_sshd_block(user: str, opens: list[str]) -> dict:
         if changed:
             put_back()
         return {"error": "sshd would not restrict the account as intended (" + ", ".join(bad) + "): put back, nothing reloaded"}
-    if changed:
-        if _run(["systemctl", "reload", "ssh"])[0] != 0 and _run(["systemctl", "reload", "sshd"])[0] != 0:
-            return {"error": "sshd reload failed (the checked config is in place; reload ssh by hand)"}
+    if changed and _run(["systemctl", "reload", "ssh"])[0] != 0 and _run(["systemctl", "reload", "sshd"])[0] != 0:
+        return {"error": "sshd reload failed (the checked config is in place; reload ssh by hand)"}
     return {"sshd_file": target, "sshd_changed": changed}
 
 
@@ -530,9 +529,9 @@ def step_deploy(p: dict) -> dict:
         if word.encode() not in content:
             return {"step": "deploy", "error": f"the new file lacks {word}"}
     path = p.get("path")
-    if path and not (str(path).startswith("/") and posixpath.basename(str(path)) == p["name"]):
-        if not str(path).replace("\\", "/").endswith("/" + p["name"]):
-            return {"step": "deploy", "error": "the target is not the named file"}
+    if (path and not (str(path).startswith("/") and posixpath.basename(str(path)) == p["name"])
+            and not str(path).replace("\\", "/").endswith("/" + p["name"])):
+        return {"step": "deploy", "error": "the target is not the named file"}
     if not path:
         unit = p["unit"]
         if not UNIT_RE.fullmatch(unit):
@@ -621,9 +620,26 @@ def step_restart(p: dict) -> dict:
     return {"step": "restart", "units": results}
 
 
+def keep_live(backup: bytes, live: bytes, names) -> bytes:
+    """The backup's bytes, except that each name in `names` keeps what the LIVE file says now
+    (or stays absent if it is absent now). A rollback must never undo a decision somebody made
+    while the rotation ran - above all the real-money orders switch."""
+    names = [n for n in names if NAME_RE.fullmatch(str(n))]
+    then, now = backup.decode("utf-8", "replace"), live.decode("utf-8", "replace")
+    a, b = parse_env(then), parse_env(now)
+    if all(a.get(n) == b.get(n) for n in names):
+        return backup
+    lines = [x for x in then.splitlines() if env_name(x) not in names]
+    for n in names:
+        lines += [x for x in now.splitlines() if env_name(x) == n][-1:]
+    return (chr(10).join(lines) + chr(10)).encode("utf-8")
+
+
 def step_restore(p: dict) -> dict:
-    """A unit that was running did not come back after its restart: put its files back from
-    this stamp's backups and start it again (it was running before we touched it)."""
+    """A unit that was running did not come back after its restart (or the rotation is being
+    undone): put its files back from this stamp's backups. `was_active` false restores the files
+    ONLY and never restarts (nothing may restart a unit whose orders switch has moved);
+    `keep_live` names keep their live values in the restored files."""
     stamp, unit = str(p["stamp"]), str(p["unit"])
     if not re.fullmatch(r"\d{8}T\d{6}Z", stamp) or not UNIT_RE.fullmatch(unit):
         return {"step": "restore", "error": "bad stamp or unit"}
@@ -634,6 +650,9 @@ def step_restore(p: dict) -> dict:
             st = os.stat(path)
             with open(bak, "rb") as fh:
                 data = fh.read()
+            if p.get("keep_live"):
+                with open(path, "rb") as fh:
+                    data = keep_live(data, fh.read(), p["keep_live"])
             tmp = path + ".pionir-tmp"
             _write_private(tmp, data, st.st_mode, getattr(st, "st_uid", None), getattr(st, "st_gid", None))
             os.replace(tmp, path)

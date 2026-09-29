@@ -570,7 +570,10 @@ function Undo-Rotation([string]$failedUnit, [string]$prefix) {
         $files = @($unitFiles[$unit] | Where-Object { $_ })
         if ($unit -ne $failedUnit) { $files = @($files | Where-Object { $_ -like "*.env" }) }
         if (-not $files.Count) { continue }
-        $ro = Try-Remote @{ step = "restore"; stamp = $stamp; unit = $unit; files = $files; was_active = [bool]$unitWasActive[$unit] }
+        # keep_live: a rollback never undoes the orders switch (PRO_RH_ORDERS_ENABLED) if it moved while the
+        # rotation ran; was_active $false (set by a caller) restores the files and restarts nothing
+        $ro = Try-Remote @{ step = "restore"; stamp = $stamp; unit = $unit; files = $files; was_active = [bool]$unitWasActive[$unit]
+                            keep_live = @("PRO_RH_ORDERS_ENABLED") }
         if ($ro) { Say ("{0}: restored ({1}); active {2}" -f $unit, ((@($ro.restored)) -join ", "), $ro.active) }
         else { Warn "$unit : the rollback could not be done - restore by hand (see [h])" }
     }
@@ -845,7 +848,16 @@ if ($Apply -and $rotate) {
             }
         }
     }
-    if ($script:failures) { Stop-Here "an env file was not updated as intended: nothing was restarted. Fix it, then run -Apply again (the same keys are used)." }
+    if ($script:failures) {
+        # Some env files may already hold the new keys while a running process holds the old ones: never leave that.
+        # Same rule as every later failure: keys not shipped -> ALL env files back together (files only, NOTHING is
+        # restarted: no process has been touched yet); keys shipped -> fail forward.
+        $unitFiles = @{}; $unitWasActive = @{}
+        foreach ($pair in @(@($rhUnit, $rhEnv), @($promUnit, $promEnv), @($karkUnit, $karkEnv))) {
+            if ($pair[0] -and $pair[1]) { $unitFiles[$pair[0]] = @($pair[1]); $unitWasActive[$pair[0]] = $false }
+        }
+        Undo-Rotation "" "an env file was not updated as intended (nothing was restarted): "
+    }
     Save-State ((Load-State) | Add-Member -NotePropertyName rotated -NotePropertyValue ([pscustomobject]$rotated) -Force -PassThru)
     Mark "env"
 } elseif (-not $Apply) {
@@ -884,7 +896,14 @@ if ($Apply -and $rotate) {
     foreach ($u in $rs.units) { $unitWasActive[$u.unit] = [bool]$u.was_active }   # all of them, before any rollback needs them
     foreach ($u in $rs.units) {
         $running[$u.unit] = ($u.state -eq "active")
-        if ($u.armed_mismatch) { Stop-Here ("{0}: real-money orders differ between the running process and its configuration: NOT restarted. Decide first (Pionir proteus.rh_orders_off / on), then run again." -f $u.unit) }
+        if ($u.armed_mismatch) {
+            # The env files are already rotated (and other units may be restarted on them): same rule as any [e]
+            # failure. This unit is NEVER restarted, not even by the rollback - a restart would arm or disarm
+            # real-money orders, which is Ian's call - and the rollback keeps the orders switch as it is now.
+            $unitWasActive[$u.unit] = $false
+            Warn ("{0}: real-money orders differ between the running process and its configuration: NOT restarted, by the rollback either. Decide first (Pionir proteus.rh_orders_off / on), then run -Apply again." -f $u.unit)
+            Undo-Rotation "" ("{0}: " -f $u.unit)
+        }
         if (-not $u.was_active) { Warn ("{0}: {1} - {2}" -f $u.unit, $u.state, $u.note); continue }
         if ($u.current) { Say ("{0}: already running with its current keys (no restart)" -f $u.unit) }
         elseif (-not $u.restarted) {
