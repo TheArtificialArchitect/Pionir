@@ -12,7 +12,9 @@ import unittest
 from pathlib import Path
 
 TESTS = Path(__file__).resolve().parent
-LIVE_ADDRESSES = ("127.0.0.1:8799", "localhost:8799", ":11434")
+# ... and Proteus: the VPS (it trades), Peter's app, and the Ollama gate's live port.
+LIVE_ADDRESSES = ("127.0.0.1:8799", "localhost:8799", ":11434", "174.138.35.184",
+                  "127.0.0.1:8790", "127.0.0.1:8774")
 
 
 def _sources() -> list[tuple[Path, ast.Module]]:
@@ -68,6 +70,14 @@ class HermeticSuiteTests(unittest.TestCase):
         self.assertEqual(offenders, [], "patch pionir.discord_gate.DiscordRest in that test "
                                         "(or leave owner_notify off)")
 
+
+    def test_no_test_builds_a_proteus_adapter_with_the_real_ssh(self) -> None:
+        # ProteusAdapter's default runner is ssh to the trading VPS. Every test hands it a
+        # fake runner, and a fake Peter health probe for the plane read.
+        offenders = [f"{path.name}:{c.lineno}" for path, tree in _sources()
+                     for c in _calls(tree, "ProteusAdapter")
+                     if not {"runner", "peter_health"} <= _keywords(c)]
+        self.assertEqual(offenders, [], "pass runner= and peter_health= fakes")
 
     def test_no_test_probes_the_live_bridges(self) -> None:
         # Doctor POSTs to Daedalus without a token to see whether it is locked. A test

@@ -78,6 +78,13 @@ BATCHED_GRANT = "approval.batched"
 # so the run may only create one - batched or not. If the thing exists by then, the
 # adapter refuses and changes nothing.
 NEW_ONLY_GRANT = "approval.new_only"
+# Granted to EVERY run of an approval the owner said yes to (PionirApp.approve), and never
+# by any other path: run_task strips every approval marker a caller supplies, and no
+# client grant can hold one. An adapter whose action must never run without a human yes
+# (arming live trading: pionir.adapters.proteus) refuses a task that lacks it - so holding
+# the capability's own permission, in-process or otherwise, is not a way around the card.
+OWNER_APPROVED_GRANT = "approval.owner"
+APPROVAL_MARKERS = frozenset({BATCHED_GRANT, NEW_ONLY_GRANT, OWNER_APPROVED_GRANT})
 
 
 def every_call_approval(capability: Any) -> bool:

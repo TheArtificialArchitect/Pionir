@@ -365,10 +365,21 @@ class ModelLeaseScheduler:
             rewarm=tuple(sorted(m for m in self.protected_models if m in resident and m != target)),
         )
 
-    def acquire(self, requirement: ModelRequirement, *, purpose: str | None = None) -> ModelLease:
+    def acquire(
+        self, requirement: ModelRequirement, *, purpose: str | None = None,
+        settle: Callable[[], bool] | None = None,
+    ) -> ModelLease:
         """Admit one model use. ``purpose`` is what the shared lock's holder
         record says (e.g. ``"daedalus: qwen3-coder:30b"``), so a process that
-        honours the lock - the voice - can say who has the card."""
+        honours the lock - the voice - can say who has the card.
+
+        ``settle`` is asked once the shared lease is held and before anything is
+        sidelined: True when every tenant that honours the lease has actually stood
+        down (the voice says she is yielding, so no turn of hers is in flight). When
+        it answers False the request is refused rather than evicting a protected
+        model mid-turn, and the lease is let go on the way out. Without it the old
+        contract stands (holding the lease is taken as the voice having stood down),
+        which is what the Daedalus path relies on."""
 
         if requirement.requires_gpu and requirement.total_vram_mb > self.budget.usable_vram_mb:
             raise ResourceUnavailable(
@@ -395,6 +406,11 @@ class ModelLeaseScheduler:
                 )
         handback: _Handback | None = None
         try:
+            if settle is not None and requirement.requires_gpu and not settle():
+                raise ResourceUnavailable(
+                    f"{requirement.model_id}: the voice has not stood down (a turn may be in "
+                    "flight), so nothing of hers is sidelined - refused."
+                )
             if shared_lease is not None:
                 handback = self._plan_handback(requirement)
             if requirement.requires_gpu and self.vram_probe is not None:

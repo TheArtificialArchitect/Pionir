@@ -299,6 +299,13 @@ class PionirSettings:
     # "running" status and 202/poll clients see progress. PIONIR_GPU_LOCK_WAIT_SECONDS
     # overrides; 0 restores the old immediate refusal.
     gpu_lock_wait_seconds: float = 600.0
+    # Proteus, Ian's trading system: its VPS control plane as proteus.* capabilities
+    # (pionir.adapters.proteus). Reached over ssh as root with proteus_ssh_key (None means
+    # ~/proteus_deploy), only when a capability runs - nothing at boot. Brakes run at once;
+    # arming parks for the owner's card on every call. PIONIR_PROTEUS_HOST set to "off"
+    # leaves it unregistered; PIONIR_PROTEUS_SSH_KEY points at another key.
+    proteus_host: str | None = "174.138.35.184"
+    proteus_ssh_key: Path | None = None
 
     def __post_init__(self) -> None:
         if self.gpu_lock_wait_seconds < 0:
@@ -614,5 +621,11 @@ class PionirSettings:
                 os.environ.get(
                     "PIONIR_GPU_LOCK_WAIT_SECONDS", _declared("gpu_lock_wait_seconds")
                 )
+            ),
+            proteus_host=_optional_url("PIONIR_PROTEUS_HOST", _declared("proteus_host")),
+            proteus_ssh_key=(
+                Path(os.environ["PIONIR_PROTEUS_SSH_KEY"]).expanduser()
+                if (os.environ.get("PIONIR_PROTEUS_SSH_KEY") or "").strip()
+                else None
             ),
         )
