@@ -38,6 +38,30 @@ def _declared(name: str) -> Any:
     raise KeyError(name)
 
 
+def _discover_src(package: str, candidates: tuple[str, ...]) -> str:
+    """The src tree to run `python -m <package>` from.
+
+    Nyx and Voodoo moved from C:\\src\\Nyx and C:\\src\\voodoo into
+    C:\\src\\Nyx.Voodoo\\{Nyx,Voodoo}\\src. Their editable installs still point
+    at the old paths, so the console script and a bare import find nothing; run
+    the module out of its own src tree instead. This returns the first candidate
+    that actually holds the package (so the new layout wins, the old is a
+    fallback), or the first candidate unchanged when none is present so the
+    setting still constructs and doctor reports the tree as gone.
+    """
+
+    for candidate in candidates:
+        root = Path(candidate)
+        if (root / package).is_dir() or (root / f"{package}.py").is_file():
+            return candidate
+    return candidates[0]
+
+
+# Resolved once at import: the src tree each security organ is run from.
+_NYX_SRC = _discover_src("nyx", (r"C:\src\Nyx.Voodoo\Nyx\src", r"C:\src\Nyx\src", r"C:\src\Nyx"))
+_VOODOO_SRC = _discover_src("voodoo", (r"C:\src\Nyx.Voodoo\Voodoo\src", r"C:\src\voodoo\src"))
+
+
 def _positive_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None:
@@ -127,13 +151,18 @@ class PionirSettings:
     # blocking). Needs bryo_status_command. Turn off with PIONIR_BRYO_PRESSURE=off.
     bryo_pressure: bool = True
     # Nyx (offensive) and Voodoo (defensive), Pionir's read-only security organs.
-    # Wired in by default: `nyx status` is an installed console script; Voodoo's
-    # editable install isn't importable, so `python -m voodoo status` runs from
-    # its src tree. Each shows unavailable in doctor if its tree/CLI is gone, and
-    # either is turned off with PIONIR_NYX/VOODOO_STATUS_COMMAND_JSON set to "off".
-    nyx_status_command: tuple[str, ...] | None = ("nyx", "status")
+    # Both moved into C:\src\Nyx.Voodoo\{Nyx,Voodoo}\src; their editable installs
+    # still point at the old C:\src\Nyx / C:\src\voodoo trees, so the `nyx`
+    # console script and a bare import find nothing. Each is run as `python -m
+    # <pkg>` out of its own src tree (discovered above, new layout preferred, old
+    # as fallback) - no reinstall, and `python -m` puts that cwd on sys.path so
+    # the package resolves from there. Each shows unavailable in doctor if its
+    # tree/CLI is gone, and either is turned off with
+    # PIONIR_NYX/VOODOO_STATUS_COMMAND_JSON set to "off".
+    nyx_status_command: tuple[str, ...] | None = ("python", "-m", "nyx", "status")
+    nyx_status_cwd: str = _NYX_SRC
     voodoo_status_command: tuple[str, ...] | None = ("python", "-m", "voodoo", "status")
-    voodoo_status_cwd: str = r"C:\src\voodoo\src"
+    voodoo_status_cwd: str = _VOODOO_SRC
     # Taskable actions: Atani may invoke one of these (privileged, so it lands in
     # the approval queue and never fires on the voice's own initiative). The
     # action is an allowlisted subcommand (one token, or the explicit two-token
@@ -142,7 +171,8 @@ class PionirSettings:
     # offensive commands are research/crawl/fingerprint/cert (`scan` is `nyx
     # improve scan`, `specialists` needs list|run); Voodoo's `hunt` is `defend
     # hunt`, and bare `defend` errors, so each defend posture is spelled out.
-    nyx_run_prefix: tuple[str, ...] = ("nyx",)
+    # Run out of the same src tree as status (see nyx_status_cwd), as a module.
+    nyx_run_prefix: tuple[str, ...] = ("python", "-m", "nyx")
     nyx_run_actions: tuple[str, ...] = ("research", "crawl", "fingerprint", "cert")
     voodoo_run_prefix: tuple[str, ...] = ("python", "-m", "voodoo")
     voodoo_run_actions: tuple[str, ...] = field(default=(
@@ -482,6 +512,9 @@ class PionirSettings:
                 else _command_from_json(
                     "PIONIR_NYX_STATUS_COMMAND_JSON", _declared("nyx_status_command")
                 )
+            ),
+            nyx_status_cwd=(
+                os.environ.get("PIONIR_NYX_STATUS_CWD") or _declared("nyx_status_cwd")
             ),
             voodoo_status_command=(
                 None

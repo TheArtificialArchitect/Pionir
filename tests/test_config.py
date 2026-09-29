@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from pionir.config import PionirSettings
+from pionir.config import PionirSettings, _discover_src
 
 
 class ConfigTests(unittest.TestCase):
@@ -46,6 +46,50 @@ class ConfigTests(unittest.TestCase):
             settings.gpu_lock_path,
             Path(os.getcwd()).resolve() / "gpu.lock",
         )
+
+    def test_security_organs_run_as_module_not_stale_console_script(self) -> None:
+        # Nyx/Voodoo moved to C:\src\Nyx.Voodoo; the editable installs still point
+        # at the old trees, so the `nyx` console script and a bare import find
+        # nothing. Pionir runs each as `python -m <pkg>` out of its own src tree.
+        settings = PionirSettings()
+        self.assertEqual(settings.nyx_status_command, ("python", "-m", "nyx", "status"))
+        self.assertEqual(settings.nyx_run_prefix, ("python", "-m", "nyx"))
+        self.assertEqual(settings.voodoo_status_command, ("python", "-m", "voodoo", "status"))
+        self.assertEqual(settings.voodoo_run_prefix, ("python", "-m", "voodoo"))
+
+    def test_discover_src_prefers_new_layout_falls_back_to_old(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            new = root / "new" / "src"
+            old = root / "old"
+            (new / "widget").mkdir(parents=True)
+            old.mkdir()
+            # The package lives under the new tree only: it wins.
+            self.assertEqual(
+                _discover_src("widget", (str(new), str(old))),
+                str(new),
+            )
+            # None of the candidates holds it: the first is returned unchanged, so
+            # the setting still constructs and doctor reports the tree as gone.
+            self.assertEqual(
+                _discover_src("absent", (str(old), str(new))),
+                str(old),
+            )
+
+    def test_security_status_cwd_honours_environment_override(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict(
+                os.environ,
+                {
+                    "PIONIR_STATE_ROOT": str(Path(directory) / "state"),
+                    "PIONIR_NYX_STATUS_CWD": directory,
+                    "PIONIR_VOODOO_STATUS_CWD": directory,
+                },
+                clear=True,
+            ):
+                settings = PionirSettings.from_environment()
+        self.assertEqual(settings.nyx_status_cwd, directory)
+        self.assertEqual(settings.voodoo_status_cwd, directory)
 
     def test_rejects_relative_shared_gpu_lock_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

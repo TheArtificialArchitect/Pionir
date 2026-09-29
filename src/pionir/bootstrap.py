@@ -164,6 +164,7 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         runtime.register(
             NyxStatusAdapter(NyxStatusSettings(
                 command=configured.nyx_status_command,
+                cwd=configured.nyx_status_cwd,
                 run_prefix=configured.nyx_run_prefix,
                 run_actions=configured.nyx_run_actions,
             ))
