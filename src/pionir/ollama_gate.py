@@ -33,6 +33,8 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import select
+import socket
 import threading
 import time
 import urllib.error
@@ -46,7 +48,7 @@ from typing import Any
 
 from .contracts import ModelRequirement
 from .errors import ResourceUnavailable
-from .scheduler import ModelLease, ModelLeaseScheduler, kv_cache_vram_mb
+from .scheduler import ModelLease, ModelLeaseScheduler, canonical_model, kv_cache_vram_mb
 
 _log = logging.getLogger(__name__)
 
@@ -64,10 +66,17 @@ LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 # the survey, 2026-09-28) plus the KV cache for Ollama's default 4096 context.
 PETER_MODEL = "qwen2.5:7b-instruct"
 PETER_REQUIREMENT_MB = 4_700
+# How long a caller waits before it gives up: Peter's distiller times out at 120 s. A call
+# the gate cannot finish inside this budget is abandoned - never left holding the queue.
+CALLER_BUDGET_SECONDS = 110.0
 
 
 class GateError(RuntimeError):
     pass
+
+
+class Abandoned(RuntimeError):
+    """The caller hung up or ran out of time; its upstream call was closed."""
 
 
 def peter_requirement(model: str) -> ModelRequirement:
@@ -81,6 +90,38 @@ def peter_requirement(model: str) -> ModelRequirement:
         requires_gpu=True,
         exclusive_card=True,
     )
+
+
+def guarded_evictor(evict: Callable[[str], None], voice_idle: "VoiceProbe",
+                    protected: Iterable[str]) -> Callable[[str], None]:
+    """The unload the gate's scheduler uses: a protected model (the voice's) is unloaded only
+    if the voice is provably idle AT THAT MOMENT - asked again right before the unload, not
+    only when the lease was taken. Otherwise it refuses (the scheduler then keeps her model
+    and the call goes to the CPU on purpose)."""
+    guarded = frozenset(canonical_model(m) for m in protected)
+
+    def run(name: str) -> None:
+        if canonical_model(name) in guarded:
+            try:
+                idle = voice_idle()
+            except Exception:  # noqa: BLE001 - unreadable is not idle
+                idle = None
+            if idle is not True:
+                raise GateError(f"{name} kept: the voice is not provably idle right now")
+        evict(name)
+
+    return run
+
+
+def client_gone(sock: socket.socket) -> bool:
+    """True when the caller has hung up: its socket reads as closed. Never blocks."""
+    try:
+        readable, _, _ = select.select([sock], [], [], 0)
+        if not readable:
+            return False
+        return sock.recv(1, socket.MSG_PEEK) == b""
+    except (OSError, ValueError):
+        return True
 
 
 def upstream_of(url: str) -> tuple[str, int]:
@@ -160,7 +201,7 @@ class GpuArbiter:
         requirement_for: Callable[[str], ModelRequirement] = peter_requirement,
         owner: str = "peter",
         mode: str = "auto",
-        confirm_seconds: float = 45.0,
+        confirm_seconds: float = 20.0,
         linger_seconds: float = 30.0,
         poll_seconds: float = 0.5,
         clock: Callable[[], float] = time.monotonic,
@@ -289,7 +330,8 @@ class OllamaGate:
 
     def __init__(self, models: Iterable[str], *, upstream: str = "http://127.0.0.1:11434",
                  port: int = GATE_PORT, arbiter: GpuArbiter | None = None,
-                 reap_seconds: float = 1.0, upstream_timeout: float = 900.0) -> None:
+                 reap_seconds: float = 1.0, caller_budget: float = CALLER_BUDGET_SECONDS,
+                 watch_seconds: float = 0.25) -> None:
         self.models = frozenset(m for m in models if m)
         if not self.models:
             raise GateError("the Ollama gate needs at least one allowed model")
@@ -297,7 +339,9 @@ class OllamaGate:
         self.port = port
         self.arbiter = arbiter
         self.reap_seconds = reap_seconds
-        self.upstream_timeout = upstream_timeout
+        self.caller_budget = caller_budget
+        self.watch_seconds = watch_seconds
+        self.abandoned = 0
         self.refused: list[str] = []
         self._serial = threading.Lock()
         self._server: ThreadingHTTPServer | None = None
@@ -312,7 +356,8 @@ class OllamaGate:
     def status(self) -> dict[str, Any]:
         return {"url": self.url, "models": sorted(self.models),
                 "upstream": f"{self.upstream[0]}:{self.upstream[1]}",
-                "running": self._server is not None,
+                "running": self._server is not None, "caller_budget_s": self.caller_budget,
+                "abandoned": self.abandoned,
                 "arbiter": self.arbiter.snapshot() if self.arbiter is not None else None}
 
     def _refuse_note(self, why: str) -> None:
@@ -321,17 +366,55 @@ class OllamaGate:
         if self.arbiter is not None:
             self.arbiter.refused(why)
 
-    def forward(self, method: str, path: str, body: bytes) -> tuple[int, dict[str, str], Any]:
-        """Place and forward one allowed call. Returns (status, headers, chunk iterator)."""
+    def forward(self, method: str, path: str, body: bytes, *, deadline: float | None = None,
+                gone: Callable[[], bool] = lambda: False) -> tuple[int, dict[str, str], Any]:
+        """Place and forward one allowed call. Returns (status, headers, chunk iterator).
+
+        ``deadline`` (monotonic) is the caller's budget: the upstream call gets no more than
+        what is left of it. A watcher closes the upstream connection the moment the caller
+        hangs up (``gone``) or the budget runs out - Ollama stops generating for a closed
+        connection - so an abandoned call never holds the queue for its full length.
+        Raises ``Abandoned`` in that case."""
+        deadline = deadline if deadline is not None else time.monotonic() + self.caller_budget
         placement: Placement | None = None
         if method == "POST" and path in GATE_LOADING_CALLS and self.arbiter is not None:
             model = json.loads(body.decode("utf-8") or "{}").get("model") or ""
             placement = self.arbiter.place(str(model))
             if placement.where == "cpu":
                 body = on_cpu(body)
-        conn = http.client.HTTPConnection(*self.upstream, timeout=self.upstream_timeout)
-        conn.request(method, path, body=body or None, headers={"Content-Type": "application/json"})
-        resp = conn.getresponse()
+        left = deadline - time.monotonic()
+        if gone() or left <= 0:
+            self._done()
+            raise Abandoned("the caller went away" if left > 0 else "the caller's time ran out")
+        conn = http.client.HTTPConnection(*self.upstream, timeout=max(1.0, left))
+        finished = threading.Event()
+        why: list[str] = []
+
+        def watch() -> None:
+            while not finished.wait(self.watch_seconds):
+                reason = ("the caller went away" if gone() else
+                          "the caller's time ran out" if time.monotonic() > deadline else None)
+                if reason:
+                    why.append(reason)
+                    try:
+                        if conn.sock is not None:
+                            conn.sock.shutdown(socket.SHUT_RDWR)
+                    except OSError:
+                        pass
+                    conn.close()
+                    return
+
+        threading.Thread(target=watch, name="pionir-gate-watch", daemon=True).start()
+        try:
+            conn.request(method, path, body=body or None, headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+        except (OSError, http.client.HTTPException, AttributeError) as error:
+            finished.set()
+            conn.close()
+            self._done()
+            if why:
+                raise Abandoned(why[0]) from error
+            raise OSError(str(error)) from error
         headers = {"Content-Type": resp.getheader("Content-Type") or "application/json"}
         if placement is not None:
             headers["X-Pionir-Placement"] = f"{placement.where}; {placement.reason}"[:300]
@@ -339,16 +422,27 @@ class OllamaGate:
         def chunks():
             try:
                 while True:
-                    chunk = resp.read(65536)
+                    try:
+                        chunk = resp.read(65536)
+                    except (OSError, http.client.HTTPException, AttributeError) as error:
+                        raise Abandoned(why[0] if why else str(error)) from error
                     if not chunk:
                         break
                     yield chunk
             finally:
+                finished.set()
                 conn.close()
-                if self.arbiter is not None:
-                    self.arbiter.done()
+                self._done()
 
         return resp.status, headers, chunks()
+
+    def _done(self) -> None:
+        if self.arbiter is not None:
+            self.arbiter.done()
+
+    def _abandon(self, why: str) -> None:
+        self.abandoned += 1
+        self._refuse_note(f"abandoned: {why}")
 
     def start(self) -> None:
         gate = self
@@ -372,6 +466,7 @@ class OllamaGate:
                 self._json(403, {"error": f"refused by the Pionir Ollama gate: {why}"})
 
             def _handle(self, method: str) -> None:
+                arrived = time.monotonic()
                 if method == "GET" and self.path.split("?", 1)[0] == STATUS_PATH:
                     return self._json(200, gate.status())
                 path = target_path(self.path, gate.upstream)
@@ -385,9 +480,23 @@ class OllamaGate:
                 why = refusal(method, path, body, gate.models)
                 if why:
                     return self._refuse(why)
-                with gate._serial:
+                # The caller's budget starts when it asked. Waiting its turn, it is dropped the
+                # moment it hangs up or its time runs out - the queue never serves the dead.
+                deadline = arrived + gate.caller_budget
+                gone = lambda: client_gone(self.connection)  # noqa: E731
+                while not gate._serial.acquire(timeout=gate.watch_seconds):
+                    if gone():
+                        return gate._abandon("the caller went away while queued")
+                    if time.monotonic() > deadline:
+                        gate._abandon("the caller's time ran out while queued")
+                        return self._json(504, {"error": "the Pionir Ollama gate: no turn inside the caller's budget"})
+                try:
                     try:
-                        status, headers, chunks = gate.forward(method, path, body)
+                        status, headers, chunks = gate.forward(method, path, body, deadline=deadline,
+                                                               gone=gone)
+                    except Abandoned as exc:
+                        gate._abandon(str(exc))
+                        return None if gone() else self._json(504, {"error": f"abandoned: {exc}"})
                     except OSError as exc:
                         gate._refuse_note(f"upstream: {exc}")
                         return self._json(502, {"error": f"Ollama is unreachable: {exc}"})
@@ -399,8 +508,12 @@ class OllamaGate:
                         for chunk in chunks:
                             self.wfile.write(chunk)
                             self.wfile.flush()
+                    except Abandoned as exc:
+                        gate._abandon(str(exc))
                     except OSError as exc:
-                        gate._refuse_note(f"client went away: {exc}")
+                        gate._abandon(f"the caller went away: {exc}")
+                finally:
+                    gate._serial.release()
                 return None
 
             def do_GET(self) -> None:          # noqa: N802 - the http.server name
@@ -458,9 +571,11 @@ class OllamaGate:
 def voice_probe(adapter: Any) -> VoiceProbe:
     """Moss's side of the handshake, read through Pionir's own Galatea adapter.
 
-    True: her state says ``gpu.yielding`` (she has stood down for the lease), or she is not
-    running at all (connection refused). False: she is up and not yielding yet. None: it
-    cannot be told (an auth error, a timeout, a malformed state) - never taken as idle."""
+    True: her state says ``gpu.yielding`` (she has stood down for the lease) AND
+    ``gpu.in_flight == 0`` (no model call of hers on the wire - "yielding" alone is set at
+    the top of a tick that can still go on into a model call), or she is not running at all
+    (connection refused). False: she is up and busy or not yielding yet. None: it cannot be
+    told (an auth error, a timeout, a Galatea too old to report in_flight) - never idle."""
     from .errors import AdapterUnavailable
 
     def probe() -> bool | None:
@@ -475,14 +590,18 @@ def voice_probe(adapter: Any) -> VoiceProbe:
         except Exception:  # noqa: BLE001 - unknown is not idle
             return None
         gpu = state.get("gpu") if isinstance(state, Mapping) else None
-        if isinstance(gpu, Mapping):
-            return gpu.get("yielding") is True
-        return None
+        if not isinstance(gpu, Mapping):
+            return None
+        flight = gpu.get("in_flight")
+        if isinstance(flight, bool) or not isinstance(flight, int):
+            return None                     # a Galatea that cannot say: never taken as idle
+        return gpu.get("yielding") is True and flight == 0
 
     return probe
 
 
 __all__ = [
-    "GATE_PORT", "GateError", "GpuArbiter", "OllamaGate", "PETER_MODEL", "Placement",
+    "Abandoned", "GATE_PORT", "GateError", "GpuArbiter", "OllamaGate", "PETER_MODEL", "Placement",
+    "client_gone", "guarded_evictor",
     "on_cpu", "peter_requirement", "refusal", "target_path", "upstream_of", "voice_probe",
 ]

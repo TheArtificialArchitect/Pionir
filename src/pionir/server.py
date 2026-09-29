@@ -1568,7 +1568,8 @@ def _start_ollama_gate(runtime: PionirRuntime) -> tuple[Any, str]:
     adapter. PIONIR_OLLAMA_GATE_MODE=cpu runs every call on the CPU and never touches the
     card; PIONIR_OLLAMA_GATE_MODELS widens the allowlist (comma list)."""
     from .benchmark import read_loaded_models, unload, warm
-    from .ollama_gate import GATE_PORT, PETER_MODEL, GpuArbiter, OllamaGate, voice_probe
+    from .ollama_gate import (GATE_PORT, PETER_MODEL, GpuArbiter, OllamaGate, guarded_evictor,
+                              voice_probe)
     from .scheduler import ModelLeaseScheduler
     from .shared_gpu import SharedGpuLock
 
@@ -1583,9 +1584,12 @@ def _start_ollama_gate(runtime: PionirRuntime) -> tuple[Any, str]:
                                      agent_id="ollama-gate", occurred_at=datetime.now(UTC),
                                      detail=detail))
 
+    voice = voice_probe(runtime.adapters.get("galatea"))
     scheduler = ModelLeaseScheduler(
         settings.resource_budget, shared_gpu_lock=SharedGpuLock(settings.gpu_lock_path),
-        evict_to_fit=settings.evict_to_fit, evictor=unload,
+        # her model goes only if she is provably idle at the moment of the unload
+        evict_to_fit=settings.evict_to_fit,
+        evictor=guarded_evictor(unload, voice, settings.protected_models),
         loaded_probe=lambda: [item.name for item in read_loaded_models()],
         protected_models=settings.protected_models, rewarmer=warm,
         lock_wait_seconds=20.0, lock_poll_seconds=2.0,
@@ -1593,7 +1597,7 @@ def _start_ollama_gate(runtime: PionirRuntime) -> tuple[Any, str]:
     models = [m.strip() for m in (os.environ.get("PIONIR_OLLAMA_GATE_MODELS") or PETER_MODEL)
               .split(",") if m.strip()]
     try:
-        arbiter = GpuArbiter(scheduler, voice_idle=voice_probe(runtime.adapters.get("galatea")),
+        arbiter = GpuArbiter(scheduler, voice_idle=voice,
                              mode=(os.environ.get("PIONIR_OLLAMA_GATE_MODE") or "auto").strip().lower(),
                              on_event=audit)
         gate = OllamaGate(models, port=int(raw), arbiter=arbiter)

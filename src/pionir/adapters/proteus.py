@@ -8,9 +8,16 @@ The droplet (174.138.35.184, root over ``~/proteus_deploy``) runs:
 - **Prometheus** (``prometheus-api.service`` on :8001, Alpaca paper; the
   ``prometheus-{scan,entry,review}.timer`` runners install DISABLED). The entry timer BUYS
   on Robinhood - LIVE money. Kill switches: ``HALT`` in its state dir
-  (``/root/.pantheon/prometheus/HALT``) and ``ROBINHOOD_KILL`` (``/root/.pantheon/ROBINHOOD_KILL``).
+  (``/root/.pantheon/prometheus/HALT``) and ``ROBINHOOD_KILL`` (``/root/.pantheon/ROBINHOOD_KILL``),
+  both read by Prometheus's own Python - the system name for the second is
+  ``prometheus-robinhood``, because it stops PROMETHEUS's Robinhood entries and nothing else.
 - **Robinhood API** (``pro-robinhood-api.service`` on :8000, LIVE): ``POST /buy /sell
-  /liquidate`` are armed only by ``PRO_RH_ORDERS_ENABLED=1`` in the service's environment.
+  /liquidate`` are armed only by ``PRO_RH_ORDERS_ENABLED=1`` in the service's environment, read
+  once at import. It never reads ROBINHOOD_KILL: its brake is ``proteus.rh_orders_off`` (the
+  variable unset, the unit restarted, the running process's environment read back).
+
+Two live-money paths, modelled apart: Prometheus -> Robinhood entries (entry timer, HALT,
+ROBINHOOD_KILL) and the Robinhood API's own order routes (PRO_RH_ORDERS_ENABLED).
 
 Two kinds of capability, and the line between them is the whole point:
 
@@ -93,7 +100,9 @@ class ProteusSettings:
     kill_files: Mapping[str, str] = field(default_factory=lambda: {
         "karkinos": "/opt/mrcrab/Mr-Crab/controls/KILL",
         "prometheus": "/root/.pantheon/prometheus/HALT",
-        "robinhood": "/root/.pantheon/ROBINHOOD_KILL",
+        # Prometheus's own Robinhood entries (pantheon brokers/robinhood.py read it). The live
+        # Robinhood API (trading-bot-app) never reads it: its brake is rh_orders_off.
+        "prometheus-robinhood": "/root/.pantheon/ROBINHOOD_KILL",
     })
     # local deploy scripts, by name - run only on an approval
     deploys: Mapping[str, str] = field(default_factory=lambda: {
@@ -157,22 +166,54 @@ def _choice(payload: Mapping[str, Any], key: str, allowed: Sequence[str], *,
 
 
 # ---- the remote commands: constants, or built only from the tables above -------------------
+# Every command that CHANGES something ends by reading back the state it was meant to leave
+# (a `unit`, `kill` or `rh_orders` line per thing touched), and the adapter judges success from
+# those lines alone - never from an exit code, and never with a `; true` that hides a failure.
+# A brake that cannot prove it braked reports ok:false with the evidence and ssh's stderr.
+def unit_report(names: Sequence[str]) -> str:
+    return (f"for u in {' '.join(names)}; do printf 'unit %s %s %s\\n' \"$u\" "
+            "\"$(systemctl is-active \"$u\" 2>/dev/null)\" \"$(systemctl is-enabled \"$u\" 2>/dev/null)\"; done")
+
+
+def kill_report(settings: ProteusSettings, systems: Sequence[str]) -> str:
+    parts = []
+    for name in systems:
+        path = settings.kill_files[name]
+        parent = path.rsplit("/", 1)[0]
+        parts.append(f"if [ -f {path} ]; then echo 'kill {name} present'; "
+                     f"elif [ -d {parent} ]; then echo 'kill {name} absent'; "
+                     f"else echo 'kill {name} noparent'; fi")
+    return "; ".join(parts)
+
+
+# The Robinhood API reads PRO_RH_ORDERS_ENABLED once, at import, in ITS OWN process. So the only
+# true answer is that process's environment: MainPID must be the python running
+# robinhood_read_api.py (a wrapper shell without exec would be MainPID and prove nothing -
+# then it is "unverifiable", never "off").
+RH_CHECK = (
+    f"pid=$(systemctl show -p MainPID --value {RH_UNIT} 2>/dev/null); "
+    "if [ -z \"$pid\" ] || [ \"$pid\" = 0 ]; then echo 'rh_orders stopped'; "
+    "elif ! tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null | grep -q 'python.*robinhood_read_api\\.py'; then "
+    "echo \"rh_orders unverifiable: MainPID $pid is not the python robinhood_read_api.py process\"; "
+    "elif [ ! -r /proc/$pid/environ ]; then echo \"rh_orders unverifiable: /proc/$pid/environ is not readable\"; "
+    "else printf 'rh_orders %s\\n' \"$(tr '\\0' '\\n' < /proc/$pid/environ | grep -c '^PRO_RH_ORDERS_ENABLED=1$')\"; fi"
+)
+RH_DROPIN_REPORT = (
+    f"if grep -qs '^UnsetEnvironment=PRO_RH_ORDERS_ENABLED$' {RH_DROPIN}; then echo 'rh_dropin off'; "
+    f"elif grep -qs '^Environment=PRO_RH_ORDERS_ENABLED=1$' {RH_DROPIN}; then echo 'rh_dropin on'; "
+    "else echo 'rh_dropin absent'; fi"
+)
+
+
 def status_script(settings: ProteusSettings) -> str:
-    units = " ".join(_unit(u, STATUS_UNITS) for u in STATUS_UNITS)
-    kills = " ".join(f"{name}={path}" for name, path in sorted(settings.kill_files.items()))
+    units = [_unit(u, STATUS_UNITS) for u in STATUS_UNITS]
     apis = " ".join(f"{name}={port}" for name, port in READ_APIS)
     return (
-        f"for u in {units}; do printf 'unit %s %s %s\\n' \"$u\" "
-        "\"$(systemctl is-active \"$u\" 2>/dev/null)\" \"$(systemctl is-enabled \"$u\" 2>/dev/null)\"; done; "
-        f"for k in {kills}; do n=${{k%%=*}}; f=${{k#*=}}; "
-        "if [ -e \"$f\" ]; then echo \"kill $n present\"; else echo \"kill $n absent\"; fi; done; "
+        f"{unit_report(units)}; "
+        f"{kill_report(settings, sorted(settings.kill_files))}; "
         f"for a in {apis}; do n=${{a%%=*}}; p=${{a#*=}}; printf 'api %s %s\\n' \"$n\" "
         "\"$(curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1:$p/health)\"; done; "
-        f"pid=$(systemctl show -p MainPID --value {RH_UNIT} 2>/dev/null); "
-        "if [ -n \"$pid\" ] && [ \"$pid\" != 0 ] && [ -r /proc/$pid/environ ]; then "
-        "printf 'rh_orders %s\\n' \"$(tr '\\0' '\\n' < /proc/$pid/environ | grep -c '^PRO_RH_ORDERS_ENABLED=1$')\"; "
-        "else echo 'rh_orders unknown'; fi; "
-        f"if [ -e {RH_DROPIN} ]; then echo 'rh_dropin present'; else echo 'rh_dropin absent'; fi; "
+        f"{RH_CHECK}; {RH_DROPIN_REPORT}; "
         f"if [ -e {SIGNALS_REMOTE} ]; then printf 'signals_age %s\\n' \"$(( $(date +%s) - $(stat -c %Y {SIGNALS_REMOTE}) ))\"; "
         "else echo 'signals_age none'; fi; "
         "systemctl list-timers --all --no-pager --no-legend 'mrcrab-*' 'prometheus-*' 2>/dev/null | sed 's/^/timer /'"
@@ -184,51 +225,48 @@ def logs_command(unit: str, lines: int) -> str:
 
 
 def kill_command(settings: ProteusSettings, systems: Sequence[str]) -> str:
+    # The parent must already exist: creating it (mkdir -p) would turn a WRONG path into a
+    # file nobody reads and a brake that "worked". Each switch is tried even if one fails.
     parts = []
     for name in systems:
         path = settings.kill_files[name]
         parent = path.rsplit("/", 1)[0]
-        parts.append(f"mkdir -p {parent} && printf '%s\\n' \"stopped by Pionir $(date -u +%FT%TZ)\" > {path} "
-                     f"&& echo 'kill {name} present'")
-    return " && ".join(parts)
+        parts.append(f"if [ -d {parent} ]; then printf '%s\\n' \"stopped by Pionir $(date -u +%FT%TZ)\" > {path}; fi")
+    return "; ".join(parts) + "; " + kill_report(settings, systems)
 
 
 def clear_kill_command(settings: ProteusSettings, systems: Sequence[str]) -> str:
-    return " && ".join(f"rm -f {settings.kill_files[name]} && echo 'kill {name} absent'"
-                       for name in systems)
+    return "; ".join(f"rm -f {settings.kill_files[name]}" for name in systems) + "; " + kill_report(settings, systems)
 
 
 def timers_command(verb: str, timers: Sequence[str]) -> str:
     assert verb in ("disable", "enable")
-    names = " ".join(_unit(t, TRADING_TIMERS) for t in timers)
-    return f"systemctl {verb} --now {names} && systemctl is-active {names}; true"
+    names = [_unit(t, TRADING_TIMERS) for t in timers]
+    # one at a time: a unit that fails must not keep the others from being stopped
+    return f"for t in {' '.join(names)}; do systemctl {verb} --now \"$t\"; done; {unit_report(names)}"
 
 
 def service_command(verb: str, services: Sequence[str]) -> str:
     assert verb in ("stop", "start")
     allowed = SERVICES if verb == "stop" else STARTABLE
-    names = " ".join(_unit(s, allowed) for s in services)
-    return f"systemctl {verb} {names}; systemctl is-active {names}; true"
+    names = [_unit(s, allowed) for s in services]
+    return f"for s in {' '.join(names)}; do systemctl {verb} \"$s\"; done; {unit_report(names)}"
 
 
 def rh_orders_command(on: bool) -> str:
-    check = (f"pid=$(systemctl show -p MainPID --value {RH_UNIT}); "
-             "if [ -n \"$pid\" ] && [ \"$pid\" != 0 ]; then printf 'rh_orders %s\\n' "
-             "\"$(tr '\\0' '\\n' < /proc/$pid/environ | grep -c '^PRO_RH_ORDERS_ENABLED=1$')\"; "
-             "else echo 'rh_orders stopped'; fi")
-    if on:
-        return (f"mkdir -p {RH_DROPIN.rsplit('/', 1)[0]} && "
-                f"printf '[Service]\\nEnvironment=PRO_RH_ORDERS_ENABLED=1\\n' > {RH_DROPIN} && "
-                f"systemctl daemon-reload && systemctl try-restart {RH_UNIT} && sleep 2; {check}")
-    # try-restart: restart only if it is running - taking orders off never STARTS a stopped
-    # live-money service.
-    return (f"rm -f {RH_DROPIN} && systemctl daemon-reload && systemctl try-restart {RH_UNIT} "
-            f"&& sleep 2; {check}")
+    # One drop-in, either way. ON sets the variable; OFF uses UnsetEnvironment=, which systemd
+    # applies AFTER Environment= and EnvironmentFile= - so it wins even over a unit whose own
+    # EnvironmentFile arms it. Then the unit restarts (try-restart: never STARTS a stopped
+    # live-money service) and the running process's own environment is read back.
+    line = "Environment=PRO_RH_ORDERS_ENABLED=1" if on else "UnsetEnvironment=PRO_RH_ORDERS_ENABLED"
+    return (f"mkdir -p {RH_DROPIN.rsplit('/', 1)[0]} && "
+            f"printf '[Service]\\n{line}\\n' > {RH_DROPIN} && systemctl daemon-reload && "
+            f"systemctl try-restart {RH_UNIT}; sleep 3; {RH_CHECK}; {RH_DROPIN_REPORT}")
 
 
 def parse_status(text: str) -> dict[str, Any]:
     units: dict[str, dict[str, str]] = {}
-    kills: dict[str, bool] = {}
+    kills: dict[str, bool | None] = {}
     apis: dict[str, str] = {}
     timers: list[str] = []
     out: dict[str, Any] = {"units": units, "kill_switches": kills, "apis": apis, "timers": timers}
@@ -242,19 +280,71 @@ def parse_status(text: str) -> dict[str, Any]:
                                   "enabled": bits[2] if len(bits) > 2 else "unknown"}
         elif head == "kill":
             name, _, state = rest.partition(" ")
-            kills[name] = state == "present"
+            # noparent: the switch's folder is missing - a wrong path, never "off"
+            kills[name] = True if state == "present" else False if state == "absent" else None
+            if state != "present" and state != "absent":
+                out.setdefault("kill_errors", []).append(f"{name}: its folder does not exist")
         elif head == "api":
             name, _, code = rest.partition(" ")
             apis[name] = code or "000"
         elif head == "rh_orders":
-            out["rh_orders_armed"] = None if rest in ("unknown", "stopped") else rest.strip() not in ("", "0")
+            if rest == "stopped":
+                out["rh_orders_armed"] = False
+                out["rh_orders_note"] = "the Robinhood API is not running: no order can be placed"
+            elif rest in ("0", "1"):
+                out["rh_orders_armed"] = rest == "1"
+            else:
+                out["rh_orders_armed"] = None
+                out["rh_orders_note"] = rest[:200] or "unknown"
         elif head == "rh_dropin":
-            out["rh_orders_dropin"] = rest == "present"
+            out["rh_orders_dropin"] = rest
         elif head == "signals_age":
             out["vps_signals_age_s"] = int(rest) if rest.isdigit() else None
         elif head == "timer":
             timers.append(rest[:200])
     return out
+
+
+def verify(capability: str, targets: Sequence[str], text: str) -> tuple[bool, list[str]]:
+    """Did the change take? Judged ONLY from the state lines the command read back.
+    Returns (ok, mismatches) - every target not left as asked is a mismatch."""
+    doc = parse_status(text)
+    units, kills = doc["units"], doc["kill_switches"]
+    bad: list[str] = []
+    for target in targets:
+        if capability in ("proteus.kill", "proteus.clear_kill"):
+            want = capability == "proteus.kill"
+            if target not in kills:
+                bad.append(f"{target} kill switch: nothing was read back")
+            elif kills[target] is None:
+                bad.append(f"{target} kill switch: its folder does not exist ({'not written' if want else 'unknown'})")
+            elif kills[target] is not want:
+                bad.append(f"{target} kill switch: wanted {'present' if want else 'absent'}, "
+                           f"read {'present' if kills[target] else 'absent'}")
+            continue
+        u = units.get(target)
+        if u is None:
+            bad.append(f"{target}: no state was read back")
+            continue
+        active, enabled = u["active"], u["enabled"]
+        if capability in ("proteus.stop_timer", "proteus.stop_service"):
+            if active not in ("inactive", "failed"):
+                bad.append(f"{target}: still {active}")
+            if capability == "proteus.stop_timer" and enabled.startswith("enabled"):
+                bad.append(f"{target}: still {enabled} (it would come back after a reboot)")
+        elif capability in ("proteus.arm_timer", "proteus.start_service"):
+            if active != "active":
+                bad.append(f"{target}: {active}, not active")
+            if capability == "proteus.arm_timer" and enabled != "enabled":
+                bad.append(f"{target}: {enabled}, not enabled")
+    armed = doc.get("rh_orders_armed")
+    if capability == "proteus.rh_orders_off" and armed is not False:
+        bad.append("Robinhood orders: " + ("STILL ARMED in the running process" if armed
+                                          else f"cannot verify - {doc.get('rh_orders_note', 'no report')}"))
+    if capability == "proteus.rh_orders_on" and armed is not True:
+        bad.append("Robinhood orders: not armed in a running process - "
+                   + str(doc.get("rh_orders_note") or "the running process does not have it set"))
+    return (not bad), bad
 
 
 # ---- the adapter ------------------------------------------------------------------------------
@@ -275,7 +365,8 @@ CAPABILITIES = (
          "Robinhood order switch, and Peter and his relay here"),
     _cap("proteus.logs", "the last lines of one allowlisted Proteus unit's journal on the VPS"),
     _cap("proteus.kill", "drop a trading kill switch: Karkinos KILL, Prometheus HALT, "
-         "ROBINHOOD_KILL, or all", risk=_BRAKE),
+         "Prometheus's ROBINHOOD_KILL, or all (the Robinhood API's brake is rh_orders_off)",
+         risk=_BRAKE),
     _cap("proteus.stop_timer", "disable and stop a Karkinos or Prometheus trading timer, or all",
          risk=_BRAKE),
     _cap("proteus.stop_service", "stop the Prometheus API or the Robinhood API service", risk=_BRAKE),
@@ -334,12 +425,13 @@ class ProteusAdapter:
     def validate(self, task: Task) -> None:
         self._plan(task)
 
-    def _plan(self, task: Task) -> tuple[str, Any]:
-        """What this task would do: ("ssh", remote) / ("local", argv) / ("status", None).
+    def _plan(self, task: Task) -> tuple[str, Any, list[str]]:
+        """What this task would do: ("ssh", remote, targets) / ("local", argv, []) /
+        ("status", None, []). ``targets`` are what the read-back must show changed.
         Raises AdapterProtocolError for anything outside the tables."""
         p, s, name = task.payload, self.settings, task.capability
         if name == "proteus.status":
-            return "status", None
+            return "status", None, []
         if name == "proteus.logs":
             unit = p.get("unit")
             if not isinstance(unit, str):
@@ -347,28 +439,34 @@ class ProteusAdapter:
             lines = p.get("lines", 80)
             if isinstance(lines, bool) or not isinstance(lines, int) or not 1 <= lines <= MAX_LOG_LINES:
                 raise AdapterProtocolError(f"lines must be a whole number from 1 to {MAX_LOG_LINES}")
-            return "ssh", logs_command(unit, lines)
+            return "ssh", logs_command(unit, lines), []
         if name == "proteus.kill":
-            return "ssh", kill_command(s, _choice(p, "system", sorted(s.kill_files), everything=True))
+            systems = _choice(p, "system", sorted(s.kill_files), everything=True)
+            return "ssh", kill_command(s, systems), systems
         if name == "proteus.clear_kill":
-            return "ssh", clear_kill_command(s, _choice(p, "system", sorted(s.kill_files)))
+            systems = _choice(p, "system", sorted(s.kill_files))
+            return "ssh", clear_kill_command(s, systems), systems
         if name == "proteus.stop_timer":
-            return "ssh", timers_command("disable", _choice(p, "timer", TRADING_TIMERS, everything=True))
+            timers = _choice(p, "timer", TRADING_TIMERS, everything=True)
+            return "ssh", timers_command("disable", timers), timers
         if name == "proteus.arm_timer":
-            return "ssh", timers_command("enable", _choice(p, "timer", TRADING_TIMERS))
+            timers = _choice(p, "timer", TRADING_TIMERS)
+            return "ssh", timers_command("enable", timers), timers
         if name == "proteus.stop_service":
-            return "ssh", service_command("stop", _choice(p, "service", SERVICES, everything=True))
+            services = _choice(p, "service", SERVICES, everything=True)
+            return "ssh", service_command("stop", services), services
         if name == "proteus.start_service":
-            return "ssh", service_command("start", _choice(p, "service", STARTABLE))
+            services = _choice(p, "service", STARTABLE)
+            return "ssh", service_command("start", services), services
         if name == "proteus.rh_orders_off":
-            return "ssh", rh_orders_command(False)
+            return "ssh", rh_orders_command(False), []
         if name == "proteus.rh_orders_on":
-            return "ssh", rh_orders_command(True)
+            return "ssh", rh_orders_command(True), []
         if name == "proteus.deploy":
             which = _choice(p, "deploy", sorted(s.deploys))[0]
             script = s.deploys[which]
             return "local", ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy",
-                             "Bypass", "-File", script]
+                             "Bypass", "-File", script], []
         raise AdapterProtocolError(f"Proteus has no capability {name}")
 
     # ---- run
@@ -380,33 +478,33 @@ class ProteusAdapter:
             # BRAKES share: stopping trading must keep working.
             return self._result(task, {"ok": False, "refused": (
                 f"{task.capability} arms live trading: it runs only from the owner's approval")})
-        kind, what = self._plan(task)
+        kind, what, targets = self._plan(task)
         if kind == "status":
             return self._result(task, self.plane())
         if kind == "local":
             result = self._run(what, float(self.settings.deploy_timeout_seconds))
             return self._result(task, {"ok": result.returncode == 0, "exit_code": result.returncode,
-                                       "output": _tail(result.stdout), "error": _tail(result.stderr, 2000)})
+                                       "output": _tail(result.stdout), "stderr": _tail(result.stderr, 2000)})
         result = self._ssh(what)
-        output: dict[str, Any] = {"ok": result.returncode == 0, "exit_code": result.returncode,
-                                  "output": _tail(result.stdout)}
-        if result.returncode != 0:
-            output["error"] = _tail(result.stderr, 2000)
+        output: dict[str, Any] = {"exit_code": result.returncode, "output": _tail(result.stdout),
+                                  "stderr": _tail(result.stderr, 2000)}
+        if task.capability == "proteus.logs":
+            output["ok"] = result.returncode == 0
+            return self._result(task, output)
+        # A change is ok only when the state it read back says so - the exit code is kept as
+        # evidence, never as the verdict.
+        ok, mismatches = verify(task.capability, targets, result.stdout)
+        output["ok"] = ok
         if task.capability in ("proteus.rh_orders_on", "proteus.rh_orders_off"):
-            armed = parse_status(result.stdout).get("rh_orders_armed")
-            output["rh_orders_armed"] = armed
-            if task.capability == "proteus.rh_orders_off" and armed:
-                # verify, do not assume: the switch is set somewhere Pionir's drop-in does
-                # not reach (the unit's own EnvironmentFile wins over a drop-in)
-                output["ok"] = False
-                output["error"] = ("orders are STILL armed: PRO_RH_ORDERS_ENABLED is set outside "
-                                   "Pionir's drop-in. Stop the service (proteus.stop_service "
-                                   "service=pro-robinhood-api.service) to take orders away now.")
-            if task.capability == "proteus.rh_orders_on" and armed is not True:
-                output["ok"] = False
-                output["error"] = ("orders are not armed now: the service is stopped (the "
-                                   "drop-in is in place, so it arms when next started) or its "
-                                   "own EnvironmentFile overrides the drop-in")
+            doc = parse_status(result.stdout)
+            output["rh_orders_armed"] = doc.get("rh_orders_armed")
+            if doc.get("rh_orders_note"):
+                output["rh_orders_note"] = doc["rh_orders_note"]
+        if not ok:
+            output["error"] = "NOT VERIFIED: " + "; ".join(mismatches)
+            if task.capability == "proteus.rh_orders_off":
+                output["error"] += (" - to take orders away now, stop the service "
+                                    "(proteus.stop_service service=pro-robinhood-api.service)")
         return self._result(task, output)
 
     def _result(self, task: Task, output: Mapping[str, Any]) -> TaskResult:
