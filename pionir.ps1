@@ -7,12 +7,13 @@
 #   .\pionir.ps1 -NoSpecialists  don't start Daedalus/Melete; reach whoever's already up
 #   .\pionir.ps1 -NoBryo         don't start Bryo, the observer organism
 #   .\pionir.ps1 -NoCrew         don't start the crew (workers, division leaders)
+#   .\pionir.ps1 -NoPeter        don't start Peter (the trading-signal feed) or his VPS relay
 #   .\pionir.ps1 -NoBrowser      don't open the dashboard in a browser
 #   .\pionir.ps1 -Port 8781      a different dashboard port
 #   .\pionir.ps1 -Stop           stop the whole stack from anywhere
 #
 # One window, every bridge a pane: with Windows Terminal (wt.exe) the dashboard
-# server, Galatea, Daedalus, Melete, the crew and Bryo each get a titled pane in a single
+# server, Galatea, Daedalus, Melete, the crew, Peter, his relay and Bryo each get a titled pane in a single
 # window. Closing that window brings the whole stack down - wt kills every pane's
 # process tree on close (verified: ports free afterwards, no orphans). If wt.exe
 # is not present the launcher falls back to one window per bridge. It is a
@@ -24,6 +25,7 @@ param(
     [switch]$NoSpecialists,
     [switch]$NoBryo,
     [switch]$NoCrew,
+    [switch]$NoPeter,
     [switch]$NoBrowser,
     [switch]$Stop,
     [int]$Port = 8780
@@ -58,6 +60,12 @@ $galateaDir  = Join-Path (Split-Path -Parent $root) "Galatea"
 $daedalusDir = if ($env:PIONIR_DAEDALUS_DIR) { $env:PIONIR_DAEDALUS_DIR } else { "C:\src\Tech-Support\daedalus" }
 $meleteDir   = if ($env:PIONIR_MELETE_DIR)   { $env:PIONIR_MELETE_DIR }   else { "C:\src\Tech-Support\melete" }
 $terrariumDir = if ($env:PIONIR_TERRARIUM_DIR) { $env:PIONIR_TERRARIUM_DIR } else { "C:\src\terrarium" }
+# Proteus, the trading system: Peter's feed (The-Web) and the Mr-Crab relay that ships
+# his signals to Karkinos on the VPS. Neither repo is edited; both run as they always did.
+$peterDir    = if ($env:PIONIR_PETER_DIR)    { $env:PIONIR_PETER_DIR }    else { "C:\src\The-Web" }
+$mrCrabDir   = if ($env:PIONIR_MRCRAB_DIR)   { $env:PIONIR_MRCRAB_DIR }   else { "C:\src\Mr-Crab" }
+$peterLive   = Join-Path $root "scripts\peter-live.ps1"
+$relayScript = Join-Path $mrCrabDir "deploy\desktop\peter-vps-relay.ps1"
 $srcDir      = Join-Path $root "src"
 $wt          = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\wt.exe"
 
@@ -209,6 +217,46 @@ function Close-EmptyPanes {
     if ($closed) { Write-Host "  closed $closed empty pane(s) left by an earlier launch." }
 }
 
+# Peter and his relay have no port of their own to stop by (8790 could be anyone's), so they
+# are known by COMMAND LINE, and stopped only when one of this launcher's panes started them:
+# a pane shell (the PIONIR_PANE marker in its decoded command) among the process's parents.
+# Peter started by hand (deploy\Peter.cmd) or by Pionir Desktop is never touched from here.
+$peterMatch = '-m peter\.cli\s.*\slive(\s|$)'
+$relayMatch = 'peter-vps-relay\.ps1'
+function Test-PionirPane($p) {
+    if (-not $p -or $p.Name -ne 'powershell.exe' -or [string]$p.CommandLine -notmatch '-EncodedCommand\s+(\S+)') { return $false }
+    try { $text = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1])) } catch { return $false }
+    return $text.StartsWith("`$env:PIONIR_PANE='1';")
+}
+function Get-Companions([object[]]$all, [string]$match) {
+    # Every process whose command line matches, and whether a Pionir pane is among its
+    # parents (four levels: pane -> wrapper powershell -> python, with room to spare).
+    foreach ($p in $all) {
+        if ([string]$p.CommandLine -notmatch $match) { continue }
+        $ours = $false
+        $cur = $p
+        for ($i = 0; $i -lt 4 -and $cur; $i++) {
+            $parentId = $cur.ParentProcessId
+            $cur = $all | Where-Object { $_.ProcessId -eq $parentId -and $_.ProcessId -ne $p.ProcessId } | Select-Object -First 1
+            if (Test-PionirPane $cur) { $ours = $true; break }
+        }
+        [pscustomobject]@{ Process = $p; Ours = $ours }
+    }
+}
+function Stop-Companion([string]$match, [string]$label) {
+    $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+    foreach ($hit in @(Get-Companions $all $match)) {
+        $procId = $hit.Process.ProcessId
+        if ($hit.Ours) {
+            # the matched process and what it started - never anything above it
+            & taskkill.exe /PID $procId /T /F 2>&1 | Out-Null
+            Write-Host "  stopped $label (pid $procId, started by a Pionir pane)."
+        } else {
+            Write-Host "  $label (pid $procId) was not started by this launcher; left alone." -ForegroundColor DarkCyan
+        }
+    }
+}
+
 if ($Stop) {
     New-Item -ItemType Directory -Force (Split-Path $stopMarker) | Out-Null
     Set-Content -Path $stopMarker -Value (Get-Date -Format o) -Encoding UTF8
@@ -217,6 +265,8 @@ if ($Stop) {
     Stop-Port 8771 "Daedalus"
     Stop-Port 8770 "Melete"
     Stop-Port 8782 "crew"
+    Stop-Companion $peterMatch "Peter"
+    Stop-Companion $relayMatch "Peter's VPS relay"
     Stop-Bryo
     Close-EmptyPanes
     Write-Host "  stack stopped. (Closing the Pionir window does the same thing.)"
@@ -342,6 +392,37 @@ if (-not $NoCrew) {
     }
 }
 
+# Peter, the trading-signal feed (C:\src\The-Web): the app on 8790 AND the collect/journal/P&L
+# loop in one process, exactly what deploy\Peter.cmd runs (scripts\peter-live.ps1 loads his
+# peter-secrets.ps1 into the pane's environment, never printing it). His distiller calls
+# Ollama at a hard-coded 127.0.0.1:11434 and takes no GPU lease; HTTP_PROXY sends those
+# calls through Pionir's Ollama gate on 8774 (it runs inside the dashboard server), which
+# puts each on the card under the lease - sidelining Moss's idle model only once she has
+# stood down - or on the CPU on purpose. NO_PROXY keeps his few plain-HTTP news feeds direct.
+# Already running (started by hand)? Adopted as he is: never started twice. His relay ships
+# data\signals.json to Karkinos on the VPS every 5 min (Mr-Crab's peter-vps-relay.ps1, as is).
+$peterPrelude = "`$env:HTTP_PROXY='http://127.0.0.1:8774'; `$env:NO_PROXY='feeds.bbci.co.uk,feeds.marketwatch.com'; "
+$peterStarted = $false
+if (-not $NoPeter) {
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name='python.exe' or Name='powershell.exe'" -ErrorAction SilentlyContinue)
+    $peterNow = @($procs | Where-Object { [string]$_.CommandLine -match $peterMatch })
+    if ($peterNow.Count) {
+        Write-Host "  Peter already running (pid $($peterNow[0].ProcessId)); adopted as he is, not started twice." -ForegroundColor DarkCyan
+        Write-Host "    (started outside Pionir, his model calls skip the GPU gate until he is restarted from here.)" -ForegroundColor DarkGray
+    } elseif (Test-Port 8790) {
+        Write-Host "  ! port 8790 is held by another program; Peter not started." -ForegroundColor Yellow
+    } elseif (Test-Path (Join-Path $peterDir "deploy\peter.ps1")) {
+        $panes += ,(Pane-Cmd "Peter :8790" $peterDir "powershell -NoProfile -ExecutionPolicy Bypass -File $peterLive" $peterPrelude)
+        $ports += 8790
+        $peterStarted = $true
+    } else { Write-Host "  ! Peter not found at $peterDir; skipping the feed." -ForegroundColor Yellow }
+    if (@($procs | Where-Object { [string]$_.CommandLine -match $relayMatch }).Count) {
+        Write-Host "  Peter's VPS relay already running; not started twice." -ForegroundColor DarkCyan
+    } elseif (Test-Path $relayScript) {
+        $panes += ,(Pane-Cmd "Peter relay (VPS)" $mrCrabDir "powershell -NoProfile -ExecutionPolicy Bypass -File $relayScript" "")
+    } else { Write-Host "  ! the relay was not found at $relayScript; Karkinos gets no fresh signals." -ForegroundColor Yellow }
+}
+
 # Bryo, the observer organism. Foreground pane now, not a logon task: he lives
 # while the window is open and stops when it closes (crash-safe - he checkpoints
 # every tick and replays on restart). He takes a singleton pidfile lock, so skip
@@ -447,6 +528,9 @@ if ($bryoStarted) {
     }
     if ($alive) { Write-Host "  up   :Bryo (organism alive)" -ForegroundColor Green }
     else { Write-Host "  DOWN :Bryo - organism did not come up" -ForegroundColor Red }
+}
+if ($peterStarted -and -not (Test-Port 8774)) {
+    Write-Host "  ! Peter's model calls go through Pionir's Ollama gate on 8774, which is not answering: they fail (visibly, in his pane) until the dashboard runs this Pionir (pionir.ps1 -Stop, then pionir.ps1)." -ForegroundColor Yellow
 }
 if (-not $NoBrowser -and (Test-Port $Port)) { Start-Process (Dashboard-Url $Port) }
 Write-Host "  ready." -ForegroundColor DarkCyan

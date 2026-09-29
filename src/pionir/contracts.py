@@ -123,6 +123,10 @@ class Capability:
     def __post_init__(self) -> None:
         if not self.name or any(char.isspace() for char in self.name):
             raise ValueError("capability names must be non-empty and contain no whitespace")
+        if any(permission.startswith("approval.") for permission in self.required_permissions):
+            # approval.* are markers PionirApp.approve adds after the owner's yes (see
+            # pionir.batching): proofs and restrictions, never a permission to require
+            raise ValueError(f"{self.name} may not require an approval.* marker as a permission")
         if self.spends_money and self.risk is not RiskLevel.PRIVILEGED:
             raise ValueError(
                 f"{self.name} spends money, so it must be RiskLevel.PRIVILEGED - "

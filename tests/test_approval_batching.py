@@ -28,6 +28,7 @@ from test_discord_gate import APPROVE, CHANNEL, DENY, OWNER, STRANGER, GateCase
 from pionir.adapters.content import ContentAdapter, ContentSettings
 from pionir.batching import (
     BATCHED_GRANT,
+    OWNER_APPROVED_GRANT,
     NEVER_BATCH_WORDS,
     DigestSettings,
     batch_refusal,
@@ -355,9 +356,10 @@ class DigestTests(BatchCase):
         self.assertEqual(row["status"], "approved")
         # exactly as its own card would have run it: an approval job, its own permission
         self.assertEqual(self.app.jobs.get(row["task_id"])["kind"], "approval")
-        # (plus the batched marker: a restriction its adapter may check, never a power)
+        # (plus the markers: the owner said yes, and it was batched - each a proof or a
+        # restriction its adapter may check, never a power)
         self.assertEqual(self.runs, [(PAGE, {"title": "Two", "body": "the page"},
-                                      [PAGE, BATCHED_GRANT])])
+                                      [PAGE, OWNER_APPROVED_GRANT, BATCHED_GRANT])])
         self.assertEqual(self.app.approvals.get(first)["status"], "pending")
         for _ in range(3):
             gate.run_once()

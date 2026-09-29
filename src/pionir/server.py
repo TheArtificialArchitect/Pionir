@@ -53,8 +53,10 @@ from .auth import (
     cookie_value,
 )
 from .batching import (
+    APPROVAL_MARKERS,
     BATCHED_GRANT,
     NEW_ONLY_GRANT,
+    OWNER_APPROVED_GRANT,
     DigestSettings,
     batch_refusal,
     local_now,
@@ -86,6 +88,8 @@ MAX_WAIT_SECONDS = 600.0
 JOBS_KEEP = 500
 _TASK_ID = re.compile(r"[0-9a-f]{32}")
 JOB_STATUSES = ("running", "done", "error", "pending_approval", "unclear", "self")
+# How old GET /api/proteus lets its read of the trading plane get before it reads again.
+PROTEUS_REFRESH_SECONDS = 120.0
 
 # Loopback admin surface: a browser tab on any origin can still POST here
 # (a `text/plain` "simple request" needs no CORS preflight), so a POST must look
@@ -338,6 +342,44 @@ class PionirApp:
         # The Discord gate running in this process (serve() sets it), so doctor can say
         # whether approvals and the digest actually reach Discord. None: not started here.
         self.gate: Any = None
+        # Proteus's plane, as GET /api/proteus shows it: the last read, refreshed in the
+        # background when older than PROTEUS_REFRESH_SECONDS (one ssh round trip), so a
+        # page that polls never waits on the VPS and never makes more than one read at once.
+        self._proteus_lock = threading.Lock()
+        self._proteus_snapshot: dict[str, Any] | None = None
+        self._proteus_at: float | None = None
+        self._proteus_busy = False
+
+    # ---- proteus: the trading plane, read ------------------------------
+    def proteus_view(self, *, refresh: Callable[[Callable[[], None]], None] | None = None,
+                     now: Callable[[], float] = time.monotonic) -> dict[str, Any]:
+        adapter = self.runtime.adapters.get("proteus")
+        if adapter is None:
+            return {"enabled": False}
+        start = refresh or (lambda work: threading.Thread(
+            target=work, name="pionir-proteus-read", daemon=True).start())
+        with self._proteus_lock:
+            stale = (self._proteus_at is None
+                     or now() - self._proteus_at > PROTEUS_REFRESH_SECONDS)
+            kick = stale and not self._proteus_busy
+            if kick:
+                self._proteus_busy = True
+            snapshot, at = self._proteus_snapshot, self._proteus_at
+
+        def work() -> None:
+            try:
+                fresh = adapter.plane()
+            except Exception as error:  # noqa: BLE001 - shown as data, never a crash
+                fresh = {"error": f"{type(error).__name__}: {error}"[:300]}
+            with self._proteus_lock:
+                self._proteus_snapshot, self._proteus_at = fresh, now()
+                self._proteus_busy = False
+
+        if kick:
+            start(work)
+        return {"enabled": True, "snapshot": snapshot,
+                "age_s": None if at is None else round(now() - at, 1),
+                "refreshing": kick or self._proteus_busy}
 
     # ---- jobs: work that outlives the request ---------------------------
     def _submit(
@@ -856,7 +898,9 @@ class PionirApp:
                 raise Unauthenticated(f"{capability} is privileged; send your client token")
             granted = sorted(grant.permissions)
         else:
-            granted = list(permissions or ())
+            # the approval markers are added by approve() alone, after the owner's yes: a
+            # caller that names one is not believed (arming live trading checks for it)
+            granted = [p for p in (permissions or ()) if p not in APPROVAL_MARKERS]
         body = {"capability": capability, "payload": payload, "permissions": granted,
                 "deferrable": deferrable}
         if grant is not None:
@@ -1056,7 +1100,9 @@ class PionirApp:
         # run it with exactly the permission it needed - never wider. A batched row also
         # carries BATCHED_GRANT (a restriction, not a power): its adapter refuses if the
         # case it was batched for no longer holds (a "new" listing that now exists).
-        permissions = list(record["permissions"])
+        permissions = [p for p in record["permissions"] if p not in APPROVAL_MARKERS]
+        # the owner said yes: the one path that carries this grant (see batching.py)
+        permissions.append(OWNER_APPROVED_GRANT)
         if record.get("batch"):
             permissions.append(BATCHED_GRANT)
         context = record.get("context")
@@ -1284,6 +1330,8 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                     self._send(app.audit(min(max(n, 1), 500)))
                 elif route.path == "/api/approvals":
                     self._send(app.approvals_view())
+                elif route.path == "/api/proteus":
+                    self._send(app.proteus_view())
                 elif route.path == "/api/voice_link":
                     status, document = app.voice_link(self.headers.get("Authorization"),
                                                       self.headers.get("Cookie"),
@@ -1512,6 +1560,53 @@ def _start_pulse(app: PionirApp) -> tuple[threading.Thread | None, threading.Eve
     return thread, stop
 
 
+def _start_ollama_gate(runtime: PionirRuntime) -> tuple[Any, str]:
+    """Start the Ollama gate on PIONIR_OLLAMA_GATE_PORT (default 8774; "0"/"off" leaves it
+    off). Its GPU arbiter has its own scheduler on the SAME shared lock, budget, protected
+    models and handback the executive's uses, a short wait for the lock (a queued Peter
+    call must still finish inside his own 120 s), and Moss's yield read through the Galatea
+    adapter. PIONIR_OLLAMA_GATE_MODE=cpu runs every call on the CPU and never touches the
+    card; PIONIR_OLLAMA_GATE_MODELS widens the allowlist (comma list)."""
+    from .benchmark import read_loaded_models, unload, warm
+    from .ollama_gate import GATE_PORT, PETER_MODEL, GpuArbiter, OllamaGate, voice_probe
+    from .scheduler import ModelLeaseScheduler
+    from .shared_gpu import SharedGpuLock
+
+    raw = (os.environ.get("PIONIR_OLLAMA_GATE_PORT") or str(GATE_PORT)).strip().lower()
+    if raw in {"", "0", "off", "none", "false"}:
+        return None, "the Ollama gate is off (PIONIR_OLLAMA_GATE_PORT)."
+    settings = runtime.settings
+    audit_sink = runtime.executive.audit_sink
+
+    def audit(kind: str, detail: str) -> None:
+        audit_sink.record(AuditEvent(event_type=f"ollama_gate.{kind}", task_id=uuid.uuid4(),
+                                     agent_id="ollama-gate", occurred_at=datetime.now(UTC),
+                                     detail=detail))
+
+    scheduler = ModelLeaseScheduler(
+        settings.resource_budget, shared_gpu_lock=SharedGpuLock(settings.gpu_lock_path),
+        evict_to_fit=settings.evict_to_fit, evictor=unload,
+        loaded_probe=lambda: [item.name for item in read_loaded_models()],
+        protected_models=settings.protected_models, rewarmer=warm,
+        lock_wait_seconds=20.0, lock_poll_seconds=2.0,
+    )
+    models = [m.strip() for m in (os.environ.get("PIONIR_OLLAMA_GATE_MODELS") or PETER_MODEL)
+              .split(",") if m.strip()]
+    try:
+        arbiter = GpuArbiter(scheduler, voice_idle=voice_probe(runtime.adapters.get("galatea")),
+                             mode=(os.environ.get("PIONIR_OLLAMA_GATE_MODE") or "auto").strip().lower(),
+                             on_event=audit)
+        gate = OllamaGate(models, port=int(raw), arbiter=arbiter)
+        gate.start()
+    except (OSError, ValueError, RuntimeError) as error:
+        return None, f"! the Ollama gate did not start: {error}"
+    proteus = runtime.adapters.get("proteus")
+    if proteus is not None:
+        proteus.local_status = lambda: {"gate": gate.status()}
+    return gate, (f"the Ollama gate is on {gate.url} ({', '.join(sorted(gate.models))}; "
+                  f"{arbiter.mode}): Peter's calls take the card under a lease, or the CPU on purpose.")
+
+
 def serve(
     runtime: PionirRuntime,
     *,
@@ -1535,6 +1630,9 @@ def serve(
     gate = DiscordGate.for_app(app, DiscordGateSettings.from_environment(runtime.settings.state_root))
     app.gate = gate
     gate_on = gate.start()
+    # The Ollama gate: Peter's model calls, placed on the card under a lease or on the CPU
+    # on purpose (pionir/ollama_gate.py). It lives and dies with this process.
+    ollama_gate, gate_note = _start_ollama_gate(runtime)
     print("  PIONIR")
     print(f"  the brain is visible at {url}")
     if pulse_thread is not None:
@@ -1544,6 +1642,7 @@ def serve(
     else:
         print(f"  Discord approvals are off ({gate.state().get('reason') or 'not configured'}); "
               "the phone still approves.")
+    print(f"  {gate_note}")
     print("  awake while this window is open; Ctrl+C stops it.")
     if open_browser:
         # Opened signed in with a one-time code (60 s, used once) that becomes the HttpOnly
@@ -1557,6 +1656,8 @@ def serve(
         print("\nstopping.")
     finally:
         gate.stop()
+        if ollama_gate is not None:
+            ollama_gate.stop()
         pulse_stop.set()
         httpd.shutdown()
         httpd.server_close()

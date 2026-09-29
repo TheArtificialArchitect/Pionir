@@ -151,6 +151,12 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
     runtime.register(
         AtaniCliAdapter(AtaniCliSettings(command=configured.atani_command))
     )
+    if configured.proteus_host is not None:
+        # Proteus's control plane: nothing touches the VPS until a proteus.* task runs.
+        from .adapters.proteus import ProteusAdapter, ProteusSettings
+
+        runtime.register(ProteusAdapter(ProteusSettings(
+            host=configured.proteus_host, key_file=configured.proteus_ssh_key)))
     if configured.bryo_status_command is not None:
         runtime.register(
             BryoStatusAdapter(

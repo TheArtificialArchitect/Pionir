@@ -21,6 +21,7 @@ from typing import Any, Self
 
 from standins import down_url
 
+from pionir.batching import OWNER_APPROVED_GRANT
 from pionir.bootstrap import build_runtime
 from pionir.config import PionirSettings
 from pionir.discord_gate import (
@@ -380,7 +381,8 @@ class OwnerOnlyTests(GateCase):
         # it ran through PionirApp.approve: claimed as a job, exact permission
         self.assertEqual(self.app.jobs.get(row["task_id"])["kind"], "approval")
         self.assertEqual(self.runs, [("coding.daedalus_solve",
-                                      {"content": "refactor the parser"}, ["daedalus.solve"])])
+                                      {"content": "refactor the parser"},
+                                      ["daedalus.solve", OWNER_APPROVED_GRANT])])
         for _ in range(3):
             gate.run_once()
         self.assertEqual(len(self.runs), 1)

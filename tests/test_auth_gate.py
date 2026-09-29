@@ -22,6 +22,7 @@ from standins import down_url
 
 from pionir import auth
 from pionir.auth import ClientAuth, ClientGrant, ensure_tokens, load_grants, token_path
+from pionir.batching import OWNER_APPROVED_GRANT
 from pionir.bootstrap import build_runtime
 from pionir.config import PionirSettings
 from pionir.contracts import AgentManifest, Capability, RiskLevel, Task, TaskResult
@@ -215,7 +216,9 @@ class GateOverHttp(unittest.TestCase):
         self.assertIn(status, (200, 202), out)
         self.assertTrue(self.app.jobs.wait(out["task_id"], 30))
         self.assertEqual(len(self.spec.ran), 1)
-        self.assertEqual(self.spec.ran[0].granted_permissions, frozenset({"gate.run"}))
+        # the recorded permission, and the proof the owner said yes (never a power)
+        self.assertEqual(self.spec.ran[0].granted_permissions,
+                         frozenset({"gate.run", OWNER_APPROVED_GRANT}))
 
     def test_the_phone_denies(self) -> None:
         aid = self._parked()
@@ -345,7 +348,9 @@ class GateOverHttp(unittest.TestCase):
         out = self.app.approve(aid, wait=30)          # what the Discord gate calls
         self.assertEqual(out["status"], "approved", out)
         self.assertEqual(len(self.spec.ran), 1)
-        self.assertEqual(self.spec.ran[0].granted_permissions, frozenset({"gate.run"}))
+        # the recorded permission, and the proof the owner said yes (never a power)
+        self.assertEqual(self.spec.ran[0].granted_permissions,
+                         frozenset({"gate.run", OWNER_APPROVED_GRANT}))
 
     # ---- 4. each token, its grant only -----------------------------------------------
     def test_each_client_reaches_only_its_granted_routes(self) -> None:
