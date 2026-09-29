@@ -204,6 +204,64 @@ def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     return dot / math.sqrt(na * nb)
 
 
+def bm25_scored(q: list[str], candidates: list[Any]) -> list[tuple[float, Any]]:
+    """Raw BM25 score per candidate row that matches at least one query term. Pure: a
+    function of the rows given, so a reader on its own connection ranks exactly as
+    ``Cortex.recall`` does (pionir/library.py) without taking the live store's lock."""
+    toks = [tokens(c["text"]) for c in candidates]
+    n = len(candidates)
+    if not n:
+        return []
+    avgdl = sum(len(t) for t in toks) / n or 1.0
+    df: Counter = Counter()
+    for t in toks:
+        df.update(set(t))
+    k1, b = 1.5, 0.75
+    scored: list[tuple[float, Any]] = []
+    for row, t in zip(candidates, toks):
+        if not t:
+            continue
+        tf = Counter(t)
+        s = 0.0
+        for term in q:
+            f = tf.get(term)
+            if not f:
+                continue
+            idf = math.log(1 + (n - df[term] + 0.5) / (df[term] + 0.5))
+            s += idf * f * (k1 + 1) / (f + k1 * (1 - b + b * len(t) / avgdl))
+        if s > 0:
+            scored.append((s, row))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored
+
+
+def recency_weight(row: Any, now: float) -> float:
+    age_days = max(0.0, (now - row["ts"]) / 86400)
+    recency = 0.6 + 0.4 * math.exp(-age_days / 45)
+    return recency * (0.5 + row["salience"] / 12)
+
+
+def weight_lexical(lexical: list[tuple[float, Any]], now: float) -> list[tuple[float, Any]]:
+    """The lexical-only ranking: BM25 x recency x salience."""
+    scored = [(s * recency_weight(row, now), row) for s, row in lexical]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored
+
+
+def fuse(lexical: list[tuple[float, Any]], semantic: list[tuple[float, Any]],
+         now: float) -> list[tuple[float, Any]]:
+    """Reciprocal-rank fusion of the two rankings, then the recency/salience weight."""
+    fused: dict[int, dict] = {}
+    for rankings in (lexical, semantic):
+        for i, (_, row) in enumerate(rankings):
+            slot = fused.setdefault(row["id"], {"row": row, "rrf": 0.0})
+            slot["rrf"] += 1.0 / (RRF_K + i + 1)
+    scored = [(slot["rrf"] * recency_weight(slot["row"], now), slot["row"])
+              for slot in fused.values()]
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return scored
+
+
 def _synchronized(method):
     """Hold the cortex lock for a whole public method.
 
@@ -514,29 +572,7 @@ class Cortex:
         self, q: list[str], candidates: list[sqlite3.Row]
     ) -> list[tuple[float, sqlite3.Row]]:
         """Raw BM25 score per candidate that matches at least one query term."""
-        toks = [tokens(c["text"]) for c in candidates]
-        n = len(candidates)
-        avgdl = sum(len(t) for t in toks) / n or 1.0
-        df: Counter = Counter()
-        for t in toks:
-            df.update(set(t))
-        k1, b = 1.5, 0.75
-        scored: list[tuple[float, sqlite3.Row]] = []
-        for row, t in zip(candidates, toks):
-            if not t:
-                continue
-            tf = Counter(t)
-            s = 0.0
-            for term in q:
-                f = tf.get(term)
-                if not f:
-                    continue
-                idf = math.log(1 + (n - df[term] + 0.5) / (df[term] + 0.5))
-                s += idf * f * (k1 + 1) / (f + k1 * (1 - b + b * len(t) / avgdl))
-            if s > 0:
-                scored.append((s, row))
-        scored.sort(key=lambda pair: pair[0], reverse=True)
-        return scored
+        return bm25_scored(q, candidates)
 
     def _semantic_scored(
         self, query: str, candidates: list[sqlite3.Row]
@@ -572,18 +608,14 @@ class Cortex:
         return scored
 
     def _weight(self, row: sqlite3.Row, now: float) -> float:
-        age_days = max(0.0, (now - row["ts"]) / 86400)
-        recency = 0.6 + 0.4 * math.exp(-age_days / 45)
-        return recency * (0.5 + row["salience"] / 12)
+        return recency_weight(row, now)
 
     def _weight_lexical(
         self, lexical: list[tuple[float, sqlite3.Row]], now: float
     ) -> list[tuple[float, sqlite3.Row]]:
         """The lexical-only path, scored exactly as before: BM25 x recency x
         salience. Kept identical so recall is unchanged where no embedder runs."""
-        scored = [(s * self._weight(row, now), row) for s, row in lexical]
-        scored.sort(key=lambda pair: pair[0], reverse=True)
-        return scored
+        return weight_lexical(lexical, now)
 
     def _fuse(
         self,
@@ -593,17 +625,7 @@ class Cortex:
     ) -> list[tuple[float, sqlite3.Row]]:
         """Reciprocal-rank fusion of the two rankings, then the recency/salience
         weight. Rank, not raw score, because BM25 and cosine are not comparable."""
-        fused: dict[int, dict] = {}
-        for rankings in (lexical, semantic):
-            for i, (_, row) in enumerate(rankings):
-                slot = fused.setdefault(row["id"], {"row": row, "rrf": 0.0})
-                slot["rrf"] += 1.0 / (RRF_K + i + 1)
-        scored = [
-            (slot["rrf"] * self._weight(slot["row"], now), slot["row"])
-            for slot in fused.values()
-        ]
-        scored.sort(key=lambda pair: pair[0], reverse=True)
-        return scored
+        return fuse(lexical, semantic, now)
 
     @_synchronized
     def memories(

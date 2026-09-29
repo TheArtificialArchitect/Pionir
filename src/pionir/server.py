@@ -1376,7 +1376,11 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
             path = getattr(cortex, "path", None)
             status, document = library.serve(
                 route.path, route.query, client=client, refused=refused,
-                store=lambda: (Path(path) if path is not None else None, cortex))
+                # the file and its embedder only: the Library reads on its own read-only
+                # connection and never takes the live store's lock
+                store=lambda: (Path(path) if path is not None else None,
+                               getattr(cortex, "embedder", None)),
+                known=lambda: app.auth.tokens.values())
             self._send(document, status)
 
         def _caller(self, path: str, raw: bytes | None = None) -> tuple[str | None, int, str]:

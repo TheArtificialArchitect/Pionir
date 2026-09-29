@@ -13,14 +13,19 @@ Three rules, all enforced here:
 
 * **Read-only, structurally.** Every read opens its OWN connection to the cortex file
   with ``mode=ro`` and ``PRAGMA query_only`` - so no statement from this module can
-  write, and a missing file is refused rather than created. Ranked search goes through
-  ``Cortex.recall`` (the same recall the bots use), which reads and never writes.
+  write, and a missing file is refused rather than created. Ranked search ranks the way
+  ``Cortex.recall`` does (the same BM25 / fusion functions, pionir/cortex.py) but on
+  that read-only connection - never under the live store's lock, so an owner's search
+  can never hold up a bot's recall or a write. A query embedding, when an embedder is
+  up, is asked for OUTSIDE any lock with a short timeout; slow or down, it is BM25.
 * **The owner's surfaces only.** A request must be authenticated - signed (Pionir
   Desktop, pionir/auth.py request_sig) or the dashboard's session - as a client in
   ``READERS``. Unlike /api/state, loopback alone is not enough: a bot's private memory
   is the owner's to read, not every local process's.
 * **Bounded.** Every argument is shape-checked; every query is parameterised, LIMITed
   and served off an index; a search is at most ``MAX_QUERY`` characters.
+* **Scrubbed.** Every answer passes pionir/secretscrub.py (the shared pattern set, and
+  this server's own client tokens) before it leaves.
 """
 
 from __future__ import annotations
@@ -28,11 +33,16 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from collections.abc import Callable, Iterator, Mapping
+import threading
+import time
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs
+
+from . import secretscrub
+from .cortex import _cosine, _unpack, bm25_scored, fuse, tokens, weight_lexical
 
 # The owner's surfaces. Fixed in code (like auth.APPROVERS): a grants file cannot add one.
 READERS = frozenset({"desktop", "dashboard"})
@@ -42,6 +52,8 @@ MAX_LIMIT = 100
 DEFAULT_LIMIT = 30
 MAX_RELATED = 20
 PREVIEW_CHARS = 280
+# How long an owner's search waits for a query embedding before ranking by BM25 alone.
+EMBED_TIMEOUT = 2.0
 _NAME = re.compile(r"[A-Za-z0-9_.:@-]{1,64}")
 _SLUG = re.compile(r"[^\x00-\x1f]{1,200}")
 
@@ -143,7 +155,7 @@ def _int(query: Mapping[str, list[str]], key: str, *, low: int, high: int) -> in
 
 
 # ---- the three reads ---------------------------------------------------------------------
-def overview(path: str | Path, cortex: Any = None) -> dict[str, Any]:
+def overview(path: str | Path, embedder: Any = None) -> dict[str, Any]:
     """What is in the store: per namespace (count, kinds, last write), per kind, the total,
     how many are retired, and whether recall is hybrid. All GROUP BYs on indexed columns."""
     p = Path(path)
@@ -169,12 +181,14 @@ def overview(path: str | Path, cortex: Any = None) -> dict[str, Any]:
             "FROM memories").fetchone()
         linked = db.execute("SELECT COUNT(*) FROM memories WHERE active = 1 AND links != '[]'"
                             ).fetchone()[0]
-    stats: dict[str, Any] = {}
-    if cortex is not None:
-        try:
-            stats = cortex.stats()
-        except Exception:  # noqa: BLE001 - the counts above stand without it
-            stats = {}
+        # hybrid only where vectors exist for the live model - counted here, not through
+        # Cortex.stats(), which would take the live store's lock
+        model = getattr(embedder, "model", None)
+        embedded = 0
+        if model:
+            embedded = db.execute(
+                "SELECT COUNT(*) FROM vectors v JOIN memories m ON m.id = v.memory_id "
+                "WHERE m.active = 1 AND v.model = ?", (model,)).fetchone()[0]
     return {
         "path": str(p),
         "size_bytes": p.stat().st_size,
@@ -185,12 +199,77 @@ def overview(path: str | Path, cortex: Any = None) -> dict[str, Any]:
         "namespaces": sorted(namespaces.values(), key=lambda s: (s["namespace"] != "lessons",
                                                                  -s["count"], s["namespace"])),
         "kinds": dict(sorted(kinds.items(), key=lambda kv: -kv[1])),
-        "recall": stats.get("recall", "lexical"),
-        "embedded": stats.get("embedded", 0),
+        "recall": "hybrid" if (model and embedded) else "lexical",
+        "embedded": int(embedded),
     }
 
 
-def entries(path: str | Path, query: Mapping[str, list[str]], cortex: Any = None) -> dict[str, Any]:
+def query_vector(embedder: Any, text: str, timeout: float = EMBED_TIMEOUT) -> list[float] | None:
+    """The query's embedding, asked for outside any lock and waited on for ``timeout``
+    seconds at most; None (rank by BM25) when there is no embedder, it is paused after
+    a failure, it is slow, or it answers nothing usable. The call itself runs in a
+    daemon thread: a wedged Ollama costs the owner at most ``timeout``, never the call."""
+    if embedder is None:
+        return None
+    paused = getattr(embedder, "paused_for", None)
+    if callable(paused) and paused() > 0:
+        return None
+    box: list[Any] = []
+
+    def ask() -> None:
+        try:
+            box.append(embedder.embed([text]))
+        except Exception:  # noqa: BLE001 - fail-open, like the cortex
+            box.append(None)
+
+    worker = threading.Thread(target=ask, name="pionir-library-embed", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if not box or not box[0]:
+        return None
+    vec = box[0][0]
+    return vec if isinstance(vec, list) and vec else None
+
+
+def ranked(db: sqlite3.Connection, query: str, k: int, *, namespace: str | None,
+           kind: str | None, embedder: Any = None, now: float | None = None,
+           timeout: float = EMBED_TIMEOUT) -> list[tuple[float, Any]]:
+    """Recall-ranked memories, as ``Cortex.recall`` ranks them (BM25, fused with cosine
+    when a query embedding and stored vectors exist), computed on this read-only
+    connection - the live store's lock is never taken."""
+    q = tokens(query)
+    if not q:
+        return []
+    where, params = ["active = 1"], []
+    if namespace:
+        where.append("namespace = ?")
+        params.append(namespace)
+    if kind:
+        where.append("kind = ?")
+        params.append(kind)
+    candidates = db.execute("SELECT * FROM memories WHERE " + " AND ".join(where),
+                            params).fetchall()
+    if not candidates:
+        return []
+    now = time.time() if now is None else now
+    lexical = bm25_scored(q, candidates)
+    semantic: list[tuple[float, Any]] = []
+    vec = query_vector(embedder, query, timeout)
+    if vec is not None:
+        by_id = {c["id"]: c for c in candidates}
+        for r in db.execute("SELECT memory_id, vec FROM vectors WHERE model = ?",
+                            (embedder.model,)):
+            row = by_id.get(r["memory_id"])
+            if row is not None:
+                score = _cosine(vec, _unpack(r["vec"]))
+                if score > 0:
+                    semantic.append((score, row))
+        semantic.sort(key=lambda pair: pair[0], reverse=True)
+    return (fuse(lexical, semantic, now) if semantic else weight_lexical(lexical, now))[:k]
+
+
+def entries(path: str | Path, query: Mapping[str, list[str]], embedder: Any = None, *,
+            embed_timeout: float = EMBED_TIMEOUT) -> dict[str, Any]:
     """A page of memories, newest first (keyset paging on id: ``before`` is the last id of
     the previous page). With ``q``: ``mode=recall`` ranks by the bots' own recall (BM25,
     hybrid when vectors exist), ``mode=text`` finds the words as written, newest first."""
@@ -209,14 +288,10 @@ def entries(path: str | Path, query: Mapping[str, list[str]], cortex: Any = None
         raise BadRequest("mode is recall or text")
 
     if q and mode == "recall":
-        if cortex is None:
-            raise BadRequest("ranked recall needs the memory engine; use mode=text")
-        hits = cortex.recall(q, k=limit, namespace=namespace,
-                             kinds=[kind] if kind else None)
-        rows = [{"id": m.id, "ts": m.ts, "namespace": m.namespace, "kind": m.kind,
-                 "text": m.text, "salience": m.salience, "slug": m.slug, "active": 1}
-                for m in hits]
-        return {"entries": [_summary(r, score=m.score) for r, m in zip(rows, hits)],
+        with _reading(path) as db:
+            hits = ranked(db, q, limit, namespace=namespace, kind=kind, embedder=embedder,
+                          timeout=embed_timeout)
+        return {"entries": [_summary(row, score=score) for score, row in hits],
                 "next_before": None, "mode": "recall"}
 
     where: list[str] = [] if retired else ["active = 1"]
@@ -305,9 +380,12 @@ def entry(path: str | Path, query: Mapping[str, list[str]]) -> dict[str, Any] | 
 
 # ---- the HTTP door -----------------------------------------------------------------------
 def serve(path_info: str, query_string: str, *, client: str | None, refused: str | None,
-          store: Callable[[], tuple[Path | None, Any]]) -> tuple[int, dict[str, Any]]:
+          store: Callable[[], tuple[Path | None, Any]],
+          known: Callable[[], Iterable[str]] = tuple) -> tuple[int, dict[str, Any]]:
     """(status, document) for one GET under /api/library/. ``client``/``refused`` are the
-    caller as auth.py identified it; ``store`` gives (the cortex file, the Cortex)."""
+    caller as auth.py identified it; ``store`` gives (the cortex file, its embedder or
+    None); ``known`` gives values that are secrets here (this server's client tokens).
+    Every answer is scrubbed (pionir/secretscrub.py) before it is returned."""
     if refused is not None:
         return 401, {"error": "unauthorized", "reason": refused}
     if client is None:
@@ -319,16 +397,22 @@ def serve(path_info: str, query_string: str, *, client: str | None, refused: str
                          strict_parsing=False)
     except ValueError:
         return 400, {"error": "bad query"}
-    path, cortex = store()
+    path, embedder = store()
     if path is None:
         return 503, {"error": "no memory store", "reason": "this Pionir has no cortex file"}
+    status, document = _read(path_info, query, path, embedder)
+    return status, secretscrub.scrub_value(document, known())
+
+
+def _read(path_info: str, query: Mapping[str, list[str]], path: Path,
+          embedder: Any) -> tuple[int, dict[str, Any]]:
     try:
         if path_info == "/api/library/overview":
             if query:
                 raise BadRequest("overview takes no arguments")
-            return 200, overview(path, cortex)
+            return 200, overview(path, embedder)
         if path_info == "/api/library/entries":
-            return 200, entries(path, query, cortex)
+            return 200, entries(path, query, embedder)
         if path_info == "/api/library/entry":
             found = entry(path, query)
             return (200, found) if found is not None else (404, {"error": "not found"})
