@@ -69,7 +69,9 @@ from .signin import NotGalatea, SigninCodes, galatea_ticket
 from .bootstrap import PionirRuntime
 from .cli import _capabilities, _doctor, _jsonable
 from .posting_health import posting_health
-from .contracts import RiskLevel, Task, outcome_ok
+from .contracts import ModelRequirement, RiskLevel, Task, outcome_ok
+from .consolidate import AUTO_CONSOLIDATE_AT
+from .cortex import NewMemory
 from .errors import PionirError, RoutingAmbiguous
 from .router import Candidate, IntentRouter, RoutingDecision
 from .runtime import AuditEvent
@@ -308,6 +310,28 @@ def _candidate_json(candidate: Candidate) -> dict[str, Any]:
     }
 
 
+def _exchange_gist(response: Mapping[str, Any]) -> str:
+    """One line of what an intent came back with, for the voice's raw turn."""
+    status = str(response.get("status") or "")
+    head = status + (f" by {response['agent_id']}" if response.get("agent_id") else "")
+    text = ""
+    error, result = response.get("error"), response.get("result")
+    if isinstance(error, Mapping):
+        text = str(error.get("message") or error.get("type") or "")
+    elif isinstance(result, Mapping):
+        for key in ("reply", "answer", "summary", "message", "text", "output", "error"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                text = value.strip()
+                break
+        else:
+            text = json.dumps(result, default=str)[:600]
+    elif isinstance(result, str):
+        text = result.strip()
+    text = text or str(response.get("question") or response.get("note") or "")
+    return (head or "answered") + (f": {text[:600]}" if text else "")
+
+
 def _product_gist(payload: Mapping[str, Any]) -> str:
     """"Post Guard 1.0.0 ($19.00) - post-guard" for a product listing's payload."""
     words = [" ".join(str(payload["name"]).split())]
@@ -349,6 +373,12 @@ class PionirApp:
         self._proteus_snapshot: dict[str, Any] | None = None
         self._proteus_at: float | None = None
         self._proteus_busy = False
+        # Folding the voice's raw turns into episodes (_consolidate). None builds an
+        # OllamaDistiller from settings.distil_model at fold time; a test injects a fake.
+        self.distiller: Any = None
+        self._consolidating: set[str] = set()
+        self._consolidating_lock = threading.Lock()
+        self._consolidation_thread: threading.Thread | None = None
 
     # ---- proteus: the trading plane, read ------------------------------
     def proteus_view(self, *, refresh: Callable[[Callable[[], None]], None] | None = None,
@@ -691,12 +721,16 @@ class PionirApp:
         decision = self.router.classify(request)
         base = {"decision": _decision_json(decision)}
         body = {"request": request}
+        # The voice's exchanges are raw turns in her own namespace (per bot, never
+        # the shared lessons one), which consolidation folds into episodes + facts.
+        namespace = client if client and client != ANONYMOUS else "voice"
 
         def settle(response: dict[str, Any]) -> dict[str, Any]:
             # No work to run: the answer is the decision itself. Still a job, so
             # the record of what the voice asked and what she was told persists.
             record = self.jobs.create("intent", body)
             self.jobs.finish(record["task_id"], _job_status(response), result=response)
+            self._remember_exchange(namespace, request, response)
             return {**response, "task_id": record["task_id"]}
 
         def run(capability: str, permissions: frozenset[str]) -> dict[str, Any]:
@@ -704,11 +738,13 @@ class PionirApp:
             # An unauthenticated caller (the compatibility window) gets none of them.
             if client == ANONYMOUS and (permissions or self._privileged(capability)):
                 raise Unauthenticated(f"{capability} is privileged; send your client token")
-            return self._submit(
-                "intent", body,
-                lambda: self._run_intent(capability, {"content": request}, permissions, decision),
-                wait, known=base,
-            )
+            def work() -> dict[str, Any]:
+                response = self._run_intent(
+                    capability, {"content": request}, permissions, decision)
+                self._remember_exchange(namespace, request, response)
+                return response
+
+            return self._submit("intent", body, work, wait, known=base)
 
         if not decision.resolved:
             if _NAMES_A_DOER.search(request):
@@ -750,6 +786,8 @@ class PionirApp:
         return None
 
     def _run_intent(self, capability, payload, permissions, decision, *, planned=False):
+        # Recall-before-act on the voice's seam too, not only on /api/task.
+        lessons = self._recall_lessons(capability, payload)
         try:
             # routing_detail: the ledger's task.routed event carries the router's
             # confidence and runner-up, as it does for `pionir route`.
@@ -758,12 +796,16 @@ class PionirApp:
                 routing_detail=decision.audit_detail(),
             )
         except Exception as error:  # noqa: BLE001 - returned to the voice as data
-            return {
+            response = {
                 "decision": _decision_json(decision),
                 "status": "error",
                 "error": {"type": type(error).__name__, "message": str(error)},
             }
-        return {
+            if lessons:
+                response["lessons"] = lessons
+            self._learn_from_failure(capability, payload, response)
+            return response
+        response = {
             "decision": _decision_json(decision),
             "status": "planned" if planned else "done",
             "planned": planned,
@@ -771,6 +813,95 @@ class PionirApp:
             "result": _jsonable(result.output),
             "evidence": list(result.evidence),
         }
+        if lessons:
+            response["lessons"] = lessons
+        return response
+
+    # ---- the voice's turns, and folding them into memory ------------------
+    # Fold a namespace once this many raw turns (two per exchange) are waiting.
+    CONSOLIDATE_AT = AUTO_CONSOLIDATE_AT
+
+    def _remember_exchange(self, namespace: str, request: str,
+                           response: Mapping[str, Any]) -> None:
+        """Write one exchange - what was asked, what came back - as two raw
+        `message` turns in the asker's own namespace, then fold the namespace if
+        enough have piled up. Nothing wrote a raw turn before this: the store held
+        lessons only, and consolidation had nothing to fold and never ran.
+        Best-effort, logged: memory never fails the voice's request."""
+        cortex = getattr(self.runtime, "cortex", None)
+        if cortex is None:
+            return
+        try:
+            cortex.remember_many([
+                NewMemory("message", f"asked: {request.strip()[:600]}", namespace),
+                NewMemory("message", f"told: {_exchange_gist(response)}", namespace),
+            ])
+        except Exception:  # noqa: BLE001 - logged, never raised into the voice's turn
+            _log.warning("recording the %s exchange as raw turns failed", namespace,
+                         exc_info=True)
+            return
+        self._maybe_consolidate(namespace)
+
+    def _maybe_consolidate(self, namespace: str) -> bool:
+        """Start one background fold of ``namespace`` when its backlog reached
+        CONSOLIDATE_AT and none is running for it. Driven by the voice's own
+        traffic inside this process - nothing is scheduled, nothing self-starts.
+        Returns whether a fold was started."""
+        try:
+            pending = len(self.runtime.cortex.memories(namespace, kind="message", limit=None))
+        except Exception:  # noqa: BLE001
+            _log.warning("counting %s raw turns failed", namespace, exc_info=True)
+            return False
+        if pending < self.CONSOLIDATE_AT:
+            return False
+        with self._consolidating_lock:
+            if namespace in self._consolidating:
+                return False
+            self._consolidating.add(namespace)
+        thread = threading.Thread(target=self._consolidate, args=(namespace,),
+                                  name=f"pionir-consolidate-{namespace}", daemon=True)
+        self._consolidation_thread = thread
+        thread.start()
+        return True
+
+    def _consolidate(self, namespace: str) -> None:
+        """One fold, under a lease for the distil model like any model work, and
+        yielding to Bryo when he advises deferring heavy work. Every outcome lands
+        in the store's consolidation log, so doctor can say when it last ran."""
+        from .consolidate import Consolidator, OllamaDistiller
+
+        cortex = self.runtime.cortex
+        try:
+            model = self.runtime.settings.distil_model
+            distiller = self.distiller
+            if distiller is None:
+                if not model:
+                    cortex.note_consolidation(namespace, "off", detail="no distil model set")
+                    return
+                distiller = OllamaDistiller(model)
+            reading = self.runtime.executive.body_reading()
+            if (reading is not None and getattr(reading, "alive", False) is True
+                    and getattr(reading, "defer_heavy_work", False) is True):
+                cortex.note_consolidation(namespace, "deferred",
+                                          detail=str(getattr(reading, "detail", "bryo")))
+                return
+            # Declared like Atani's 4B: a CPU/elastic tenant that never takes the card
+            # from the voice. The lease is for accounting and the one-at-a-time rule.
+            requirement = ModelRequirement(model or "distiller", 0, requires_gpu=False)
+            with self.runtime.executive.scheduler.acquire(
+                    requirement, purpose=f"pionir: consolidate {namespace}"):
+                Consolidator(cortex, distiller).consolidate(
+                    namespace, min_turns=self.CONSOLIDATE_AT)
+        except Exception as error:  # noqa: BLE001 - logged and recorded, never silent
+            _log.warning("consolidating %s failed", namespace, exc_info=True)
+            try:
+                cortex.note_consolidation(namespace, "failed",
+                                          detail=f"{type(error).__name__}: {error}")
+            except Exception:  # noqa: BLE001
+                _log.warning("recording the failed consolidation failed", exc_info=True)
+        finally:
+            with self._consolidating_lock:
+                self._consolidating.discard(namespace)
 
     def _cap_and_agent(self, name: str):
         for manifest in self.runtime.executive.registry.manifests():
@@ -963,13 +1094,15 @@ class PionirApp:
         *, deferrable: bool = False,
     ) -> dict[str, Any]:
         """The synchronous core: run it now, on this thread, and report as data."""
-        self._recall_lessons(capability, payload)
+        lessons = self._recall_lessons(capability, payload)
         try:
             result = self.runtime.executive.execute(
                 Task(capability, payload, frozenset(granted)), deferrable=deferrable
             )
         except Exception as error:  # noqa: BLE001 - returned as data
             response = {"ok": False, "error": {"type": type(error).__name__, "message": str(error)}}
+            if lessons:
+                response["lessons"] = lessons
             self._learn_from_failure(capability, payload, response)
             return response
         # The adapter can return normally and still carry a failing verdict; the
@@ -983,26 +1116,30 @@ class PionirApp:
             "result": _jsonable(result.output),
             "evidence": list(result.evidence),
         }
+        if lessons:
+            response["lessons"] = lessons
         if not ok:
             self._learn_from_failure(capability, payload, response)
         return response
 
-    def _recall_lessons(self, capability: str, payload: dict[str, Any]) -> None:
-        """Consult the shared lessons namespace before tasking a doer, and note
-        what was recalled in the ledger, so a mistake learned once is in front of
-        the next similar action (the recall-before-act hook, previously only wired
-        into the CLI)."""
+    def _recall_lessons(self, capability: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        """Consult the shared lessons namespace before tasking a doer, note what
+        was recalled in the ledger, and RETURN it, so the caller's response
+        carries the lessons (`lessons`) to whoever sent the task. They used to be
+        recalled, counted in the ledger and thrown away - 3,134 recalls and not one
+        reached a caller, while the same fiverr.ack mistake repeated 398 times."""
 
         cortex = getattr(self.runtime, "cortex", None)
         if cortex is None:
-            return
+            return []
         context = self._summarize(capability, payload)
         try:
             lessons = cortex.lessons_for(context)
         except Exception:  # noqa: BLE001 - memory must never fail a task
-            return
+            _log.warning("recalling lessons for %s failed", capability, exc_info=True)
+            return []
         if not lessons:
-            return
+            return []
         try:
             self.runtime.executive.audit_sink.record(
                 AuditEvent(
@@ -1010,11 +1147,14 @@ class PionirApp:
                     task_id=uuid.uuid4(),
                     agent_id=capability.split(".")[0],
                     occurred_at=datetime.now(UTC),
-                    detail=f"capability={capability} lessons={len(lessons)}",
+                    detail=(f"capability={capability} lessons={len(lessons)} "
+                            f"ids={','.join(str(m.id) for m in lessons)}"),
                 )
             )
         except Exception:  # noqa: BLE001
             _log.warning("recording recalled-lessons event failed", exc_info=True)
+        return [{"id": m.id, "text": m.text, "seen": int(m.meta.get("seen", 1)),
+                 **({"via": m.via} if m.via else {})} for m in lessons]
 
     def _learn_from_failure(
         self, capability: str, payload: dict[str, Any], response: dict[str, Any]

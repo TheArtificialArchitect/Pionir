@@ -237,6 +237,11 @@ def _parser() -> argparse.ArgumentParser:
         "reindex-memory",
         help="embed any memories that lack a vector for the current model (hybrid recall backfill)",
     )
+    commands.add_parser(
+        "undo-lesson-dedupe",
+        help="reverse the duplicate-lesson collapse: re-activate every lesson it retired "
+             "(the pre-dedupe backup beside memory.db is the other way back)",
+    )
     rc = commands.add_parser(
         "recall-check",
         help=(
@@ -363,9 +368,26 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
         # Counts, not a health verdict. An empty store here is honest - ready and
         # unused, not broken - and distinguishing that from a store that recalls
         # nothing because it is broken is exactly the wired-but-inert check (3.1).
-        "memory": runtime.cortex.stats(),
+        "memory": {**runtime.cortex.stats(), "output": _memory_output(runtime)},
         "specialists": specialists,
     }
+
+
+def _memory_output(runtime: PionirRuntime) -> dict[str, Any]:
+    """What memory has DONE lately, with its stall alarms (memory_health.py) - the
+    counts above only say what is in the store, which looked healthy while nothing
+    but duplicate lessons was ever written."""
+    import time
+
+    from .memory_health import memory_health
+
+    sink = runtime.executive.audit_sink
+    try:
+        events = sink.recent(2000) if hasattr(sink, "recent") else []
+        return memory_health(runtime.cortex, events, now=time.time())
+    except Exception as error:  # noqa: BLE001 - doctor reports, it does not fail
+        return {"alerts": [f"MEMORY: its output could not be read: "
+                           f"{type(error).__name__}: {error}"]}
 
 
 def _declared_models(runtime: PionirRuntime) -> list[dict[str, Any]]:
@@ -656,6 +678,10 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
                     "folded_turns": outcome.folded_turns,
                 }
             )
+        return 0
+    if args.command == "undo-lesson-dedupe":
+        _print({"restored_lessons": runtime.cortex.undo_lesson_dedupe(),
+                "stats": runtime.cortex.stats()})
         return 0
     if args.command == "reindex-memory":
         filled = runtime.cortex.reindex()

@@ -15,6 +15,7 @@ nothing usable, the turns are left as they are and tried again later, never lost
 from __future__ import annotations
 
 import json
+import logging
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -22,9 +23,14 @@ from typing import Protocol, Sequence
 
 from .cortex import Cortex
 
+_log = logging.getLogger(__name__)
+
 # Below this many un-consolidated turns, leave them in the window - there is not
 # enough yet to be worth a summary, and they are still recalled as messages.
 DEFAULT_MIN_TURNS = 6
+# The server folds a namespace on its own traffic once this many raw turns wait
+# (two per exchange of the voice's, so every six exchanges).
+AUTO_CONSOLIDATE_AT = 12
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,11 +72,19 @@ class Consolidator:
         texts = [m.text for m in turns]
         try:
             distilled = self.distiller.distill(texts)
-        except Exception:  # noqa: BLE001 - distilling is fail-open by contract
+        except Exception as error:  # noqa: BLE001 - distilling is fail-open by contract
+            # Fail-open, not fail-silent: logged and written to the attempt log.
+            why = f"{type(error).__name__}: {error}"
+            _log.warning("consolidating %s: the distiller failed (%s); turns kept", namespace, why)
+            self.cortex.note_consolidation(namespace, "failed", detail=why)
             return None
         # No usable summary: leave the turns untouched to try again later. Losing
         # them because the model hiccuped would be the opposite of the point.
         if distilled is None or not distilled.summary.strip():
+            reason = getattr(self.distiller, "last_error", None) or "no usable summary"
+            _log.warning("consolidating %s: the distiller declined (%s); turns kept",
+                         namespace, reason)
+            self.cortex.note_consolidation(namespace, "declined", detail=reason)
             return None
 
         # One transaction: the episode and facts are written and the raw turns
@@ -83,6 +97,10 @@ class Consolidator:
             distilled.summary.strip(),
             [fact for fact in distilled.facts if fact.strip()],
             meta={"folded_turns": len(turns)},
+        )
+        self.cortex.note_consolidation(
+            namespace, "folded", episode_id=episode_id, folded=len(turns),
+            detail=f"{len(fact_ids)} facts",
         )
         return Consolidation(episode_id, tuple(fact_ids), len(turns))
 
@@ -113,6 +131,8 @@ class OllamaDistiller:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout_seconds
         self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        # Why the last distill declined, for the Consolidator's attempt log.
+        self.last_error: str | None = None
 
     def distill(self, turns: Sequence[str]) -> Distilled | None:
         transcript = "\n".join(turns)
@@ -139,14 +159,16 @@ class OllamaDistiller:
                 document = json.loads(response.read().decode("utf-8"))
             content = document["message"]["content"]
             parsed = json.loads(content)
-        except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError, TypeError):
+        except (urllib.error.URLError, TimeoutError, OSError, ValueError, KeyError,
+                TypeError) as error:
+            self.last_error = f"{self._model}: {type(error).__name__}: {error}"[:300]
             return None
-        if not isinstance(parsed, dict):
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("summary"), str):
+            self.last_error = f"{self._model}: reply was not {{summary, facts}} JSON"
             return None
+        self.last_error = None
         summary = parsed.get("summary")
         facts = parsed.get("facts", [])
-        if not isinstance(summary, str):
-            return None
         if not isinstance(facts, list):
             facts = []
         return Distilled(

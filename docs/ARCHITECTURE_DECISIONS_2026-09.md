@@ -215,6 +215,19 @@ pieces, none urgent, none needing the strip:
   distill pass) to fold raw messages into episodes and extract facts. The engine
   stays model-free and testable; the distilling lives in the caller. Do not build
   it until something is writing conversations for it to fold.
+- **Wired-but-inert, found and fixed 2026-09-28 (branch `memory-live`).** The live
+  store held 800 lessons and nothing else - 6 distinct texts, 398 copies each of two
+  fiverr.ack failures; no raw turn ever written, consolidation never run; every task
+  handed 3 lessons however unrelated, then thrown away. Now: a known lesson recurs
+  (`seen`/`burst`) instead of re-inserting, and migration 1 collapses an existing
+  flood (backup file first, duplicates soft-retired, `pionir undo-lesson-dedupe`);
+  `lessons_for` is relevance-floored and the recalled lessons ride back in the task
+  response (`lessons`); the voice's `/api/intent` exchanges are raw turns in her
+  namespace, folded by her own traffic at 12 turns (a distil-model lease, Bryo can
+  defer it, every attempt logged); embedding failures are counted and backfilled;
+  and doctor's `memory.output` (`memory_health.py`) counts writes, folds and
+  coverage, with alarms for a stalled lesson writer, a lesson recurring all day, a
+  stalled fold and low coverage.
 
 ## Open decisions, not yet made
 
