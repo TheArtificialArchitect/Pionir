@@ -94,7 +94,15 @@ class FakeScrooge:
         if parts.path == "/dash/fiverr/events":
             return _Resp(200, {"ok": True, "events": self.events})
         if parts.path == "/dash/fiverr/ack":
-            return _Resp(200, {"ok": True})
+            # Scrooge's own rule (worker/src/fiverr.ts ack): the id is a JSON NUMBER, a safe
+            # positive whole number - "3" is a 400. The fake refuses what Scrooge refuses.
+            eid = (json.loads(request.data) if request.data else {}).get("id")
+            if isinstance(eid, bool) or not isinstance(eid, int) or not 1 <= eid < 2 ** 53:
+                raise urllib.error.HTTPError(
+                    request.full_url, 400, "bad", {}, io.BytesIO(
+                        b'{"ok": false, "error": "id: must be an event id (a positive '
+                        b'whole number)"}'))
+            return _Resp(200, {"ok": True, "id": eid, "already": False})
         raise AssertionError(parts.path)
 
 
@@ -316,7 +324,21 @@ class EventTests(_Case):
         self.assertEqual((method, path, query, token), ("GET", "/dash/fiverr/events",
                                                         "after=7", OPS))
         self.assertTrue(self.run_task(self.adapter(), ACK, {"id": "8"})["ok"])
-        self.assertEqual(self.scrooge.calls[-1][4], {"id": "8"})
+        self.assertEqual(self.scrooge.calls[-1][4], {"id": 8})       # a JSON number
+
+    def test_an_ack_is_sent_the_way_scrooge_takes_it(self) -> None:
+        # 2026-09-28: every ack sent {"id": "1"} and Scrooge answered 400 every 5 minutes
+        for eid in ("1", 3, "123456789012345"):
+            with self.subTest(eid=eid):
+                out = self.run_task(self.adapter(), ACK, {"id": eid})
+                self.assertTrue(out["ok"], out)
+                self.assertIsInstance(self.scrooge.calls[-1][4]["id"], int)
+        for bad in ("abc", "0", "-1", "1.5", "FO8", 0, True, None, "1234567890123456"):
+            with self.subTest(bad=bad):
+                calls = len(self.scrooge.calls)
+                with self.assertRaises(AdapterProtocolError):
+                    self.run_task(self.adapter(), ACK, {"id": bad})
+                self.assertEqual(len(self.scrooge.calls), calls)     # never sent
 
     def test_a_missing_route_is_not_set_up_never_no_orders(self) -> None:
         self.scrooge.status = 404

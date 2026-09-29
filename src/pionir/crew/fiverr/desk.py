@@ -138,26 +138,48 @@ def shown(value, limit: int = 120) -> str:
     return f"`{text}`" if text else "`?`"
 
 
+# Scrooge's event (worker/src/fiverr.ts listEvents): ``order_no`` ('' when the email is about
+# no order), and every buyer-influenced field under ``untrusted`` by ITS names. The desk read
+# ``order_number``, ``gig_title`` and ``price_text`` at the top level, so a real order event
+# would have been dropped as "no plain order number" and acknowledged - lost without a card.
+# Desk field <- Scrooge's ``untrusted`` field.
+_SCROOGE_UNTRUSTED = {"buyer": "buyer", "gig_title": "gig", "package": "package",
+                      "price_text": "price", "due": "due", "subject": "subject", "text": "text"}
+NO_ORDER = "about no order"
+
+
+def _field(ev: dict, name: str):
+    """A field by the desk's name: Scrooge's ``untrusted.<its name>`` first, then a flat one."""
+    inner = ev.get("untrusted")
+    if isinstance(inner, dict) and inner.get(_SCROOGE_UNTRUSTED[name]) is not None:
+        return inner.get(_SCROOGE_UNTRUSTED[name])
+    return ev.get(name)
+
+
 def normalize(ev) -> tuple:
-    """``(event, None)`` for an event this desk can apply, or ``(None, why)``."""
+    """``(event, None)`` for an event this desk can apply, or ``(None, why)``. ``why``
+    starts with ``NO_ORDER`` for a well-formed email about no order (Fiverr's account and
+    marketing mail): nothing to apply, and not malformed either."""
     if not isinstance(ev, dict):
         return None, "an event that is not an object"
     eid = ev.get("id")
     if isinstance(eid, bool) or not isinstance(eid, (int, str)) \
             or not _EVENT_ID.fullmatch(str(eid)):
         return None, "an event without a plain id"
-    order = ev.get("order_number")
+    order = ev.get("order_no") if "order_no" in ev else ev.get("order_number")
+    if order == "" and ev.get("kind") in KINDS:
+        return None, f"{NO_ORDER}: event {eid} ({ev.get('kind')})"
     if not isinstance(order, str) or not _ORDER.fullmatch(order.strip()):
         return None, f"event {eid}: no plain order number"
     kind = ev.get("kind") if ev.get("kind") in KINDS else "unknown"
     return {"id": str(eid), "kind": kind, "order_number": order.strip(),
-            "buyer": untrusted_text(ev.get("buyer"), 60),
-            "gig_title": untrusted_text(ev.get("gig_title"), 120),
-            "package": untrusted_text(ev.get("package"), 40),
-            "price_text": untrusted_text(ev.get("price_text"), 40),
-            "due": untrusted_text(ev.get("due"), 60),
-            "subject": untrusted_text(ev.get("subject"), 200),
-            "text": untrusted_text(ev.get("text"), MAX_TEXT, lines=True)}, None
+            "buyer": untrusted_text(_field(ev, "buyer"), 60),
+            "gig_title": untrusted_text(_field(ev, "gig_title"), 120),
+            "package": untrusted_text(_field(ev, "package"), 40),
+            "price_text": untrusted_text(_field(ev, "price_text"), 40),
+            "due": untrusted_text(_field(ev, "due"), 60),
+            "subject": untrusted_text(_field(ev, "subject"), 200),
+            "text": untrusted_text(_field(ev, "text"), MAX_TEXT, lines=True)}, None
 
 
 _USD = re.compile(r"(?i)^(?:us\s?\$|\$|usd\s?)\s?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{1,2}))?$"
@@ -424,8 +446,12 @@ class FiverrDesk(_Base):
         for ev in raw[:MAX_EVENTS_PER_RUN]:
             norm, why = normalize(ev)
             if norm is None:
-                rec["counts"]["malformed_events"] += 1
-                log.warning("%s: %s", self.worker_id, why)
+                if why.startswith(NO_ORDER):
+                    rec["counts"]["ignored_events"] += 1
+                    log.info("%s: %s; acknowledged, nothing to apply", self.worker_id, why)
+                else:
+                    rec["counts"]["malformed_events"] += 1
+                    log.warning("%s: %s", self.worker_id, why)
                 eid = ev.get("id") if isinstance(ev, dict) else None
                 if isinstance(eid, (int, str)) and not isinstance(eid, bool) \
                         and _EVENT_ID.fullmatch(str(eid)):

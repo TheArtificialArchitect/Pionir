@@ -27,6 +27,7 @@ from pionir.crew.fiverr.desk import (
     STATES,
     FiverrDesk,
     FiverrEarnings,
+    normalize,
     earnings,
     price_cents,
     route,
@@ -239,6 +240,54 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(price_cents("45 USD"), 4500)
         for text in ("€24", "£30", "about $20", "", None, "$0"):
             self.assertIsNone(price_cents(text), text)
+
+
+def scrooge_ev(eid, kind, order_no="FO1ABC23", **untrusted) -> dict:
+    """An event exactly as Scrooge serves it (worker/src/fiverr.ts listEvents): its id a
+    number, ``order_no``, and the buyer-influenced fields under ``untrusted`` by its names."""
+    fields = {"subject": None, "buyer": None, "gig": None, "package": None, "price": None,
+              "due": None, "text": None, "attachments": [], "sent_at": None}
+    fields.update(untrusted)
+    return {"id": eid, "kind": kind, "order_no": order_no, "text_source": "whole",
+            "verified_by": "dkim", "received_at": "2026-09-28T14:45:35.976Z", "acked_at": None,
+            "untrusted": fields}
+
+
+class ScroogeContractTests(_Case):
+    """The desk reads the events in Scrooge's own vocabulary (2026-09-28): it read
+    ``order_number`` / ``gig_title`` / ``price_text`` at the top level, so every real order
+    event would have been dropped as malformed and acknowledged - an order lost unseen."""
+
+    def test_a_real_order_event_is_an_order(self) -> None:
+        self.pionir.events = [scrooge_ev(1, "new_order", buyer="cakefan22",
+                                         gig=RESEARCH.title, package="Basic", price="$24",
+                                         due="2026-10-01")]
+        self.assertIsInstance(self.run_desk(), Ok)
+        rec = self.record()
+        self.assertEqual(rec["counts"]["malformed_events"], 0)
+        o = rec["orders"]["FO1ABC23"]
+        self.assertEqual(o["state"], "new")
+        self.assertEqual(self.pionir.acks, ["1"])
+
+    def test_the_buyer_fields_are_read_from_untrusted(self) -> None:
+        norm, why = normalize(scrooge_ev(7, "requirements", buyer="cakefan22",
+                                         gig=RESEARCH.title, price="$24", text="A kettle."))
+        self.assertIsNone(why)
+        self.assertEqual((norm["id"], norm["order_number"], norm["buyer"], norm["gig_title"],
+                          norm["price_text"], norm["text"]),
+                         ("7", "FO1ABC23", "cakefan22", RESEARCH.title, "$24", "A kettle."))
+
+    def test_fiverr_account_mail_is_acknowledged_and_ignored_not_malformed(self) -> None:
+        # the three live events: a W-9 notice, a W-9 confirmation, a marketing email
+        self.pionir.events = [scrooge_ev(i, "unknown", order_no="",
+                                         subject="Your account needs a W-9 form")
+                              for i in (1, 2, 3)]
+        self.assertIsInstance(self.run_desk(), Ok)
+        rec = self.record()
+        self.assertEqual((rec["counts"]["ignored_events"], rec["counts"]["malformed_events"]),
+                         (3, 0))
+        self.assertEqual(rec["orders"], {})
+        self.assertEqual(self.pionir.acks, ["1", "2", "3"])
 
 
 class StateMachineTests(_Case):

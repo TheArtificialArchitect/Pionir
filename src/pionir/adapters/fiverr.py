@@ -7,8 +7,8 @@ through Scrooge, which reads Fiverr's notification emails; everything leaves to 
 only, in his Discord channel, for him to deliver on Fiverr himself.
 
 - ``fiverr.events`` (READ_ONLY): ``GET /dash/fiverr/events?after=<id>`` on Scrooge with the
-  ops token - Fiverr's order emails as normalised events (id, kind, order_number, buyer,
-  gig_title, package, price_text, due, text). Off until Scrooge serves the route
+  ops token - Fiverr's emails as Scrooge serves them (id, kind, order_no, and the
+  buyer-influenced fields under ``untrusted``; the desk reads them, crew/fiverr/desk.py). Off until Scrooge serves the route
   (``PIONIR_FIVERR_EVENTS=1`` turns it on): until then it answers ``unavailable``, and the
   desk reports its orders as UNKNOWN - never as none.
 - ``fiverr.ack`` (REVERSIBLE_WRITE): ``POST /dash/fiverr/ack {id}`` - marks an event read in
@@ -83,6 +83,10 @@ IN_FLIGHT = timedelta(minutes=2)
 _KEY = re.compile(r"[A-Za-z0-9:._-]{3,120}")
 _REF = re.compile(r"[A-Za-z0-9_-]{1,40}")
 _EVENT_ID = re.compile(r"[A-Za-z0-9_.:-]{1,80}")
+# Scrooge's own event id (worker/src/fiverr.ts): a row id, a positive whole number. Its ack
+# route takes it ONLY as a JSON number - "id": "3" is refused with HTTP 400 ("id: must be an
+# event id (a positive whole number)"), which failed every ack from the first event on.
+_SCROOGE_ID = re.compile(r"[1-9]\d{0,14}")
 _FILE = re.compile(r"(?:[A-Za-z0-9_-][A-Za-z0-9_.-]{0,80}/){0,4}[A-Za-z0-9_-][A-Za-z0-9_.-]{0,80}")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 _FENCE = "```"
@@ -235,8 +239,9 @@ class FiverrAdapter:
                 raise AdapterProtocolError(f"{EVENTS}: the payload is {{after?: event id}}")
         elif task.capability == ACK:
             eid = p.get("id")
-            if set(p) != {"id"} or isinstance(eid, bool) or not _EVENT_ID.fullmatch(str(eid)):
-                raise AdapterProtocolError(f"{ACK}: the payload is {{id: event id}}")
+            if set(p) != {"id"} or isinstance(eid, bool) or not isinstance(eid, (int, str))                     or not _SCROOGE_ID.fullmatch(str(eid).strip()):
+                raise AdapterProtocolError(f"{ACK}: the payload is {{id: event id}}, a "
+                                           "positive whole number (Scrooge's row id)")
         elif task.capability == INBOX:
             if set(p) - {"kind"} or (p.get("kind") is not None
                                      and p.get("kind") not in INBOX_KINDS):
@@ -326,7 +331,7 @@ class FiverrAdapter:
         if task.capability == EVENTS:
             return self._result(task, self._events(task.payload.get("after")))
         if task.capability == ACK:
-            return self._result(task, self._ack(str(task.payload["id"])))
+            return self._result(task, self._ack(int(str(task.payload["id"]).strip())))
         if task.capability == INBOX:
             replies = owner_replies(self.store, self.settings.owner_user_id,
                                     task.payload.get("kind"))
@@ -345,12 +350,12 @@ class FiverrAdapter:
             return _unavailable("Scrooge answered without an event list")
         return {"ok": True, "events": events[:MAX_EVENTS], "more": len(events) > MAX_EVENTS}
 
-    def _ack(self, eid: str) -> dict:
+    def _ack(self, eid: int) -> dict:
         if not self.settings.events_enabled:
             return _unavailable(EVENTS_OFF, not_configured=True)
-        status, doc = self._scrooge("POST", "/dash/fiverr/ack", {"id": eid})
+        status, doc = self._scrooge("POST", "/dash/fiverr/ack", {"id": eid})   # a JSON number
         if status == 200 and isinstance(doc, dict) and doc.get("ok") is not False:
-            return {"ok": True, "id": eid}
+            return {"ok": True, "id": str(eid)}
         return self._scrooge_error(status, doc)
 
     def _scrooge_error(self, status: int, doc: Any) -> dict:
