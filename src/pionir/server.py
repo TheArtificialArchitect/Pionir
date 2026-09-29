@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from . import atomic
+from . import atomic, library
 from .approvals import ApprovalQueue
 from .auth import (
     ANONYMOUS,
@@ -1318,6 +1318,9 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if route.path.startswith("/api/library/"):
+                self._library(route)
+                return
             try:
                 if route.path == "/api/state":
                     self._send(app.state())
@@ -1355,6 +1358,26 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                     self._send({"error": "not found"}, 404)
             except Exception as error:  # noqa: BLE001
                 self._send({"error": type(error).__name__, "message": str(error)}, 500)
+
+        def _library(self, route: Any) -> None:
+            """The Library (pionir/library.py): the owner's surfaces read Pionir's memory,
+            read-only. Unlike /api/state it needs the caller to prove who it is - signed
+            (the desktop) or the dashboard's session."""
+            head = self.headers
+            if any(head.get(h) is not None for h in SIGN_HEADERS):
+                client, refused = app.auth.from_signed(
+                    head.get("X-Pionir-Client"), "GET", self.path, head.get("X-Pionir-Ts"),
+                    head.get("X-Pionir-Nonce"), head.get("X-Pionir-Sig"), body=b"")
+            else:
+                client, refused = app.auth.from_headers(head.get("Authorization"),
+                                                        head.get("Cookie"),
+                                                        head.get(PROOF_HEADER))
+            cortex = getattr(app.runtime, "cortex", None)
+            path = getattr(cortex, "path", None)
+            status, document = library.serve(
+                route.path, route.query, client=client, refused=refused,
+                store=lambda: (Path(path) if path is not None else None, cortex))
+            self._send(document, status)
 
         def _caller(self, path: str, raw: bytes | None = None) -> tuple[str | None, int, str]:
             """Who is POSTing, or (None, status, why) to refuse it. A credential that is
