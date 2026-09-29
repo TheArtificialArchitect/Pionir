@@ -450,7 +450,8 @@ class ArmingGateTests(unittest.TestCase):
 
     def test_moss_cannot_approve_her_own_card(self) -> None:
         aid = self.app.run_task("proteus.rh_orders_on", {}, client="galatea")["approval_id"]
-        for who in ("galatea", "crew", "atani", "desktop"):
+        # only the owner's own surfaces approve (dashboard, phone, the desktop's owner console)
+        for who in ("galatea", "crew", "atani"):
             self.assertFalse(self.app.approve(aid, approver=who)["ok"], who)
         self.assertEqual(self.ssh.calls, [])
 
@@ -529,3 +530,40 @@ class MarkerStripTests(unittest.TestCase):
                 self.assertEqual(probe.seen, [frozenset({"x.read"})])
             finally:
                 app.runtime.cortex.close()
+
+
+class TheWebFactsTests(unittest.TestCase):
+    """The Web (Peter), as the desktop's court shows him: read from his own files."""
+
+    def test_last_cycle_signals_and_paper_books(self) -> None:
+        import json as _json
+        import sqlite3
+        from pionir.adapters.proteus import peter_facts
+        with tempfile.TemporaryDirectory() as tmp:
+            sig = Path(tmp) / "signals.json"
+            sig.write_text(_json.dumps({"as_of": "2026-09-29T00:45:54+00:00", "equities": {
+                "AAPL": {"news": {"direction": "bearish", "conviction": 0.6, "summary": "legal risk",
+                                  "observed_at": "2026-09-29T00:27:17+00:00"}},
+                "TSM": {"news": {"direction": "bullish", "conviction": 0.8, "summary": "fab news",
+                                 "observed_at": "2026-09-29T00:40:00+00:00"}},
+                "KO": {"options": {"pc_oi_ratio": 0.7}}}, "crypto": {"BTC": {}}}), encoding="utf-8")
+            vault = Path(tmp) / "vault.sqlite"
+            con = sqlite3.connect(vault)
+            con.executescript("CREATE TABLE books (brain_id TEXT PRIMARY KEY, seeded TEXT);"
+                              "CREATE TABLE pnl (id INTEGER PRIMARY KEY, at TEXT, brain_id TEXT, "
+                              "equity TEXT, positions INTEGER);"
+                              "INSERT INTO books VALUES ('momentum', '5000');"
+                              "INSERT INTO pnl VALUES (1, 't1', 'momentum', '4900', 3);"
+                              "INSERT INTO pnl VALUES (2, 't2', 'momentum', '5100', 4);")
+            con.commit()
+            con.close()
+            facts = peter_facts(sig, vault)
+            self.assertEqual(facts["last_cycle_at"], "2026-09-29T00:45:54+00:00")
+            self.assertEqual(facts["signals"]["subjects"], 4)
+            self.assertEqual(facts["signals"]["directional"], 2)
+            self.assertEqual(facts["signals"]["latest"]["subject"], "TSM")
+            self.assertEqual(facts["pnl"], [{"brain": "momentum", "at": "t2", "equity": 5100.0,
+                                             "positions": 4, "return_pct": 2.0}])
+            missing = peter_facts(Path(tmp) / "nope.json", Path(tmp) / "nope.sqlite")
+            self.assertIn("signals_error", missing)
+            self.assertIn("pnl_error", missing)

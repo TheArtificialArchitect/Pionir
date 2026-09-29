@@ -227,6 +227,8 @@ class GpuArbiter:
         self._last_used = 0.0
         self.counts = {"gpu": 0, "cpu": 0, "leases": 0, "refused": 0}
         self.recent: deque[dict[str, Any]] = deque(maxlen=20)
+        # where the last model call ran, and why - The Web's inspector shows it
+        self.last: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------ decisions
     def _event(self, kind: str, detail: str) -> None:
@@ -260,7 +262,7 @@ class GpuArbiter:
                 return self._cpu(model, "the gate is set to CPU (PIONIR_OLLAMA_GATE_MODE=cpu)")
             if self._lease is not None and self._lease_model == model:
                 self._last_used = self._clock()
-                return self._gpu("lease held for this burst")
+                return self._gpu("lease held for this burst", model)
             self._release_locked("another model asked for the card")
             if self.scheduler is None:
                 return self._cpu(model, "no GPU scheduler is wired")
@@ -276,14 +278,20 @@ class GpuArbiter:
             self._last_used = self._clock()
             self.counts["leases"] += 1
             self._event("gpu.lease", f"{self.owner}: {model} has the card (the voice stood down)")
-            return self._gpu("leased the card")
+            return self._gpu("leased the card", model)
 
-    def _gpu(self, why: str) -> Placement:
+    def _note_last(self, where: str, model: str, why: str) -> None:
+        self.last = {"where": where, "model": model, "reason": why[:200],
+                     "at": datetime.now(UTC).isoformat(timespec="seconds")}
+
+    def _gpu(self, why: str, model: str = "") -> Placement:
         self.counts["gpu"] += 1
+        self._note_last("gpu", model or (self._lease_model or ""), why)
         return Placement("gpu", why)
 
     def _cpu(self, model: str, why: str) -> Placement:
         self.counts["cpu"] += 1
+        self._note_last("cpu", model, why)
         self._event("gpu.cpu", f"{self.owner}: {model} runs on the CPU, on purpose: {why}")
         return Placement("cpu", why)
 
@@ -319,7 +327,7 @@ class GpuArbiter:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            return {"mode": self.mode, "holding": self._lease_model,
+            return {"mode": self.mode, "holding": self._lease_model, "last": self.last,
                     "counts": dict(self.counts), "recent": list(self.recent)[:8]}
 
 

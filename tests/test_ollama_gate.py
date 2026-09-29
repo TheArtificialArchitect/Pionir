@@ -315,6 +315,8 @@ class HttpTests(unittest.TestCase):
             doc = json.loads(resp.read())
         self.assertEqual(doc["models"], [PETER_MODEL])
         self.assertEqual(doc["arbiter"]["counts"]["cpu"], 1)
+        self.assertEqual((doc["arbiter"]["last"]["where"], doc["arbiter"]["last"]["model"]),
+                         ("cpu", PETER_MODEL))
 
 
 class VoiceProbeTests(unittest.TestCase):

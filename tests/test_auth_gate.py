@@ -251,7 +251,9 @@ class GateOverHttp(unittest.TestCase):
         self.assertIn(status, (200, 202), out)
         self.assertTrue(self.app.jobs.wait(out["task_id"], 30))
         self.assertEqual(len(self.spec.ran), 1)
-        self.assertEqual(self.spec.ran[0].granted_permissions, frozenset({"gate.run"}))
+        # the recorded permission, and the proof the owner said yes (never a power)
+        self.assertEqual(self.spec.ran[0].granted_permissions,
+                         frozenset({"gate.run", OWNER_APPROVED_GRANT}))
         self.assertEqual(self.app.approvals.get(aid)["status"], "approved")
 
     def test_the_desktop_denies_signed(self) -> None:

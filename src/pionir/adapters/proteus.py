@@ -112,6 +112,7 @@ class ProteusSettings:
     # the local side, read by status
     peter_url: str = "http://127.0.0.1:8790"
     peter_signals: Path = Path(r"C:\src\The-Web\data\signals.json")
+    peter_vault: Path = Path(r"C:\src\The-Web\data\vault.sqlite")
 
     def __post_init__(self) -> None:
         if not re.fullmatch(r"[A-Za-z0-9.-]+", self.host) or not re.fullmatch(r"[a-z_][a-z0-9_-]*", self.user):
@@ -529,7 +530,8 @@ class ProteusAdapter:
         except (AdapterUnavailable, AdapterProtocolError) as error:
             doc["vps"] = {"ok": False, "error": str(error)[:400]}
         doc["peter"] = {"healthy": self._peter_health(), "url": self.settings.peter_url,
-                        "signals_age_s": _age(self.settings.peter_signals, self._clock())}
+                        "signals_age_s": _age(self.settings.peter_signals, self._clock()),
+                        **peter_facts(self.settings.peter_signals, self.settings.peter_vault)}
         if self.local_status is not None:
             try:
                 doc.update(dict(self.local_status()))
@@ -538,6 +540,63 @@ class ProteusAdapter:
         doc["controls"] = [{"capability": c.name, "arming": c.name in ARMING,
                             "description": c.description} for c in CAPABILITIES]
         return doc
+
+
+def peter_facts(signals: Path, vault: Path) -> dict[str, Any]:
+    """What The Web (Peter) last produced, read from his own files - never his app (its
+    /api/state rebuilds every brief and is far too heavy to poll):
+
+    - ``last_cycle_at``: the ``as_of`` of data/signals.json, written at the end of each
+      collect/journal/P&L cycle;
+    - ``signals``: how many subjects carry derived signals, how many a news read calls
+      bullish or bearish, and the newest such read (subject, direction, conviction, summary);
+    - ``pnl``: each brain's newest PAPER book mark from the vault's ledger, opened read-only.
+
+    Each part fails soft: a missing or unreadable file leaves that part out, with a reason."""
+    out: dict[str, Any] = {}
+    try:
+        doc = json.loads(signals.read_text(encoding="utf-8"))
+        subjects = {**(doc.get("equities") or {}), **(doc.get("crypto") or {})}
+        directional = 0
+        newest: dict[str, Any] | None = None
+        for name, block in subjects.items():
+            news = block.get("news") if isinstance(block, dict) else None
+            if not isinstance(news, dict) or news.get("direction") not in ("bullish", "bearish"):
+                continue
+            directional += 1
+            at = str(news.get("observed_at") or news.get("valid_at") or "")
+            if newest is None or at > newest["at"]:
+                newest = {"subject": name, "direction": news["direction"],
+                          "conviction": news.get("conviction"), "at": at,
+                          "summary": str(news.get("summary") or "")[:200]}
+        out["last_cycle_at"] = doc.get("as_of")
+        out["signals"] = {"subjects": len(subjects), "equities": len(doc.get("equities") or {}),
+                          "crypto": len(doc.get("crypto") or {}), "directional": directional,
+                          "latest": newest}
+    except (OSError, ValueError, AttributeError) as error:
+        out["signals_error"] = f"{type(error).__name__}: {error}"[:200]
+    try:
+        import sqlite3
+
+        uri = "file:" + vault.as_posix() + "?mode=ro"
+        con = sqlite3.connect(uri, uri=True, timeout=2)
+        try:
+            rows = con.execute(
+                "SELECT p.brain_id, p.at, p.equity, p.positions, b.seeded FROM pnl p "
+                "LEFT JOIN books b ON b.brain_id = p.brain_id "
+                "WHERE p.id IN (SELECT max(id) FROM pnl GROUP BY brain_id) ORDER BY p.brain_id"
+            ).fetchall()
+        finally:
+            con.close()
+        books = []
+        for brain, at, equity, positions, seeded in rows:
+            eq, seed = float(equity), float(seeded or 0) or None
+            books.append({"brain": brain, "at": at, "equity": round(eq, 2), "positions": int(positions),
+                          "return_pct": round((eq - seed) / seed * 100, 2) if seed else None})
+        out["pnl"] = books
+    except Exception as error:  # noqa: BLE001 - a locked or missing vault is shown, never raised
+        out["pnl_error"] = f"{type(error).__name__}: {error}"[:200]
+    return out
 
 
 def _tail(text: str | None, limit: int = MAX_OUTPUT) -> str:
