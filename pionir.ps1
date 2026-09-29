@@ -8,6 +8,7 @@
 #   .\pionir.ps1 -NoBryo         don't start Bryo, the observer organism
 #   .\pionir.ps1 -NoCrew         don't start the crew (workers, division leaders)
 #   .\pionir.ps1 -NoPeter        don't start Peter (the trading-signal feed) or his VPS relay
+#   .\pionir.ps1 -NoTunnel       don't open the SSH tunnel to the VPS trading APIs
 #   .\pionir.ps1 -NoBrowser      don't open the dashboard in a browser
 #   .\pionir.ps1 -Port 8781      a different dashboard port
 #   .\pionir.ps1 -Stop           stop the whole stack from anywhere
@@ -26,6 +27,7 @@ param(
     [switch]$NoBryo,
     [switch]$NoCrew,
     [switch]$NoPeter,
+    [switch]$NoTunnel,
     [switch]$NoBrowser,
     [switch]$Stop,
     [int]$Port = 8780
@@ -66,6 +68,10 @@ $peterDir    = if ($env:PIONIR_PETER_DIR)    { $env:PIONIR_PETER_DIR }    else {
 $mrCrabDir   = if ($env:PIONIR_MRCRAB_DIR)   { $env:PIONIR_MRCRAB_DIR }   else { "C:\src\Mr-Crab" }
 $peterLive   = Join-Path $root "scripts\peter-live.ps1"
 $relayScript = Join-Path $mrCrabDir "deploy\desktop\peter-vps-relay.ps1"
+# The SSH tunnel to the VPS trading APIs (loopback 18000-18002 -> VPS 8000-8002), on a
+# restricted key tools\vps-lockdown.ps1 makes. No key yet: no pane, one line saying so.
+$tunnelScript = Join-Path $root "scripts\vps-tunnel.ps1"
+$tunnelKey    = Join-Path $HOME ".pionir\secrets\vps-tunnel-key"
 $srcDir      = Join-Path $root "src"
 $wt          = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\wt.exe"
 
@@ -223,6 +229,8 @@ function Close-EmptyPanes {
 # Peter started by hand (deploy\Peter.cmd) or by Pionir Desktop is never touched from here.
 $peterMatch = '-m peter\.cli\s.*\slive(\s|$)'
 $relayMatch = 'peter-vps-relay\.ps1'
+# The VPS tunnel is known the same way: its wrapper's command line (ssh is its child).
+$tunnelMatch = 'vps-tunnel\.ps1'
 function Test-PionirPane($p) {
     if (-not $p -or $p.Name -ne 'powershell.exe' -or [string]$p.CommandLine -notmatch '-EncodedCommand\s+(\S+)') { return $false }
     try { $text = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($Matches[1])) } catch { return $false }
@@ -267,6 +275,7 @@ if ($Stop) {
     Stop-Port 8782 "crew"
     Stop-Companion $peterMatch "Peter"
     Stop-Companion $relayMatch "Peter's VPS relay"
+    Stop-Companion $tunnelMatch "the VPS tunnel"
     Stop-Bryo
     Close-EmptyPanes
     Write-Host "  stack stopped. (Closing the Pionir window does the same thing.)"
@@ -421,6 +430,25 @@ if (-not $NoPeter) {
     } elseif (Test-Path $relayScript) {
         $panes += ,(Pane-Cmd "Peter relay (VPS)" $mrCrabDir "powershell -NoProfile -ExecutionPolicy Bypass -File $relayScript" "")
     } else { Write-Host "  ! the relay was not found at $relayScript; Karkinos gets no fresh signals." -ForegroundColor Yellow }
+}
+
+# The VPS tunnel: the ONLY way the dashboards reach the droplet's trading APIs (Robinhood
+# :8000, Prometheus :8001, Karkinos :8002), as loopback 18000-18002 inside SSH. It restarts
+# ssh with backoff when the link drops. One already running (by hand, or Pionir Desktop) is
+# left as it is; a loopback port held by another program means no tunnel - never a fall
+# back to the public plain-HTTP ports (the feeds then say "tunnel down").
+if (-not $NoTunnel) {
+    $tprocs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue)
+    if (@($tprocs | Where-Object { [string]$_.CommandLine -match $tunnelMatch }).Count) {
+        Write-Host "  VPS tunnel already running; not started twice." -ForegroundColor DarkCyan
+    } elseif ((Test-Port 18000) -or (Test-Port 18001) -or (Test-Port 18002)) {
+        Write-Host "  ! a port in 18000-18002 is held by another program; the VPS tunnel is not started (the money feeds say 'tunnel down')." -ForegroundColor Yellow
+    } elseif (-not (Test-Path $tunnelKey)) {
+        Write-Host "  VPS tunnel not set up yet (no key at $tunnelKey): run tools\vps-lockdown.ps1 to set it up." -ForegroundColor DarkCyan
+    } elseif (Test-Path $tunnelScript) {
+        $panes += ,(Pane-Cmd "VPS tunnel" $root "powershell -NoProfile -ExecutionPolicy Bypass -File $tunnelScript" "")
+        $ports += 18000
+    } else { Write-Host "  ! the tunnel script was not found at $tunnelScript." -ForegroundColor Yellow }
 }
 
 # Bryo, the observer organism. Foreground pane now, not a logon task: he lives

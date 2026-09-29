@@ -14,7 +14,9 @@ from pathlib import Path
 TESTS = Path(__file__).resolve().parent
 # ... and Proteus: the VPS (it trades), Peter's app, and the Ollama gate's live port.
 LIVE_ADDRESSES = ("127.0.0.1:8799", "localhost:8799", ":11434", "174.138.35.184",
-                  "127.0.0.1:8790", "127.0.0.1:8774")
+                  "127.0.0.1:8790", "127.0.0.1:8774",
+                  # the VPS tunnel's loopback ends (they reach the live trading APIs)
+                  "127.0.0.1:18000", "127.0.0.1:18001", "127.0.0.1:18002")
 
 
 def _sources() -> list[tuple[Path, ast.Module]]:
@@ -73,11 +75,12 @@ class HermeticSuiteTests(unittest.TestCase):
 
     def test_no_test_builds_a_proteus_adapter_with_the_real_ssh(self) -> None:
         # ProteusAdapter's default runner is ssh to the trading VPS. Every test hands it a
-        # fake runner, and a fake Peter health probe for the plane read.
+        # fake runner, a fake Peter health probe and a fake tunnel probe (the real one
+        # reads the live tunnel's loopback ports) for the plane read.
         offenders = [f"{path.name}:{c.lineno}" for path, tree in _sources()
                      for c in _calls(tree, "ProteusAdapter")
-                     if not {"runner", "peter_health"} <= _keywords(c)]
-        self.assertEqual(offenders, [], "pass runner= and peter_health= fakes")
+                     if not {"runner", "peter_health", "tunnel_health"} <= _keywords(c)]
+        self.assertEqual(offenders, [], "pass runner=, peter_health= and tunnel_health= fakes")
 
     def test_no_test_probes_the_live_bridges(self) -> None:
         # Doctor POSTs to Daedalus without a token to see whether it is locked. A test

@@ -70,9 +70,10 @@ class _Ssh:
         return [argv[-1] for argv in self.calls]
 
 
-def _adapter(ssh: _Ssh, **kw) -> ProteusAdapter:
+def _adapter(ssh: _Ssh, tunnel=lambda port: "down", **kw) -> ProteusAdapter:
     settings = ProteusSettings(host=HOST, key_file=Path("C:/keys/proteus_deploy"), **kw)
-    return ProteusAdapter(settings, runner=ssh, peter_health=lambda: True)
+    return ProteusAdapter(settings, runner=ssh, peter_health=lambda: True,
+                          tunnel_health=tunnel)
 
 
 def _app(tmp: str, ssh: _Ssh) -> PionirApp:

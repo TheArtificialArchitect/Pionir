@@ -24,6 +24,12 @@ Two kinds of capability, and the line between them is the whole point:
   ``PionirApp.approve`` adds (``OWNER_APPROVED_GRANT``) - holding ``proteus.arm`` is not
   enough, so no path from Moss, the crew or any client reaches the wire without a human.
 
+This machine reaches the three read APIs ONLY through the SSH tunnel (scripts\\vps-tunnel.ps1,
+a pane of the stack: loopback 18000-18002 -> the droplet's 8000-8002, on a restricted key that
+can do nothing but forward). ``plane()`` reports it (``tunnel``: each API's unauthenticated
+/health through its loopback end); nothing here ever uses the public plain-HTTP ports.
+tools\\vps-lockdown.ps1 sets the tunnel up and rotates the keys.
+
 Everything that crosses to the VPS is an argv list (``ssh -i KEY -o BatchMode=yes ...
 root@HOST <remote>``) run without a local shell; the remote command is assembled only from
 the fixed tables below (unit names, kill-file paths) and integers, never from a request's
@@ -74,7 +80,13 @@ STATUS_UNITS = SERVICES + TRADING_TIMERS + ("proteus.service",)
 # Read APIs on the droplet's loopback: (name, port). /health is unauthenticated and says
 # nothing about an account - status reads no key and sends none over the wire.
 READ_APIS = (("prometheus", 8001), ("karkinos", 8002), ("robinhood", 8000))
-RH_UNIT = "pro-robinhood-api.service"
+# The SSH tunnel (scripts\vps-tunnel.ps1, a pane of the stack): (name, this machine's
+# loopback port, the droplet's loopback port). The ONLY way anything here reaches those
+# APIs - never the public plain-HTTP ports. 18000-18002: clear of every estate port (8000
+# here is genesis's). tests/test_vps_tunnel.py pins these against the tunnel script.
+TUNNEL_PORTS = (("robinhood", 18000, 8000), ("prometheus", 18001, 8001), ("karkinos", 18002, 8002))
+TUNNEL_HOST = "127.0.0.1"
+RH_UNIT ="pro-robinhood-api.service"
 RH_DROPIN = "/etc/systemd/system/pro-robinhood-api.service.d/pionir-orders.conf"
 SIGNALS_REMOTE = "/opt/mrcrab/signals.json"
 MAX_LOG_LINES = 500
@@ -299,10 +311,12 @@ class ProteusAdapter:
     def __init__(self, settings: ProteusSettings | None = None, *, runner: Runner = real_runner,
                  peter_health: Callable[[], bool | None] | None = None,
                  local_status: Callable[[], Mapping[str, Any]] | None = None,
+                 tunnel_health: Callable[[int], str] | None = None,
                  clock: Callable[[], float] = time.time) -> None:
         self.settings = settings or ProteusSettings()
         self._run = runner
         self._peter_health = peter_health or self._read_peter_health
+        self._tunnel_health = tunnel_health or read_tunnel_health
         # set by the server once its Ollama gate is up: the gate and relay, as it sees them
         self.local_status = local_status
         self._clock = clock
@@ -432,6 +446,7 @@ class ProteusAdapter:
             doc["vps"] = {"ok": False, "error": str(error)[:400]}
         doc["peter"] = {"healthy": self._peter_health(), "url": self.settings.peter_url,
                         "signals_age_s": _age(self.settings.peter_signals, self._clock())}
+        doc["tunnel"] = self.tunnel()
         if self.local_status is not None:
             try:
                 doc.update(dict(self.local_status()))
@@ -440,6 +455,42 @@ class ProteusAdapter:
         doc["controls"] = [{"capability": c.name, "arming": c.name in ARMING,
                             "description": c.description} for c in CAPABILITIES]
         return doc
+
+    def tunnel(self) -> dict[str, Any]:
+        """The SSH tunnel as this machine sees it: each API's unauthenticated /health through
+        its loopback port (no key is read or sent). "down" means that port does not answer -
+        the tunnel pane is not up; nothing ever falls back to the public port."""
+        apis: dict[str, Any] = {}
+        for name, local, remote in TUNNEL_PORTS:
+            try:
+                code = str(self._tunnel_health(local))
+            except Exception as error:  # noqa: BLE001 - a probe must not sink the plane read
+                code = f"down ({type(error).__name__})"
+            apis[name] = {"local": f"{TUNNEL_HOST}:{local}", "remote_port": remote, "health": code}
+        up = all(a["health"] == "200" for a in apis.values())
+        state = "up" if up else ("down" if all(a["health"].startswith("down") for a in apis.values())
+                                 else "partial")
+        return {"state": state, "apis": apis}
+
+
+def read_tunnel_health(local_port: int) -> str:
+    """GET http://127.0.0.1:<local_port>/health through the tunnel: the HTTP status as text,
+    or "down" when nothing answers. Loopback only, no proxy, no key, no redirect."""
+    if not any(local_port == lp for _, lp, _ in TUNNEL_PORTS):
+        raise ValueError(f"{local_port} is not a tunnel port")
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    try:
+        with opener.open(f"http://{TUNNEL_HOST}:{local_port}/health", timeout=4) as response:
+            return str(response.status)
+    except urllib.error.HTTPError as error:
+        return str(error.code)
+    except (urllib.error.URLError, OSError):
+        return "down"
 
 
 def _tail(text: str | None, limit: int = MAX_OUTPUT) -> str:
@@ -460,5 +511,5 @@ def _age(path: Path, now: float) -> int | None:
 
 
 __all__ = ["ARMING", "ARM_PERMISSION", "CAPABILITIES", "ProteusAdapter", "ProteusSettings",
-           "kill_command", "logs_command", "parse_status", "rh_orders_command", "ssh_argv",
-           "status_script", "timers_command"]
+           "TUNNEL_PORTS", "kill_command", "logs_command", "parse_status", "read_tunnel_health",
+           "rh_orders_command", "ssh_argv", "status_script", "timers_command"]
