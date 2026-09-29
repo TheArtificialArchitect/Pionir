@@ -9,8 +9,12 @@ One run:
 1. **Follow up** every post already waiting on the owner (``ctx.approval``): approved and
    done WITH a URL is published; denied, failed or done-without-a-URL is not; anything
    else is still waiting. Nothing is ever assumed published.
-2. **At most one draft per day** (``draft_every_seconds``): the owner reads each one by
-   hand, and a flood of them would only teach him to stop reading.
+2. **One draft for each of the owner's daily digests** (``draft_due``): the owner reads
+   each one by hand, and a flood of them would only teach him to stop reading. A draft is
+   due once the digest the last one waited for is out, so every morning's digest holds
+   exactly one post. (A bare 24 hours after the last draft drifted a run later every day -
+   23:04, 04:45, 10:26 - so some digests got none: the 10:26 draft came an hour after the
+   09:00 digest.) With no digest known, it is every ``draft_every_seconds``.
 3. **A topic**: the evergreen seed, tied to a real product, that the division's goal as
    Moss set it matches best - otherwise, or with no goal, the next seed in the rotation.
    The goal steers among the seeds; it is never a post's subject itself. A topic or slug
@@ -38,9 +42,11 @@ is published.
 from __future__ import annotations
 
 import json
+import math
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import urlsplit
@@ -328,10 +334,12 @@ class DailyPoster(_Base):
                              "refusing to draft, since it could repeat a topic or slug",
                              retryable=False)
         events: list = []
+        if rec.get("first_run_at") is None:
+            rec["first_run_at"] = _first_seen(rec, ctx.now)
+        rec["last_run_at"] = ctx.now
         events += self._follow_up(ctx, rec)
         drafted: Result | None = None
-        last = rec.get("last_drafted_at")
-        if last is None or ctx.now - float(last) >= self.draft_every_seconds:
+        if self.draft_due(ctx.now, rec.get("last_drafted_at"), ctx.digest):
             drafted = self._draft_and_submit(ctx, rec, events)
         self.save(ctx.state_dir, rec)
         if isinstance(drafted, Err):
@@ -339,6 +347,99 @@ class DailyPoster(_Base):
                 return drafted
             log.warning("%s: no draft this run: %s", self.worker_id, drafted.error)
         return Ok((*events, self._tally(ctx, rec)))
+
+    # ---- 2. when: one draft for each of the owner's daily digests ---------------------------
+    @staticmethod
+    def _digest_on(digest) -> bool:
+        return digest is not None and bool(getattr(digest, "enabled", False))             and callable(getattr(digest, "next_digest", None))
+
+    @staticmethod
+    def _digest_of(t: float, digest) -> datetime:
+        """The digest a post parked at ``t`` waits for - Pionir's server stamps each batched
+        approval with exactly this (``DigestSettings.next_digest`` of its local time)."""
+        return digest.next_digest(datetime.fromtimestamp(float(t)).astimezone())
+
+    def draft_due(self, now: float, last, digest=None) -> bool:
+        """Is a draft due? Never drafted: yes. With the owner's digest on: when the digest a
+        draft made now would wait for has none yet - one post in every digest, drafted as
+        early as it can be, so a brain that is busy for a run or two still makes it. Without
+        one: ``draft_every_seconds`` after the last."""
+        if last is None:
+            return True
+        if self._digest_on(digest):
+            return self._digest_of(last, digest) < self._digest_of(now, digest)
+        return now - float(last) >= self.draft_every_seconds
+
+    def next_draft_at(self, now: float, last, digest=None) -> float:
+        """When the next draft is due (``now`` when it already is)."""
+        if self.draft_due(now, last, digest):
+            return now
+        if self._digest_on(digest):
+            return self._digest_of(last, digest).timestamp()     # once that digest is out
+        return float(last) + self.draft_every_seconds
+
+    def output_window_seconds(self) -> int:
+        """How long this worker may go without submitting a post before that is an alarm:
+        a day's post, plus the widest gap between its runs and a second chance at it."""
+        return int(self.draft_every_seconds + 2 * math.ceil(self.cadence_seconds * 1.15))
+
+    # ---- its pulse: what it has REALLY produced, for doctor and the vitals ----------------
+    def pulse(self, state_dir: Path | None, now: float, digest=None) -> dict:
+        """This worker's output counter, from its own record - never from whether its runs
+        succeeded: a run that drafts, is blocked and returns a tally is a success that
+        produced nothing for the owner. ``alert`` is set when no post has reached the owner
+        within ``output_window_seconds`` (or it has nothing left to draft)."""
+        out: dict = {"worker": self.worker_id, "capability": self.capability}
+        if state_dir is None:
+            return {**out, "alert": "no state dir: it cannot keep its record"}
+        try:
+            rec = self.load(state_dir)
+        except _Unreadable as exc:
+            return {**out, "alert": f"its record is unreadable ({exc})"}
+        c = rec.get("counts") or {}
+        posts = [p for p in rec.get("posts") or [] if isinstance(p, dict)]
+        reached = [float(p["submitted_at"]) for p in posts
+                   if isinstance(p.get("submitted_at"), (int, float))
+                   and p.get("status") != "unreachable"]
+        published = [float(p.get("settled_at") or 0) for p in posts
+                     if p.get("status") == "published"]
+        blocked = [b for b in rec.get("blocked") or [] if isinstance(b, dict)]
+        last = rec.get("last_drafted_at")
+        window = self.output_window_seconds()
+        topics_left = sum(1 for t in SEEDS if t.key not in (rec.get("used_topics") or []))
+        out.update({
+            "last_run_at": rec.get("last_run_at"),
+            "last_drafted_at": last,
+            "next_draft_at": self.next_draft_at(now, last, digest),
+            "drafts_written": int(c.get("drafts_written", 0)),
+            "drafts_blocked": int(c.get("drafts_blocked", 0)),
+            "submitted": int(c.get("submitted_for_approval", 0)),
+            "pending": sum(1 for p in posts if p.get("status") == "pending_approval"),
+            "published": int(c.get("published", 0)),
+            "denied": int(c.get("denied", 0)),
+            "last_submitted_at": max(reached) if reached else None,
+            "last_published_at": max(published) if published else None,
+            "last_block_reasons": [_clip(r, 120) for r in (blocked[-1].get("reasons") or [])[:3]]
+            if blocked else [],
+            "topics_left": topics_left,
+            "window_s": window,
+            "alert": None,
+        })
+        since = out["last_submitted_at"]
+        start = since if since is not None else float(
+            rec.get("first_run_at") or _first_seen(rec, now))
+        if topics_left == 0 and not out["pending"]:
+            out["alert"] = ("has used every topic and will draft nothing more until a new "
+                            "seed topic is added")
+        elif now - start > window:
+            hours = round((now - start) / 3600)
+            what = (f"its last post reached the owner {hours} h ago" if since is not None
+                    else f"no post has EVER reached the owner ({hours} h since it first ran)")
+            out["alert"] = (f"{what}: {out['drafts_written']} drafts written, "
+                            f"{out['drafts_blocked']} blocked by the content check, "
+                            f"{out['submitted']} submitted for approval. Its runs succeed, "
+                            "so nothing else says so")
+        return out
 
     # ---- 1. what became of the posts already waiting -------------------------------------
     def _follow_up(self, ctx: WorkContext, rec: dict) -> list:
@@ -582,9 +683,8 @@ class DailyPoster(_Base):
             Figure(int(c.get("published", 0)), "count", "posts published", window="all_time"),
             Figure(int(c.get("denied", 0)), "count", "posts denied", window="all_time"),
         ]
-        last = rec.get("last_drafted_at")
-        wait = 0 if last is None else max(0, round(float(last) + self.draft_every_seconds
-                                                   - ctx.now))
+        wait = max(0, round(self.next_draft_at(ctx.now, rec.get("last_drafted_at"),
+                                               ctx.digest) - ctx.now))
         return make_output(self, kind="post.tally", valid_at=ctx.now, observed_at=ctx.now,
                            payload={"pending_approval": pending[-3:],
                                     "next_draft_in_hours": round(wait / 3600, 1),
@@ -593,6 +693,21 @@ class DailyPoster(_Base):
                            figures=figures, entities=self.entities,
                            provenance={"source": "real", "provider": self.provider,
                                        "record": self.record_what})
+
+
+def _first_seen(rec: dict, now: float) -> float:
+    """The earliest moment a record shows its worker at work (``now`` for a new one): a
+    record written before ``first_run_at`` existed still dates the worker's first day."""
+    seen = [now]
+    for key in ("last_drafted_at", "last_run_at"):
+        if isinstance(rec.get(key), (int, float)):
+            seen.append(float(rec[key]))
+    for entry in list(rec.get("posts") or []) + list(rec.get("blocked") or []):
+        if isinstance(entry, dict):
+            for key in ("submitted_at", "at"):
+                if isinstance(entry.get(key), (int, float)):
+                    seen.append(float(entry[key]))
+    return min(seen)
 
 
 class BlogWorker(DailyPoster):

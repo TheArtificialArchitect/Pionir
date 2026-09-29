@@ -110,7 +110,9 @@ class Crew:
                                                thread_name_prefix="pionir-crew-leader")
         self._leaders_busy: set = set()
         self._llock = threading.Lock()
-        self.vitals = Vitals(self.store, self.all_cadences, clock=now)
+        self.vitals = Vitals(self.store, self.all_cadences, clock=now,
+                             outputs=self.output_alerts)
+        self.direction.outputs = self.output_alerts
         self.started_at = now()
         self.born_real = 0.0
         self.paused_seconds_total = 0.0
@@ -138,7 +140,8 @@ class Crew:
                            affiliates=tuple(getattr(self.cfg, "affiliates", ()) or ()),
                            build_site=partial(self.escalator.build_site, worker.division),
                            review=partial(self.escalator.review, worker.division),
-                           fiverr_dir=getattr(self.cfg, "fiverr_dir", None))
+                           fiverr_dir=getattr(self.cfg, "fiverr_dir", None),
+                           digest=getattr(self.cfg, "digest", None))
 
     def _words(self, worker, purpose: str, system: str, user: str, schema: dict) -> Result:
         """The ONLY way a worker reaches a model: the shared brain, JSON-schema output,
@@ -299,12 +302,49 @@ class Crew:
         return {"workers": report, "leaders": results}
 
     # ---- for a viewer ----------------------------------------------------------
-    def api_health(self) -> dict:
-        """What ``GET /api/health`` says: up, paused or stopping, and which divisions."""
+    def pulses(self) -> list:
+        """Every worker that keeps an output counter (the daily posters), as it stands:
+        its runs, what it drafted, what reached the owner, what was published - and an
+        ``alert`` when nothing did within its window. Read from each worker's own record
+        (``pulse``), so a green run that produced nothing is seen as exactly that."""
         now = self._now()
-        return {"service": "pionir-crew", "paused": self.paused_reason,
-                "stopping": self.stopping, "uptime_s": round(now - self.started_at),
-                "divisions": list(self.registry.division_ids())}
+        state_dir = self.cfg.state_dir / "workers"
+        digest = getattr(self.cfg, "digest", None)
+        health = {h.worker_id: h for h in self.store.health(self.registry.cadences(), now)}
+        out = []
+        for w in self.registry.all():
+            pulse = getattr(w, "pulse", None)
+            if not callable(pulse):
+                continue
+            try:
+                p = dict(pulse(state_dir, now, digest))
+            except Exception as exc:  # noqa: BLE001 - a broken pulse is itself an alarm
+                lesion("crew.pulse", exc)
+                p = {"worker": w.worker_id,
+                     "alert": f"its pulse could not be read ({type(exc).__name__}: {exc})"}
+            h = health.get(w.worker_id)
+            if h is not None:
+                p.update(last_attempt_at=h.last_attempt_at, last_success_at=h.last_success_at,
+                         last_error=h.last_error if h.last_outcome == "err" else None)
+            out.append(p)
+        return out
+
+    def output_alerts(self) -> dict:
+        """{worker id: why it has produced no output in its window} for the vitals."""
+        return {p["worker"]: p["alert"] for p in self.pulses() if p.get("alert")}
+
+    def api_health(self) -> dict:
+        """What ``GET /api/health`` says: up, paused or stopping, which divisions - and,
+        for doctor, the posters' pulses and every open vitals alarm, so a crew that runs
+        green and puts nothing before the owner cannot look healthy there either."""
+        now = self._now()
+        doc = {"service": "pionir-crew", "paused": self.paused_reason,
+               "stopping": self.stopping, "uptime_s": round(now - self.started_at),
+               "divisions": list(self.registry.division_ids())}
+        if not self.stopping:
+            doc["posting"] = self.pulses()
+            doc["alerts"] = [a for a in self.vitals.report() if a["check"] != "not_wired"]
+        return doc
 
     def snapshot(self) -> dict:
         now = self._now()

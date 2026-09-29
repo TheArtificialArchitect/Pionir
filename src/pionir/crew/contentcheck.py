@@ -572,6 +572,8 @@ def _uncovered(phrase: list, initial: bool, allow: frozenset, common: frozenset,
             step = 1
         if not step and _ordinary_word(phrase[k]):
             step = 1
+        if not step and _compound_vouched(phrase[k], allow):
+            step = 1
         if not step and phrase[k].startswith("FY") and _is_year_range(phrase[k][2:]):
             step = 1        # a fiscal year ("FY2024-25") names nobody
         if step:
@@ -585,6 +587,34 @@ def _uncovered(phrase: list, initial: bool, allow: frozenset, common: frozenset,
     if run:
         out.append(" ".join(run))
     return out
+
+
+def _compound_vouched(tok: str, allow: frozenset) -> bool:
+    """A hyphenated compound built on a name the post may use: "JSON-to-PDF", "JSON-based",
+    "PDF-Ready". The drafting prompt offers the allowlisted names as the only capitalised
+    words; the model joins them, and each compound was refused as an unknown name (the blog,
+    2026-09-27 and -28). It passes when at least one part is allowlisted and every other part
+    is allowlisted, a lower-case word or an ordinary word. A part with a digit is never
+    vouched for that way ("INV-2024-001", "REF-12345" are invented ids), and a compound with
+    no allowlisted part is still judged whole ("Coca-Cola", "Jean-Luc")."""
+    parts = tok.split("-")
+    if len(parts) < 2 or not all(parts):
+        return False
+    named, i = False, 0
+    while i < len(parts):
+        # the longest allowlisted run first: a name may hold a hyphen itself ("Wi-Fi-ready")
+        for j in range(len(parts), i, -1):
+            if _allowed(["-".join(parts[i:j])], allow):
+                named, i = True, j
+                break
+        else:
+            part = parts[i]
+            if any(ch.isdigit() for ch in part):
+                return False
+            if not (part.isalpha() and (part.islower() or _ordinary_word(part))):
+                return False
+            i += 1
+    return named
 
 
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s")

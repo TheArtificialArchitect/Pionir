@@ -11,6 +11,11 @@ worker produced against the chances it has had:
 - **silent**: succeeded ``SILENT_AFTER`` times in a row and produced nothing. It reads as
   green everywhere else; this is the only place it is said aloud.
 - **stale**: once succeeded, but not within ``STALE_AFTER_CADENCES`` of its cadence.
+- **no output**: a worker whose job is to put something before the owner (a daily poster)
+  and has not, within its window, by its OWN output counter (``outputs``: the workers'
+  pulses). Its runs succeed and each writes a tally, so none of the checks above can see
+  it: the blog drafted six posts in three days, the content check blocked all six, and
+  every run, every health line and every division summary read "ok".
 
 Every check is edge-triggered and CLEARS when its condition passes, so none of this is a
 latch: the first row a silent worker writes retires its warning for good.
@@ -48,9 +53,12 @@ class Vitals:
     """Edge-triggered, so a standing problem is said once and a fixed one is said once."""
 
     def __init__(self, store, cadences: Callable[[], dict],
-                 clock: Callable[[], float]) -> None:
+                 clock: Callable[[], float],
+                 outputs: Callable[[], dict] | None = None) -> None:
         self.store = store
         self.cadences = cadences          # -> {worker or leader id: cadence seconds}
+        # -> {worker id: why it has produced no output in its window}; runtime.Crew.pulses
+        self.outputs = outputs
         self._clock = clock
         self.open: dict = {}              # (id, check) -> sentence
         self.raised = 0
@@ -66,6 +74,10 @@ class Vitals:
         for h in self.store.health(self.cadences(), now):
             for cid, sentence in _complaints(h).items():
                 seen[(h.worker_id, cid)] = sentence
+        if self.outputs is not None:
+            for wid, sentence in (self.outputs() or {}).items():
+                if sentence:
+                    seen[(wid, "no_output")] = f"has produced NO OUTPUT in its window: {sentence}"
         for key, sentence in seen.items():
             if key not in self.open:
                 self.raised += 1

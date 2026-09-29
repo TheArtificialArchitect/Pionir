@@ -302,6 +302,43 @@ class DevtoWorker(DailyPoster):
                 return
         self._settle(ctx, rec, post, "failed", reason, events)
 
+    # ---- its pulse ---------------------------------------------------------------------------
+    def pulse(self, state_dir, now: float, digest=None) -> dict:
+        """What it has cross-posted, and what it waits on: it drafts nothing of its own, so
+        it only has work once the blog has published a post. No alert of its own for that -
+        the blog's pulse says why nothing is published."""
+        out: dict = {"worker": self.worker_id, "capability": self.capability}
+        if state_dir is None:
+            return {**out, "alert": "no state dir: it cannot keep its record"}
+        try:
+            rec = self.load(state_dir)
+            blog = read_record(state_dir, self.blog_worker)
+        except _Unreadable as exc:
+            return {**out, "alert": f"a record it reads is unreadable ({exc})"}
+        c = rec.get("counts") or {}
+        posts = [p for p in rec.get("posts") or [] if isinstance(p, dict)]
+        done = {p.get("draft_id") for p in posts if p.get("status") != "unreachable"}
+        source = published_posts(blog)
+        waiting = sum(1 for p in source if p.get("draft_id") not in done)
+        reached = [float(p["submitted_at"]) for p in posts
+                   if isinstance(p.get("submitted_at"), (int, float))
+                   and p.get("status") != "unreachable"]
+        published = [float(p.get("settled_at") or 0) for p in posts
+                     if p.get("status") == "published"]
+        out.update({
+            "blog_posts_published": len(source),
+            "waiting_to_cross_post": waiting,
+            "submitted": int(c.get("submitted_for_approval", 0)),
+            "pending": sum(1 for p in posts if p.get("status") == "pending_approval"),
+            "published": int(c.get("published", 0)),
+            "blocked": int(c.get("drafts_blocked", 0)),
+            "last_submitted_at": max(reached) if reached else None,
+            "last_published_at": max(published) if published else None,
+            "waits_on": self.blog_worker,
+            "alert": None,
+        })
+        return out
+
     # ---- what the leader reads ------------------------------------------------------------
     def _tally(self, ctx: WorkContext, rec: dict, waiting: int = 0):
         c = rec["counts"]

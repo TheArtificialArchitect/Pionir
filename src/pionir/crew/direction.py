@@ -30,6 +30,7 @@ import time
 from collections.abc import Callable
 
 from .figures import Figure
+from .log import log
 
 # The closed list of what Moss may allocate. Compute only - see the module docstring.
 RESOURCES = {
@@ -98,6 +99,19 @@ class Direction:
         self.registry = registry
         self.allocation = allocation
         self._clock = clock
+        # -> {worker id: why it put nothing before the owner in its window} (the crew's
+        # pulses, runtime.Crew.output_alerts). A worker that runs green and produces nothing
+        # is not "ok" in anything Moss reads.
+        self.outputs: Callable[[], dict] | None = None
+
+    def _no_output(self) -> dict:
+        if self.outputs is None:
+            return {}
+        try:
+            return dict(self.outputs() or {})
+        except Exception as exc:  # noqa: BLE001 - a read must still answer; say it could not
+            log.warning("direction: the workers' output pulses could not be read: %s", exc)
+            return {}
 
     # ---- down ----------------------------------------------------------------
     def set_goal(self, division: str, goal: str, *, priority: int = 3,
@@ -154,6 +168,7 @@ class Direction:
     def divisions(self) -> list:
         now = self._clock()
         goals = self.store.directions()
+        quiet = self._no_output()
         out = []
         for d in self.registry.divisions():
             workers = self.registry.workers_in(d.division_id)
@@ -167,7 +182,7 @@ class Direction:
                 "workers": [{"id": w.worker_id, "live": bool(w.live),
                              "uses": list(self.registry.uses(w.worker_id))}
                             for w in workers],
-                "health": _health_line(health),
+                "health": _health_line(health, quiet),
             })
         return out
 
@@ -177,6 +192,7 @@ class Direction:
         bounded by cutting detail, never whole divisions (see ``_bounded``)."""
         now = self._clock()
         goals = self.store.directions()
+        quiet = self._no_output()
         entries = []
         for d in self.registry.divisions():
             health = self.store.health(self.registry.cadences(d.division_id), now)
@@ -184,7 +200,7 @@ class Direction:
             e = {"division": d.division_id, "title": d.title,
                  "priority": (goals.get(d.division_id) or {}).get("priority", 3),
                  "goal": (goals.get(d.division_id) or {}).get("goal"),
-                 "workers": _health_line(health)}
+                 "workers": _health_line(health, quiet)}
             if not rows:
                 e.update(status="silent", attention="watch",
                          text="no report yet from this division's leader")
@@ -220,6 +236,12 @@ class Direction:
                     e.update(attention="watch",
                              text=f"the leader's report was rejected ({why}); its text is "
                                   "withheld. The full reason is in the report record.")
+            mine = {h.worker_id: quiet[h.worker_id] for h in health if quiet.get(h.worker_id)}
+            if mine:
+                # the worker's own counter, not the leader's words: said whatever the report
+                e["no_output"] = {w: _clip_text(why, 240) for w, why in sorted(mine.items())}
+                if e.get("attention") in (None, "none"):
+                    e["attention"] = "watch"
             entries.append(e)
         rank = {a: i for i, a in enumerate(ATTENTION)}
         entries.sort(key=lambda e: (rank.get(e.get("attention"), 1), e["priority"]))
@@ -239,10 +261,17 @@ def _fig_text(d: dict) -> str:
         return str(d)
 
 
-def _health_line(health: list) -> dict:
+def _clip_text(s: str, n: int) -> str:
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[:n - 3] + "..."
+
+
+def _health_line(health: list, no_output: dict | None = None) -> dict:
+    quiet = {w for w, why in (no_output or {}).items() if why}
     return {
         "total": len(health),
-        "ok": sorted(h.worker_id for h in health if not h.is_stale),
+        "ok": sorted(h.worker_id for h in health if not h.is_stale and h.worker_id not in quiet),
+        "no_output": sorted(h.worker_id for h in health if h.worker_id in quiet),
         "never_succeeded": sorted(h.worker_id for h in health
                                   if h.has_never_succeeded and not h.not_wired),
         "not_wired": sorted(h.worker_id for h in health if h.not_wired),

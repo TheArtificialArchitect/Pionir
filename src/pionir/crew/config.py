@@ -98,6 +98,10 @@ class CrewSettings:
     # files prepared for him to upload on Fiverr (``orders/<n>/out/``). Pionir's fiverr.card
     # reads the same folder. None -> ~/.pionir/fiverr
     fiverr_dir: Path | None = None
+    # When the owner's daily digest is (pionir.batching.DigestSettings, read by from_pionir
+    # from the same place Pionir's server reads it). The daily posters draft in time for it,
+    # so each day's post is in that morning's digest. None: they draft every 24 hours.
+    digest: object = None
 
     def __post_init__(self) -> None:
         if self.tick_seconds <= 0:
@@ -138,6 +142,9 @@ class CrewSettings:
         overrides.setdefault("gpu_lock_path", settings.gpu_lock_path)
         from ..auth import token_path
         overrides.setdefault("pionir_token_file", token_path(settings.client_token_path, "crew"))
+        if "digest" not in overrides:
+            from ..batching import DigestSettings
+            overrides["digest"] = DigestSettings.from_environment(settings.state_root)
         return cls(**overrides)
 
     @classmethod
@@ -189,6 +196,9 @@ class CrewSettings:
         d["pionir_token_file"] = str(self.pionir_token_file) if self.pionir_token_file else None
         d["catalogue_path"] = str(self.catalogue_path) if self.catalogue_path else None
         d["affiliates"] = [p.public() for p in self.affiliates]
+        digest = self.digest
+        d["digest"] = ({"enabled": bool(digest.enabled), "time": digest.time_text}
+                       if digest is not None else None)
         return d
 
 

@@ -1336,6 +1336,17 @@ def _compose(status: str, head: str) -> str:
     return text if len(text) <= MESSAGE_LIMIT else text[:MESSAGE_LIMIT - 1] + "…"
 
 
+def _run_summary(run: Any) -> dict[str, Any] | None:
+    """The last digest run, in brief, for state(): when, why, how many items it carried,
+    how many cards it owed and whether it finished."""
+    if not isinstance(run, dict):
+        return None
+    return {"date": run.get("date"), "reason": run.get("reason"),
+            "started_at": run.get("started_at"), "items": len(run.get("items") or []),
+            "cards": len(run.get("pages") or []), "complete": bool(run.get("complete")),
+            "gave_up": list(run.get("gave_up") or [])[:5]}
+
+
 def _now() -> datetime:
     return datetime.now(UTC)
 
@@ -1562,12 +1573,32 @@ class DiscordGate:
             "digest": {"enabled": self._digest.enabled, "time": self._digest.time_text,
                        "expire_days": self._digest.expire_days,
                        "last_run_at": self._dstate.get("last_run_at"),
+                       # when a digest card last reached Discord - a run with nothing
+                       # waiting posts none, and that must not read as "sent"
+                       "last_sent_at": max((str(c.get("posted_at"))
+                                            for c in self._dstate["cards"].values()
+                                            if c.get("posted_at")), default=None),
+                       "last_run": _run_summary(self._dstate.get("run")),
                        "problems": list(self._dstate.get("problems") or [])[-3:],
                        "open_cards": sum(1 for c in self._dstate["cards"].values()
                                          if not c.get("final"))},
         }
 
     def _loop(self) -> None:
+        try:
+            self._loop_body()
+        except BaseException as error:
+            # run_once never raises; anything that still gets here killed the gate, and a
+            # dead gate is exactly what must never be silent (doctor reads ``running``)
+            self.last_error = self._scrub(f"the gate's loop died: {type(error).__name__}: "
+                                          f"{error}")
+            _log.exception("discord gate: its loop died; no card or digest reaches Discord "
+                           "until Pionir is restarted")
+            raise
+        finally:
+            self.running = False
+
+    def _loop_body(self) -> None:
         failures = 0
         while not self._stop.is_set():
             ok = self.run_once()

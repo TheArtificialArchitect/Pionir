@@ -65,6 +65,7 @@ from .adapters.galatea import GLASS_KEY_FILE, read_key
 from .signin import NotGalatea, SigninCodes, galatea_ticket
 from .bootstrap import PionirRuntime
 from .cli import _capabilities, _doctor, _jsonable
+from .posting_health import posting_health
 from .contracts import RiskLevel, Task, outcome_ok
 from .errors import PionirError, RoutingAmbiguous
 from .router import Candidate, IntentRouter, RoutingDecision
@@ -333,6 +334,9 @@ class PionirApp:
         # One-time sign-in codes for the owner's browser (pionir/signin.py): no launcher
         # puts the dashboard token itself in a URL.
         self.signin_codes = SigninCodes()
+        # The Discord gate running in this process (serve() sets it), so doctor can say
+        # whether approvals and the digest actually reach Discord. None: not started here.
+        self.gate: Any = None
 
     # ---- jobs: work that outlives the request ---------------------------
     def _submit(
@@ -519,7 +523,22 @@ class PionirApp:
         }
 
     def doctor(self) -> dict[str, Any]:
-        return _doctor(self.runtime)
+        report = _doctor(self.runtime)
+        report["posting"] = self.posting_health()
+        return report
+
+    def posting_health(self) -> dict[str, Any]:
+        """Is anything reaching the owner and going out? (posting_health.py): when each
+        digest capability last parked and published, when the digest last reached Discord,
+        whether the gate runs - and alerts for the step that went quiet."""
+        try:
+            gate = self.gate.state() if self.gate is not None else None
+        except Exception as error:  # noqa: BLE001 - doctor reports, it does not fail
+            gate = {"running": False, "reason": f"its state could not be read: {error}"}
+        return posting_health(
+            rows=self.approvals.recent(500),
+            capabilities=_capabilities(self.runtime, digest_enabled=self.digest.enabled),
+            digest=self.digest, gate=gate, now_local=local_now())
 
     def audit(self, limit: int = 60) -> dict[str, Any]:
         sink = self.runtime.executive.audit_sink
@@ -1486,6 +1505,7 @@ def serve(
     # process and stops with it; unconfigured, it stays off and says why (the phone still works).
     from .discord_gate import DiscordGate, DiscordGateSettings
     gate = DiscordGate.for_app(app, DiscordGateSettings.from_environment(runtime.settings.state_root))
+    app.gate = gate
     gate_on = gate.start()
     print("  PIONIR")
     print(f"  the brain is visible at {url}")
