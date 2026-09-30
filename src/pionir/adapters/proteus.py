@@ -53,6 +53,7 @@ text. A payload chooses a KEY in a table - it never supplies a word that is exec
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import urllib.error
@@ -640,10 +641,16 @@ class ProteusAdapter:
         try:
             reads = dict(self._accounts())
         except Exception as error:  # noqa: BLE001 - the balance read must not sink the plane
+            logging.getLogger("pionir.proteus").warning("day P/L: the balance read failed: %s", error)
             reads = {name: Read(None, f"the balance read failed ({type(error).__name__})")
                      for name in DAY_ACCOUNTS}
-        return {"enabled": True, "zone": TZ_NAME, "checked_at": _iso(now),
-                "accounts": day_view(self._day_store, reads, now)}
+        try:
+            accounts = day_view(self._day_store, reads, now)
+        except Exception as error:  # noqa: BLE001 - day P/L must never take the tailnet alarms with it
+            logging.getLogger("pionir.proteus").warning("day P/L: the view failed: %s", error)
+            accounts = {name: {"state": "unknown", "why": f"day P/L failed ({type(error).__name__})"}
+                        for name in DAY_ACCOUNTS}
+        return {"enabled": True, "zone": TZ_NAME, "checked_at": _iso(now), "accounts": accounts}
 
     def tunnel(self) -> dict[str, Any]:
         """The SSH tunnel as this machine sees it: each API's unauthenticated /health through

@@ -359,7 +359,7 @@ class Crew:
                     "last_at": at, "kind": _kind_word(kind),
                     "last_attempt_at": h.last_attempt_at if h else None,
                     "last_success_at": h.last_success_at if h else None,
-                    "alert": _clip_words(alert, 160) if alert else None}
+                    "alert": _alert_words(alert) if alert else None}
             if "submitted" in pulse or "published" in pulse:
                 fact["posting"] = {k: pulse.get(k) for k in POSTING_FACTS
                                    if isinstance(pulse.get(k), (int, float))
@@ -417,6 +417,12 @@ _KIND_OK = re.compile(r"^[A-Za-z0-9_.:-]{1,60}$")
 def _kind_word(kind) -> str | None:
     """An output's kind is a code like ``post.tally``; anything else is not shown."""
     return kind if isinstance(kind, str) and _KIND_OK.fullmatch(kind) else None
+
+
+def _alert_words(alert) -> str:
+    """The crew's alert sentence for a viewer. Some alerts end in ``(<exception text>)`` - a
+    file path, a parser's words - which are the crew's own log, not a fact for a panel: cut there."""
+    return _clip_words(str(alert).split(" (", 1)[0], 160)
 
 
 def _clip_words(text, n: int) -> str:

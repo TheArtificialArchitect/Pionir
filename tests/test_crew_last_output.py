@@ -133,6 +133,17 @@ class LastOutputTests(_Case):
         self.assertEqual(fact["last_attempt_at"], NOW - 5)
         self.assertIsNone(fact["last_success_at"])
 
+    def test_an_unreadable_records_path_and_parser_words_never_reach_the_panel(self) -> None:
+        path = record_path(self.state, "posting.blog")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{ nope", encoding="utf-8")
+        fact = self.facts()["posting.blog"]
+        self.assertEqual(fact["state"], "no_output")
+        self.assertEqual(fact["alert"], "its record is unreadable")     # the sentence, not the exception
+        blob = json.dumps(self.crew.direction.divisions())
+        self.assertNotIn(str(self.state), blob)
+        self.assertNotIn("Expecting", blob)
+
     def test_an_odd_kind_is_not_shown(self) -> None:
         self.attempt("fiverr.gigs", at=NOW - 5, kind="has spaces and <b>markup</b>")
         fact = self.facts()["fiverr.gigs"]

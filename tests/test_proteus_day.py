@@ -194,6 +194,32 @@ class DayViewTests(unittest.TestCase):
                 self.store.record("2026-09-29", "robinhood", 555, at(*TUE, 12))
         self.assertEqual(self.path.read_text(encoding="utf-8"), before)
 
+    def test_two_readers_at_once_cannot_both_write_the_days_open(self) -> None:
+        import time as _t
+        from pionir import atomic
+        store = DayOpenStore(Path(self._tmp.name) / "day.json")
+        real = atomic.write_text
+
+        def slow(path, text):
+            _t.sleep(0.25)                                  # a slow disk: the other reader arrives mid-write
+            return real(path, text)
+
+        got = {}
+
+        def go(name, cents):
+            got[name] = store.record("2026-09-29", "prometheus", cents, at(*TUE, 10))["open_cents"]
+
+        with mock.patch.object(atomic, "write_text", slow):
+            a = threading.Thread(target=go, args=("a", 1_000_000))
+            b = threading.Thread(target=go, args=("b", 2_000_000))
+            a.start()
+            _t.sleep(0.05)
+            b.start()
+            a.join()
+            b.join()
+        self.assertEqual(got["a"], got["b"])                # one open stands for both
+        self.assertEqual(store.opened("2026-09-29", "prometheus")["open_cents"], got["a"])
+
     def test_the_write_is_atomic_and_leaves_no_temp_file(self) -> None:
         seen = []
         real_replace = proteus_day.atomic.replace
@@ -242,6 +268,13 @@ class ValueTests(unittest.TestCase):
         for account, body in (("prometheus", {"equity": 0, "buying_power": 0, "position_count": 0}),
                               ("robinhood", {"total_value": 0, "buying_power": 0, "positions": []})):
             self.assertIn("empty book", value_of(account, body).why)
+
+    def test_a_note_alone_is_a_soft_failure_even_with_a_nonzero_value(self) -> None:
+        # not covered by the empty-book rule: a real-looking number carrying a "note" is not trusted
+        self.assertIsNone(value_of("robinhood", {"total_value": 5000.0, "buying_power": 10, "positions": [],
+                                                 "note": "session needs reconnect"}).cents)
+        self.assertIsNone(value_of("prometheus", {"equity": 5000.0, "buying_power": 10, "position_count": 1,
+                                                  "note": "stale"}).cents)
 
     def test_a_zero_equity_with_positions_is_a_real_answer_shape_but_not_a_usable_value(self) -> None:
         self.assertIsNone(value_of("prometheus", {"equity": 0, "buying_power": 0, "position_count": 3}).cents)
@@ -319,6 +352,34 @@ class RealReaderTests(unittest.TestCase):
         self.assertIsNone(dead["robinhood"].cents)
         self.assertIn("tunnel", dead["robinhood"].why)
 
+    def test_a_redirect_is_not_followed_so_the_key_goes_nowhere_else(self) -> None:
+        other = HTTPServer(("127.0.0.1", 0), _Api)
+        threading.Thread(target=other.serve_forever, daemon=True).start()
+        self.addCleanup(other.server_close)
+        self.addCleanup(other.shutdown)
+
+        class _Redirect(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{other.server_address[1]}/status")
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        hop = HTTPServer(("127.0.0.1", 0), _Redirect)
+        threading.Thread(target=hop.serve_forever, daemon=True).start()
+        self.addCleanup(hop.server_close)
+        self.addCleanup(hop.shutdown)
+        (self.secrets / "prometheus-read-key.txt").write_text("the-read-key")
+        (self.secrets / "proteus-read-key.txt").write_text("the-read-key")
+        with mock.patch.object(proteus_day, "READ_ROUTES", (
+                ("prometheus", hop.server_address[1], "/status", "prometheus-read-key.txt"),)):
+            got = real_account_reader(self.secrets)()
+        self.assertIsNone(got["prometheus"].cents)
+        self.assertIn("302", got["prometheus"].why)
+        self.assertEqual(_Api.seen, [])                     # the other server never saw the key
+
     def test_only_get_routes_exist_in_the_table(self) -> None:
         self.assertEqual({(r[0], r[2]) for r in proteus_day.READ_ROUTES},
                          {("prometheus", "/status"), ("robinhood", "/portfolio")})
@@ -356,6 +417,17 @@ class PlaneTests(unittest.TestCase):
             accounts = plane["day_pl"]["accounts"]
             self.assertEqual({a["state"] for a in accounts.values()}, {"unknown"})
             self.assertIn("vps", plane)
+
+    def test_a_day_view_that_raises_is_unknown_and_does_not_sink_the_plane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = self._adapter(tmp, lambda: {"prometheus": Read(1_000_000)}, lambda: at(*TUE, 10))
+            with mock.patch("pionir.adapters.proteus.day_view", side_effect=RuntimeError("zone data missing")):
+                plane = adapter.plane()
+            accounts = plane["day_pl"]["accounts"]
+            self.assertEqual({a["state"] for a in accounts.values()}, {"unknown"})
+            self.assertTrue(all(a["why"] for a in accounts.values()))
+            self.assertIn("vps", plane)
+            self.assertIn("tailnet", plane)                 # the alarms ride the same document
 
     def test_without_a_reader_no_account_is_read_and_nothing_is_written(self) -> None:
         from pionir.adapters._proc import ProcessResult

@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
@@ -98,6 +99,8 @@ class DayOpenStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self.problem: str | None = None
+        # the plane refresh and a proteus.status task can read at once: one writer of the open
+        self._lock = threading.RLock()
 
     def load(self) -> dict[str, dict[str, Any]]:
         """The days on file. An unreadable file is set aside once and read as empty, and
@@ -138,6 +141,10 @@ class DayOpenStore:
     def record(self, day: str, account: str, cents: int, ts: float) -> dict[str, Any]:
         """Record ``account``'s open for ``day`` unless one is already there; returns the
         entry that stands (the existing one when there was one - never overwritten)."""
+        with self._lock:
+            return self._record(day, account, cents, ts)
+
+    def _record(self, day: str, account: str, cents: int, ts: float) -> dict[str, Any]:
         days = self.load()
         if self.problem:
             # an unreadable file may hold today's open: writing now could destroy it
