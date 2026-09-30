@@ -1076,6 +1076,7 @@ class RemoteHalf(unittest.TestCase):
             ("busctl, raw usec, due", self.busctl_answers(soon * 1_000_000), 600, 0),
             ("busctl, raw usec, later", self.busctl_answers(later * 1_000_000), None, 0),
             ("busctl, unset", self.busctl_answers(0), None, 0),
+            ("busctl answers an implausible stamp: the next attempt still reads it", {"busctl": (0, "t 5" + chr(10)), "systemctl show": self.show_answer(f"@{soon}")}, 600, 0),
             ("systemd 245: show prints a UTC date, due", {"busctl": fail, "systemctl show": self.show_answer(self.utc_date(soon))}, 600, 0),
             ("systemd 245: show prints a UTC date, later", {"busctl": fail, "systemctl show": self.show_answer(self.utc_date(later))}, None, 0),
             ("systemd 249: show prints unix stamps, due", {"busctl": fail, "systemctl show": self.show_answer(f"@{soon}")}, 600, 0),
