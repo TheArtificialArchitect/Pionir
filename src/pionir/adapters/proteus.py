@@ -89,6 +89,11 @@ SERVICES = ("prometheus-api.service", "pro-robinhood-api.service")
 # STARTABLE - nothing in Pionir stops or starts it (it serves reads only; the money is in the
 # timers, which have their own brakes).
 KARKINOS_SERVICES = ("mrcrab-api.service",)
+
+# What the owner must provide for the plane to be read at all (setup_needs). The wording is the
+# desktop's (its sources/tunnel.ts and secrets.ts), so a plane row and its sibling rows agree.
+TUNNEL_KEY_FILE = "vps-tunnel-key"
+TUNNEL_SETUP_STEP = r"run tools\vps-lockdown.ps1 in C:\src\Pionir"
 # What start_service may start (both serve live-money order routes) - never the retired
 # proteus.service, which is hard-killed and stays that way.
 STARTABLE = SERVICES
@@ -457,8 +462,11 @@ class ProteusAdapter:
                  tunnel_health: Callable[[int], str] | None = None,
                  accounts: Callable[[], Mapping[str, Read]] | None = None,
                  day_open_file: Path | None = None,
+                 secrets_dir: Path | None = None,
                  clock: Callable[[], float] = time.time) -> None:
         self.settings = settings or ProteusSettings()
+        # where the owner's secret files live; None (every test) means "do not look"
+        self._secrets_dir = secrets_dir
         self._run = runner
         self._peter_health = peter_health or self._read_peter_health
         self._tunnel_health = tunnel_health or read_tunnel_health
@@ -582,6 +590,26 @@ class ProteusAdapter:
     def _result(self, task: Task, output: Mapping[str, Any]) -> TaskResult:
         return TaskResult(task_id=task.task_id, agent_id="proteus", output=output,
                           evidence=(f"proteus:{task.capability}",))
+
+    def setup_needs(self) -> list[dict[str, str]]:
+        """What the OWNER has not provided yet, so the plane cannot be read: each a missing FILE,
+        checked offline (existence only - no ssh, no port, no key is read or shown). A source that
+        is merely failing has nothing here. The desktop shows a plane with any of these as
+        "setup needed", not "down", and the first one as its next step. Empty when the secrets
+        folder is unknown (a plane built without one) or nothing is missing.
+
+        Only what the plane read itself needs: the ssh key (the read of the VPS) and the tunnel key
+        (the tunnel it reports). The account read keys are NOT here: they only feed the day P/L, which
+        says its own "no read key" as an unknown, and adding them would ask for files that change
+        nothing about whether the plane can be read."""
+        needs: list[dict[str, str]] = []
+        if self._secrets_dir is None:
+            return needs
+        if not (self._secrets_dir / TUNNEL_KEY_FILE).exists():
+            needs.append({"what": "the VPS tunnel key", "next_step": TUNNEL_SETUP_STEP})
+        if not self.settings.key_path.exists():
+            needs.append({"what": "the plane's ssh key", "next_step": f"put the ssh key at {self.settings.key_path}"})
+        return needs
 
     def status(self) -> dict[str, Any]:
         """The health contract ``pionir doctor`` calls on every adapter: offline on purpose

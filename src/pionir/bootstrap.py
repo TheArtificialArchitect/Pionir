@@ -164,7 +164,8 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
             ProteusSettings(host=configured.proteus_host, key_file=configured.proteus_ssh_key),
             # day P/L: read keys through the tunnel, the day's open in a small state file
             accounts=real_account_reader(configured.secrets_path),
-            day_open_file=configured.state_root / "state" / "proteus-day-open.json"))
+            day_open_file=configured.state_root / "state" / "proteus-day-open.json",
+            secrets_dir=configured.secrets_path))
     # The owner's hours and pay (worklog.py): Moss reads totals through work.summary. Its own
     # file, opened only when a work.summary task runs or doctor asks - nothing at boot.
     runtime.register(WorkSummaryAdapter(WorkSummarySettings(

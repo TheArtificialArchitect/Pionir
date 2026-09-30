@@ -248,6 +248,15 @@ class Jobs:
         return out
 
 
+def _plane_setup_needs(adapter: Any) -> list[dict[str, str]]:
+    """The plane's missing owner-provided files, or [] - never an error: the view must answer."""
+    try:
+        return [{"what": str(n["what"])[:80], "next_step": str(n["next_step"])[:200]}
+                for n in adapter.setup_needs()][:6]
+    except Exception:  # noqa: BLE001 - an adapter without the check, or one that fails, says nothing
+        return []
+
+
 def _job_status(result: dict[str, Any]) -> str:
     """Map a handler's response dict onto the job's terminal status."""
     status = result.get("status")
@@ -425,9 +434,13 @@ class PionirApp:
 
         if kick:
             start(work)
+        # setup_needs: what only the owner can provide (missing key files), from an offline
+        # existence check - so a plane that has not read yet can say WHY (waiting on its keys)
+        # instead of looking broken. Empty when nothing is missing.
         return {"enabled": True, "snapshot": snapshot,
                 "age_s": None if at is None else round(now() - at, 1),
-                "refreshing": kick or self._proteus_busy}
+                "refreshing": kick or self._proteus_busy,
+                "setup_needs": _plane_setup_needs(adapter)}
 
     # ---- jobs: work that outlives the request ---------------------------
     def _submit(
