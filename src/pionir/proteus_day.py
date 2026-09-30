@@ -13,7 +13,8 @@ Unknown is not zero. Every path that lacks either number says "unknown" and why:
 - a weekend, or before 09:30 ET -> unknown (there is no open yet);
 - after 16:00 ET with no open recorded (Pionir was off all session) -> unknown: an open
   taken after the close would make every day P/L a fake 0;
-- an unreadable state file -> unknown, and the file is set aside (never silently reused).
+- an unreadable state file -> unknown, and the file is set aside (never silently reused);
+  if it cannot even be set aside, the view says so - it never claims a move that did not happen.
 
 A first read that comes late in the session (Pionir started at noon) IS recorded, and the view
 says ``since`` when it was taken: the P/L is "since 12:03", never dressed up as since the open.
@@ -22,18 +23,28 @@ Exchange holidays are not modelled: on one the first read simply records an unch
 Read-only against the accounts: the real reader GETs Prometheus's ``/status`` and the Robinhood
 API's ``/portfolio`` on the SSH tunnel's loopback end with the READ keys, and nothing else. It is
 injectable, and off by default: a Pionir built without it (every test) reads no account.
+
+The read key is sent only to the SSH tunnel: before each read the reader asks the OS who holds the
+loopback port and sends nothing unless every listener on it is ``ssh.exe``. Any other program on
+18000/18001 would otherwise be handed the key (the /health probe elsewhere sends none). If the
+holder cannot be determined the key stays home and the account reads unknown, with the reason.
 """
 from __future__ import annotations
 
+import csv
+import io
 import json
 import logging
 import math
+import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime, time as dtime, timezone
+from datetime import UTC, datetime
+from datetime import time as dtime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -71,7 +82,7 @@ def _zone() -> ZoneInfo:
 
 
 def _local(ts: float) -> datetime:
-    return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(_zone())
+    return datetime.fromtimestamp(ts, tz=UTC).astimezone(_zone())
 
 
 def _clock_words(moment: datetime) -> str:
@@ -124,12 +135,15 @@ class DayOpenStore:
         return days
 
     def _set_aside(self) -> None:
-        self.problem = "the day-open file was unreadable and was set aside; today's open may have been lost"
         try:
             aside = self.path.with_suffix(self.path.suffix + ".corrupt")
             atomic.replace(self.path, aside)
-        except OSError:
-            pass
+        except OSError as error:
+            LOG.warning("the unreadable day-open file %s could not be set aside: %s", self.path, error)
+            self.problem = (f"the day-open file is unreadable and could NOT be set aside "
+                            f"({type(error).__name__}); today's open may be lost")
+            return
+        self.problem = "the day-open file was unreadable and was set aside; today's open may have been lost"
 
     def opened(self, day: str, account: str) -> dict[str, Any] | None:
         entry = self.load().get(day, {}).get(account)
@@ -154,7 +168,7 @@ class DayOpenStore:
             return existing
         local = _local(ts)
         entry = {"open_cents": int(cents),
-                 "opened_at": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(timespec="seconds"),
+                 "opened_at": datetime.fromtimestamp(ts, tz=UTC).isoformat(timespec="seconds"),
                  "opened_local": local.isoformat(timespec="seconds")}
         days.setdefault(day, {})[account] = entry
         for stale in sorted(days)[:-KEEP_DAYS]:
@@ -233,7 +247,7 @@ def _cents(value: Any) -> int | None:
             return None
     if not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
-    return int(round(float(value) * 100))
+    return round(float(value) * 100)
 
 
 def _soft(body: Mapping[str, Any]) -> str | None:
@@ -276,13 +290,68 @@ def _key(secrets: Path, name: str) -> str | None:
     return text if text and "\n" not in text else None
 
 
+NO_LISTENER = ""
+TUNNEL_IMAGES = ("ssh.exe", "ssh")
+
+
+def _hidden() -> dict[str, Any]:
+    return {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+
+
+def listener_owner(port: int, *, run: Callable[..., Any] = subprocess.run,
+                   platform: str | None = None) -> str | None:
+    """Who listens on loopback ``port``: the process image names (comma-joined, sorted), ``""``
+    when nothing listens, or None when that cannot be determined (not Windows, a command failed,
+    an unreadable answer). EVERY listener on the port counts, whatever address it bound - a
+    wildcard listener also receives connections to 127.0.0.1. Read-only; never raises."""
+    if (platform or sys.platform) != "win32":
+        return None
+    try:
+        net = run(["netstat", "-ano"], capture_output=True, text=True, timeout=8, **_hidden())
+        if net.returncode != 0:
+            return None
+        pids: set[str] = set()
+        for line in net.stdout.splitlines():
+            cols = line.split()
+            # TCP  <local>  <foreign>  LISTENING  <pid>: a listener has an all-zero foreign
+            # address (matched on that, not on the word LISTENING, which is localised)
+            if len(cols) >= 5 and cols[0].upper() == "TCP" and cols[2] in ("0.0.0.0:0", "[::]:0")                     and cols[1].rpartition(":")[2] == str(port):
+                pids.add(cols[-1])
+        names: set[str] = set()
+        for pid in sorted(pids):
+            if not pid.isdigit():
+                return None
+            task = run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                       capture_output=True, text=True, timeout=8, **_hidden())
+            rows = [r for r in csv.reader(io.StringIO(task.stdout)) if len(r) >= 2 and r[1] == pid]
+            if task.returncode != 0 or not rows:
+                return None
+            names.add(rows[0][0].lower())
+        return ",".join(sorted(names))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, *args: Any, **kwargs: Any) -> None:
         return None
 
 
-def real_account_reader(secrets: Path, *, timeout: float = 6.0) -> AccountReader:
-    """The reader Pionir runs on the live box: each account through its tunnel port, GET only."""
+def _not_the_tunnel(port: int, owner: str | None) -> str | None:
+    """Why the key must not be sent to ``port`` - None when its only listener is the SSH tunnel."""
+    if owner is None:
+        return f"cannot tell who holds port {port}, so the read key was not sent"
+    if owner == NO_LISTENER:
+        return "the SSH tunnel is down (nothing answered)"
+    if not all(name in TUNNEL_IMAGES for name in owner.split(",")):
+        return f"port {port} is held by {owner[:60]}, not the SSH tunnel, so the read key was not sent"
+    return None
+
+
+def real_account_reader(secrets: Path, *, timeout: float = 6.0,
+                        owner_of: Callable[[int], str | None] = listener_owner) -> AccountReader:
+    """The reader Pionir runs on the live box: each account through its tunnel port, GET only.
+    The key goes only to a port whose every listener is ssh.exe (``owner_of``)."""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
     def read() -> dict[str, Read]:
@@ -291,6 +360,10 @@ def real_account_reader(secrets: Path, *, timeout: float = 6.0) -> AccountReader
             key = _key(secrets, key_name)
             if key is None:
                 found[account] = Read(None, f"no read key ({key_name}) on this machine")
+                continue
+            refused = _not_the_tunnel(port, owner_of(port))
+            if refused:
+                found[account] = Read(None, refused)
                 continue
             request = urllib.request.Request(f"http://{LOOPBACK}:{port}{path}", method="GET",
                                              headers={"x-api-key": key})

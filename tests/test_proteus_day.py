@@ -17,6 +17,7 @@ import unittest
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from typing import ClassVar
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -164,6 +165,18 @@ class DayViewTests(unittest.TestCase):
         self.assertEqual(second["state"], "known")
         self.assertEqual(second["since"], "10:02 ET")                  # says it is not the open
 
+    def test_a_failed_set_aside_is_logged_and_not_reported_as_done(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text("{ not json", encoding="utf-8")
+        with mock.patch.object(proteus_day.atomic, "replace", side_effect=PermissionError("locked")),                 self.assertLogs("pionir.proteus_day", "WARNING") as logged:
+            got = self._view(at(*TUE, 10), prometheus=Read(1_000_000))["prometheus"]
+        self.assertEqual(got["state"], "unknown")
+        self.assertIn("could NOT be set aside", got["why"])
+        self.assertNotIn("was set aside", got["why"])
+        self.assertIn("could not be set aside", logged.output[0])
+        self.assertTrue(self.path.exists())                             # it is still there
+        self.assertEqual(self.path.read_text(encoding="utf-8"), "{ not json")   # never overwritten
+
     def test_a_file_that_cannot_be_read_is_never_overwritten(self) -> None:
         self._view(at(*TUE, 9, 31), prometheus=Read(7_000_000))
         real = Path.read_text
@@ -189,13 +202,13 @@ class DayViewTests(unittest.TestCase):
                 raise PermissionError("held by a scanner")
             return real(path, *a, **k)
 
-        with mock.patch.object(Path, "read_text", locked):
-            with self.assertRaises(OSError):
-                self.store.record("2026-09-29", "robinhood", 555, at(*TUE, 12))
+        with mock.patch.object(Path, "read_text", locked), self.assertRaises(OSError):
+            self.store.record("2026-09-29", "robinhood", 555, at(*TUE, 12))
         self.assertEqual(self.path.read_text(encoding="utf-8"), before)
 
     def test_two_readers_at_once_cannot_both_write_the_days_open(self) -> None:
         import time as _t
+
         from pionir import atomic
         store = DayOpenStore(Path(self._tmp.name) / "day.json")
         real = atomic.write_text
@@ -281,10 +294,10 @@ class ValueTests(unittest.TestCase):
 
 
 class _Api(BaseHTTPRequestHandler):
-    seen: list = []
-    bodies: dict = {}
+    seen: ClassVar[list] = []
+    bodies: ClassVar[dict] = {}
 
-    def do_GET(self):  # noqa: N802
+    def do_GET(self):
         _Api.seen.append((self.path, self.headers.get("x-api-key")))
         if self.headers.get("x-api-key") != "the-read-key":
             self.send_response(401)
@@ -295,13 +308,16 @@ class _Api(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_POST(self):  # noqa: N802
+    def do_POST(self):
         _Api.seen.append(("POST " + self.path, None))
         self.send_response(405)
         self.end_headers()
 
     def log_message(self, *args):
         pass
+
+
+SSH = lambda port: "ssh.exe"
 
 
 class RealReaderTests(unittest.TestCase):
@@ -328,13 +344,13 @@ class RealReaderTests(unittest.TestCase):
         (self.secrets / "prometheus-read-key.txt").write_text("the-read-key\n")
         (self.secrets / "proteus-read-key.txt").write_text("the-read-key")
         with self._routes():
-            got = real_account_reader(self.secrets)()
+            got = real_account_reader(self.secrets, owner_of=SSH)()
         self.assertEqual(got, {"prometheus": Read(9_900_000), "robinhood": Read(123_450)})
         self.assertEqual(sorted(_Api.seen), [("/portfolio", "the-read-key"), ("/status", "the-read-key")])
 
     def test_a_missing_key_sends_nothing_and_says_so(self) -> None:
         with self._routes():
-            got = real_account_reader(self.secrets)()
+            got = real_account_reader(self.secrets, owner_of=SSH)()
         self.assertEqual(_Api.seen, [])
         self.assertIsNone(got["prometheus"].cents)
         self.assertIn("no read key", got["prometheus"].why)
@@ -343,12 +359,12 @@ class RealReaderTests(unittest.TestCase):
         (self.secrets / "prometheus-read-key.txt").write_text("wrong")
         (self.secrets / "proteus-read-key.txt").write_text("wrong")
         with self._routes():
-            got = real_account_reader(self.secrets)()
+            got = real_account_reader(self.secrets, owner_of=SSH)()
         self.assertIn("401", got["prometheus"].why)
         self.server.shutdown()
         self.server.server_close()
         with self._routes():
-            dead = real_account_reader(self.secrets)()
+            dead = real_account_reader(self.secrets, owner_of=SSH)()
         self.assertIsNone(dead["robinhood"].cents)
         self.assertIn("tunnel", dead["robinhood"].why)
 
@@ -359,7 +375,7 @@ class RealReaderTests(unittest.TestCase):
         self.addCleanup(other.shutdown)
 
         class _Redirect(BaseHTTPRequestHandler):
-            def do_GET(self):  # noqa: N802
+            def do_GET(self):
                 self.send_response(302)
                 self.send_header("Location", f"http://127.0.0.1:{other.server_address[1]}/status")
                 self.end_headers()
@@ -375,14 +391,96 @@ class RealReaderTests(unittest.TestCase):
         (self.secrets / "proteus-read-key.txt").write_text("the-read-key")
         with mock.patch.object(proteus_day, "READ_ROUTES", (
                 ("prometheus", hop.server_address[1], "/status", "prometheus-read-key.txt"),)):
-            got = real_account_reader(self.secrets)()
+            got = real_account_reader(self.secrets, owner_of=SSH)()
         self.assertIsNone(got["prometheus"].cents)
         self.assertIn("302", got["prometheus"].why)
         self.assertEqual(_Api.seen, [])                     # the other server never saw the key
 
+    def test_the_key_is_sent_only_to_a_port_the_ssh_tunnel_holds(self) -> None:
+        (self.secrets / "prometheus-read-key.txt").write_text("the-read-key")
+        (self.secrets / "proteus-read-key.txt").write_text("the-read-key")
+        cases = {"python.exe": "is held by python.exe", "ssh.exe,python.exe": "is held by",
+                 None: "cannot tell who holds"}
+        for owner, words in cases.items():
+            _Api.seen.clear()
+            with self._routes():
+                got = real_account_reader(self.secrets, owner_of=lambda port, o=owner: o)()
+            self.assertEqual(_Api.seen, [], owner)            # nothing - not even the key - was sent
+            for account in ("prometheus", "robinhood"):
+                self.assertIsNone(got[account].cents)
+                self.assertIn(words, got[account].why, owner)
+        with self._routes():                                   # nothing listening = tunnel down
+            got = real_account_reader(self.secrets, owner_of=lambda port: "")()
+        self.assertEqual(_Api.seen, [])
+        self.assertIn("tunnel is down", got["prometheus"].why)
+
     def test_only_get_routes_exist_in_the_table(self) -> None:
         self.assertEqual({(r[0], r[2]) for r in proteus_day.READ_ROUTES},
                          {("prometheus", "/status"), ("robinhood", "/portfolio")})
+
+
+class _Run:
+    """A stand-in for subprocess.run: netstat/tasklist answers by command."""
+
+    def __init__(self, netstat: str, tasks: dict[str, str], net_code: int = 0) -> None:
+        self.netstat, self.tasks, self.net_code, self.calls = netstat, tasks, net_code, []
+
+    def __call__(self, argv, **kw):
+        self.calls.append(list(argv))
+        if argv[0] == "netstat":
+            return mock.Mock(returncode=self.net_code, stdout=self.netstat)
+        pid = argv[2].split()[-1]
+        image = self.tasks.get(pid)
+        out = f'"{image}","{pid}","Console","1","9,000 K"\n' if image else "INFO: No tasks are running\n"
+        return mock.Mock(returncode=0, stdout=out)
+
+
+NETSTAT = """
+Active Connections
+
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       900
+  TCP    127.0.0.1:18000        0.0.0.0:0              LISTENING       4242
+  TCP    127.0.0.1:18000        127.0.0.1:50000        ESTABLISHED     4242
+  TCP    127.0.0.1:18001        0.0.0.0:0              LISTENING       5151
+  TCP    0.0.0.0:18001          0.0.0.0:0              LISTENING       6161
+  TCP    [::]:18002             [::]:0                 LISTENING       7171
+  UDP    0.0.0.0:18003          *:*                                    8181
+"""
+
+
+class ListenerOwnerTests(unittest.TestCase):
+    def owner(self, port, run):
+        return proteus_day.listener_owner(port, run=run, platform="win32")
+
+    def test_it_names_the_process_that_holds_the_port(self) -> None:
+        run = _Run(NETSTAT, {"4242": "ssh.exe", "5151": "ssh.exe", "6161": "node.exe", "7171": "ssh.exe"})
+        self.assertEqual(self.owner(18000, run), "ssh.exe")
+        self.assertEqual(self.owner(18001, run), "node.exe,ssh.exe")     # EVERY listener counts
+        self.assertEqual(self.owner(18002, run), "ssh.exe")               # an IPv6 listener too
+        self.assertEqual(self.owner(18003, run), "")                      # UDP is not a listener
+        self.assertEqual(self.owner(19999, run), "")                      # nothing there
+        self.assertTrue(all(c[0] in ("netstat", "tasklist") for c in run.calls))   # read-only
+
+    def test_it_says_unknown_rather_than_guess(self) -> None:
+        self.assertIsNone(self.owner(18000, _Run(NETSTAT, {}, net_code=1)))       # netstat failed
+        self.assertIsNone(self.owner(18000, _Run(NETSTAT, {})))                   # the pid vanished
+        self.assertIsNone(proteus_day.listener_owner(18000, platform="linux"))    # not Windows
+
+        def boom(argv, **kw):
+            raise OSError("no netstat")
+        self.assertIsNone(self.owner(18000, boom))
+
+    def test_the_reader_wires_it_in_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "prometheus-read-key.txt").write_text("k")
+            (Path(tmp) / "proteus-read-key.txt").write_text("k")
+            reader = real_account_reader(Path(tmp))
+            with mock.patch.object(proteus_day, "sys", mock.Mock(platform="linux")):
+                got = reader()
+        # off Windows the holder cannot be told: nothing is sent and both say why
+        self.assertIn("cannot tell who holds", got["prometheus"].why)
+        self.assertIn("cannot tell who holds", got["robinhood"].why)
 
 
 class PlaneTests(unittest.TestCase):

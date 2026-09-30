@@ -90,6 +90,7 @@ class FakeVps(_Ssh):
         for t in ("prometheus-scan.timer", "prometheus-entry.timer", "prometheus-review.timer"):
             self.units[t] = ["inactive", "disabled"]
         self.stuck: set[str] = set()
+        self.missing: set[str] = set()      # units that are not installed (LoadState=not-found)
         self.dirs = set(self.DIRS)
         self.readonly: set[str] = set()
         self.files: set[str] = set()
@@ -143,7 +144,8 @@ class FakeVps(_Ssh):
             self._restart()
         for units in re.findall(r"for u in ([^;]+); do printf 'unit", cmd):
             for u in units.split():
-                active, enabled = self.units.get(u, ["inactive", ""])
+                active, enabled = (["not-found", ""] if u in self.missing
+                                  else self.units.get(u, ["inactive", ""]))
                 out.append(f"unit {u} {active} {enabled}")
         for path, name, parent in re.findall(r"if \[ -f (\S+) \]; then echo 'kill (\S+) present'; elif \[ -d (\S+) \]", cmd):
             out.append(f"kill {name} " + ("present" if path in self.files else
@@ -582,6 +584,21 @@ class KarkinosApiUnitTests(unittest.TestCase):
         ssh.units["mrcrab-api.service"] = ["failed", "enabled"]
         plane = _adapter(ssh).plane()
         self.assertEqual(plane["vps"]["units"]["mrcrab-api.service"]["active"], "failed")
+
+    def test_a_unit_that_is_not_installed_reads_not_found_never_stopped(self) -> None:
+        # the unit's name is not confirmed by the Mr-Crab repo (no unit file there): if the VPS
+        # has no such unit, `systemctl is-active` alone would say "inactive" - a stopped service
+        ssh = FakeVps()
+        ssh.missing.add("mrcrab-api.service")
+        plane = _adapter(ssh).plane()
+        unit = plane["vps"]["units"]["mrcrab-api.service"]
+        self.assertEqual(unit["active"], "not-found")
+        self.assertNotIn(unit["active"], ("inactive", "failed", "active"))
+        self.assertEqual(plane["vps"]["units"]["prometheus-api.service"]["active"], "active")
+        # and the command asks LoadState BEFORE is-active, for every unit it reports
+        remote = ssh.remotes[0]
+        self.assertIn("systemctl show \"$u\" -p LoadState --value", remote)
+        self.assertLess(remote.index("LoadState"), remote.index("systemctl is-active"))
 
     def test_its_logs_are_readable_and_only_read(self) -> None:
         ssh = _Ssh("line")

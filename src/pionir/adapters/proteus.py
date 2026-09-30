@@ -218,8 +218,13 @@ assert "'" not in TS_READER
 # those lines alone - never from an exit code, and never with a `; true` that hides a failure.
 # A brake that cannot prove it braked reports ok:false with the evidence and ssh's stderr.
 def unit_report(names: Sequence[str]) -> str:
+    # `systemctl is-active` says "inactive" for a unit that does not exist at all - the same word
+    # as for a stopped one - so LoadState is asked first: a unit that is not there reports
+    # "not-found" (unknown), never a stopped service.
     return (f"for u in {' '.join(names)}; do printf 'unit %s %s %s\\n' \"$u\" "
-            "\"$(systemctl is-active \"$u\" 2>/dev/null)\" \"$(systemctl is-enabled \"$u\" 2>/dev/null)\"; done")
+            "\"$(if [ \"$(systemctl show \"$u\" -p LoadState --value 2>/dev/null)\" = not-found ]; "
+            "then echo not-found; else systemctl is-active \"$u\" 2>/dev/null; fi)\" "
+            "\"$(systemctl is-enabled \"$u\" 2>/dev/null)\"; done")
 
 
 def kill_report(settings: ProteusSettings, systems: Sequence[str]) -> str:

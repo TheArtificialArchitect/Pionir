@@ -125,7 +125,7 @@ class LastOutputTests(_Case):
             self.assertNotIn(word, blob)
 
     def test_an_error_message_never_reaches_the_panel(self) -> None:
-        self.attempt("fiverr.gigs", at=NOW - 5, error=WorkerError("fiverr.gigs", list(ErrorKind)[0], SECRET))
+        self.attempt("fiverr.gigs", at=NOW - 5, error=WorkerError("fiverr.gigs", next(iter(ErrorKind)), SECRET))
         blob = json.dumps(self.crew.direction.divisions())
         self.assertNotIn("Jane", blob)
         fact = self.facts()["fiverr.gigs"]
