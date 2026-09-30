@@ -24,7 +24,6 @@ from pionir.config import PionirSettings
 from pionir.server import PionirApp
 
 TUNNEL_STEP = r"run tools\vps-lockdown.ps1 in C:\src\Pionir"
-READ_STEP = r"add %USERPROFILE%\.pionir\secrets" + "\\"
 
 
 class _NoSsh:
@@ -69,24 +68,30 @@ class SetupNeedsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             key = Path(tmp) / "no-such-key"
             needs = _plane(Path(tmp), key).setup_needs()
-            self.assertEqual([n["what"] for n in needs], [
-                "the VPS tunnel key", "the prometheus read key", "the robinhood read key",
-                "the plane's ssh key"])
+            self.assertEqual([n["what"] for n in needs], ["the VPS tunnel key", "the plane's ssh key"])
             self.assertEqual(needs[0]["next_step"], TUNNEL_STEP)
-            self.assertEqual(needs[1]["next_step"], READ_STEP + "prometheus-read-key.txt")
-            self.assertEqual(needs[2]["next_step"], READ_STEP + "proteus-read-key.txt")
-            self.assertIn(str(key), needs[3]["next_step"])
+            self.assertIn(str(key), needs[1]["next_step"])
             for need in needs:
                 self.assertEqual(set(need), {"what", "next_step"})
+
+    def test_the_account_read_keys_are_not_a_need_of_the_plane_read(self) -> None:
+        # They only feed the day P/L (which says "no read key" as an unknown itself): asking for
+        # them would name files that change nothing about whether the plane can be read.
+        with tempfile.TemporaryDirectory() as tmp:
+            secrets = Path(tmp)
+            _touch(secrets, "vps-tunnel-key", "ssh-key")
+            self.assertEqual(_plane(secrets, secrets / "ssh-key").setup_needs(), [])
+            joined = json.dumps(_plane(secrets, secrets / "no-key").setup_needs())
+            self.assertNotIn("read key", joined)
+            self.assertNotIn("read-key", joined)
 
     def test_a_file_that_is_there_is_not_a_need(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             secrets = Path(tmp)
             key = secrets / "ssh-key"
-            _touch(secrets, "vps-tunnel-key", "prometheus-read-key.txt", "ssh-key")
-            needs = _plane(secrets, key).setup_needs()
-            self.assertEqual([n["what"] for n in needs], ["the robinhood read key"])
-            _touch(secrets, "proteus-read-key.txt")
+            _touch(secrets, "vps-tunnel-key")
+            self.assertEqual([n["what"] for n in _plane(secrets, key).setup_needs()], ["the plane's ssh key"])
+            _touch(secrets, "ssh-key")
             self.assertEqual(_plane(secrets, key).setup_needs(), [])
 
     def test_the_check_reaches_for_no_ssh_and_shows_no_key(self) -> None:
@@ -113,7 +118,7 @@ class ViewTests(unittest.TestCase):
             try:
                 view = app.proteus_view(refresh=lambda work: None, now=lambda: 1.0)
                 self.assertIsNone(view["snapshot"])          # nothing read yet
-                self.assertEqual(len(view["setup_needs"]), 4)
+                self.assertEqual(len(view["setup_needs"]), 2)
                 self.assertEqual(view["setup_needs"][0]["next_step"], TUNNEL_STEP)
                 json.dumps(view)                             # it is the wire
             finally:
@@ -123,8 +128,7 @@ class ViewTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             secrets = Path(tmp) / "secrets"
             secrets.mkdir()
-            _touch(secrets, "vps-tunnel-key", "prometheus-read-key.txt",
-                   "proteus-read-key.txt", "ssh-key")
+            _touch(secrets, "vps-tunnel-key", "ssh-key")
             app = self._app(tmp, _plane(secrets, secrets / "ssh-key"))
             try:
                 view = app.proteus_view(refresh=lambda work: None, now=lambda: 1.0)

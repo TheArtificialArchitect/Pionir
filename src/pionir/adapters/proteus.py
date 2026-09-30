@@ -68,7 +68,7 @@ from pionir.batching import OWNER_APPROVED_GRANT
 from pionir.contracts import AgentManifest, Capability, RiskLevel, Task, TaskResult
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
 from pionir.proteus_day import ACCOUNTS as DAY_ACCOUNTS
-from pionir.proteus_day import READ_ROUTES, TZ_NAME, DayOpenStore, Read, day_view
+from pionir.proteus_day import TZ_NAME, DayOpenStore, Read, day_view
 
 DEFAULT_HOST = "174.138.35.184"
 ARM_PERMISSION = "proteus.arm"
@@ -94,7 +94,6 @@ KARKINOS_SERVICES = ("mrcrab-api.service",)
 # desktop's (its sources/tunnel.ts and secrets.ts), so a plane row and its sibling rows agree.
 TUNNEL_KEY_FILE = "vps-tunnel-key"
 TUNNEL_SETUP_STEP = r"run tools\vps-lockdown.ps1 in C:\src\Pionir"
-SECRETS_STEP_PREFIX = r"add %USERPROFILE%\.pionir\secrets" + "\\"
 # What start_service may start (both serve live-money order routes) - never the retired
 # proteus.service, which is hard-killed and stays that way.
 STARTABLE = SERVICES
@@ -597,16 +596,17 @@ class ProteusAdapter:
         checked offline (existence only - no ssh, no port, no key is read or shown). A source that
         is merely failing has nothing here. The desktop shows a plane with any of these as
         "setup needed", not "down", and the first one as its next step. Empty when the secrets
-        folder is unknown (a plane built without one) or nothing is missing."""
+        folder is unknown (a plane built without one) or nothing is missing.
+
+        Only what the plane read itself needs: the ssh key (the read of the VPS) and the tunnel key
+        (the tunnel it reports). The account read keys are NOT here: they only feed the day P/L, which
+        says its own "no read key" as an unknown, and adding them would ask for files that change
+        nothing about whether the plane can be read."""
         needs: list[dict[str, str]] = []
         if self._secrets_dir is None:
             return needs
         if not (self._secrets_dir / TUNNEL_KEY_FILE).exists():
             needs.append({"what": "the VPS tunnel key", "next_step": TUNNEL_SETUP_STEP})
-        for account, _port, _path, key_name in READ_ROUTES:
-            if not (self._secrets_dir / key_name).exists():
-                needs.append({"what": f"the {account} read key",
-                              "next_step": SECRETS_STEP_PREFIX + key_name})
         if not self.settings.key_path.exists():
             needs.append({"what": "the plane's ssh key", "next_step": f"put the ssh key at {self.settings.key_path}"})
         return needs
