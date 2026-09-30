@@ -103,6 +103,18 @@ class Direction:
         # pulses, runtime.Crew.output_alerts). A worker that runs green and produces nothing
         # is not "ok" in anything Moss reads.
         self.outputs: Callable[[], dict] | None = None
+        # -> {worker id: what it last produced and when} (runtime.Crew.output_facts): counts,
+        # timestamps and kinds only, never a payload. Shown per worker in ``divisions``.
+        self.facts: Callable[[], dict] | None = None
+
+    def _output_facts(self) -> dict | None:
+        if self.facts is None:
+            return None
+        try:
+            return dict(self.facts() or {})
+        except Exception as exc:  # noqa: BLE001 - a read must still answer; say it could not
+            log.warning("direction: the workers' output facts could not be read: %s", exc)
+            return None
 
     def _no_output(self) -> dict:
         if self.outputs is None:
@@ -169,6 +181,7 @@ class Direction:
         now = self._clock()
         goals = self.store.directions()
         quiet = self._no_output()
+        facts = self._output_facts()
         out = []
         for d in self.registry.divisions():
             workers = self.registry.workers_in(d.division_id)
@@ -179,8 +192,12 @@ class Direction:
                 "priority": (goals.get(d.division_id) or {}).get("priority"),
                 # "uses": the Pionir capabilities the worker calls (the
                 # catalogue's declaration), so a reader can look up each one's approval
+                # "output": what it last produced and when - absent only when the crew
+                # could not read it (never a made-up "nothing")
                 "workers": [{"id": w.worker_id, "live": bool(w.live),
-                             "uses": list(self.registry.uses(w.worker_id))}
+                             "uses": list(self.registry.uses(w.worker_id)),
+                             **({"output": facts[w.worker_id]}
+                                if facts is not None and w.worker_id in facts else {})}
                             for w in workers],
                 "health": _health_line(health, quiet),
             })

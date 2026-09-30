@@ -27,6 +27,7 @@ queued work keeps its place. Nothing is made up afterwards.
 """
 from __future__ import annotations
 
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -113,6 +114,7 @@ class Crew:
         self.vitals = Vitals(self.store, self.all_cadences, clock=now,
                              outputs=self.output_alerts)
         self.direction.outputs = self.output_alerts
+        self.direction.facts = self.output_facts
         self.started_at = now()
         self.born_real = 0.0
         self.paused_seconds_total = 0.0
@@ -333,6 +335,45 @@ class Crew:
         """{worker id: why it has produced no output in its window} for the vitals."""
         return {p["worker"]: p["alert"] for p in self.pulses() if p.get("alert")}
 
+    def output_facts(self) -> dict:
+        """{worker id: what it last produced and when} for every worker, for a viewer's panel.
+        Read-only and scrubbed: counts, timestamps and the KIND of the newest output - never a
+        payload, a title, a buyer's word or an error message. ``state`` is ``produced`` (an
+        output exists), ``no_output`` (its own counter says nothing reached the owner in its
+        window - ``alert`` says why, in the crew's words) or ``never`` (it has produced
+        nothing, ever: a worker that has not run and one that runs green and writes nothing
+        both read this way, and ``last_attempt_at`` tells them apart)."""
+        now = self._now()
+        state_dir = self.cfg.state_dir / "workers"
+        latest = self.store.latest_outputs()
+        health = {h.worker_id: h for h in self.store.health(self.registry.cadences(), now)}
+        pulses = {p.get("worker"): p for p in self.pulses()}
+        out = {}
+        for w in self.registry.all():
+            wid = w.worker_id
+            kind, at = latest.get(wid, (None, None))
+            h = health.get(wid)
+            pulse = pulses.get(wid) or {}
+            alert = pulse.get("alert")
+            fact = {"state": "no_output" if alert else "produced" if at is not None else "never",
+                    "last_at": at, "kind": _kind_word(kind),
+                    "last_attempt_at": h.last_attempt_at if h else None,
+                    "last_success_at": h.last_success_at if h else None,
+                    "alert": _clip_words(alert, 160) if alert else None}
+            if "submitted" in pulse or "published" in pulse:
+                fact["posting"] = {k: pulse.get(k) for k in POSTING_FACTS
+                                   if isinstance(pulse.get(k), (int, float))
+                                   and not isinstance(pulse.get(k), bool)}
+            extra = getattr(w, "output_facts", None)
+            if callable(extra):
+                try:
+                    fact.update(extra(state_dir))
+                except Exception as exc:  # noqa: BLE001 - one worker's record must not blank the rest
+                    lesion("crew.output_facts", exc)
+                    fact["facts_error"] = type(exc).__name__
+            out[wid] = fact
+        return out
+
     def api_health(self) -> dict:
         """What ``GET /api/health`` says: up, paused or stopping, which divisions - and,
         for doctor, the posters' pulses and every open vitals alarm, so a crew that runs
@@ -365,6 +406,22 @@ class Crew:
             "lesions": lesion_snapshot(),
             "budget": self.monitor.latest if self.monitor else None,
         }
+
+
+# the poster pulse's own counts and timestamps (blog.py / devto.py): numbers only
+POSTING_FACTS = ("submitted", "pending", "published", "drafts_written", "drafts_blocked",
+                 "last_submitted_at", "last_published_at")
+_KIND_OK = re.compile(r"^[A-Za-z0-9_.:-]{1,60}$")
+
+
+def _kind_word(kind) -> str | None:
+    """An output's kind is a code like ``post.tally``; anything else is not shown."""
+    return kind if isinstance(kind, str) and _KIND_OK.fullmatch(kind) else None
+
+
+def _clip_words(text, n: int) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= n else text[:n - 3] + "..."
 
 
 def build(cfg, *, registry: Registry | None = None, **injected) -> Crew:

@@ -406,6 +406,12 @@ class CrewStore:
                           "ORDER BY observed_at DESC, valid_at DESC, output_id DESC LIMIT ?", args)
         return [_output_row(r) for r in rows]
 
+    def latest_outputs(self) -> dict:
+        """{worker id: (kind, observed_at)} of each worker's newest output row - a read for a
+        viewer that must say what a worker last produced, without pulling any payload."""
+        rows = self._read("SELECT worker_id, kind, MAX(observed_at) FROM outputs GROUP BY worker_id")
+        return {r[0]: (r[1], r[2]) for r in rows}
+
     def output_kinds(self, division: str) -> list:
         return [r[0] for r in self._read(
             "SELECT DISTINCT kind FROM outputs WHERE division=? ORDER BY kind", (division,))]

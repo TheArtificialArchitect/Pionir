@@ -158,9 +158,13 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
     if configured.proteus_host is not None:
         # Proteus's control plane: nothing touches the VPS until a proteus.* task runs.
         from .adapters.proteus import ProteusAdapter, ProteusSettings
+        from .proteus_day import real_account_reader
 
-        runtime.register(ProteusAdapter(ProteusSettings(
-            host=configured.proteus_host, key_file=configured.proteus_ssh_key)))
+        runtime.register(ProteusAdapter(
+            ProteusSettings(host=configured.proteus_host, key_file=configured.proteus_ssh_key),
+            # day P/L: read keys through the tunnel, the day's open in a small state file
+            accounts=real_account_reader(configured.secrets_path),
+            day_open_file=configured.state_root / "state" / "proteus-day-open.json"))
     # The owner's hours and pay (worklog.py): Moss reads totals through work.summary. Its own
     # file, opened only when a work.summary task runs or doctor asks - nothing at boot.
     runtime.register(WorkSummaryAdapter(WorkSummarySettings(

@@ -124,6 +124,9 @@ class DivisionsTests(_Case):
         crew = self.crew(divisions={"alpha": [{"name": "a1", "uses": ["x.read", "x.post"]},
                                               {"name": "a2"}]})
         (alpha,) = crew.direction.divisions()
+        # each worker also carries its last output; none of these has run, so it is "never"
+        outputs = [w.pop("output") for w in alpha["workers"]]
+        self.assertEqual([o["state"] for o in outputs], ["never", "never"])
         self.assertEqual(alpha["workers"], [
             {"id": "alpha.a1", "live": True, "uses": ["x.read", "x.post"]},
             {"id": "alpha.a2", "live": True, "uses": []}])

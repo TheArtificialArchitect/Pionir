@@ -86,7 +86,7 @@ class FakeVps(_Ssh):
         super().__init__()
         self.units = {u: ["active", "enabled"] for u in (
             "mrcrab-t1.timer", "mrcrab-research.timer", "mrcrab-t2.timer", "mrcrab-t3.timer",
-            "prometheus-api.service", "pro-robinhood-api.service")}
+            "prometheus-api.service", "pro-robinhood-api.service", "mrcrab-api.service")}
         for t in ("prometheus-scan.timer", "prometheus-entry.timer", "prometheus-review.timer"):
             self.units[t] = ["inactive", "disabled"]
         self.stuck: set[str] = set()
@@ -568,3 +568,34 @@ class TheWebFactsTests(unittest.TestCase):
             missing = peter_facts(Path(tmp) / "nope.json", Path(tmp) / "nope.sqlite")
             self.assertIn("signals_error", missing)
             self.assertIn("pnl_error", missing)
+
+
+class KarkinosApiUnitTests(unittest.TestCase):
+    """mrcrab-api.service (Karkinos's read API): read-only in the plane - reported by status,
+    readable by proteus.logs, and in NEITHER the stop nor the start table."""
+
+    def test_the_status_read_reports_it_from_the_read_back(self) -> None:
+        ssh = FakeVps()
+        plane = _adapter(ssh).plane()
+        self.assertIn("mrcrab-api.service", ssh.remotes[0])
+        self.assertEqual(plane["vps"]["units"]["mrcrab-api.service"], {"active": "active", "enabled": "enabled"})
+        ssh.units["mrcrab-api.service"] = ["failed", "enabled"]
+        plane = _adapter(ssh).plane()
+        self.assertEqual(plane["vps"]["units"]["mrcrab-api.service"]["active"], "failed")
+
+    def test_its_logs_are_readable_and_only_read(self) -> None:
+        ssh = _Ssh("line")
+        out = _adapter(ssh).execute(Task("proteus.logs", {"unit": "mrcrab-api.service", "lines": 25})).output
+        self.assertTrue(out["ok"])
+        self.assertEqual(ssh.remotes, ["journalctl -u mrcrab-api.service -n 25 --no-pager -o short-iso"])
+
+    def test_it_is_not_a_brake_or_an_arm_target(self) -> None:
+        adapter = _adapter(_Ssh())
+        for name, payload in (("proteus.stop_service", {"service": "mrcrab-api.service"}),
+                              ("proteus.start_service", {"service": "mrcrab-api.service"}),
+                              ("proteus.stop_timer", {"timer": "mrcrab-api.service"})):
+            with self.assertRaises(AdapterProtocolError, msg=name):
+                adapter.validate(Task(name, payload))
+        # "stop everything" must not sweep the Karkinos API in either
+        remote = adapter._plan(Task("proteus.stop_service", {"service": "all"}))[1]
+        self.assertNotIn("mrcrab-api", remote)

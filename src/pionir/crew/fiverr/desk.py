@@ -373,6 +373,19 @@ class FiverrDesk(_Base):
         rec["counts"] = {**self._blank()["counts"], **(rec.get("counts") or {})}
         return rec
 
+    def output_facts(self, state_dir) -> dict:
+        """The desk's own counters for a viewer's panel: whole numbers only - how many events
+        it has applied, how many Fiverr events it still owes an acknowledgement for, how many
+        orders it holds. Never an order's text, a buyer's name or a message."""
+        rec = self.load(state_dir)
+        c = rec["counts"]
+        desk = {"orders": len(rec.get("orders") or {}), "acks_pending": len(rec.get("acks_pending") or [])}
+        for key in ("events", "unknown_events", "ignored_events", "malformed_events", "event_errors"):
+            v = c.get(key)
+            if isinstance(v, int) and not isinstance(v, bool):
+                desk[key] = v
+        return {"desk": desk}
+
     def _save(self, ctx: WorkContext, rec: dict) -> None:
         rec["events_seen"] = rec["events_seen"][-KEEP_EVENT_IDS:]
         rec["replies_seen"] = rec["replies_seen"][-KEEP_EVENT_IDS:]

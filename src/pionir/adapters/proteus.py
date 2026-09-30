@@ -16,6 +16,10 @@ The droplet (174.138.35.184, root over ``~/proteus_deploy``) runs:
   once at import. It never reads ROBINHOOD_KILL: its brake is ``proteus.rh_orders_off`` (the
   variable unset, the unit restarted, the running process's environment read back).
 
+Day P/L (``plane()["day_pl"]``, pionir.proteus_day): Prometheus's and the Robinhood account's
+value now minus their value at the day's open (the first good read after 09:30 America/New_York,
+recorded once a day in a state file); "unknown" and why when either number is missing.
+
 Two live-money paths, modelled apart: Prometheus -> Robinhood entries (entry timer, HALT,
 ROBINHOOD_KILL) and the Robinhood API's own order routes (PRO_RH_ORDERS_ENABLED).
 
@@ -62,6 +66,8 @@ from pionir.adapters._proc import ProcessResult, run_process
 from pionir.batching import OWNER_APPROVED_GRANT
 from pionir.contracts import AgentManifest, Capability, RiskLevel, Task, TaskResult
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
+from pionir.proteus_day import ACCOUNTS as DAY_ACCOUNTS
+from pionir.proteus_day import TZ_NAME, DayOpenStore, Read, day_view
 
 DEFAULT_HOST = "174.138.35.184"
 ARM_PERMISSION = "proteus.arm"
@@ -77,6 +83,11 @@ PROMETHEUS_TIMERS = ("prometheus-scan.timer", "prometheus-entry.timer", "prometh
 TRADING_TIMERS = KARKINOS_TIMERS + PROMETHEUS_TIMERS
 # Long-running services. The Robinhood API is live money; prometheus-api is Pro's app API.
 SERVICES = ("prometheus-api.service", "pro-robinhood-api.service")
+# Karkinos's read API (:8002; the desktop's karkinos-read-key reads it). READ-ONLY here: it is in
+# the status report and the journal allowlist, and deliberately in neither SERVICES nor
+# STARTABLE - nothing in Pionir stops or starts it (it serves reads only; the money is in the
+# timers, which have their own brakes).
+KARKINOS_SERVICES = ("mrcrab-api.service",)
 # What start_service may start (both serve live-money order routes) - never the retired
 # proteus.service, which is hard-killed and stays that way.
 STARTABLE = SERVICES
@@ -85,9 +96,9 @@ LOG_UNITS = (
     "mrcrab@t1.service", "mrcrab@research.service", "mrcrab@t2.service", "mrcrab@t3.service",
     "prometheus-api.service", "prometheus-scan.service", "prometheus-entry.service",
     "prometheus-review.service", "pro-robinhood-api.service", "proteus.service",
-) + TRADING_TIMERS
+) + KARKINOS_SERVICES + TRADING_TIMERS
 # Every unit status reports on.
-STATUS_UNITS = SERVICES + TRADING_TIMERS + ("proteus.service",)
+STATUS_UNITS = SERVICES + KARKINOS_SERVICES + TRADING_TIMERS + ("proteus.service",)
 # Read APIs on the droplet's loopback: (name, port). /health is unauthenticated and says
 # nothing about an account - status reads no key and sends none over the wire.
 READ_APIS = (("prometheus", 8001), ("karkinos", 8002), ("robinhood", 8000))
@@ -438,11 +449,17 @@ class ProteusAdapter:
                  peter_health: Callable[[], bool | None] | None = None,
                  local_status: Callable[[], Mapping[str, Any]] | None = None,
                  tunnel_health: Callable[[int], str] | None = None,
+                 accounts: Callable[[], Mapping[str, Read]] | None = None,
+                 day_open_file: Path | None = None,
                  clock: Callable[[], float] = time.time) -> None:
         self.settings = settings or ProteusSettings()
         self._run = runner
         self._peter_health = peter_health or self._read_peter_health
         self._tunnel_health = tunnel_health or read_tunnel_health
+        # Day P/L (proteus_day): both are None unless bootstrap wires them, so a plane built
+        # without them (every test) reads no account and writes no file.
+        self._accounts = accounts
+        self._day_store = DayOpenStore(day_open_file) if day_open_file is not None else None
         # set by the server once its Ollama gate is up: the gate and relay, as it sees them
         self.local_status = local_status
         self._clock = clock
@@ -598,6 +615,7 @@ class ProteusAdapter:
                         "signals_age_s": _age(self.settings.peter_signals, self._clock()),
                         **peter_facts(self.settings.peter_signals, self.settings.peter_vault)}
         doc["tunnel"] = self.tunnel()
+        doc["day_pl"] = self.day_pl()
         vps_doc = doc.get("vps") or {}
         live = vps_doc.get("tailnet_key_expiry") if vps_doc.get("ok") else None
         # "unknown" is a live answer (Tailscale is not Running on the VPS): an ALARM, never fine
@@ -611,6 +629,21 @@ class ProteusAdapter:
         doc["controls"] = [{"capability": c.name, "arming": c.name in ARMING,
                             "description": c.description} for c in CAPABILITIES]
         return doc
+
+    def day_pl(self) -> dict[str, Any]:
+        """Each account's balance now minus its balance at today's open (America/New_York),
+        or "unknown" and why. Read-only against the accounts; the only write is the day-open
+        state file, once per account per day (see proteus_day)."""
+        if self._accounts is None or self._day_store is None:
+            return {"enabled": False}
+        now = self._clock()
+        try:
+            reads = dict(self._accounts())
+        except Exception as error:  # noqa: BLE001 - the balance read must not sink the plane
+            reads = {name: Read(None, f"the balance read failed ({type(error).__name__})")
+                     for name in DAY_ACCOUNTS}
+        return {"enabled": True, "zone": TZ_NAME, "checked_at": _iso(now),
+                "accounts": day_view(self._day_store, reads, now)}
 
     def tunnel(self) -> dict[str, Any]:
         """The SSH tunnel as this machine sees it: each API's unauthenticated /health through
