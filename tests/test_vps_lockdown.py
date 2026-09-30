@@ -601,14 +601,14 @@ class LockdownRuns(unittest.TestCase):
     def test_a_guard_that_cannot_tell_blocks_the_restart(self) -> None:
         far = int(time.time()) + 6 * 3600
         for setup, words in (
-                (lambda: self.sim.set(systemd=232), "cannot tell when it fires (systemd 232"),
                 (lambda: self.sim.set(show_fail=True), "its next run could not be read"),
-                (lambda: self.sim.set(show_junk=True), "its next run could not be read"),
+                (lambda: self.sim.set(show_fail=True), "busctl: exit 1 'Failed to get property: Access denied'"),
+                (lambda: self.sim.set(show_junk=True), "show: exit 0 'NextElapseUSecRealtime=Tue 2026-09-29 13:15:00 CEST"),
                 (lambda: self.sim.set(health_down=True), "did not say how many jobs are in flight"),
                 (lambda: self.sim.set(health_junk=True), "did not say how many jobs are in flight")):
             with self.subTest(words=words):
                 self.sim.set(units={}, sched={"prometheus-scan.timer": far}, jobs_running=0, systemd=255,
-                             show_fail=False, show_junk=False, health_down=False, health_junk=False)
+                             show_fail=False, show_junk=False, busctl_fail=False, health_down=False, health_junk=False)
                 self.sim.boot_units()
                 setup()
                 done = self.run_script("-Apply")
@@ -1011,7 +1011,7 @@ class RemoteHalf(unittest.TestCase):
         self.sim.boot_units()
         ok = self.r.step_guard(ask)
         self.assertEqual((ok["safe"], ok["unknown"], ok["jobs_running"]), (True, [], 0))
-        for name, flags in (("old systemd", {"systemd": 232}), ("show errors", {"show_fail": True}),
+        for name, flags in (("show errors", {"show_fail": True}),
                             ("unparseable date", {"show_junk": True}), ("health down", {"health_down": True}),
                             ("health without jobs_running", {"health_junk": True})):
             self.sim.set(systemd=255, show_fail=False, show_junk=False, health_down=False, health_junk=False)
@@ -1024,9 +1024,167 @@ class RemoteHalf(unittest.TestCase):
         self.sim.unit("prometheus-api.service", active=False)
         g = self.r.step_guard(ask)
         self.assertEqual((g["safe"], g["unknown"], g["jobs_running"]), (True, [], 0))
-        # no active timer: an old systemd is irrelevant
-        self.sim.set(sched={}, systemd=232)
+        # no active timer: nothing to read, however old systemd is
+        self.sim.set(sched={}, systemd=232, show_fail=True)
         self.assertTrue(self.r.step_guard(ask)["safe"])
+        # a systemd whose bus is unreachable but whose `show` answers unix stamps (or a UTC date) is read
+        self.sim.set(sched={"prometheus-scan.timer": far}, systemd=249, show_fail=False, busctl_fail=True)
+        self.assertTrue(self.r.step_guard(ask)["safe"])
+
+    # ---- the timer clock: read on any systemd, fail closed, due within 15 minutes ------------------------
+    T0 = 1_800_000_000                                  # 2027-01-15 08:00:00 UTC (a Friday)
+
+    @staticmethod
+    def utc_date(epoch: int, zone: str = "UTC") -> str:
+        return time.strftime("%a %Y-%m-%d %H:%M:%S", time.gmtime(epoch)) + " " + zone
+
+    def guard_runner(self, answers: dict, calls: list | None = None):
+        """A `_run` for the guard: `answers` maps a marker in the command to (code, out). Anything
+        else is 127. The timer is active; systemctl --version says 249."""
+        def run(argv, timeout=30, env=None, merge_stderr=False):
+            line = " ".join(argv)
+            if calls is not None:
+                calls.append(line)
+            if argv[:2] == ["systemctl", "is-active"]:
+                return (0, "active\n") if argv[2].endswith(".timer") else (3, "inactive\n")
+            if argv == ["systemctl", "--version"]:
+                return 0, "systemd 249 (249.11-0ubuntu3.12)\n+PAM\n"
+            for marker, ans in answers.items():
+                if marker in line:
+                    return ans(line) if callable(ans) else ans
+            return 127, ""
+        return run
+
+    def guard_one(self, answers: dict, now: int | None = None, mono_now: float = 1000.0, timer="prometheus-scan.timer"):
+        r = load_remote()
+        r._run = self.guard_runner(answers)
+        r.NOW = lambda: self.T0 if now is None else now
+        r.MONO_CLOCKS = (lambda: mono_now,)
+        return r.step_guard({"services": [], "timers": [timer]})
+
+    def busctl_answers(self, realtime_usec: int, mono_usec: int = 0) -> dict:
+        return {"busctl": lambda line: (0, f"t {realtime_usec if line.endswith('Realtime') else mono_usec}\n")}
+
+    def show_answer(self, realtime: str, mono: str = "0"):
+        return (0, f"NextElapseUSecRealtime={realtime}\nNextElapseUSecMonotonic={mono}\n")
+
+    def test_the_guard_reads_a_timer_on_every_systemd(self) -> None:
+        soon, later = self.T0 + 10 * 60, self.T0 + 3 * 3600
+        fail = (1, "")
+        cases = [
+            # (name, answers, expected due in_s or None, expected unknown count)
+            ("busctl, raw usec, due", self.busctl_answers(soon * 1_000_000), 600, 0),
+            ("busctl, raw usec, later", self.busctl_answers(later * 1_000_000), None, 0),
+            ("busctl, unset", self.busctl_answers(0), None, 0),
+            ("busctl answers an implausible stamp: the next attempt still reads it", {"busctl": (0, "t 5" + chr(10)), "systemctl show": self.show_answer(f"@{soon}")}, 600, 0),
+            ("systemd 245: show prints a UTC date, due", {"busctl": fail, "systemctl show": self.show_answer(self.utc_date(soon))}, 600, 0),
+            ("systemd 245: show prints a UTC date, later", {"busctl": fail, "systemctl show": self.show_answer(self.utc_date(later))}, None, 0),
+            ("systemd 249: show prints unix stamps, due", {"busctl": fail, "systemctl show": self.show_answer(f"@{soon}")}, 600, 0),
+            ("systemd 249: only --timestamp=utc is honoured", {"busctl": fail, "systemctl show": lambda line: (
+                self.show_answer(self.utc_date(soon)) if "--timestamp=utc" in line else self.show_answer("Fri 09:15 CET"))}, 600, 0),
+            ("systemd 252: raw microseconds from show", {"busctl": fail, "systemctl show": self.show_answer(str(soon * 1_000_000))}, 600, 0),
+            ("show: fractional UTC date (us style)", {"busctl": fail, "systemctl show": self.show_answer(self.utc_date(soon).replace(" UTC", ".250000 UTC"))}, 600, 0),
+            ("show: n/a", {"busctl": fail, "systemctl show": self.show_answer("n/a")}, None, 0),
+            ("show: empty", {"busctl": fail, "systemctl show": self.show_answer("")}, None, 0),
+            # fails closed
+            ("everything errors", {"busctl": fail, "systemctl show": fail}, None, 1),
+            ("a zone abbreviation is never guessed", {"busctl": fail, "systemctl show": self.show_answer(self.utc_date(soon, "CEST"))}, None, 1),
+            ("a wrong weekday is not a date", {"busctl": fail, "systemctl show": self.show_answer(self.utc_date(soon).replace("Fri", "Mon"))}, None, 1),
+            ("junk", {"busctl": fail, "systemctl show": self.show_answer("soonish")}, None, 1),
+            ("a property missing", {"busctl": fail, "systemctl show": (0, f"NextElapseUSecRealtime=@{soon}\n")}, None, 1),
+            ("show exits non-zero with a good-looking answer", {"busctl": fail, "systemctl show": (1, f"NextElapseUSecRealtime=@{soon}\nNextElapseUSecMonotonic=0\n")}, None, 1),
+            ("busctl answers a string, not a uint64", {"busctl": (0, 's "x"\n'), "systemctl show": fail}, None, 1),
+            ("a stamp far outside any plausible date", {"busctl": fail, "systemctl show": self.show_answer("@5")}, None, 1),
+        ]
+        for name, answers, in_s, unknown in cases:
+            with self.subTest(name):
+                g = self.guard_one(answers)
+                self.assertEqual(len(g["unknown"]), unknown, g)
+                self.assertEqual([d["in_s"] for d in g["due"]], [] if in_s is None else [in_s], g)
+                self.assertEqual(g["safe"], in_s is None and not unknown, g)
+
+    def test_the_due_window_is_fifteen_minutes_with_a_grace_for_an_elapsed_timer(self) -> None:
+        def at(delta: int):
+            return self.guard_one(self.busctl_answers((self.T0 + delta) * 1_000_000))
+        self.assertEqual([d["in_s"] for d in at(14 * 60 + 59)["due"]], [14 * 60 + 59])
+        self.assertEqual(at(15 * 60 + 1)["due"], [])
+        self.assertEqual([d["in_s"] for d in at(15 * 60)["due"]], [900])
+        self.assertEqual([d["in_s"] for d in at(0)["due"]], [0])
+        self.assertEqual([d["in_s"] for d in at(-1)["due"]], [-1])       # elapsed, maybe not yet fired (AccuracySec)
+        self.assertEqual([d["in_s"] for d in at(-299)["due"]], [-299])
+        self.assertEqual(at(-301)["due"], [])                    # long past: fired (or never will); its service is the busy check's
+        self.assertTrue(at(15 * 60 + 1)["safe"])
+        self.assertFalse(at(14 * 60 + 59)["safe"])
+
+    def test_a_monotonic_only_timer_is_judged_too(self) -> None:
+        fail = (1, "")
+        def mono(delta_s: int, boot_s: float = 1000.0, rt: str = "", via: str = "busctl"):
+            usec = int((boot_s + delta_s) * 1_000_000)
+            if via == "busctl":
+                answers = self.busctl_answers(0, usec)
+            else:
+                answers = {"busctl": fail, "systemctl show": self.show_answer(rt, str(usec))}
+            return self.guard_one(answers, mono_now=boot_s)
+        for via in ("busctl", "show"):
+            with self.subTest(via):
+                self.assertEqual([d["in_s"] for d in mono(14 * 60 + 59, via=via)["due"]], [14 * 60 + 59])
+                self.assertEqual(mono(15 * 60 + 1, via=via)["due"], [])
+                self.assertEqual([d["in_s"] for d in mono(-30, via=via)["due"]], [-30])
+                self.assertEqual(mono(-3600, via=via)["due"], [])
+                self.assertFalse(mono(60, via=via)["safe"])
+        # both triggers: the sooner one counts (calendar far, monotonic near - and the reverse)
+        far = self.T0 + 5 * 3600
+        both = {"busctl": (lambda line: (0, f"t {far * 1_000_000}\n") if line.endswith("Realtime")
+                           else (0, f"t {int((1000 + 300) * 1e6)}\n"))}
+        self.assertEqual([d["in_s"] for d in self.guard_one(both)["due"]], [300])
+        both = {"busctl": (lambda line: (0, f"t {(self.T0 + 120) * 1_000_000}\n") if line.endswith("Realtime")
+                           else (0, f"t {int((1000 + 5 * 3600) * 1e6)}\n"))}
+        self.assertEqual([d["in_s"] for d in self.guard_one(both)["due"]], [120])
+        # a formatted timespan for the monotonic trigger cannot be read exactly: closed, not idle
+        g = self.guard_one({"busctl": fail, "systemctl show": self.show_answer("", "3h 12min 4.5s")})
+        self.assertEqual((len(g["unknown"]), g["safe"]), (1, False))
+        # the timer clocks: due on EITHER of boottime / monotonic
+        r = load_remote()
+        r._run = self.guard_runner(self.busctl_answers(0, int((1000 + 300) * 1e6)))
+        r.NOW = lambda: self.T0
+        r.MONO_CLOCKS = (lambda: 1000.0 + 290 * 24 * 3600, lambda: 1000.0)     # boottime far ahead (suspended), monotonic not
+        self.assertEqual([d["in_s"] for d in r.step_guard({"services": [], "timers": ["a.timer"]})["due"]], [300])
+
+    def test_an_unreadable_timer_says_why_with_exit_codes_and_the_first_output(self) -> None:
+        g = self.guard_one({"busctl": (1, "Failed to get property NextElapseUSecRealtime: No such interface\n"),
+                            "systemctl show": (0, "NextElapseUSecRealtime=" + "x" * 200 + "\n")})
+        (msg,) = g["unknown"]
+        self.assertIn("prometheus-scan.timer: its next run could not be read", msg)
+        self.assertIn("busctl: exit 1 'Failed to get property NextElapseUSecRealtime: No such interface'"[:70], msg)
+        self.assertIn("show: exit 0 'NextElapseUSecRealtime=" + "x" * 37 + "'", msg)         # first 60 characters only
+        self.assertNotIn("x" * 38, msg)
+        self.assertIn("show utc: exit 0", msg)
+        self.assertIn("show unix: exit 0", msg)
+        self.assertIn("systemd 249", msg)
+
+    def test_the_guard_asks_the_bus_first_and_pins_utc_and_english(self) -> None:
+        calls, envs = [], []
+        r = load_remote()
+        base = self.guard_runner(self.busctl_answers((self.T0 + 7200) * 1_000_000), calls)
+        def spy(argv, timeout=30, env=None, merge_stderr=False):
+            envs.append((argv[0], env, merge_stderr))
+            return base(argv, timeout, env, merge_stderr)
+        r._run = spy
+        r.NOW = lambda: self.T0
+        r.MONO_CLOCKS = (lambda: 1000.0,)
+        r.step_guard({"services": [], "timers": ["mrcrab-t1.timer"]})
+        self.assertTrue(any("busctl get-property org.freedesktop.systemd1 /org/freedesktop/systemd1/unit/mrcrab_2dt1_2etimer "
+                            "org.freedesktop.systemd1.Timer NextElapseUSecRealtime" in c for c in calls), calls)
+        (_, env, merged), = [e for e in envs if e[0] == "busctl"][:1]
+        self.assertEqual((env["TZ"], env["LC_ALL"], merged), ("UTC", "C", True))
+        self.assertFalse(any(c.startswith("systemctl show") for c in calls))            # the bus answered: nothing else asked
+        self.assertEqual(r._bus_path("prometheus-scan.timer"), "/org/freedesktop/systemd1/unit/prometheus_2dscan_2etimer")
+
+    def test_run_can_merge_stderr_into_the_answer(self) -> None:
+        r = load_remote()
+        code, out = r._run([sys.executable, "-c", "import sys; print('out'); print('err', file=sys.stderr); sys.exit(3)"], merge_stderr=True)
+        self.assertEqual((code, sorted(out.split())), (3, ["err", "out"]))
+        self.assertEqual(r._run([sys.executable, "-c", "import sys; print('out'); print('err', file=sys.stderr)"]), (0, "out\n"))
 
     def test_tailscale_reports_key_expiry_of_the_vps_and_the_phones(self) -> None:
         self.sim.set(ts_state="Running", ts_key_expiry="2027-01-01T00:00:00Z", phone_expiry="2027-02-01T00:00:00Z")

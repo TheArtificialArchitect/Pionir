@@ -42,6 +42,7 @@ through _run (tests replace it).
 from __future__ import annotations
 
 import base64
+import calendar
 import glob
 import hashlib
 import json
@@ -73,9 +74,13 @@ def emit(obj: dict) -> None:
     print(json.dumps(obj, sort_keys=True))
 
 
-def _run(argv: list[str], timeout: float = 30, env: dict | None = None) -> tuple[int, str]:
+def _run(argv: list[str], timeout: float = 30, env: dict | None = None,
+         merge_stderr: bool = False) -> tuple[int, str]:
+    """(exit code, stdout). stderr is dropped unless `merge_stderr` (a diagnosis wants the
+    error text; a parse of the output never does)."""
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env, check=False)
+        done = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+                              text=True, timeout=timeout, env=env, check=False)
         return done.returncode, done.stdout
     except (OSError, subprocess.TimeoutExpired):
         return 127, ""
@@ -683,7 +688,116 @@ def _http_json(url: str):
 HTTP_JSON = _http_json
 
 
-UNIX_TIMESTAMP_SYSTEMD = 247     # `systemctl show --timestamp=unix` exists from this version
+WINDOW_S = 15 * 60                 # a timer this close to firing is "due"
+GRACE_S = 5 * 60                   # ... and one that elapsed this recently may not have fired yet (AccuracySec
+                                   # lets systemd start it up to a minute or more AFTER its next-elapse stamp)
+EPOCH_RANGE_S = (1_000_000_000, 4_000_000_000)     # a plausible next-run stamp, in seconds (2001..2096)
+WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+DATE_RE = re.compile(r"(?:(Mon|Tue|Wed|Thu|Fri|Sat|Sun) )?(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)(?:\.(\d{1,6}))? UTC")
+NONE = "none"                       # sentinel: nothing pending on that trigger (not a number, not unreadable)
+
+
+def _boottime() -> float:
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+# systemd measures a timer's monotonic trigger (OnBootSec, OnUnitActiveSec ...) on CLOCK_BOOTTIME
+# where the kernel has it, CLOCK_MONOTONIC otherwise; they differ only by time spent suspended
+# (never, on a VPS). Both are checked: due on either clock is due.
+MONO_CLOCKS = tuple(c for c in (_boottime if hasattr(time, "CLOCK_BOOTTIME") else None, time.monotonic) if c)
+
+
+def parse_realtime(raw: str):
+    """A timer's NextElapseUSecRealtime as printed by ANY systemd, to epoch seconds: NONE when it
+    has no calendar trigger pending, a number when it does, None when this is not a format that
+    can be read EXACTLY (a zone abbreviation other than UTC is ambiguous and is never guessed)."""
+    raw = raw.strip()
+    if raw in ("", "n/a", "0"):
+        return NONE
+    m = re.fullmatch(r"@(\d+)", raw)                       # --timestamp=unix: seconds
+    if m:
+        sec = int(m.group(1))
+    elif re.fullmatch(r"\d{15,17}", raw):                  # no formatting at all: microseconds
+        sec = int(raw) / 1e6
+    else:
+        m = DATE_RE.fullmatch(raw)                         # "Wed 2026-09-30 09:00:00 UTC"
+        if not m:
+            return None
+        wd, y, mo, d, hh, mi, ss, frac = m.groups()
+        try:
+            sec = calendar.timegm((int(y), int(mo), int(d), int(hh), int(mi), int(ss)))
+            if wd and time.gmtime(sec).tm_wday != WEEKDAYS.index(wd):
+                return None
+        except (ValueError, OverflowError):
+            return None
+        sec += int(frac.ljust(6, "0")) / 1e6 if frac else 0
+    return sec if EPOCH_RANGE_S[0] <= sec <= EPOCH_RANGE_S[1] else None
+
+
+def parse_monotonic(raw: str):
+    """NextElapseUSecMonotonic to microseconds on the timer clock: NONE when unset; None when it
+    is anything else than a plain number (a formatted timespan like "3h 12min" is not read)."""
+    raw = raw.strip()
+    if raw in ("", "n/a", "0", "infinity"):
+        return NONE
+    return int(raw) if re.fullmatch(r"\d{1,20}", raw) else None
+
+
+def _bus_path(unit: str) -> str:
+    """The D-Bus object path of a unit (sd_bus_path_encode): anything but [A-Za-z0-9] becomes _xx."""
+    return "/org/freedesktop/systemd1/unit/" + "".join(c if c.isascii() and c.isalnum() else f"_{ord(c):02x}" for c in unit)
+
+
+def _short(text: str, n: int = 60) -> str:
+    return " / ".join(x.strip() for x in (text or "").strip().splitlines() if x.strip())[:n]
+
+
+def _parse_busctl(realtime_out: str, monotonic_out: str):
+    """busctl prints `t <microseconds>` for a uint64 property; 0 is "not set"."""
+    vals = []
+    for raw in (realtime_out, monotonic_out):
+        m = re.fullmatch(r"t (\d{1,20})", raw.strip())
+        if not m:
+            return None
+        vals.append(m.group(1))
+    rt = parse_realtime(vals[0])                # "0" is NONE there
+    mono = parse_monotonic(vals[1])
+    return None if rt is None or mono is None else (rt, mono)
+
+
+def _parse_show(out: str):
+    props = dict(line.partition("=")[::2] for line in out.splitlines() if "=" in line)
+    if "NextElapseUSecRealtime" not in props or "NextElapseUSecMonotonic" not in props:
+        return None
+    rt, mono = parse_realtime(props["NextElapseUSecRealtime"]), parse_monotonic(props["NextElapseUSecMonotonic"])
+    return None if rt is None or mono is None else (rt, mono)
+
+
+def read_next_elapse(timer: str):
+    """(realtime epoch s | NONE, monotonic usec | NONE, "") for a timer, or (None, None, why) when no
+    attempt could read it. Ordered attempts, every answer strictly validated, the first that
+    parses wins: the bus (raw microseconds, the same on every systemd), then `systemctl show`
+    printing whatever it prints, then with an explicit UTC and unix style. TZ and LC_ALL are
+    pinned so a date string is UTC and English. `why` names each attempt's exit code and the
+    first 60 characters of what it printed (a timestamp, never a secret)."""
+    env = {**os.environ, "TZ": "UTC", "LC_ALL": "C"}
+    trail = []
+    bus = [_run(["busctl", "get-property", "org.freedesktop.systemd1", _bus_path(timer),
+                 "org.freedesktop.systemd1.Timer", prop], env=env, merge_stderr=True)
+           for prop in ("NextElapseUSecRealtime", "NextElapseUSecMonotonic")]
+    got = _parse_busctl(bus[0][1], bus[1][1]) if bus[0][0] == 0 and bus[1][0] == 0 else None
+    if got:
+        return got[0], got[1], ""
+    worst = bus[0] if bus[0][0] or not bus[1][0] else bus[1]
+    trail.append(f"busctl: exit {worst[0]} '{_short(worst[1])}'")
+    show = ["systemctl", "show", timer, "-p", "NextElapseUSecRealtime", "-p", "NextElapseUSecMonotonic"]
+    for label, extra in (("show", []), ("show utc", ["--timestamp=utc"]), ("show unix", ["--timestamp=unix"])):
+        code, out = _run(show + extra, env=env, merge_stderr=True)
+        got = _parse_show(out) if code == 0 else None
+        if got:
+            return got[0], got[1], ""
+        trail.append(f"{label}: exit {code} '{_short(out)}'")
+    return None, None, "; ".join(trail)
 
 
 def _systemd_version():
@@ -694,13 +808,13 @@ def _systemd_version():
 
 def step_guard(p: dict) -> dict:
     """Busy right now? A trading job running (its service unit active), a timer about to
-    fire one (within 15 min), or Prometheus's API with background jobs in flight
-    (/api/health jobs_running - unauthenticated, loopback).
+    fire one (within 15 min, on its calendar or its monotonic trigger), or Prometheus's API
+    with background jobs in flight (/api/health jobs_running - unauthenticated, loopback).
 
-    Fails CLOSED: an active timer whose next run cannot be read (systemd older than 247 has
-    no --timestamp=unix, an errored or unparseable answer), and a running Prometheus API
-    that does not say how many jobs it has, are reported in `unknown` and make the moment
-    unsafe. Not knowing is never the same as idle."""
+    Fails CLOSED: an active timer whose next run cannot be read by any of the attempts in
+    read_next_elapse (the reason names each one's exit code and first output), and a running
+    Prometheus API that does not say how many jobs it has, are reported in `unknown` and make
+    the moment unsafe. Not knowing is never the same as idle."""
     busy, due, unknown = [], [], []
     for unit in p.get("services", []):
         if UNIT_RE.fullmatch(unit):
@@ -708,27 +822,25 @@ def step_guard(p: dict) -> dict:
             if state in ("active", "activating", "reloading"):
                 busy.append(unit)
     now = NOW()
-    version = None
-    version_read = False
     for timer in p.get("timers", []):
         if not re.fullmatch(r"[a-z0-9][a-z0-9@_.-]*\.timer", timer):
             continue
         if _run(["systemctl", "is-active", timer])[1].strip() != "active":
             continue
-        if not version_read:
-            version, version_read = _systemd_version(), True
-        if version is None or version < UNIX_TIMESTAMP_SYSTEMD:
-            unknown.append(f"{timer}: cannot tell when it fires (systemd "
-                           f"{version if version is not None else 'version unknown'} cannot print unix timestamps)")
+        rt, mono, why = read_next_elapse(timer)
+        if rt is None:
+            version = _systemd_version()
+            unknown.append(f"{timer}: its next run could not be read ({why}; systemd "
+                           f"{version if version is not None else 'version unknown'})")
             continue
-        code, out = _run(["systemctl", "show", timer, "-p", "NextElapseUSecRealtime", "--value", "--timestamp=unix"])
-        raw = (out or "").strip()
-        m = re.fullmatch(r"@(\d+)", raw)
-        if code != 0 or not (m or raw in ("", "n/a")):
-            unknown.append(f"{timer}: its next run could not be read")
-            continue
-        if m and 0 <= int(m.group(1)) - now <= 15 * 60:
-            due.append({"timer": timer, "in_s": int(int(m.group(1)) - now)})
+        ins = []
+        if rt != NONE:
+            ins.append(rt - now)
+        if mono != NONE:
+            ins += [mono / 1e6 - clock() for clock in MONO_CLOCKS]
+        soon = [x for x in ins if -GRACE_S <= x <= WINDOW_S]
+        if soon:
+            due.append({"timer": timer, "in_s": int(min(soon))})
     jobs = None
     port = p.get("jobs_port")
     if port:

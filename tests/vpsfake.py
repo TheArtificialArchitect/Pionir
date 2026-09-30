@@ -95,7 +95,7 @@ class Sim:
         return dict(item.decode().partition("=")[::2] for item in raw.split(b"\0") if item)
 
     # ---- the command runner remote._run is replaced with
-    def run(self, argv, timeout=30, env=None):
+    def run(self, argv, timeout=30, env=None, merge_stderr=False):
         s = self.state()
         s["log"].append(list(argv))
         code, out = self._run(s, list(argv))
@@ -119,12 +119,25 @@ class Sim:
             return 0, ""
         if a == ["systemctl", "--version"]:
             return 0, f"systemd {s.get('systemd', 255)} (255.4-1ubuntu8)\n+PAM +AUDIT\n"
+        if a[:1] == ["busctl"]:
+            # get-property org.freedesktop.systemd1 <object path> org.freedesktop.systemd1.Timer <property>
+            if s.get("show_fail"):
+                return 1, "Failed to get property: Access denied\n"
+            if s.get("show_junk"):
+                return 0, 's "Tue 2026-09-29 13:15:00 CEST"\n'
+            if s.get("busctl_fail"):
+                return 127, ""
+            unit = a[3].rsplit("/", 1)[1].replace("_2d", "-").replace("_2e", ".")
+            sec = s.get("sched", {}).get(unit, 0)
+            return 0, f"t {sec * 1_000_000 if a[5] == 'NextElapseUSecRealtime' else 0}\n"
+        if a[:2] == ["systemctl", "show"] and a[3:4] == ["-p"] and a[5:6] == ["-p"]:
+            if s.get("show_fail"):
+                return 1, "Failed to get properties: Access denied\n"
+            if s.get("show_junk"):
+                return 0, "NextElapseUSecRealtime=Tue 2026-09-29 13:15:00 CEST\nNextElapseUSecMonotonic=0\n"
+            sec = s.get("sched", {}).get(a[2], 0)
+            return 0, f"NextElapseUSecRealtime={f'@{sec}' if sec else ''}\nNextElapseUSecMonotonic=0\n"
         if a[:2] == ["systemctl", "show"]:
-            if a[4:5] == ["NextElapseUSecRealtime"]:
-                if s.get("show_fail"):
-                    return 1, ""
-                if s.get("show_junk"):
-                    return 0, "Tue 2026-09-29 13:15:00 UTC\n"       # what an old systemd prints (no unix stamps)
             return self._show(s, a[2], a[4])
         if a[:2] == ["systemctl", "is-active"]:
             name = a[2]
@@ -185,8 +198,6 @@ class Sim:
         return 127, ""
 
     def _show(self, s: dict, unit: str, prop: str) -> tuple[int, str]:
-        if prop == "NextElapseUSecRealtime":
-            return 0, f"@{s.get('sched', {}).get(unit, 0)}\n"
         u = s["units"].get(unit, {})
         if prop == "MainPID":
             return 0, f"{u.get('pid', 0)}\n"
