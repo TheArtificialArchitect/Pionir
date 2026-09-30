@@ -1090,7 +1090,7 @@ class RemoteHalf(unittest.TestCase):
             ("a zone abbreviation is never guessed", {"busctl": fail, "systemctl show": self.show_answer(self.utc_date(soon, "CEST"))}, None, 1),
             ("a wrong weekday is not a date", {"busctl": fail, "systemctl show": self.show_answer(self.utc_date(soon).replace("Fri", "Mon"))}, None, 1),
             ("junk", {"busctl": fail, "systemctl show": self.show_answer("soonish")}, None, 1),
-            ("a property missing", {"busctl": fail, "systemctl show": (0, "NextElapseUSecRealtime=@%d\n" % soon)}, None, 1),
+            ("a property missing", {"busctl": fail, "systemctl show": (0, f"NextElapseUSecRealtime=@{soon}\n")}, None, 1),
             ("show exits non-zero with a good-looking answer", {"busctl": fail, "systemctl show": (1, f"NextElapseUSecRealtime=@{soon}\nNextElapseUSecMonotonic=0\n")}, None, 1),
             ("busctl answers a string, not a uint64", {"busctl": (0, 's "x"\n'), "systemctl show": fail}, None, 1),
             ("a stamp far outside any plausible date", {"busctl": fail, "systemctl show": self.show_answer("@5")}, None, 1),
