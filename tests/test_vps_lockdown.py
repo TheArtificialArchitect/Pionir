@@ -1102,14 +1102,16 @@ class RemoteHalf(unittest.TestCase):
                 self.assertEqual([d["in_s"] for d in g["due"]], [] if in_s is None else [in_s], g)
                 self.assertEqual(g["safe"], in_s is None and not unknown, g)
 
-    def test_the_due_window_is_fifteen_minutes_and_a_past_timer_is_not_due(self) -> None:
+    def test_the_due_window_is_fifteen_minutes_with_a_grace_for_an_elapsed_timer(self) -> None:
         def at(delta: int):
             return self.guard_one(self.busctl_answers((self.T0 + delta) * 1_000_000))
         self.assertEqual([d["in_s"] for d in at(14 * 60 + 59)["due"]], [14 * 60 + 59])
         self.assertEqual(at(15 * 60 + 1)["due"], [])
         self.assertEqual([d["in_s"] for d in at(15 * 60)["due"]], [900])
         self.assertEqual([d["in_s"] for d in at(0)["due"]], [0])
-        self.assertEqual(at(-1)["due"], [])                      # already past: its service (if any) is the busy check's
+        self.assertEqual([d["in_s"] for d in at(-1)["due"]], [-1])       # elapsed, maybe not yet fired (AccuracySec)
+        self.assertEqual([d["in_s"] for d in at(-299)["due"]], [-299])
+        self.assertEqual(at(-301)["due"], [])                    # long past: fired (or never will); its service is the busy check's
         self.assertTrue(at(15 * 60 + 1)["safe"])
         self.assertFalse(at(14 * 60 + 59)["safe"])
 
@@ -1126,7 +1128,8 @@ class RemoteHalf(unittest.TestCase):
             with self.subTest(via):
                 self.assertEqual([d["in_s"] for d in mono(14 * 60 + 59, via=via)["due"]], [14 * 60 + 59])
                 self.assertEqual(mono(15 * 60 + 1, via=via)["due"], [])
-                self.assertEqual(mono(-30, via=via)["due"], [])
+                self.assertEqual([d["in_s"] for d in mono(-30, via=via)["due"]], [-30])
+                self.assertEqual(mono(-3600, via=via)["due"], [])
                 self.assertFalse(mono(60, via=via)["safe"])
         # both triggers: the sooner one counts (calendar far, monotonic near - and the reverse)
         far = self.T0 + 5 * 3600

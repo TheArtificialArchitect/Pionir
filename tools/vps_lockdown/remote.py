@@ -689,6 +689,8 @@ HTTP_JSON = _http_json
 
 
 WINDOW_S = 15 * 60                 # a timer this close to firing is "due"
+GRACE_S = 5 * 60                   # ... and one that elapsed this recently may not have fired yet (AccuracySec
+                                   # lets systemd start it up to a minute or more AFTER its next-elapse stamp)
 EPOCH_RANGE_S = (1_000_000_000, 4_000_000_000)     # a plausible next-run stamp, in seconds (2001..2096)
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 DATE_RE = re.compile(r"(?:(Mon|Tue|Wed|Thu|Fri|Sat|Sun) )?(\d{4})-(\d\d)-(\d\d) (\d\d):(\d\d):(\d\d)(?:\.(\d{1,6}))? UTC")
@@ -836,7 +838,7 @@ def step_guard(p: dict) -> dict:
             ins.append(rt - now)
         if mono != NONE:
             ins += [mono / 1e6 - clock() for clock in MONO_CLOCKS]
-        soon = [x for x in ins if 0 <= x <= WINDOW_S]
+        soon = [x for x in ins if -GRACE_S <= x <= WINDOW_S]
         if soon:
             due.append({"timer": timer, "in_s": int(min(soon))})
     jobs = None
