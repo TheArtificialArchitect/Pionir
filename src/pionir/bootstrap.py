@@ -274,6 +274,12 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         from .adapters.builds import BuildCardAdapter, build_card_settings
 
         runtime.register(BuildCardAdapter(build_card_settings(configured)))
+    if configured.mailbox:
+        # The owner's second Gmail, read only. The credentials file is read when a call
+        # runs (not_configured until it exists); no network at boot.
+        from .adapters.mailbox import MailboxAdapter, mailbox_settings
+
+        runtime.register(MailboxAdapter(mailbox_settings(configured)))
     if configured.content_url is not None and configured.instagram_graph_url is not None:
         # Needs Scrooge to host the card image. No boot-time call: both token files are
         # read when a post runs. social.instagram_post always parks for approval.
