@@ -549,11 +549,14 @@ def step_deploy(p: dict) -> dict:
     except SyntaxError as error:
         return {"step": "deploy", "error": f"does not compile: line {error.lineno}"}
     with open(path, "rb") as fh:
-        running = hashlib.sha256(fh.read()).hexdigest()
+        raw = fh.read()
+    running = hashlib.sha256(raw).hexdigest()
     if running == p["sha256"]:
         return {"step": "deploy", "path": path, "deployed": False, "unchanged": True}
+    # a file put there from Windows has CRLF line endings: the same code, a different hash
+    running_lf = hashlib.sha256(raw.replace(b"\r\n", b"\n")).hexdigest()
     bases = [b for b in p.get("base_sha256", []) if b]
-    if bases and running not in bases and not p.get("allow_drift"):
+    if bases and running not in bases and running_lf not in bases and not p.get("allow_drift"):
         # the file on the VPS is not the one the reviewed change was made against: putting
         # the new one there would ship every other difference too
         return {"step": "deploy", "error": f"{path} is not the reviewed base version (it has changes the review did not see): nothing replaced", "drift": True}

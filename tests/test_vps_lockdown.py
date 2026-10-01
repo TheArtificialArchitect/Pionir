@@ -990,6 +990,12 @@ class RemoteHalf(unittest.TestCase):
         target.write_bytes(b"BASE\n")
         self.assertTrue(self.r.step_deploy(pay())["deployed"])
         self.assertIn("error", self.r.step_deploy(pay(path="/etc/passwd")))
+        # the base with Windows line endings is still the base; a real change with them is not
+        target.write_bytes(b"BASE\r\n")
+        self.assertTrue(self.r.step_deploy(pay())["deployed"])
+        target.write_bytes(b"BASX\r\n")
+        self.assertTrue(self.r.step_deploy(pay())["drift"])
+        self.assertEqual(target.read_bytes(), b"BASX\r\n")
 
     def test_the_guard(self) -> None:
         self.r.NOW = lambda: 1_800_000_000
