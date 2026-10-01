@@ -233,6 +233,12 @@ class PionirSettings:
     # touches Fiverr. Off unless PIONIR_FIVERR_DESK=1, and off in a bare PionirSettings, so a
     # test runtime is never wired to the real bot (the owner_notify rule).
     fiverr_desk: bool = False
+    # The owner's second Gmail, read only (adapters/mailbox.py: mail.inbox, mail.read). On in
+    # from_environment (PIONIR_MAILBOX=0 leaves it unregistered) and answers not_configured
+    # until ~/.pionir/secrets/pantheon-gmail.txt exists; off in a bare PionirSettings so a
+    # test runtime never reaches Gmail.
+    mailbox: bool = False
+    mailbox_secret_file: Path | None = None
     # fiverr.events / fiverr.ack read and acknowledge the order events Scrooge takes from
     # Fiverr's emails (GET /dash/fiverr/events). Off (they answer "unavailable") until
     # Scrooge serves the route: PIONIR_FIVERR_EVENTS=1 turns them on.
@@ -406,6 +412,13 @@ class PionirSettings:
         return home / ".pionir" / "secrets"
 
     @property
+    def mailbox_secret_path(self) -> Path:
+        """Line 1 the Gmail address, line 2 its app password; read when a call runs."""
+        if self.mailbox_secret_file is not None:
+            return self.mailbox_secret_file
+        return self.secrets_path / "pantheon-gmail.txt"
+
+    @property
     def instagram_token_path(self) -> Path:
         if self.instagram_token_file is not None:
             return self.instagram_token_file
@@ -571,6 +584,8 @@ class PionirSettings:
                          not in {"0", "off", "false", "no"}),
             owner_notify=(os.environ.get("PIONIR_OWNER_NOTIFY", "1").strip().lower()
                           not in {"0", "off", "false", "no"}),
+            mailbox=(os.environ.get("PIONIR_MAILBOX", "1").strip().lower()
+                     not in {"0", "off", "false", "no"}),
             fiverr_desk=(os.environ.get("PIONIR_FIVERR_DESK", "0").strip().lower()
                          in {"1", "on", "true", "yes"}),
             fiverr_events=(os.environ.get("PIONIR_FIVERR_EVENTS", "0").strip().lower()
