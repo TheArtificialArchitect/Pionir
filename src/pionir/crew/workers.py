@@ -347,6 +347,14 @@ def product_shelf(spec, **params):
     return ProductShelf(spec, **params)
 
 
+def api_builder(spec, **params):
+    """REAL. ``products.api_builder`` (apibuild/worker.py): a paid API product written by the
+    Write-only Claude runner, checked, staged on a branch of the Scrooge repo, and verified
+    only on the owner's yes."""
+    from .apibuild.worker import ApiBuilder
+    return ApiBuilder(spec, **params)
+
+
 def fiverr_gigs(spec, **params):
     """REAL. ``fiverr.gigs`` (fiverr/gigs.py): one checked Fiverr listing per service, handed to
     the owner on Discord to paste into Fiverr himself; redrafted only when he asks."""
@@ -381,6 +389,7 @@ IMPLS = {
     "delivery_desk": delivery_desk,
     "finder": finder,
     "product_shelf": product_shelf,
+    "api_builder": api_builder,
     "fiverr_gigs": fiverr_gigs,
     "fiverr_desk": fiverr_desk,
     "fiverr_earnings": fiverr_earnings,

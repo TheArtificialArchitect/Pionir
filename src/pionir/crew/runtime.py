@@ -143,6 +143,8 @@ class Crew:
                            build_site=partial(self.escalator.build_site, worker.division),
                            review=partial(self.escalator.review, worker.division),
                            fiverr_dir=getattr(self.cfg, "fiverr_dir", None),
+                           apibuilds_dir=getattr(self.cfg, "apibuilds_dir", None),
+                           scrooge_repo=getattr(self.cfg, "scrooge_repo", None),
                            digest=getattr(self.cfg, "digest", None))
 
     def _words(self, worker, purpose: str, system: str, user: str, schema: dict) -> Result:

@@ -973,6 +973,32 @@ def _instagram_lines(payload: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+APIBUILD_VERIFY = "apibuild.verify"
+
+
+def apibuild_lines(row: Mapping[str, Any]) -> list[str]:
+    """The staged API product as parked: its branch, commit, files and diff stat, and what
+    approving runs. Approving runs the checks only; nothing is deployed."""
+    context = row.get("context")
+    lines = ["🧪 **RUNS A MODEL-WRITTEN API PRODUCT'S CHECKS** - tsc and the tests run "
+             "in a worktree of the Scrooge repo if you approve. Nothing is deployed, pushed "
+             "or written to D1."]
+    if not isinstance(context, Mapping):
+        return lines
+    lines.append(f"**Branch:** `{_fence_safe(str(context.get('branch')))}` at "
+                 f"`{_fence_safe(str(context.get('commit')))}`")
+    files = context.get("files")
+    if isinstance(files, list) and files:
+        lines.append("**Files:** " + ", ".join(f"`{_fence_safe(str(f))}`" for f in files))
+    stat = context.get("diff_stat")
+    if isinstance(stat, str) and stat:
+        lines += ["**Diff stat:**", _FENCE, _fence_safe(stat), _FENCE]
+    for key, label in (("checks", "Already checked"), ("runs", "Approving runs")):
+        if isinstance(context.get(key), str):
+            lines.append(f"**{label}:** {_escape(context[key])}")
+    return lines
+
+
 def render_request(row: Mapping[str, Any], owner: str | None, *,
                    delivery: Mapping[str, Any] | None = None,
                    product: Mapping[str, Any] | None = None,
@@ -1012,6 +1038,8 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
         listing = listing_line(row)
         if listing:
             lines.append(listing)
+    if row.get("capability") == APIBUILD_VERIFY:
+        lines += apibuild_lines(row)
     if delivers:
         lines.append(client_deliver_line(payload.get("to")))
         if payload.get("hold_for_balance") is True:
