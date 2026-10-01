@@ -158,9 +158,20 @@
       "id": "builds",
       "title": "Builds",
       "leader_cadence_seconds": 21600,
+      "entities": ["Daedalus", "Claude", "Gumroad", "Discord"],
+      "leader_notes": "builds.daedalus builds the owner's small paid developer tools ($9-19 each on Gumroad), one product a night: a contained Daedalus (a separate, firewalled Windows user) writes it in its own fresh sandbox repo, ONLY inside the overnight window (build.tally's window, local time) because it takes the whole GPU, one job at a time; then our own checks (the product's tests run by us, no network access, no secrets or owner data, the licence) and Claude's review. Only a build Claude APPROVED is staged on the product shelf, and a staged product is NOT on sale: products.shelf submits it for the owner's approval like every product, so never call a built or staged product live, published or on sale. Report each build.staged row first (the product's slug, name and listing price as recorded), then each build.shelved row with its reason (a build rejected again after its one repair, one whose review could not be completed, or one that could not be staged). A build.rejected row is a review that said no, with its reasons: its one repair follows. build.attempt_failed is a Daedalus attempt that failed its own gate or ran out of time: a repair follows. build.waiting means Daedalus, the GPU or Claude's budget was not available: the build waits, it did not fail. When the worker reports NOT CONFIGURED, the owner has not yet run tools\\setup-build-sandbox.ps1: nothing is built until he does - say exactly that. build.tally holds the counts: products staged, shelved, in progress (with what each waits for), the backlog's next products, whether Daedalus is down, and cards that did not reach Discord. The owner edits the backlog by replying to the Builds cards; build.backlog_reply rows say what his replies changed. Never invent a sale, a price or a product; prices are the listing prices the rows state, never revenue.",
+      "brief_quota": {"build.tally": 3, "build.staged": 5, "build.shelved": 5,
+                      "build.rejected": 5, "build.built": 4, "build.started": 4,
+                      "build.attempt_failed": 4, "build.waiting": 3,
+                      "build.waiting_for_claude": 2, "build.review_failed": 3,
+                      "build.backlog_reply": 4, "build.night_reported": 2,
+                      "build.not_set_up": 2, "build.checks_unavailable": 2,
+                      "build.backlog_unreadable": 2},
       "workers": [
-        {"name": "daedalus", "impl": "placeholder", "kind": "build", "cadence_seconds": 21600,
-         "provider": "none", "entities": ["Daedalus"], "note": "coding jobs through Daedalus"}
+        {"name": "daedalus", "impl": "daedalus_builds", "uses": ["builds.card", "builds.inbox", "coding.daedalus_build", "coding.daedalus_build_cancel"], "kind": "build", "cadence_seconds": 300,
+         "provider": "claude", "entities": ["Daedalus", "Claude"],
+         "note": "one small developer tool a night, built by Daedalus in a fresh sandbox repo inside the overnight GPU window, reviewed by Claude on the daily cap, and staged for the product shelf (still the owner's approval before any sale)",
+         "params": {"window": "01:00-07:00", "budget_minutes": 45, "max_attempts": 2, "ssh_dir": "~/.ssh"}}
       ]
     }
   ]

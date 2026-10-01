@@ -58,6 +58,10 @@ EXPECTED = {
     "crew.set_goal": ("auto", None),
     "crew.allocate": ("auto", None),
     "coding.daedalus_solve": ("card", None),
+    "coding.daedalus_build": ("card", None),
+    "coding.daedalus_build_cancel": ("auto", None),
+    "builds.card": ("auto", None),
+    "builds.inbox": ("auto", None),
     "fiverr.events": ("auto", None),
     "fiverr.ack": ("auto", None),
     "fiverr.card": ("auto", None),
@@ -110,7 +114,7 @@ def _full_runtime(case: unittest.TestCase, tmp: str):
         bryo_status_command=_NO_BINARY, bryo_pressure=False,
         nyx_status_command=_NO_BINARY, voodoo_status_command=_NO_BINARY,
         evict_to_fit=False, crew_url=down_url(),
-        owner_notify=True, quote_cards=True, fiverr_desk=True,
+        owner_notify=True, quote_cards=True, fiverr_desk=True, builds_cards=True,
         client_token_dir=Path(tmp) / "secrets",
     ))
 

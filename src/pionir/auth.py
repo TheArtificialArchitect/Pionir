@@ -97,11 +97,31 @@ SIGNED_ONLY = frozenset({"desktop"})
 SIGN_HEADERS = ("X-Pionir-Client", "X-Pionir-Ts", "X-Pionir-Nonce", "X-Pionir-Sig")
 SIGN_WINDOW = 30.0            # seconds a signed request may be off this server's clock
 
-# The hook for the one narrow pre-grant ever planned: the Daedalus sandbox work will let
-# the crew run sandboxed solves without parking. It adds that permission HERE and to the
-# crew's DEFAULT_GRANTS entry. Until then this is empty, so no client - and no grants
-# file - can hold a privileged permission: every privileged action parks for the owner.
-GRANTABLE_PERMISSIONS: frozenset[str] = frozenset()
+# The one narrow pre-grant: the crew's Builds division may run Daedalus in its SANDBOX
+# without parking. A grantable permission is scoped twice, here and in code only: to the
+# ONE client that may hold it, and to the ONE capability it unlocks. ``coding.daedalus_build``
+# itself reaches nothing but a sandbox repo the Builds worker made (adapters/daedalus.py),
+# running as the contained ``pionir-builds`` user. No other permission is grantable, so every
+# other privileged action from every client still parks for the owner.
+PERMISSION_SCOPES: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
+    "daedalus.build_sandbox": (frozenset({"crew"}), frozenset({"coding.daedalus_build"})),
+}
+GRANTABLE_PERMISSIONS: frozenset[str] = frozenset(PERMISSION_SCOPES)
+
+
+def scoped(permissions: Iterable[str], client: str, capability: str | None = None
+           ) -> frozenset[str]:
+    """The permissions this client may hold (and, given a capability, the ones that
+    unlock THAT capability): every other one is dropped."""
+    out = set()
+    for permission in permissions:
+        scope = PERMISSION_SCOPES.get(permission)
+        if scope is None or client not in scope[0]:
+            continue
+        if capability is not None and capability not in scope[1]:
+            continue
+        out.add(permission)
+    return frozenset(out)
 
 COMPAT_ENV = "PIONIR_AUTH_COMPAT"
 TOKEN_DIR_ENV = "PIONIR_CLIENT_TOKEN_DIR"
@@ -126,12 +146,23 @@ class ClientGrant:
     def allows_capability(self, name: str) -> bool:
         return any(fnmatchcase(name, pattern) for pattern in self.capabilities)
 
+    def permissions_for(self, capability: str | None) -> frozenset[str]:
+        """The permissions this grant holds that unlock ``capability`` - never one that is
+        scoped to another capability (PERMISSION_SCOPES)."""
+        out = set()
+        for permission in self.permissions:
+            scope = PERMISSION_SCOPES.get(permission)
+            if scope is not None and capability in scope[1]:
+                out.add(permission)
+        return frozenset(out)
+
 
 # The code default: the same non-privileged set each client could reach before (every
 # non-privileged capability; privileged ones park, as they did for every caller that
 # sent no permission), bounded to the routes each actually uses.
 DEFAULT_GRANTS: Mapping[str, ClientGrant] = {
-    "crew": ClientGrant(frozenset({TASK}), ("*",)),
+    # the crew's one privileged permission: Daedalus builds in the sandbox, nothing else
+    "crew": ClientGrant(frozenset({TASK}), ("*",), frozenset({"daedalus.build_sandbox"})),
     "galatea": ClientGrant(frozenset({TASK, INTENT}), ("*",)),
     "atani": ClientGrant(frozenset({TASK}), ("*",)),
     "dashboard": ClientGrant(frozenset({TASK, INTENT, ROUTE, APPROVE}), ("*",)),
@@ -260,10 +291,11 @@ def load_grants(path: Path | None) -> dict[str, ClientGrant]:
             routes -= {APPROVE}
         capabilities = tuple(str(c) for c in entry.get("capabilities", base.capabilities))
         asked = frozenset(str(p) for p in entry.get("permissions", base.permissions))
-        refused = asked - GRANTABLE_PERMISSIONS
+        allowed = scoped(asked, client)
+        refused = asked - allowed
         if refused:
             _log.warning("client grants: %s may not hold %s; dropped", client, sorted(refused))
-        grants[client] = ClientGrant(routes, capabilities, asked & GRANTABLE_PERMISSIONS)
+        grants[client] = ClientGrant(routes, capabilities, allowed)
     return grants
 
 

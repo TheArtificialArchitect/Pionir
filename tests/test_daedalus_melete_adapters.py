@@ -55,6 +55,7 @@ class AsyncFakeClient:
 
 
 def _daedalus_task(content="add a null check", **payload):
+    payload.setdefault("repo", "C:/src/thing")
     return Task("coding.daedalus_solve", {"content": content, **payload}, frozenset({"daedalus.solve"}))
 
 
@@ -137,21 +138,25 @@ class DaedalusTests(unittest.TestCase):
 
     def test_timeout_requests_cancellation_and_preserves_job_id(self) -> None:
         client = AsyncFakeClient(running=True)
-        ticks = iter((0.0, 6.0))
+        ticks = iter(range(0, 10 ** 6, 6))
         adapter = DaedalusAdapter(
             DaedalusSettings(
                 timeout_seconds=5,
                 request_timeout_seconds=5,
                 poll_interval_seconds=0.01,
+                cancel_grace_seconds=30,
             ),
             client=client,
             sleep=lambda _s: None,
-            monotonic=lambda: next(ticks),
+            monotonic=lambda: float(next(ticks)),
         )
         with self.assertRaises(AdapterTimeout) as caught:
             adapter.execute(_daedalus_task())
         self.assertEqual(caught.exception.job_id, "job-1")
-        self.assertEqual(client.calls[-1][0], "/jobs/job-1/cancel")
+        paths = [c[0] for c in client.calls]
+        self.assertIn("/jobs/job-1/cancel", paths)
+        # and it waited on the job after the cancel, before handing the lease back
+        self.assertEqual(paths[paths.index("/jobs/job-1/cancel") + 1], "/jobs/job-1")
 
 
 class MeleteTests(unittest.TestCase):

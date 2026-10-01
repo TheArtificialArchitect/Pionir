@@ -91,6 +91,25 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(settings.nyx_status_cwd, directory)
         self.assertEqual(settings.voodoo_status_cwd, directory)
 
+    def test_bootstrap_hands_nyx_its_working_directory(self) -> None:
+        from pionir.bootstrap import build_runtime
+
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = build_runtime(PionirSettings(
+                state_root=Path(directory).resolve(), atani_command=("no-such-binary",),
+                bryo_status_command=None, daedalus_url=None, melete_url=None,
+                crew_url=None, galatea_url=None, content_url=None, gumroad_url=None,
+                evict_to_fit=False, embed_model=None,
+                nyx_status_cwd=directory, voodoo_status_cwd=directory))
+            try:
+                nyx = runtime.adapters["nyx"]
+                self.assertEqual(nyx.settings.cwd, directory)
+                self.assertEqual(nyx._runner._cwd, directory)
+                self.assertEqual(nyx.settings.run_prefix, ("python", "-m", "nyx"))
+                self.assertEqual(runtime.adapters["voodoo"].settings.cwd, directory)
+            finally:
+                runtime.cortex.close()
+
     def test_rejects_relative_shared_gpu_lock_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             settings = PionirSettings(

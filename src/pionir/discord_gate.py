@@ -1388,6 +1388,7 @@ class DiscordGate:
         inspect_product: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
         quotes: QuoteReplies | None = None,
         fiverr: FiverrReplies | None = None,
+        builds: FiverrReplies | None = None,
         digest: DigestSettings | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
@@ -1403,6 +1404,9 @@ class DiscordGate:
         # The owner's replies to the Fiverr desk's cards -> recorded for the crew
         # (pionir/fiverr.py). Only his; nothing is acted on here.
         self._fiverr = fiverr
+        # The owner's replies to the Builds division's cards (adapters/builds.py), recorded
+        # the same way for the crew. Only his; nothing is acted on here.
+        self._builds = builds
         self._approvals = approvals      # ApprovalQueue: pending() / get()
         self._approve = approve          # PionirApp.approve: claim, run as a job, settle
         self._deny = deny                # PionirApp.deny
@@ -1456,6 +1460,12 @@ class DiscordGate:
         if fiverr is not None and "fiverr" not in kwargs:
             # Read only for the Fiverr cards in its record: with none posted, nothing is read.
             kwargs["fiverr"] = FiverrReplies(fiverr_store_for(settings.state_root))
+        builds = adapters.get("builds") if isinstance(adapters, Mapping) else None
+        if builds is not None and "builds" not in kwargs:
+            # Read only for the Builds cards in their record: with none posted, nothing is read.
+            from .adapters.builds import build_replies
+
+            kwargs["builds"] = build_replies(settings.state_root)
         if isinstance(getattr(app, "digest", None), DigestSettings):
             kwargs.setdefault("digest", app.digest)   # the same settings that batch at enqueue
         return cls(settings, approvals=app.approvals, approve=app.approve, deny=app.deny,
@@ -1685,6 +1695,9 @@ class DiscordGate:
                 self._call, self.settings.owner, str(self.settings.channel_id)))
         if self._fiverr is not None:
             self._guard("fiverr-replies", lambda: self._fiverr.tick(
+                self._call, self.settings.owner, str(self.settings.channel_id)))
+        if self._builds is not None:
+            self._guard("build-replies", lambda: self._builds.tick(
                 self._call, self.settings.owner, str(self.settings.channel_id)))
         pending = self._approvals.pending()     # also auto-denies the expired
         fresh = set()

@@ -706,7 +706,7 @@ class PionirApp:
                 return {"executed": False, "decision": _decision_json(decision),
                         "error": {"type": "NotGranted",
                                   "message": f"{client} may not call {decision.capability}"}}
-            permissions = sorted(grant.permissions)
+            permissions = sorted(grant.permissions_for(decision.capability))
         try:
             _, result = self.router.route(
                 request, granted_permissions=permissions or ()
@@ -1075,7 +1075,8 @@ class PionirApp:
             grant = self.auth.grant(client)
             if client == ANONYMOUS and self._privileged(capability):
                 raise Unauthenticated(f"{capability} is privileged; send your client token")
-            granted = sorted(grant.permissions)
+            # only the permissions scoped to THIS capability (auth.PERMISSION_SCOPES)
+            granted = sorted(grant.permissions_for(capability))
         else:
             # the approval markers are added by approve() alone, after the owner's yes: a
             # caller that names one is not believed (arming live trading checks for it)

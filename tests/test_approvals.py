@@ -65,7 +65,7 @@ class GateTests(unittest.TestCase):
         self._t.cleanup()
 
     def test_privileged_without_permission_is_parked_not_run(self):
-        out = self.app.run_task("coding.daedalus_solve", {"content": "refactor X"})
+        out = self.app.run_task("coding.daedalus_solve", {"content": "refactor X", "repo": "C:/src/thing"})
         self.assertEqual(out["status"], "pending_approval")
         self.assertIn("approval_id", out)
         self.assertIn("daedalus", out["summary"])
@@ -74,12 +74,12 @@ class GateTests(unittest.TestCase):
     def test_granted_permission_bypasses_the_gate(self):
         # with the permission, it runs (daedalus is a 503 stand-in here, so it errors -
         # but it is NOT parked); the gate only holds the UN-permitted.
-        out = self.app.run_task("coding.daedalus_solve", {"content": "x"},
+        out = self.app.run_task("coding.daedalus_solve", {"content": "x", "repo": "C:/src/thing"},
                                 permissions=["daedalus.solve"])
         self.assertNotEqual(out.get("status"), "pending_approval")
 
     def test_approve_runs_it_then_cannot_run_twice(self):
-        aid = self.app.run_task("coding.daedalus_solve", {"content": "x"})["approval_id"]
+        aid = self.app.run_task("coding.daedalus_solve", {"content": "x", "repo": "C:/src/thing"})["approval_id"]
         res = self.app.approve(aid)
         # Claimed and running as a job: the answer comes back at once with the
         # job's id; the approval record settles when the job ends.
@@ -96,12 +96,12 @@ class GateTests(unittest.TestCase):
         self.assertFalse(self.app.approve(aid)["ok"])       # already resolved
 
     def test_deny_never_runs_it(self):
-        aid = self.app.run_task("coding.daedalus_solve", {"content": "x"})["approval_id"]
+        aid = self.app.run_task("coding.daedalus_solve", {"content": "x", "repo": "C:/src/thing"})["approval_id"]
         self.assertTrue(self.app.deny(aid)["ok"])
         self.assertEqual(self.app.approvals.get(aid)["status"], "denied")
 
     def test_view_lists_pending_and_recent(self):
-        self.app.run_task("coding.daedalus_solve", {"content": "a"})
+        self.app.run_task("coding.daedalus_solve", {"content": "a", "repo": "C:/src/thing"})
         view = self.app.approvals_view()
         self.assertEqual(len(view["pending"]), 1)
         self.assertGreaterEqual(len(view["recent"]), 1)

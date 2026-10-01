@@ -159,6 +159,13 @@ class WorkContext:
     # Pionir's server stamps each batched approval's ``digest_date`` with). A daily poster
     # drafts in time for it (blog.DailyPoster.draft_due); None: a plain 24-hour spacing.
     digest: Any = None
+    # (capability, task_id) -> hands.JobOutcome: what became of a job Pionir is still running
+    # (one submitted with ``Job.follow=0``). A read: it starts nothing. None: not available.
+    task: Callable[..., Any] | None = None
+    # the Builds division's folder (config.CrewSettings.builds_dir: its backlog.json) and its
+    # sandbox workspace, where each product gets a fresh repo (CrewSettings.builds_sandbox)
+    builds_dir: Path | None = None
+    builds_sandbox: Path | None = None
 
 
 @runtime_checkable

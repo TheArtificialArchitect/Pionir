@@ -60,6 +60,11 @@ class Job:
     what: str = ""                  # in words: "send the follow-ups"
     permissions: tuple = ()         # never sent: Pionir parks anything privileged for the owner
     wait: float = 30.0              # seconds Pionir may hold the call before handing back an id
+    # seconds the hands keep following it while Pionir says it is still running (None: the
+    # crew's job_follow_seconds). 0 hands back ``running`` with its task id at once - for a job
+    # that runs for most of an hour (a Daedalus build), which the worker follows itself with
+    # ``WorkContext.task`` rather than holding the one hands thread every other worker needs.
+    follow: float | None = None
 
     def __post_init__(self) -> None:
         if not self.capability or not isinstance(self.capability, str):
@@ -286,7 +291,8 @@ class Hands:
             return JobOutcome("unreachable", job.capability,
                               error="the hands are stopped; the job was not sent")
         self.submit(agent_id, job, callback)
-        wait = timeout if timeout is not None else self.follow_seconds + job.wait + 120
+        follow = self.follow_seconds if job.follow is None else max(0.0, float(job.follow))
+        wait = timeout if timeout is not None else follow + job.wait + 120
         deadline = time.monotonic() + wait
         while not done.wait(0.25):
             if self._stop.is_set() or time.monotonic() >= deadline:
@@ -317,6 +323,27 @@ class Hands:
             if isinstance(row, dict) and row.get("id") == approval_id:
                 return dict(row)
         return {"status": "unknown"}
+
+    def task_outcome(self, capability: str, task_id: str) -> JobOutcome:
+        """What became of a job Pionir is running (one submitted with ``follow=0``): a read
+        of ``GET /api/task/<id>``, answered at once - it starts nothing and does not wait on
+        the hands' queue. ``running`` while Pionir says so; ``unreachable`` when Pionir could
+        not be asked; otherwise the job's own outcome (``failed`` for an id Pionir does not
+        know)."""
+        try:
+            record = self.client.task(task_id, wait=0.0)
+        except Exception as exc:  # noqa: BLE001 - not knowing is an answer, never a crash
+            return JobOutcome("unreachable", capability, task_id=task_id,
+                              error=f"{type(exc).__name__}: {exc}")
+        if not isinstance(record, dict):
+            return JobOutcome("failed", capability, task_id=task_id,
+                              error="Pionir's task record is not an object")
+        if record.get("status") == "running":
+            return JobOutcome("running", capability, task_id=task_id)
+        inner = record.get("result")
+        out = outcome_of(capability, inner if isinstance(inner, dict) else record)
+        out.task_id = out.task_id or task_id
+        return out
 
     # ---- the worker -----------------------------------------------------
     def step(self) -> bool:
@@ -378,7 +405,8 @@ class Hands:
         doc = self.client.run_task(job.capability, dict(job.payload),
                                    permissions=tuple(job.permissions), wait=job.wait)
         out = outcome_of(job.capability, doc)
-        deadline = self._now() + self.follow_seconds
+        follow = self.follow_seconds if job.follow is None else max(0.0, float(job.follow))
+        deadline = self._now() + follow
         while out.status == "running" and out.task_id and not self._stop.is_set():
             left = deadline - self._now()
             if left <= 0:

@@ -143,7 +143,10 @@ class Crew:
                            build_site=partial(self.escalator.build_site, worker.division),
                            review=partial(self.escalator.review, worker.division),
                            fiverr_dir=getattr(self.cfg, "fiverr_dir", None),
-                           digest=getattr(self.cfg, "digest", None))
+                           digest=getattr(self.cfg, "digest", None),
+                           task=self.hands.task_outcome,
+                           builds_dir=getattr(self.cfg, "builds_dir", None),
+                           builds_sandbox=getattr(self.cfg, "builds_sandbox", None))
 
     def _words(self, worker, purpose: str, system: str, user: str, schema: dict) -> Result:
         """The ONLY way a worker reaches a model: the shared brain, JSON-schema output,

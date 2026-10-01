@@ -751,6 +751,22 @@ class InProcessRules(unittest.TestCase):
             self.app.route("x", permissions=["gate.run"], client="crew")
         self.assertEqual(self.spec.ran, [])
 
+    def test_the_crews_sandbox_grant_unlocks_only_the_sandbox_build(self) -> None:
+        # a privileged capability that needs the very same permission, under another name:
+        # the crew's grant is scoped to coding.daedalus_build, so this still parks
+        class Lookalike(Recorder):
+            def __init__(self) -> None:
+                super().__init__()
+                self._manifest = AgentManifest("lookalike", "test", (
+                    Capability("gate.sandbox_like", "privileged", risk=RiskLevel.PRIVILEGED,
+                               required_permissions=frozenset({"daedalus.build_sandbox"})),))
+
+        spec = Lookalike()
+        self.app.runtime.register(spec)
+        out = self.app.run_task("gate.sandbox_like", {}, client="crew", wait=30)
+        self.assertEqual(out["status"], "pending_approval", out)
+        self.assertEqual(spec.ran, [])
+
     def test_anonymous_holds_nothing_once_the_window_is_shut(self) -> None:
         self.app.auth.compat = True
         self.assertTrue(self.app.run_task("gate.read", {}, client=auth.ANONYMOUS)["ok"])
@@ -844,11 +860,26 @@ class GrantsFile(unittest.TestCase):
         self.assertEqual(load_grants(self.path), dict(auth.DEFAULT_GRANTS))
 
     def test_no_default_grant_holds_a_permission_or_lets_a_tasking_client_approve(self) -> None:
+        # the one exception: the crew's sandbox build, scoped to that one capability
         for client, grant in auth.DEFAULT_GRANTS.items():
-            self.assertEqual(grant.permissions, frozenset(), client)
+            expected = frozenset({"daedalus.build_sandbox"}) if client == "crew" else frozenset()
+            self.assertEqual(grant.permissions, expected, client)
             if auth.APPROVE in grant.routes:
                 self.assertIn(client, auth.APPROVERS)
-        self.assertEqual(auth.GRANTABLE_PERMISSIONS, frozenset())
+        self.assertEqual(auth.GRANTABLE_PERMISSIONS, frozenset({"daedalus.build_sandbox"}))
+        crew = auth.DEFAULT_GRANTS["crew"]
+        self.assertEqual(crew.permissions_for("coding.daedalus_build"),
+                         frozenset({"daedalus.build_sandbox"}))
+        for other in ("coding.daedalus_solve", "security.nyx_run", "product.gumroad_publish",
+                      None, ""):
+            self.assertEqual(crew.permissions_for(other), frozenset(), other)
+
+    def test_the_sandbox_grant_cannot_be_given_to_another_client(self) -> None:
+        grants = self._load({"galatea": {"permissions": ["daedalus.build_sandbox"]},
+                             "atani": {"permissions": ["daedalus.build_sandbox",
+                                                       "daedalus.solve"]}})
+        self.assertEqual(grants["galatea"].permissions, frozenset())
+        self.assertEqual(grants["atani"].permissions, frozenset())
 
     def test_a_file_narrows_a_client(self) -> None:
         grants = self._load({"crew": {"capabilities": ["client.*"]}})
@@ -859,7 +890,8 @@ class GrantsFile(unittest.TestCase):
         grants = self._load({"crew": {"permissions": ["daedalus.solve"],
                                       "routes": ["task", "approve"]},
                              "stranger": {"routes": ["task"]}})
-        self.assertEqual(grants["crew"].permissions, frozenset())
+        self.assertNotIn("daedalus.solve", grants["crew"].permissions)
+        self.assertEqual(grants["crew"].permissions_for("coding.daedalus_solve"), frozenset())
         self.assertNotIn(auth.APPROVE, grants["crew"].routes)
         self.assertNotIn("stranger", grants)
 
