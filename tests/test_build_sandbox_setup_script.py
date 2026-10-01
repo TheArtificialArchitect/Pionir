@@ -44,6 +44,7 @@ class SetupScriptTests(unittest.TestCase):
         code = "\n".join(line for line in self.text.splitlines()
                          if not line.lstrip().startswith("#"))
         code = re.sub(r'@"\n.*?\n"@', "", code, flags=re.S)          # the Python probe
+        code = re.sub(r"@'\n.*?\n'@", "", code, flags=re.S)          # the node probe (JavaScript)
         for op in ("&&", "||", "??", "?."):
             self.assertNotIn(op, code, op)
         self.assertIsNone(re.search(r"\)\s*\?\s*[^\s]+\s*:", code))  # a ternary

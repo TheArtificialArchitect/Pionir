@@ -23,6 +23,7 @@ from pathlib import Path
 from ..adapters.daedalus import DEFAULT_SANDBOX_ROOT
 from ..config import PionirSettings
 from .affiliate import programs_from_environment
+from .escalation import DEFAULT_CLAUDE_MODEL, DEFAULT_NIGHT_CAP, clean_model
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 
@@ -70,6 +71,12 @@ class CrewSettings:
     leader_pool_size: int = 2
     # Claude escalations per local day across ALL leaders. 0 turns escalation off.
     claude_daily_cap: int = 10
+    # Overnight Claude work (the Builds division's review, the API builder's review and edit)
+    # is held tighter: at most this many calls a night (noon to noon), INSIDE the daily cap,
+    # on this model (passed to `claude --model`; "default" = the CLI's own default).
+    # PIONIR_CREW_CLAUDE_NIGHT_CAP / PIONIR_CREW_CLAUDE_MODEL override.
+    claude_night_cap: int = DEFAULT_NIGHT_CAP
+    claude_model: str = DEFAULT_CLAUDE_MODEL
     escalation_timeout_seconds: float = 300.0
     # The loopback HTTP API Moss reaches the crew through (api.py), via Pionir's
     # ``crew.*`` capabilities. Bound to 127.0.0.1 only. 0 takes a free port (tests);
@@ -134,6 +141,9 @@ class CrewSettings:
             raise ValueError("pool sizes must be positive")
         if self.claude_daily_cap < 0:
             raise ValueError("claude_daily_cap cannot be negative")
+        if self.claude_night_cap < 0:
+            raise ValueError("claude_night_cap cannot be negative")
+        clean_model(self.claude_model)
         if self.api_port is not None and (isinstance(self.api_port, bool)
                                           or not 0 <= self.api_port <= 65535):
             raise ValueError("api_port is a TCP port (0-65535), or None for no API")
@@ -185,6 +195,8 @@ class CrewSettings:
             ("PIONIR_CREW_REQUEST_TTL_SECONDS", "request_ttl_seconds", float),
             ("PIONIR_CREW_POOL_SIZE", "pool_size", int),
             ("PIONIR_CREW_CLAUDE_DAILY_CAP", "claude_daily_cap", int),
+            ("PIONIR_CREW_CLAUDE_NIGHT_CAP", "claude_night_cap", int),
+            ("PIONIR_CREW_CLAUDE_MODEL", "claude_model", str),
             ("PIONIR_CREW_SECRETS_DIR", "secrets_dir", Path),
             ("PIONIR_CREW_CATALOGUE", "catalogue_path", Path),
             ("PIONIR_CREW_DELIVERIES_DIR", "deliveries_dir", Path),

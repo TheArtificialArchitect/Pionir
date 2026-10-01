@@ -52,6 +52,7 @@ class _Base:
 
     def __init__(self, spec) -> None:
         self.worker_id = spec.worker_id
+        self.impl = spec.impl
         self.name = spec.name
         self.division = spec.division
         self.kind = spec.kind

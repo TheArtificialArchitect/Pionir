@@ -100,6 +100,13 @@ CREATE TABLE IF NOT EXISTS escalations (
     status TEXT NOT NULL CHECK (status IN ('running', 'ok', 'failed')), note TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_esc_day ON escalations(day, division);
+-- Which of those attempts were overnight work, and which night (noon to noon) each was: the
+-- per-night Claude cap counts these. A separate table, so an existing database needs no
+-- migration.
+CREATE TABLE IF NOT EXISTS night_escalations (
+    esc_id INTEGER PRIMARY KEY, night TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_night_esc ON night_escalations(night);
 """
 
 CALL_CAP = 20000
@@ -495,9 +502,11 @@ class CrewStore:
 
     # ---- Claude escalations -------------------------------------------------
     def reserve_escalation(self, *, day: str, division: str, t: float, global_cap: int,
-                           division_cap: int) -> tuple:
-        """Check both caps and take a slot in ONE writer transaction, so two leaders can
-        never both take the last one. -> (ok, reason, id)."""
+                           division_cap: int, night: str | None = None,
+                           night_cap: int = 0) -> tuple:
+        """Check the caps (the daily one, the division's share and, for overnight work - a
+        ``night`` key - the night's) and take a slot in ONE writer transaction, so two
+        leaders can never both take the last one. -> (ok, reason, id)."""
         def fn(c):
             used = c.execute("SELECT COUNT(*) FROM escalations WHERE day=?", (day,)).fetchone()[0]
             if used >= global_cap:
@@ -508,14 +517,27 @@ class CrewStore:
                 why = (f"{division}'s share of the Claude cap is {division_cap} a day and "
                        f"{mine} are used")
                 return False, why, None
+            if night is not None:
+                spent = c.execute("SELECT COUNT(*) FROM night_escalations WHERE night=?",
+                                  (night,)).fetchone()[0]
+                if spent >= night_cap:
+                    return False, (f"the night's Claude cap of {night_cap} is used up "
+                                   f"({spent} tonight)"), None
             cur = c.execute("INSERT INTO escalations (t, day, division, status) "
                             "VALUES (?,?,?,'running')", (t, day, division))
+            if night is not None:
+                c.execute("INSERT INTO night_escalations (esc_id, night) VALUES (?,?)",
+                          (cur.lastrowid, night))
             return True, "", cur.lastrowid
         return self._write(fn)
 
     def finish_escalation(self, esc_id: int, ok: bool, note: str = "") -> None:
         self._write(lambda c: c.execute("UPDATE escalations SET status=?, note=? WHERE id=?",
                                         ("ok" if ok else "failed", note[:500], esc_id)))
+
+    def night_escalations(self, night: str) -> int:
+        return self._read("SELECT COUNT(*) FROM night_escalations WHERE night=?",
+                          (night,))[0][0]
 
     def escalations_on(self, day: str, division: str | None = None) -> int:
         if division is None:

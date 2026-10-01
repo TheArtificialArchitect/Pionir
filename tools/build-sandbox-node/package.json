@@ -1,0 +1,11 @@
+{
+  "name": "pionir-build-sandbox-node-tools",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The TypeScript tooling the Builds division's contained node runs: exact pins, matching Scrooge's worker devDependencies (typescript ^5.6.0, vitest ^3.0.0, @cloudflare/workers-types for the Worker globals). Installed once by tools/setup-build-sandbox.ps1 with --ignore-scripts.",
+  "dependencies": {
+    "@cloudflare/workers-types": "5.20260907.1",
+    "typescript": "5.9.3",
+    "vitest": "3.2.7"
+  }
+}

@@ -22,6 +22,15 @@ that record (the account, the interpreter and its Low label, the Daedalus copy, 
 sandbox, the credential) and says ``SETUP_HINT`` when anything is missing - then nothing is
 built and nothing is run.
 
+TypeScript products (a Cloudflare-Worker API, tested with ``tsc --noEmit`` and ``vitest run``)
+need node. The setup script optionally adds a Low-labelled copy of the owner's ``node.exe`` and
+``node-tools`` (typescript, vitest and workers-types, pinned and installed by the OWNER's npm,
+read-only to the sandbox user) under the same install folder, with its own loopback-only
+firewall rule; ``load_setup`` validates ALL of it or none (``SandboxSetup.node`` is None when
+the record has no node keys), and ``run_ts_checks`` runs the two checks contained, node
+invoked directly (never npm, npx or a .cmd shim) on a ``node_modules`` made of one junction
+per package into the read-only tools.
+
 Every process here starts SUSPENDED on a private window station and desktop, is put in a job
 object (kill-on-close: if Pionir dies, the whole tree dies; no breakaway; every UI
 restriction; a cap on processes, memory and CPU time) and only then resumed. Its output goes
@@ -45,10 +54,12 @@ from __future__ import annotations
 
 import ctypes
 import http.client
+import ipaddress
 import json
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import threading
 import time
@@ -71,6 +82,9 @@ RECORD_VERSION = 3
 LOW_RID = 0x1000                    # SECURITY_MANDATORY_LOW_RID
 STATE_DIR_NAME = ".daedalus-state"
 RUNS_DIR_NAME = ".runs"
+NODE_HINT = r"node is not set up: run tools\setup-build-sandbox.ps1 as administrator"
+NODE_KEYS = ("node", "node_tools", "node_firewall_rules", "node_version", "node_typescript",
+             "node_vitest", "node_workers_types")
 _LOW_LABEL = re.compile(r"(?im)^.*Mandatory Label\\Low Mandatory Level:.*$")
 
 
@@ -337,6 +351,12 @@ class SandboxSetup:
     sandbox_root: Path
     daedalus_src: Path
     credential: Path
+    node: Path | None = None            # the Low-labelled node.exe, when set up (validated whole)
+    node_tools: Path | None = None      # read-only folder holding node_modules (typescript, vitest)
+
+    @property
+    def node_dir(self) -> Path | None:
+        return self.node.parent if self.node is not None else None
 
     @property
     def python_dir(self) -> Path:
@@ -374,11 +394,131 @@ def _inside(path: Path, folder: Path) -> bool:
         return False
 
 
+_FIREWALL_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$out = @()
+foreach ($r in @(Get-NetFirewallRule -DisplayName $env:PIONIR_FW_RULE -ErrorAction SilentlyContinue)) {
+  $app = Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $r
+  $adr = Get-NetFirewallAddressFilter -AssociatedNetFirewallRule $r
+  $out += [pscustomobject]@{enabled = [string]$r.Enabled; direction = [string]$r.Direction;
+                            action = [string]$r.Action; program = [string]$app.Program;
+                            remote = @($adr.RemoteAddress | ForEach-Object { [string]$_ })}
+}
+ConvertTo-Json -InputObject @($out) -Depth 4 -Compress
+"""
+
+
+def read_firewall_rule(name: str) -> list:
+    """The Windows Firewall rules called ``name`` (as dicts: enabled, direction, action,
+    program, remote), ``[]`` when there are none. A read - it works without elevation and
+    changes nothing. Raises SandboxError when the firewall cannot be read at all."""
+    if not _WIN:
+        raise SandboxError("the firewall can only be read on Windows")
+    exe = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" \
+        / "v1.0" / "powershell.exe"
+    try:
+        done = subprocess.run([str(exe), "-NoProfile", "-NonInteractive", "-Command",
+                               _FIREWALL_SCRIPT], capture_output=True, text=True,
+                              errors="replace", timeout=90, check=False,
+                              env={**os.environ, "PIONIR_FW_RULE": name})
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SandboxError(f"the firewall could not be read ({type(exc).__name__})") from exc
+    if done.returncode != 0:
+        raise SandboxError("the firewall could not be read "
+                           f"(exit {done.returncode}: {(done.stderr or '').strip()[-120:]})")
+    try:
+        rules = json.loads(done.stdout.strip() or "[]")
+    except ValueError as exc:
+        raise SandboxError("the firewall answer is not JSON") from exc
+    return [r for r in (rules if isinstance(rules, list) else [rules]) if isinstance(r, dict)]
+
+
+def _covers_loopback(spec: str) -> bool:
+    """True when the firewall RemoteAddress ``spec`` includes 127.0.0.1 (or means 'any')."""
+    spec = str(spec).strip()
+    if spec.lower() in ("any", "*", ""):
+        return True
+    probe = ipaddress.ip_address("127.0.0.1")
+    try:
+        if "-" in spec:
+            low_, high = (ipaddress.ip_address(x.strip()) for x in spec.split("-", 1))
+            return low_.version == 4 and low_ <= probe <= high
+        if "/" in spec:
+            net = ipaddress.ip_network(spec, strict=False)
+            return net.version == 4 and probe in net
+        return ipaddress.ip_address(spec) == probe
+    except ValueError:
+        return False                    # a keyword like LocalSubnet, or an IPv6 address
+
+
+def firewall_problem(rules, name: str, exe) -> str | None:
+    """Why the firewall does not hold ``exe`` to loopback through the rule called ``name``,
+    or None when an enabled outbound BLOCK rule for exactly that program exists and its remote
+    addresses leave out 127.0.0.1 (so it blocks every address but loopback)."""
+    if isinstance(rules, dict):
+        rules = [rules]
+    rules = [r for r in (rules or []) if isinstance(r, dict)]
+    if not rules:
+        return f"the firewall rule '{name}' is missing"
+    want = os.path.normcase(os.path.abspath(str(exe)))
+    for rule in rules:
+        if str(rule.get("enabled")).lower() not in ("true", "1"):
+            continue
+        if str(rule.get("direction")).lower() != "outbound" \
+                or str(rule.get("action")).lower() != "block":
+            continue
+        program = str(rule.get("program") or "")
+        if not program or os.path.normcase(os.path.abspath(program)) != want:
+            continue
+        remote = rule.get("remote")
+        remote = [remote] if isinstance(remote, str) else list(remote or [])
+        if not remote or any(_covers_loopback(r) for r in remote):
+            continue
+        return None
+    return (f"the firewall rule '{name}' is not an enabled outbound block of {exe} for every "
+            "address but loopback")
+
+
+def _node_problem(doc: dict, install: Path, *, low, firewall):
+    """``(node, node_tools, None)`` when the record's node keys are ALL present and true, else
+    ``(None, None, why)``. Called only when at least one node key is in the record."""
+    node_text, tools_text = doc.get("node"), doc.get("node_tools")
+    rules = doc.get("node_firewall_rules")
+    if not (isinstance(node_text, str) and node_text and isinstance(tools_text, str)
+            and tools_text and isinstance(rules, list) and rules
+            and all(isinstance(r, str) and r for r in rules)):
+        return None, None, ("the record names only part of the node setup (node, node_tools "
+                            "and node_firewall_rules must all be there)")
+    node, tools = Path(node_text), Path(tools_text)
+    for label, path in (("node.exe", node), ("the node tools", tools)):
+        if not os.path.isabs(str(path)):
+            return None, None, f"{label} ({path}) is not an absolute path"
+        if not _inside(path, install):
+            return None, None, f"{label} ({path}) is not inside {install}"
+    if not node.is_file():
+        return None, None, f"node.exe ({node}) is missing"
+    if not low(node):
+        return None, None, f"node.exe ({node}) does not carry a Low integrity label"
+    for rel in ("typescript/lib/tsc.js", "vitest/vitest.mjs"):
+        if not (tools / "node_modules" / Path(rel)).is_file():
+            return None, None, f"{rel.split('/')[0]} is not installed in {tools}"
+    for name in rules:
+        try:
+            why = firewall_problem(firewall(name), name, node)
+        except (OSError, SandboxError) as exc:
+            return None, None, f"the firewall rule '{name}' cannot be checked ({exc})"
+        if why:
+            return None, None, why
+    return node, tools, None
+
+
 def load_setup(sandbox_root, *, record: Path | None = None, credential: Path | None = None,
-               lookup=lookup_sid, read=read_password,
-               low=is_low_labelled) -> tuple[SandboxSetup | None, str | None]:
+               lookup=lookup_sid, read=read_password, low=is_low_labelled,
+               firewall=read_firewall_rule) -> tuple[SandboxSetup | None, str | None]:
     """``(setup, None)`` when the sandbox user is set up and usable, else ``(None, why)``
-    (always starting with SETUP_HINT). Reads only; never creates anything."""
+    (always starting with SETUP_HINT). Reads only; never creates anything. The node keys of
+    the record are optional, but if ANY is present ALL of it is validated strictly - or the
+    whole record is refused; with none, ``setup.node`` is None."""
     record = Path(record) if record is not None else default_record_path()
     try:
         doc = json.loads(record.read_text(encoding="utf-8-sig"))
@@ -423,7 +563,13 @@ def load_setup(sandbox_root, *, record: Path | None = None, credential: Path | N
         read(cred)
     except (OSError, SandboxError, UnicodeDecodeError) as exc:
         return None, f"{SETUP_HINT} (the {USER} credential cannot be read: {exc})"
-    return SandboxSetup(USER, sid, python, root, src, cred), None
+    node = tools = None
+    if any(key in doc for key in NODE_KEYS):
+        node, tools, why = _node_problem(doc, install, low=low, firewall=firewall)
+        if why:
+            return None, f"{SETUP_HINT} (node: {why}; run it again)"
+    return SandboxSetup(USER, sid, python, root, src, cred, node, tools), None
+
 
 # ---- a process in a job object, on a desktop of its own ----------------------------------------
 @dataclass(frozen=True)
@@ -954,6 +1100,245 @@ def require_preflight(python, *, work: Path, logon, sid, secrets_dir: Path,
         raise SandboxError(f"the {USER} user is not contained - " + "; ".join(problems)
                            + ". Nothing of a build runs until it is.")
     return doc
+
+
+# ---- TypeScript products: tsc and vitest, contained -------------------------------------------
+@dataclass
+class TsRun:
+    passed: bool
+    ran: int
+    tsc_ok: bool
+    command: str
+    tail: str
+    timed_out: bool = False
+
+
+TS_COMMAND = "node tsc --noEmit; node vitest run (contained, no network, no watch)"
+TSC_JS = ("node_modules", "typescript", "lib", "tsc.js")
+VITEST_MJS = ("node_modules", "vitest", "vitest.mjs")
+TSC_SHARE = 0.4                         # of the timeout; vitest gets the rest
+TS_ARGS_TSC = ["--noEmit", "--pretty", "false"]
+TS_ARGS_VITEST = ["run", "--watch=false", "--coverage.enabled=false", "--reporter=default",
+                  "--maxWorkers=4", "--minWorkers=1"]
+TS_ENV = {"NODE_OPTIONS": "", "NODE_ENV": "test", "FORCE_COLOR": "0", "DO_NOT_TRACK": "1",
+          "NO_UPDATE_NOTIFIER": "1", "npm_config_update_notifier": "false",
+          "npm_config_audit": "false", "npm_config_fund": "false",
+          "WRANGLER_SEND_METRICS": "false", "NEXT_TELEMETRY_DISABLED": "1"}
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_VITEST_TESTS = re.compile(r"(?m)^\s*Tests\s+(\S.*?)\s*\((\d+)\)\s*$")
+_VITEST_COUNT = re.compile(r"(\d+)\s+(failed|passed|skipped|todo)\b")
+
+
+def node_ready(setup) -> str | None:
+    """None when node and its tools are set up and usable, else a short why."""
+    node = getattr(setup, "node", None)
+    tools = getattr(setup, "node_tools", None)
+    if node is None or tools is None:
+        return NODE_HINT
+    if not Path(node).is_file():
+        return f"node.exe ({node}) is missing: run tools\\setup-build-sandbox.ps1 as administrator"
+    if not Path(tools, *TSC_JS).is_file() or not Path(tools, *VITEST_MJS).is_file():
+        return (f"typescript or vitest is missing from {tools}: "
+                "run tools\\setup-build-sandbox.ps1 as administrator")
+    return None
+
+
+def vitest_ran(output: str) -> int:
+    """How many tests vitest actually ran (passed + failed, never skipped or todo) from its
+    summary line (``Tests  1 failed | 4 passed (5)``); 0 when there is none."""
+    found = _VITEST_TESTS.findall(_ANSI.sub("", output or ""))
+    if not found:
+        return 0
+    counts = {kind: int(n) for n, kind in _VITEST_COUNT.findall(found[-1][0])}
+    return counts.get("passed", 0) + counts.get("failed", 0)
+
+
+def _safe_rel(rel) -> list:
+    if not isinstance(rel, str) or not rel or "\\" in rel or ":" in rel or rel.startswith("/"):
+        raise SandboxError(f"{rel!r} is not a safe relative path")
+    parts = rel.split("/")
+    if any(p in ("", ".", "..") or p.endswith((" ", ".")) for p in parts):
+        raise SandboxError(f"{rel!r} is not a safe relative path")
+    if any(p.lower() == "node_modules" for p in parts):
+        raise SandboxError(f"{rel!r} is inside node_modules, which only the tools may fill")
+    return parts
+
+
+def write_ts_tree(files: dict, dest) -> None:
+    """Materialise ``{relative path: bytes}`` in ``dest``, refusing any path that could land
+    outside it (absolute, ``..``, a drive, a backslash) and any ``node_modules`` entry."""
+    dest = Path(dest)
+    for rel, data in files.items():
+        parts = _safe_rel(rel)
+        if not isinstance(data, (bytes, bytearray)):
+            raise SandboxError(f"{rel!r} is not bytes")
+        path = dest.joinpath(*parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(bytes(data))
+
+
+def _make_junction(target: Path, link: Path) -> None:
+    import _winapi
+    _winapi.CreateJunction(str(target), str(link))
+
+
+def _is_link(path: Path) -> bool:
+    return os.path.islink(path) or os.path.isjunction(path)
+
+
+def link_node_modules(dest, setup, *, make_link=None) -> int:
+    """Give the repo at ``dest`` a ``node_modules`` its tools can run in: a REAL folder holding
+    one junction per package into ``setup.node_tools`` (scoped packages one level down), made
+    here, by the owner - the sandbox user can read through them but never change the tools, and
+    vite's caches (``.vite``, ``.vite-temp``) land in the real folder. A package that cannot be
+    linked is copied instead. Returns how many packages were linked or copied. Use
+    ``remove_tree`` to delete ``dest`` afterwards - never ``Remove-Item -Recurse``."""
+    make = make_link or _make_junction
+    source = Path(setup.node_tools) / "node_modules"
+    if not source.is_dir():
+        raise SandboxError(f"{source} does not exist")
+    target = Path(dest) / "node_modules"
+    target.mkdir(parents=True, exist_ok=True)
+    made = 0
+
+    def one(src: Path, link: Path) -> int:
+        if link.exists() or _is_link(link):
+            return 0
+        try:
+            make(src, link)
+        except (OSError, ValueError, ImportError):
+            shutil.copytree(src, link, symlinks=True)
+        return 1
+
+    for entry in sorted(source.iterdir()):
+        if entry.name.startswith(".") or not entry.is_dir():
+            continue
+        if entry.name.startswith("@"):
+            (target / entry.name).mkdir(exist_ok=True)
+            for child in sorted(entry.iterdir()):
+                if child.is_dir():
+                    made += one(child, target / entry.name / child.name)
+        else:
+            made += one(entry, target / entry.name)
+    return made
+
+
+def remove_tree(path) -> None:
+    """Delete a tree WITHOUT ever following a link or junction (which would delete what it
+    points at - the read-only tools): every junction or symlink in it is unlinked first, then
+    what is left is removed."""
+    path = Path(path)
+    if not os.path.lexists(path):
+        return
+    if _is_link(path):
+        _unlink_dir(path)
+        return
+    for root, dirs, files in os.walk(path, topdown=True, followlinks=False):
+        for name in list(dirs):
+            full = Path(root) / name
+            if _is_link(full):
+                dirs.remove(name)
+                _unlink_dir(full)
+        for name in files:
+            full = Path(root) / name
+            if _is_link(full):
+                _unlink_dir(full)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _unlink_dir(path: Path) -> None:
+    try:
+        os.rmdir(path)                  # a junction or directory symlink: only the link goes
+    except OSError:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _ts_tail(text: str, size: int) -> str:
+    return _ANSI.sub("", text or "").strip()[-size:]
+
+
+def run_ts_checks(files: dict, *, setup, timeout: float = 240.0, spawner=None) -> TsRun:
+    """``tsc --noEmit`` then ``vitest run`` on a TypeScript product, CONTAINED like
+    ``review.run_tests``: as the ``pionir-builds`` user, with the Low-labelled node.exe the
+    firewall blocks from everything but loopback, in a fresh folder inside the sandbox, in a
+    kill-on-close job (node-sized limits), output to files, a minimal environment, each step
+    killed with its whole tree at its share of ``timeout``. node runs the tools' ``.js``
+    directly - never npm, npx or a .cmd shim - from the read-only ``setup.node_tools``, on a
+    ``node_modules`` of junctions into them (``link_node_modules``). Passed means tsc exited 0,
+    vitest exited 0 AND at least one test ran. Never raises: anything that stops it from
+    starting contained is a failed run saying so."""
+    shown = TS_COMMAND
+    not_started = "the tests could not start contained ({})"
+    why = node_ready(setup)
+    if why:
+        return TsRun(False, 0, False, shown, not_started.format(why))
+    work = Path(setup.runs_dir) / f"run-{secrets.token_hex(6)}"
+    steps: list = []
+    try:
+        try:
+            setup.reap()                    # nothing of the sandbox user's runs before
+            work.mkdir(parents=True)
+            product = work / "product"
+            product.mkdir()
+            write_ts_tree(files, product)
+            link_node_modules(product, setup)
+            setup.preflight()               # proven Low, and blind to the owner's secrets
+            node = str(setup.node)
+            system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
+            env = minimal_env(work=work / "env", path_dirs=[setup.node.parent, system32],
+                              extra=TS_ENV)
+            step_limit = max(30.0, float(timeout) * 4)
+            limits = JobLimits(active_processes=16, job_memory_mb=3072, cpu_seconds=step_limit)
+            logon = setup.logon()
+            sid = getattr(setup, "sid", None)
+            started = time.monotonic()
+            plan = (("tsc", Path(setup.node_tools, *TSC_JS), TS_ARGS_TSC, float(timeout) * TSC_SHARE),
+                    ("vitest", Path(setup.node_tools, *VITEST_MJS), TS_ARGS_VITEST, None))
+            for name, script, args, share in plan:
+                left = float(timeout) - (time.monotonic() - started)
+                this = share if share is not None else max(float(timeout) * (1 - TSC_SHARE), left)
+                done = run([node, str(script), *args], cwd=product, env=env,
+                           out_dir=work / f"out-{name}", timeout=max(1.0, this), limits=limits,
+                           logon=logon, spawner=spawner, sid=sid)
+                steps.append((name, done))
+                if done.timed_out:
+                    break
+        except (SandboxError, OSError) as exc:
+            return TsRun(False, 0, False, shown, not_started.format(exc))
+        except Exception as exc:            # noqa: BLE001 - never raises
+            return TsRun(False, 0, False, shown,
+                         not_started.format(f"unexpected {type(exc).__name__}: {exc}"))
+        finally:
+            try:
+                setup.reap()                # ... and nothing it started survives it
+            except Exception:               # noqa: BLE001 - never raises; the next start
+                pass                        # refuses while any process survives
+    finally:
+        try:
+            remove_tree(work)
+        except Exception:                   # noqa: BLE001
+            pass
+    results = dict(steps)
+    for name, done in steps:
+        if done.timed_out:
+            return TsRun(False, 0, name != "tsc" and results["tsc"].returncode == 0, shown,
+                         f"{name} did not finish within the time allowed "
+                         "(every process it started was killed)", timed_out=True)
+    tsc, vit = results["tsc"], results.get("vitest")
+    tsc_ok = tsc.returncode == 0
+    tsc_out = f"{tsc.stdout}\n{tsc.stderr}"
+    vit_out = f"{vit.stdout}\n{vit.stderr}" if vit is not None else ""
+    ran = vitest_ran(vit_out)
+    ok = tsc_ok and vit is not None and vit.returncode == 0 and ran >= 1
+    size = 1300 if tsc_ok else 700
+    parts = ["tsc --noEmit: ok" if tsc_ok else
+             f"tsc --noEmit (exit {tsc.returncode}):\n{_ts_tail(tsc_out, size)}"]
+    if vit is not None:
+        parts.append(f"vitest run (exit {vit.returncode}, {ran} ran):\n{_ts_tail(vit_out, size)}")
+    return TsRun(ok, ran, tsc_ok, shown, "\n".join(parts).strip()[-1500:])
 
 
 # ---- the Ollama gate -----------------------------------------------------------------------------

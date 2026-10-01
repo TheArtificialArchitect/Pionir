@@ -39,6 +39,8 @@ from .brain import Brain, Post, http_post_json
 from .clock import WallClock
 from .direction import Allocation, Direction
 from .escalation import (
+    DEFAULT_CLAUDE_MODEL,
+    DEFAULT_NIGHT_CAP,
     Escalator,
     Runner,
     claude_cli_runner,
@@ -59,6 +61,10 @@ from .vitals import Vitals
 from .worker import ErrorKind, WorkContext, WorkerError
 
 LEADER_FIRST_DELAY = 90.0
+# The workers that run unattended overnight: their Claude calls take the per-night cap and the
+# cheaper model (escalation.Escalator). Everything else - the Fiverr desk's client work, the
+# leaders' escalations - is daytime work the owner is around for.
+NIGHT_IMPLS = frozenset({"daedalus_builds", "api_builder"})
 FIRST_CHECKPOINT_SECONDS = 60
 
 
@@ -97,6 +103,11 @@ class Crew:
         self.escalator = Escalator(self.store, self.allocation,
                                    runner=claude_runner if cfg.claude_daily_cap > 0 else None,
                                    daily_cap=cfg.claude_daily_cap,
+                                   night_cap=min(getattr(cfg, "claude_night_cap",
+                                                         DEFAULT_NIGHT_CAP),
+                                                 cfg.claude_daily_cap),
+                                   night_model=getattr(cfg, "claude_model",
+                                                       DEFAULT_CLAUDE_MODEL),
                                    timeout=cfg.escalation_timeout_seconds, clock=now,
                                    research_runner=(research_runner
                                                     if cfg.claude_daily_cap > 0 else None),
@@ -140,8 +151,10 @@ class Crew:
                            products_dir=getattr(self.cfg, "products_dir", None),
                            research=partial(self.escalator.research, worker.division),
                            affiliates=tuple(getattr(self.cfg, "affiliates", ()) or ()),
-                           build_site=partial(self.escalator.build_site, worker.division),
-                           review=partial(self.escalator.review, worker.division),
+                           build_site=partial(self.escalator.build_site, worker.division,
+                                              night=getattr(worker, "impl", None) in NIGHT_IMPLS),
+                           review=partial(self.escalator.review, worker.division,
+                                          night=getattr(worker, "impl", None) in NIGHT_IMPLS),
                            fiverr_dir=getattr(self.cfg, "fiverr_dir", None),
                            digest=getattr(self.cfg, "digest", None),
                            task=self.hands.task_outcome,

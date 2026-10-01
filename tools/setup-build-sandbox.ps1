@@ -28,11 +28,19 @@
        other top-level data folder of every fixed drive that ordinary users can write -
        each one is listed as it is done
     6. Windows Firewall rules (group "Pionir builds"): pionir-builds' outbound traffic -
-       any program - blocked except loopback; the dedicated Python blocked except loopback;
-       and a best-effort rule against loopback except the build gate (127.0.0.1:8773), which
-       Windows does not enforce for ordinary programs. A rule Windows will not take, or a
-       firewall profile that is off, STOPS the setup.
-    7. %ProgramData%\PionirBuilds\setup.json, the record Pionir checks, written last.
+       any program - blocked except loopback; the dedicated Python (and node.exe, below)
+       blocked except loopback; and a best-effort rule against loopback except the build gate
+       (127.0.0.1:8773), which Windows does not enforce for ordinary programs. A rule Windows
+       will not take, or a firewall profile that is off, STOPS the setup.
+    7. OPTIONAL, for TypeScript products (a Cloudflare-Worker API tested with tsc and vitest):
+       %ProgramData%\PionirBuilds\node\node.exe, a copy of YOUR node.exe with a LOW integrity
+       label, and %ProgramData%\PionirBuilds\node-tools, typescript and vitest installed by
+       YOUR npm (npm ci --ignore-scripts, from tools\build-sandbox-node\package-lock.json:
+       every package pinned by version and integrity hash), read-only to pionir-builds.
+       pionir-builds has no network, so nothing is ever installed as it. If no node is found
+       this part is SKIPPED with a warning - the Python Builds division is set up regardless.
+    8. %ProgramData%\PionirBuilds\setup.json, the record Pionir checks, written last (the
+       node keys in it only when the node part was set up AND proven).
   It makes NO scheduled task, NO service and NO autostart of any kind. It changes nothing in
   your secrets folder: it only checks it.
 
@@ -45,14 +53,20 @@
   started without its token, Galatea trusting any loopback caller).
 
   Before the record is written it proves the containment by running AS pionir-builds - the
-  dedicated Python, git.exe and powershell.exe: each must fail to reach the internet; the
-  Python must run at LOW integrity, write the sandbox and nothing else (C:\src, the data
-  folders, C:\Users\Public, your profile), and read none of your secrets. Then Pionir's own
+  dedicated Python, node.exe (when set up), git.exe and powershell.exe: each must fail to
+  reach the internet; the Python and node must run at LOW integrity, write the sandbox and
+  nothing else (C:\src, the data folders, C:\Users\Public, your profile, the node tools), and
+  read none of your secrets. Node must also run tsc and vitest through the same kind of
+  link Pionir makes in each test run. Then Pionir's own
   preflight runs the same proof through the exact path a build takes. Anything not contained
   stops the setup, and nothing is used.
 
 .PARAMETER ResetPassword
   Make a new password (and credential file) even if the current one still works.
+
+.PARAMETER NodeSource
+  The node.exe (or the folder holding it) to copy for TypeScript products. Default: the node
+  found on PATH. If there is none, the node part is skipped with a warning.
 #>
 [CmdletBinding()]
 param(
@@ -61,6 +75,7 @@ param(
     [string]$DaedalusSrc = "C:\src\Tech-Support\daedalus",
     [string]$PythonSource = "",
     [string]$InstallDir = "",
+    [string]$NodeSource = "",
     [switch]$ResetPassword
 )
 
@@ -74,6 +89,12 @@ if (-not $InstallDir) { $InstallDir = Join-Path $env:ProgramData "PionirBuilds" 
 $PyDir = Join-Path $InstallDir "python"
 $PyExe = Join-Path $PyDir "python.exe"
 $DaedalusCopy = Join-Path $InstallDir "daedalus"
+$NodeDir = Join-Path $InstallDir "node"
+$NodeExe = Join-Path $NodeDir "node.exe"
+$NodeTools = Join-Path $InstallDir "node-tools"
+$NodeManifestDir = Join-Path $PSScriptRoot "build-sandbox-node"
+$NodeEnabled = $false
+$nodeRules = @()
 $Record = Join-Path $InstallDir "setup.json"
 $SecretsDir = Join-Path $env:USERPROFILE ".pionir\secrets"
 $CredFile = Join-Path $SecretsDir "pionir-builds.cred"
@@ -238,6 +259,110 @@ foreach ($exe in @($PyExe, (Join-Path $PyDir "pythonw.exe"))) {
 }
 Did "labelled python.exe and pythonw.exe Low: everything run from them runs at Low integrity"
 
+# ---- 3b. Node (optional): node.exe and the pinned TypeScript tools --------------------------
+Step "Node (for TypeScript products): a Low-labelled node.exe and pinned typescript + vitest"
+$nodeSkip = ""
+if (-not $NodeSource) {
+    $foundNode = Get-Command node -ErrorAction SilentlyContinue
+    if ($foundNode) { $NodeSource = $foundNode.Source }
+}
+if ($NodeSource -and (Test-Path -LiteralPath $NodeSource -PathType Container)) { $NodeSource = Join-Path $NodeSource "node.exe" }
+$NpmCmd = ""
+$NodeVersion = ""
+$NodeTsVersion = ""
+$NodeVtVersion = ""
+$NodeWtVersion = ""
+if (-not $NodeSource -or -not (Test-Path -LiteralPath $NodeSource -PathType Leaf)) {
+    $nodeSkip = "no node.exe was found on PATH (and none was given with -NodeSource)"
+} else {
+    $nodeVer = $null
+    try {
+        $NodeVersion = ([string](& $NodeSource --version | Select-Object -First 1)).Trim()
+        $nodeVer = [version]($NodeVersion.TrimStart("v"))
+    } catch { $nodeVer = $null }
+    $npmNext = Join-Path (Split-Path $NodeSource -Parent) "npm.cmd"
+    if (Test-Path -LiteralPath $npmNext) { $NpmCmd = $npmNext }
+    else {
+        $npmFound = Get-Command npm.cmd -ErrorAction SilentlyContinue
+        if ($npmFound) { $NpmCmd = $npmFound.Source }
+    }
+    if ($null -eq $nodeVer) { $nodeSkip = "$NodeSource did not report a version" }
+    elseif (-not (($nodeVer.Major -ge 23) -or ($nodeVer.Major -eq 22 -and $nodeVer.Minor -ge 12) -or ($nodeVer.Major -eq 20 -and $nodeVer.Minor -ge 19))) {
+        $nodeSkip = "$NodeSource is node $NodeVersion; the pinned vitest/vite need node 20.19+ or 22.12+"
+    }
+    elseif (-not $NpmCmd) { $nodeSkip = "npm was not found next to $NodeSource or on PATH" }
+    elseif (-not ((Test-Path (Join-Path $NodeManifestDir "package.json")) -and (Test-Path (Join-Path $NodeManifestDir "package-lock.json")))) {
+        Fail "no pinned manifest in $NodeManifestDir (package.json and package-lock.json)"
+    }
+    else { $NodeEnabled = $true }
+}
+if (-not $NodeEnabled) {
+    Write-Host "    WARNING  the node part is SKIPPED: $nodeSkip." -ForegroundColor Yellow
+    Write-Host "             Python products are set up as usual; the record will have NO node keys, so TypeScript" -ForegroundColor Yellow
+    Write-Host "             products are not built or tested. Install node and run this script again to add it." -ForegroundColor Yellow
+} else {
+    Write-Host "    node        $NodeSource ($NodeVersion)"
+    Write-Host "    npm         $NpmCmd"
+    New-Item -ItemType Directory -Force -Path $NodeDir, $NodeTools | Out-Null
+    # node.exe: a copy in the install folder (read-only to pionir-builds), labelled Low like python.exe
+    $nodeSrcHash = (Get-FileHash -LiteralPath $NodeSource -Algorithm SHA256).Hash
+    if ((Test-Path -LiteralPath $NodeExe) -and ((Get-FileHash -LiteralPath $NodeExe -Algorithm SHA256).Hash -eq $nodeSrcHash)) {
+        Had "$NodeExe is a copy of $NodeSource"
+    } else {
+        Copy-Item -LiteralPath $NodeSource -Destination $NodeExe -Force
+        Did "copied $NodeSource -> $NodeExe"
+    }
+    Run-Icacls @($NodeExe, "/setintegritylevel", "low")
+    Did "labelled node.exe Low: everything run from it runs at Low integrity"
+    # typescript + vitest: installed by YOUR npm (you have the network; pionir-builds has none),
+    # from the pinned manifest and its lockfile (integrity hashes), with no install scripts
+    $manifest = Get-Content (Join-Path $NodeManifestDir "package.json") -Raw | ConvertFrom-Json
+    $NodeTsVersion = [string]$manifest.dependencies.typescript
+    $NodeVtVersion = [string]$manifest.dependencies.vitest
+    $NodeWtVersion = [string]$manifest.dependencies."@cloudflare/workers-types"
+    $lockSrc = Join-Path $NodeManifestDir "package-lock.json"
+    $lockHere = Join-Path $NodeTools "package-lock.json"
+    $tsJs = Join-Path $NodeTools "node_modules\typescript\lib\tsc.js"
+    $vtMjs = Join-Path $NodeTools "node_modules\vitest\vitest.mjs"
+    $wtDir = Join-Path $NodeTools "node_modules\@cloudflare\workers-types"
+    function Get-PkgVersion([string]$dir) {
+        $f = Join-Path $dir "package.json"
+        if (-not (Test-Path -LiteralPath $f)) { return "" }
+        return [string](Get-Content -LiteralPath $f -Raw | ConvertFrom-Json).version
+    }
+    $sameLock = (Test-Path -LiteralPath $lockHere) -and ((Get-FileHash -LiteralPath $lockHere -Algorithm SHA256).Hash -eq (Get-FileHash -LiteralPath $lockSrc -Algorithm SHA256).Hash)
+    if ($sameLock -and (Test-Path -LiteralPath $tsJs) -and (Test-Path -LiteralPath $vtMjs) -and
+        ((Get-PkgVersion (Join-Path $NodeTools "node_modules\typescript")) -eq $NodeTsVersion) -and
+        ((Get-PkgVersion (Join-Path $NodeTools "node_modules\vitest")) -eq $NodeVtVersion) -and
+        ((Get-PkgVersion $wtDir) -eq $NodeWtVersion)) {
+        Had "typescript $NodeTsVersion, vitest $NodeVtVersion and workers-types $NodeWtVersion are installed in $NodeTools"
+    } else {
+        if (Test-Path -LiteralPath (Join-Path $NodeTools "node_modules")) { Remove-Item -Recurse -Force -LiteralPath (Join-Path $NodeTools "node_modules") }
+        Copy-Item -LiteralPath (Join-Path $NodeManifestDir "package.json") -Destination (Join-Path $NodeTools "package.json") -Force
+        Copy-Item -LiteralPath $lockSrc -Destination $lockHere -Force
+        $npmArgs = @("ci", "--ignore-scripts", "--no-audit", "--no-fund")
+        Write-Host ("    $NpmCmd " + ($npmArgs -join " ") + "   (in $NodeTools)") -ForegroundColor DarkGray
+        $eap = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"      # npm writes progress to stderr: not a failure
+        Push-Location $NodeTools
+        try { & $NpmCmd @npmArgs 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray } }
+        finally { Pop-Location; $ErrorActionPreference = $eap }
+        if ($LASTEXITCODE -ne 0) { Fail "npm ci failed (exit $LASTEXITCODE): an integrity hash did not match, or the registry did not answer" }
+        Did "installed typescript $NodeTsVersion, vitest $NodeVtVersion and workers-types $NodeWtVersion (npm ci --ignore-scripts, lockfile integrity)"
+    }
+    $tsSaid = ([string](& $NodeExe $tsJs --version | Select-Object -First 1)).Trim()
+    $vtSaid = ([string](& $NodeExe $vtMjs --version | Select-Object -First 1)).Trim()
+    if ($tsSaid -ne "Version $NodeTsVersion") { Fail "tsc reports '$tsSaid', not 'Version $NodeTsVersion'" }
+    if ($vtSaid -notlike "vitest/$NodeVtVersion *") { Fail "vitest reports '$vtSaid', not 'vitest/$NodeVtVersion'" }
+    if ((Get-PkgVersion $wtDir) -ne $NodeWtVersion) { Fail "@cloudflare/workers-types is not at the pinned $NodeWtVersion in $NodeTools" }
+    Did "node runs tsc ($tsSaid) and vitest ($vtSaid) from $NodeTools"
+    # read-only to pionir-builds: it may read and run the tools, never change them
+    Run-Icacls @($NodeTools, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F",
+        "*S-1-5-32-544:(OI)(CI)F", "*${OwnerSid}:(OI)(CI)RX", "*${UserSid}:(OI)(CI)RX")
+    Run-Icacls @($NodeTools, "/deny", "*${UserSid}:(OI)(CI)(W,D,DC,WDAC,WO)")
+    Did "${NodeTools}: $User may read and run it, and is denied every write"
+}
+
 # ---- 4. the sandbox folder ------------------------------------------------------------------
 Step "The sandbox folder $SandboxRoot"
 if (-not (Test-Path $SandboxRoot)) { New-Item -ItemType Directory -Path $SandboxRoot | Out-Null; Did "created $SandboxRoot" }
@@ -302,6 +427,12 @@ try {
             -Program $exe -RemoteAddress $NotLoopback -Profile Any | Out-Null
         Did "rule: $name (every address but loopback)"; $rules += $name
     }
+    if ($NodeEnabled) {
+        $name = "Pionir builds - block outbound - " + (Split-Path $NodeExe -Leaf)
+        New-NetFirewallRule -DisplayName $name -Group $RuleGroup -Direction Outbound -Action Block `
+            -Program $NodeExe -RemoteAddress $NotLoopback -Profile Any | Out-Null
+        Did "rule: $name (every address but loopback)"; $rules += $name; $nodeRules += $name
+    }
     $sddl = "D:(A;;CC;;;$UserSid)"
     $name = "Pionir builds - block outbound - user $User"
     New-NetFirewallRule -DisplayName $name -Group $RuleGroup -Direction Outbound -Action Block `
@@ -362,6 +493,23 @@ $srcFile = (Get-ChildItem $SrcRoot -File -Recurse -Depth 1 -ErrorAction Silently
     Where-Object { -not $_.FullName.StartsWith($SandboxRoot, [StringComparison]::OrdinalIgnoreCase) } |
     Select-Object -First 1).FullName
 $secretFiles = @(Get-ChildItem -Force -Recurse -File $SecretsDir -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+# the links Pionir makes in each TypeScript test run: a real node_modules folder in the sandbox
+# with one junction per package to the read-only tools (made by YOU, the owner, as Pionir does)
+function Remove-ProbeLinks {
+    foreach ($n in @("typescript", "vitest", "@cloudflare\workers-types")) {
+        $l = Join-Path $probeDir "nm\$n"
+        if (Test-Path -LiteralPath $l) { & cmd.exe /c rmdir "`"$l`"" | Out-Null }
+    }
+}
+Remove-ProbeLinks
+if ($NodeEnabled) {
+    New-Item -ItemType Directory -Force (Join-Path $probeDir "nm") | Out-Null
+    New-Item -ItemType Directory -Force (Join-Path $probeDir "nm\@cloudflare") | Out-Null
+    foreach ($n in @("typescript", "vitest", "@cloudflare\workers-types")) {
+        & cmd.exe /c mklink /J "`"$(Join-Path $probeDir "nm\$n")`"" "`"$(Join-Path $NodeTools "node_modules\$n")`"" | Out-Null
+        if ($LASTEXITCODE -ne 0) { Fail "could not make a junction to $NodeTools\node_modules\$n" }
+    }
+}
 $loopbackPorts = [ordered]@{}
 foreach ($svc in $LoopbackServices) { $loopbackPorts[$svc.name] = $svc.port }
 $targets = @{ sandbox = (Join-Path $probeDir "w.txt"); src = (Join-Path $SrcRoot "probe-$User.txt");
@@ -371,6 +519,11 @@ $targets = @{ sandbox = (Join-Path $probeDir "w.txt"); src = (Join-Path $SrcRoot
               programdata = (Join-Path $env:ProgramData "probe-$User.txt");
               wintemp = (Join-Path $env:windir "Temp\probe-$User.txt");
               install = (Join-Path $InstallDir "probe-$User.txt");
+              nodetools = (Join-Path $NodeTools "probe-$User.txt");
+              nodemodules = (Join-Path $NodeTools "node_modules\probe-$User.txt");
+              nodebeside = (Join-Path $probeDir "nm\probe.txt");
+              nodetsc = (Join-Path $probeDir "nm\typescript\lib\tsc.js");
+              nodevitest = (Join-Path $probeDir "nm\vitest\vitest.mjs");
               secrets = $secretFiles; secretsdir = $SecretsDir;
               roots = $dataRoots; loopback = $loopbackPorts }
 $targets | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $probeDir "targets.json") -Encoding UTF8
@@ -445,6 +598,69 @@ if ($gitExe) {
         -Credential $cred -WorkingDirectory $probeDir -WindowStyle Hidden -Wait -PassThru -LoadUserProfile
     $gitResult = if ($gp.ExitCode -eq 0) { "allowed" } else { "blocked (exit $($gp.ExitCode))" }
 } else { $gitResult = "git.exe not found (not tested)" }
+if ($NodeEnabled) {
+    # the same proof for node.exe, AS pionir-builds: it must run at Low integrity, write the sandbox
+    # (and next to the linked tools) and nothing else, read none of your secrets, and reach no
+    # internet; and it must RUN tsc and vitest through links like the ones Pionir makes
+    $nodeProbe = @'
+// run by tools\setup-build-sandbox.ps1 as the contained user: node's half of the proof
+const fs = require('fs');
+const net = require('net');
+const path = require('path');
+const cp = require('child_process');
+const t = JSON.parse(fs.readFileSync(process.argv[2], 'utf8').replace(/^\uFEFF/, ''));
+const out = process.argv[3];
+const checks = {};
+const works = { version: process.version, low: null, tsc: null, vitest: null };
+function attempt(name, fn) {
+  try { fn(); checks[name] = 'allowed'; } catch (e) { checks[name] = 'blocked (' + String(e.code) + ')'; }
+}
+function write(p) { fs.writeFileSync(p, 'x'); fs.unlinkSync(p); }
+attempt('write the sandbox', () => write(t.sandbox));
+attempt('write beside the linked tools', () => write(t.nodebeside));
+attempt('write C:\\src', () => write(t.src));
+if (t.srcfile) attempt('read a file in C:\\src', () => fs.readSync(fs.openSync(t.srcfile, 'r'), Buffer.alloc(1), 0, 1, 0));
+attempt('read your profile', () => fs.readdirSync(t.profile));
+attempt('write your profile', () => write(t.profilewrite));
+attempt('list your secrets folder', () => fs.readdirSync(t.secretsdir));
+for (const s of (t.secrets || [])) {
+  attempt('read your secret ' + path.basename(s), () => fs.readSync(fs.openSync(s, 'r'), Buffer.alloc(1), 0, 1, 0));
+}
+attempt('write Public Documents', () => write(t.public));
+attempt('write C:\\ProgramData', () => write(t.programdata));
+attempt('write the Windows temp folder', () => write(t.wintemp));
+attempt('write the install folder', () => write(t.install));
+attempt('write the node tools folder', () => write(t.nodetools));
+attempt('write the node tools packages', () => write(t.nodemodules));
+for (const r of (t.roots || [])) {
+  attempt('write ' + r, () => write(path.join(r, 'probe.txt')));
+}
+try {
+  const who = cp.execFileSync(path.join(process.env.SystemRoot, 'System32', 'whoami.exe'), ['/groups'], { encoding: 'utf8', timeout: 20000 });
+  works.low = /Mandatory Label\\Low Mandatory Level/i.test(who);
+} catch (e) { works.low = null; }
+try {
+  works.tsc = cp.execFileSync(process.execPath, [t.nodetsc, '--version'], { encoding: 'utf8', timeout: 90000 }).trim();
+} catch (e) { works.tsc = null; }
+try {
+  works.vitest = cp.execFileSync(process.execPath, [t.nodevitest, '--version'], { encoding: 'utf8', timeout: 90000 }).trim();
+} catch (e) { works.vitest = null; }
+let done = false;
+function finish() {
+  if (done) return;
+  done = true;
+  fs.writeFileSync(out, JSON.stringify({ checks: checks, works: works }, null, 1));
+}
+const sock = net.connect({ host: '1.1.1.1', port: 443, timeout: 5000 });
+sock.on('connect', () => { checks['reach the internet (1.1.1.1:443)'] = 'allowed'; sock.destroy(); finish(); });
+sock.on('timeout', () => { checks['reach the internet (1.1.1.1:443)'] = 'blocked (timeout)'; sock.destroy(); finish(); });
+sock.on('error', (e) => { checks['reach the internet (1.1.1.1:443)'] = 'blocked (' + String(e.code) + ')'; finish(); });
+setTimeout(() => { if (!done) { checks['reach the internet (1.1.1.1:443)'] = 'blocked (no answer)'; finish(); process.exit(0); } }, 20000);
+'@
+    [IO.File]::WriteAllText((Join-Path $probeDir "probe-node.js"), $nodeProbe, $utf8NoBom)
+    Start-Process -FilePath $NodeExe -ArgumentList @("`"$probeDir\probe-node.js`"", "`"$probeDir\targets.json`"", "`"$probeDir\node.json`"") `
+        -Credential $cred -WorkingDirectory $probeDir -WindowStyle Hidden -Wait -LoadUserProfile
+}
 
 $results = [ordered]@{}
 $loopbackSeen = [ordered]@{}
@@ -457,6 +673,20 @@ if (Test-Path "$probeDir\python.json") {
 } else { $results["python probe"] = "did not run as $User" }
 $results["powershell.exe: reach the internet"] = if (Test-Path "$probeDir\powershell.txt") { (Get-Content "$probeDir\powershell.txt" -Raw).Trim() } else { "did not run" }
 $results["git.exe: reach the internet"] = $gitResult
+$nodeResults = [ordered]@{}
+$nodeLow = $null
+$nodeTsc = ""
+$nodeVitest = ""
+$nodeProbeRan = $false
+if ($NodeEnabled -and (Test-Path "$probeDir\node.json")) {
+    $nodeProbeRan = $true
+    $gotNode = Get-Content "$probeDir\node.json" -Raw | ConvertFrom-Json
+    foreach ($p in $gotNode.checks.PSObject.Properties) { $nodeResults["node: " + $p.Name] = [string]$p.Value }
+    if ($null -ne $gotNode.works.low) { $nodeLow = [bool]$gotNode.works.low }
+    if ($null -ne $gotNode.works.tsc) { $nodeTsc = [string]$gotNode.works.tsc }
+    if ($null -ne $gotNode.works.vitest) { $nodeVitest = [string]$gotNode.works.vitest }
+}
+Remove-ProbeLinks                      # the links first: Remove-Item must never follow them
 Remove-Item -Recurse -Force $probeDir -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $SrcRoot "probe-$User.txt") -ErrorAction SilentlyContinue
 $contained = $true
@@ -465,6 +695,34 @@ foreach ($k in $results.Keys) {
     $want = if ($k -eq "python: write the sandbox") { "allowed" } else { "blocked" }
     if ($v.StartsWith($want) -or $v -like "*not tested*") { Did "$k : $v" }
     else { Write-Host "    NOT CONTAINED  $k : $v" -ForegroundColor Red; $contained = $false }
+}
+# node (when it is being set up): contained exactly as python is - anything but the two writes
+# below must be blocked - and it must be Low and able to run tsc and vitest through the links.
+# A node that cannot be proven (its probe did not run, or tsc/vitest do not run as the user)
+# is simply LEFT OUT of the record: nothing unproven is ever recorded or used.
+if ($NodeEnabled -and -not $nodeProbeRan) {
+    Write-Host "    WARNING  node: its probe did not run as $User, so node is not proven contained - the node part is LEFT OUT of the record" -ForegroundColor Yellow
+    $NodeEnabled = $false
+}
+if ($NodeEnabled) {
+    foreach ($k in $nodeResults.Keys) {
+        $v = $nodeResults[$k]
+        $nodeWant = if ($k -eq "node: write the sandbox" -or $k -eq "node: write beside the linked tools") { "allowed" } else { "blocked" }
+        if ($v.StartsWith($nodeWant)) { Did "$k : $v" }
+        else { Write-Host "    NOT CONTAINED  $k : $v" -ForegroundColor Red; $contained = $false }
+    }
+    if ($nodeLow -eq $true) { Did "node: runs at LOW integrity when started as $User" }
+    else {
+        Write-Host "    NOT CONTAINED  node: it could not be shown to run at Low integrity (whoami /groups, run by node, lacks the Low label): the Low label on $NodeExe did not take effect" -ForegroundColor Red
+        $contained = $false
+    }
+    $nodeTsOk = $nodeTsc -eq "Version $NodeTsVersion"
+    $nodeVtOk = $nodeVitest -like "vitest/$NodeVtVersion *"
+    if ($nodeTsOk -and $nodeVtOk) { Did "node: runs tsc ($nodeTsc) and vitest ($nodeVitest) as $User through a link into the read-only tools" }
+    elseif ($contained) {
+        Write-Host "    WARNING  node: as $User it could not run tsc/vitest through a link into $NodeTools (tsc said '$nodeTsc', vitest said '$nodeVitest') - the node part is LEFT OUT of the record" -ForegroundColor Yellow
+        $NodeEnabled = $false
+    }
 }
 # Low integrity (CreateProcessWithLogonW + the Low label on python.exe) has never been seen
 # working on this machine before this line: it is required, never assumed
@@ -522,8 +780,19 @@ $doc = [ordered]@{
     loopback = "open: $LoopbackDecision"
     set_up_at = (Get-Date).ToString("o")
 }
+# the node keys are optional, and written only now - after every probe above has passed
+if ($NodeEnabled) {
+    $doc["node"] = $NodeExe
+    $doc["node_tools"] = $NodeTools
+    $doc["node_firewall_rules"] = @($nodeRules)
+    $doc["node_version"] = $NodeVersion
+    $doc["node_typescript"] = $NodeTsVersion
+    $doc["node_vitest"] = $NodeVtVersion
+    $doc["node_workers_types"] = $NodeWtVersion
+}
 [IO.File]::WriteAllText($Record, ($doc | ConvertTo-Json -Depth 4), $utf8NoBom)
-Did "wrote $Record"
+if ($NodeEnabled) { Did "wrote $Record (with node $NodeVersion, typescript $NodeTsVersion, vitest $NodeVtVersion)" }
+else { Did "wrote $Record (WITHOUT node: TypeScript products are not built until node is set up)" }
 Write-Host ""
 Write-Host "Done. The sandbox is proven. Night builds still wait for Pionir's own checks at each build:" -ForegroundColor Cyan
 Write-Host "  PIONIR_AUTH_COMPAT off, your Daedalus holding its token, Galatea requiring her token from loopback." -ForegroundColor Cyan

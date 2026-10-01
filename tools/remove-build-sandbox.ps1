@@ -5,13 +5,15 @@
 .DESCRIPTION
   Removes everything the setup made, printing each step and checking each result:
     1. every process pionir-builds still has (killed first)
-    2. the Windows Firewall rules in the group "Pionir builds"
+    2. the Windows Firewall rules in the group "Pionir builds" (including the one blocking
+       node.exe, and any node rule the record names that is somehow outside the group)
     3. the deny entries for pionir-builds on C:\src, on the folders in it that do not
        inherit, and on the other data folders the setup listed
     4. the sandbox folder's own permissions: pionir-builds' access, the explicit
        SYSTEM/Administrators/owner entries the setup added and the Low label; it inherits
        from C:\src again (its contents - the product repos - are left where they are)
-    5. %ProgramData%\PionirBuilds (the dedicated Python, the Daedalus copy, setup.json)
+    5. %ProgramData%\PionirBuilds (the dedicated Python, the Daedalus copy, node.exe and the
+       TypeScript tools if they were set up, setup.json)
     6. the credential file and HKCU\Software\Pionir\BuildSandbox
     7. the sign-in screen entry, the user pionir-builds and its profile folder
   The SID is found from the account, the record, or the registry copy - whichever is left.
@@ -82,6 +84,17 @@ if ($rules.Count) {
     if (@(Get-NetFirewallRule -Group $RuleGroup -ErrorAction SilentlyContinue).Count) { Bad "firewall rules remain in '$RuleGroup'" }
     else { Did ("removed " + (($rules | ForEach-Object DisplayName) -join "; ")) }
 } else { Had "no rules in the group '$RuleGroup'" }
+# the node rule(s) the record names, by name, in case one was ever moved out of the group
+if ($doc -and $doc.PSObject.Properties["node_firewall_rules"]) {
+    foreach ($nodeRule in @($doc.node_firewall_rules)) {
+        $stray = @(Get-NetFirewallRule -DisplayName ([string]$nodeRule) -ErrorAction SilentlyContinue)
+        if ($stray.Count) {
+            $stray | Remove-NetFirewallRule
+            if (@(Get-NetFirewallRule -DisplayName ([string]$nodeRule) -ErrorAction SilentlyContinue).Count) { Bad "the node firewall rule '$nodeRule' remains" }
+            else { Did "removed the node firewall rule '$nodeRule'" }
+        } else { Had "no node firewall rule '$nodeRule'" }
+    }
+}
 
 Step "The deny entries"
 if ($UserSid) {
@@ -108,6 +121,7 @@ if (Test-Path $SandboxRoot) {
 
 Step "The install folder"
 if (Test-Path $InstallDir) {
+    # the node tools are read-only to pionir-builds (not to you): take ownership of nothing, just delete
     Remove-Item -Recurse -Force $InstallDir -ErrorAction SilentlyContinue
     if (Test-Path $InstallDir) { Bad "could not delete $InstallDir" } else { Did "deleted $InstallDir" }
 } else { Had "$InstallDir does not exist" }

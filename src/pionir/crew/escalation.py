@@ -35,10 +35,18 @@ that is not a regular file is reported, never followed) and deletes the director
 worker then validates every byte (crew/fiverr/site.py) - nothing Claude wrote is trusted.
 **Reviews** (``Escalator.review``) run through ``claude_review_runner`` with NO tools at all.
 Both spend the same cap and share as research.
+
+**Overnight work** (the Builds division and the API builder: ``night=True``) is held tighter:
+a separate per-night cap (``night_cap``, default 3; a night is noon to noon, local time),
+INSIDE the daily cap, and an explicit cheaper model (``night_model``, default
+``DEFAULT_CLAUDE_MODEL``, passed to the CLI as ``--model``) - the owner does not want unattended
+overnight runs spending his usage on the biggest model. A call over the night cap is refused as
+a ``budget`` refusal, which the worker waits out rather than counting a failed attempt.
 """
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -49,12 +57,37 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 
 from .log import log
 from .result import Err, Ok, Result
 
 # (prompt, timeout_seconds) -> Claude's answer; raises on any failure
 Runner = Callable[[str, float], str]
+
+# What overnight Claude calls use unless PIONIR_CREW_CLAUDE_MODEL says otherwise: a pinned
+# Sonnet-class id, not the "sonnet" alias, because an alias follows whatever is newest (and
+# priciest) while a pinned id moves only when the owner moves it. Probed 2026-09-30 with the
+# Max login: `claude -p --model claude-sonnet-5` ran as claude-sonnet-5.
+DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,63}")
+DEFAULT_NIGHT_CAP = 3
+
+
+def clean_model(model) -> str | None:
+    """The model id to pass as ``--model``, or None for the CLI's own default. A value that
+    is not a plain model id/alias (it could be taken for another option) is refused."""
+    text = str(model or "").strip()
+    if not text or text.lower() in {"default", "none"}:
+        return None
+    if not _MODEL_ID.fullmatch(text):
+        raise ValueError(f"{text!r} is not a model id or alias the claude CLI takes")
+    return text
+
+
+def night_key(t: float) -> str:
+    """The night ``t`` belongs to: noon to noon, local time, named by the date it began on."""
+    return datetime.fromtimestamp(t - 12 * 3600).strftime("%Y-%m-%d")
 
 MAX_PROMPT_CHARS = 12000
 MAX_ANSWER_CHARS = 4000
@@ -173,8 +206,10 @@ REVIEW_DENIED = SITE_DENIED + SITE_TOOLS
 
 
 def _locked_argv(tools: tuple, denied: tuple, allowed: tuple = (), *,
-                 mode: str = REVIEW_MODE) -> list:
+                 mode: str = REVIEW_MODE, model: str | None = None) -> list:
+    model = clean_model(model)
     return ["claude", "-p",
+            *(["--model", model] if model else []),
             "--output-format", "json",
             "--restricted",
             "--tools", ",".join(tools),
@@ -186,14 +221,14 @@ def _locked_argv(tools: tuple, denied: tuple, allowed: tuple = (), *,
             "--no-session-persistence"]
 
 
-def site_argv() -> list:
+def site_argv(model: str | None = None) -> list:
     """The exact ``claude`` command line for a website build. The prompt goes on stdin."""
-    return _locked_argv(SITE_TOOLS, SITE_DENIED, SITE_ALLOWED, mode=SITE_MODE)
+    return _locked_argv(SITE_TOOLS, SITE_DENIED, SITE_ALLOWED, mode=SITE_MODE, model=model)
 
 
-def review_argv() -> list:
+def review_argv(model: str | None = None) -> list:
     """The exact ``claude`` command line for a review: no tools at all (``--tools ""``)."""
-    return _locked_argv((), REVIEW_DENIED)
+    return _locked_argv((), REVIEW_DENIED, model=model)
 
 
 def _final_text(done) -> str:
@@ -251,14 +286,15 @@ def collect_site(workdir: str) -> dict:
     return {"files": files, "problems": problems}
 
 
-def claude_site_runner(prompt: str, timeout: float, *, run=subprocess.run) -> str:
+def claude_site_runner(prompt: str, timeout: float, *, run=subprocess.run,
+                       model: str | None = None) -> str:
     """One website build on the owner's Max login (the API key removed): ``site_argv`` in an
     empty temporary directory, deleted afterwards. Returns JSON ``{"files", "problems",
     "said"}``; raises on any failure. ``run`` is injected by tests."""
     env = claude_env()
     workdir = tempfile.mkdtemp(prefix="pionir-site-")
     try:
-        done = run(site_argv(), input=prompt, capture_output=True, text=True,
+        done = run(site_argv(model), input=prompt, capture_output=True, text=True,
                    encoding="utf-8", errors="replace", timeout=timeout, env=env, cwd=workdir,
                    check=False)
         said = _final_text(done)
@@ -269,13 +305,14 @@ def claude_site_runner(prompt: str, timeout: float, *, run=subprocess.run) -> st
     return json.dumps(got, ensure_ascii=False)
 
 
-def claude_review_runner(prompt: str, timeout: float, *, run=subprocess.run) -> str:
+def claude_review_runner(prompt: str, timeout: float, *, run=subprocess.run,
+                         model: str | None = None) -> str:
     """One review on the owner's Max login with NO tools, in an empty temporary directory.
     Returns Claude's answer text; raises on any failure."""
     env = claude_env()
     workdir = tempfile.mkdtemp(prefix="pionir-review-")
     try:
-        done = run(review_argv(), input=prompt, capture_output=True, text=True,
+        done = run(review_argv(model), input=prompt, capture_output=True, text=True,
                    encoding="utf-8", errors="replace", timeout=timeout, env=env, cwd=workdir,
                    check=False)
     finally:
@@ -284,6 +321,17 @@ def claude_review_runner(prompt: str, timeout: float, *, run=subprocess.run) -> 
     if not text:
         raise RuntimeError("claude -p answered nothing")
     return text
+
+
+def _takes_model(runner) -> bool:
+    """True when ``runner`` accepts a ``model=`` keyword (the real runners do; a test's plain
+    two-argument fake is simply called without one)."""
+    try:
+        params = inspect.signature(runner).parameters
+    except (TypeError, ValueError):
+        return False
+    return "model" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                                    for p in params.values())
 
 
 @dataclass(frozen=True)
@@ -318,9 +366,12 @@ class Escalator:
     def __init__(self, store, allocation, *, runner: Runner | None, daily_cap: int,
                  timeout: float = 300.0, clock: Callable[[], float] = time.time,
                  research_runner: Runner | None = None, site_runner: Runner | None = None,
-                 review_runner: Runner | None = None) -> None:
+                 review_runner: Runner | None = None, night_cap: int = DEFAULT_NIGHT_CAP,
+                 night_model: str | None = DEFAULT_CLAUDE_MODEL) -> None:
         if daily_cap < 0:
             raise ValueError("the daily Claude cap cannot be negative")
+        if night_cap < 0:
+            raise ValueError("the night's Claude cap cannot be negative")
         self.store = store
         self.allocation = allocation
         self.runner = runner
@@ -330,6 +381,8 @@ class Escalator:
         self.researched = 0
         self.built = 0
         self.daily_cap = int(daily_cap)
+        self.night_cap = int(night_cap)
+        self.night_model = clean_model(night_model)
         self.timeout = timeout
         self._clock = clock
         self.refused = 0
@@ -384,33 +437,42 @@ class Escalator:
         return self._capped(division, self.research_runner, "research", prompt, timeout,
                             MAX_RESEARCH_PROMPT_CHARS, MAX_RESEARCH_ANSWER_CHARS)
 
-    def build_site(self, division: str, prompt: str, timeout: float | None = None) -> Result:
+    def build_site(self, division: str, prompt: str, timeout: float | None = None, *,
+                   night: bool = False) -> Result:
         """One website build (``claude_site_runner``: the Write tool only, confined to an
         empty temporary directory): ``Ok(json of the files written)`` or
-        ``Err(ClaudeRefusal)``. The same cap and share as research. Never raises."""
+        ``Err(ClaudeRefusal)``. The same cap and share as research; ``night=True`` (overnight
+        work) adds the per-night cap and the cheaper model. Never raises."""
         return self._capped(division, self.site_runner, "site build", prompt, timeout,
-                            MAX_SITE_PROMPT_CHARS, MAX_SITE_ANSWER_CHARS)
+                            MAX_SITE_PROMPT_CHARS, MAX_SITE_ANSWER_CHARS, night=night)
 
-    def review(self, division: str, prompt: str, timeout: float | None = None) -> Result:
+    def review(self, division: str, prompt: str, timeout: float | None = None, *,
+               night: bool = False) -> Result:
         """One review call with NO tools at all (``claude_review_runner``): Claude reads what
-        it is given and answers. The same cap and share. Never raises."""
+        it is given and answers. The same cap and share (and, for ``night=True``, the
+        per-night cap and the cheaper model). Never raises."""
         return self._capped(division, self.review_runner, "review", prompt, timeout,
-                            MAX_SITE_PROMPT_CHARS, MAX_RESEARCH_ANSWER_CHARS)
+                            MAX_SITE_PROMPT_CHARS, MAX_RESEARCH_ANSWER_CHARS, night=night)
 
     def _capped(self, division: str, runner, label: str, prompt: str, timeout,
-                max_prompt: int, max_answer: int) -> Result:
+                max_prompt: int, max_answer: int, *, night: bool = False) -> Result:
         if runner is None or self.daily_cap <= 0:
             return Err(ClaudeRefusal("off", f"Claude {label} is off (no {label} runner, or "
                                             "the daily Claude cap is 0)"
                                      if label != "research" else
                                      "Claude research is off (no research runner, or "
                                      "the daily Claude cap is 0)"))
+        if night and self.night_cap <= 0:
+            return Err(ClaudeRefusal("off", f"Claude {label} overnight is off (the night's "
+                                            "Claude cap is 0)"))
         now = self._clock()
         try:
             share = self.allocation.cap("claude_escalations", division)
             ok, reason, esc_id = self.store.reserve_escalation(
                 day=local_day(now), division=division, t=now, global_cap=self.daily_cap,
-                division_cap=min(share, self.daily_cap))
+                division_cap=min(share, self.daily_cap),
+                night=night_key(now) if night else None,
+                night_cap=min(self.night_cap, self.daily_cap))
         except Exception as exc:  # noqa: BLE001 - a refusal, in words
             return Err(ClaudeRefusal("unavailable", f"could not reserve a Claude slot: "
                                                     f"{type(exc).__name__}: {exc}"))
@@ -420,7 +482,10 @@ class Escalator:
             return Err(ClaudeRefusal("budget", reason))
         digest = hashlib.sha256(prompt.encode()).hexdigest()[:16]
         try:
-            answer = str(runner(prompt[:max_prompt], timeout or self.timeout)).strip()
+            call = runner
+            if night and self.night_model and _takes_model(runner):
+                call = partial(runner, model=self.night_model)
+            answer = str(call(prompt[:max_prompt], timeout or self.timeout)).strip()
             if not answer:
                 raise RuntimeError("an empty answer")
         except Exception as exc:  # noqa: BLE001 - recorded; the slot stays spent
@@ -442,6 +507,8 @@ class Escalator:
     def snapshot(self) -> dict:
         day = local_day(self._clock())
         return {"enabled": self.enabled, "daily_cap": self.daily_cap,
+                "night_cap": self.night_cap, "night_model": self.night_model,
+                "used_tonight": self.store.night_escalations(night_key(self._clock())),
                 "used_today": self.store.escalations_on(day), "answered": self.answered,
                 "failed": self.failed, "refused": self.refused,
                 "researched": self.researched, "built_or_reviewed": self.built,

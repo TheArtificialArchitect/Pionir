@@ -47,3 +47,23 @@ so a stateless product needs no D1 table. Product ids are lowercase letters only
 1. Idea source [owner's backlog + Moss's reorder; no auto-invention].
 2. Release [Ian runs deploy.ps1 himself].
 3. Price/plan [none: new products ride the existing plans; no per-product price].
+
+## Update: Daedalus writes, Claude only reviews and edits
+
+This supersedes the "Claude writes the product" parts above. The flow per product:
+
+1. Overnight (the 01:00-07:00 window, one new product a night) Pionir generates a small
+   self-contained scaffold repo in the build sandbox (`api-<id>`): a trimmed Product
+   interface, env and openapi helpers, one model product, a vitest config and BRIEF.md.
+   It is never the real Scrooge repo.
+2. Daedalus (local model, contained sandbox user, free) writes the three product files via
+   the Builds division's `coding.daedalus_build` job; its gate runs `tsc` and `vitest` with
+   the sandbox's node (absolute paths from `setup.json`). No node set up: NOT SET UP, nothing built.
+3. Pionir re-checks statically (tamper, banned constructs, spec) and re-runs the tests
+   contained. A failure goes back to Daedalus with the reasons, then is shelved.
+4. Claude does ONE review (no tools; `claude_model`, default `claude-sonnet-5`, per-night cap
+   3 inside the daily cap). If it finds fixable problems: at most ONE edit pass (Write-only),
+   re-checked and re-tested; still red means shelved. An edited product is staged without a
+   second review; the owner's approval of the real verify is the final gate.
+5. Staging onto Scrooge `api/<id>` and the approval-gated real `tsc` + `vitest` are unchanged.
+   Scaffold-vs-real drift is caught by that verify.

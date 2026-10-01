@@ -192,9 +192,21 @@ RULES = """- NO network access of any kind anywhere (no sockets, HTTP, urllib.re
 
 
 def create(root, entry: dict, *, year: int, created_at: float, run=subprocess.run) -> str:
-    """A fresh sandbox repo for this entry, seeded and committed; returns the seed commit.
-    Refuses a folder that already exists (it was not made for this product) and checks the
-    result with the very rule Pionir's adapter enforces."""
+    """A fresh sandbox repo for this entry, seeded and committed; returns the seed commit."""
+    return create_repo(root, entry["slug"], seed_files(entry, year),
+                       marker={"slug": entry["slug"], "created_at": created_at,
+                               "made_by": "the crew's Builds worker",
+                               "listing": listing(entry)["name"]},
+                       message=f"Seed {entry['slug']}: brief, licence and project skeleton",
+                       run=run)
+
+
+def create_repo(root, slug: str, files: dict, *, marker: dict, message: str,
+                run=subprocess.run) -> str:
+    """A fresh sandbox repo ``<root>/<slug>`` holding ``files`` ({relative path: text}),
+    committed; returns the seed commit. Refuses a folder that already exists (it was not
+    made for this product) and checks the result with the very rule Pionir's adapter
+    enforces. The Builds division and the API builder both seed through here."""
     root = Path(root)
     # the root first, before anything is made: it exists (the setup made it, with its
     # ACL), it is a real folder and not a link or junction to somewhere else
@@ -203,7 +215,7 @@ def create(root, entry: dict, *, year: int, created_at: float, run=subprocess.ru
                            r"tools\setup-build-sandbox.ps1")
     if os.path.normcase(os.path.realpath(root)) != os.path.normcase(os.path.abspath(root)):
         raise SandboxError(f"the sandbox workspace {root} resolves somewhere else")
-    repo = root / entry["slug"]
+    repo = root / slug
     if repo.exists() or is_reparse(repo):
         raise SandboxError(f"{repo} already exists; a sandbox repo is always fresh")
     repo.mkdir()
@@ -212,16 +224,13 @@ def create(root, entry: dict, *, year: int, created_at: float, run=subprocess.ru
         sanitize(repo, run=run)             # canonical config, no hooks, from the start
     except GitError as exc:
         raise SandboxError(str(exc)) from exc
-    for rel, text in seed_files(entry, year).items():
+    for rel, text in files.items():
         path = repo / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding="utf-8", newline="\n")
-    marker = {"slug": entry["slug"], "created_at": created_at,
-              "made_by": "the crew's Builds worker", "listing": listing(entry)["name"]}
     (repo / ".git" / SANDBOX_MARKER).write_text(json.dumps(marker, indent=1), encoding="utf-8")
     git(["add", "-A"], repo, run=run)
-    git([*_IDENTITY, "commit", "-q", "-m",
-         f"Seed {entry['slug']}: brief, licence and project skeleton"], repo, run=run)
+    git([*_IDENTITY, "commit", "-q", "-m", message], repo, run=run)
     problem = sandbox_repo_problem(str(repo), str(root))
     if problem:
         raise SandboxError(f"the new sandbox repo does not pass the sandbox rule: {problem}")
