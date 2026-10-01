@@ -502,7 +502,8 @@ class FiverrDesk(_Base):
                 "key": f"inquiry:{eid}", "ref": f"inquiry-{eid}", "kind": "message",
                 "title": "Fiverr: a buyer wrote to you (no order yet)",
                 "body": f"From {shown(q['buyer'], 60)}, subject {shown(q['subject'], 200)}. "
-                "No order is attached, so nothing was prepared. **Reply to them yourself on "
+                "No order is attached, so nothing was prepared. Do NOT open any link or file in it: "
+                "fake buyers send 'please review the project' links. **Reply to them yourself on "
                 "Fiverr.**\n```text\n" + quoted + "\n```"},
                 f"tell the owner a buyer wrote with no order (event {eid})")
             if posted:
