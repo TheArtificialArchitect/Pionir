@@ -31,7 +31,8 @@ class DefaultCatalogueTests(unittest.TestCase):
                                 "fiverr.desk", "fiverr.gigs", "posting.blog",
                                 "posting.devto",
                                 "posting.instagram",
-                                "posting.results", "products.shelf", "treasury.fiverr",
+                                "posting.results", "products.api_builder", "products.shelf",
+                                "treasury.fiverr",
                                 "treasury.ledger", "watch.health"])
 
     def test_adding_a_worker_is_adding_an_entry(self) -> None:

@@ -106,7 +106,7 @@ class ExpiryTests(_Case):
 
 
 class ForegroundRunTests(unittest.TestCase):
-    def test_run_says_what_is_live_and_what_is_placeholder_and_stops_cleanly(self) -> None:
+    def test_run_says_what_is_live_and_stops_cleanly(self) -> None:
         with temp_dir() as root:
             http = FakeHttp()                  # every URL unreachable: nothing leaves the box
             crew = make_crew(root, registry=default_registry(), http=http, tick_seconds=0.05)
@@ -122,8 +122,7 @@ class ForegroundRunTests(unittest.TestCase):
             self.assertIn("treasury.ledger", text)
             self.assertIn("LIVE but NOT CONFIGURED", text)        # no token file in the temp dir
             self.assertIn("posting.blog", text)
-            self.assertIn("PLACEHOLDER", text)
-            self.assertIn("14 live, 1 placeholder(s)", text)
+            self.assertIn("15 live, 0 placeholder(s)", text)
             self.assertIn("stopped cleanly", lines[-1])
             self.assertTrue(crew.stopping)
             self.assertGreater(crew.steps, 0)

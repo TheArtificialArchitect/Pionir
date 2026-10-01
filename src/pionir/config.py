@@ -302,6 +302,11 @@ class PionirSettings:
     gumroad_url: str | None = "https://api.gumroad.com/v2"
     gumroad_token_file: Path | None = None
     products_dir: Path | None = None
+    # The API builder (crew/apibuild): the Scrooge repository it stages ``api/<id>`` branches
+    # in (None means C:/src/Scrooge) and its folder (None means ~/.pionir/apibuilds). The crew
+    # reads the same variables, PIONIR_SCROOGE_REPO and PIONIR_APIBUILDS_DIR.
+    scrooge_repo: Path | None = None
+    apibuilds_dir: Path | None = None
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
     # The local embedding model for hybrid recall. Default on: it is ~0.32 GB and
@@ -455,6 +460,20 @@ class PionirSettings:
         except RuntimeError:
             return self.state_root / "products"
         return home / ".pionir" / "products"
+
+    @property
+    def scrooge_path(self) -> Path:
+        return self.scrooge_repo if self.scrooge_repo is not None else Path("C:/src/Scrooge")
+
+    @property
+    def apibuilds_path(self) -> Path:
+        if self.apibuilds_dir is not None:
+            return self.apibuilds_dir
+        try:
+            home = Path.home()
+        except RuntimeError:
+            return self.state_root / "apibuilds"
+        return home / ".pionir" / "apibuilds"
 
     @property
     def fiverr_path(self) -> Path:
@@ -639,6 +658,16 @@ class PionirSettings:
             products_dir=(
                 Path(os.environ["PIONIR_PRODUCTS_DIR"]).expanduser()
                 if (os.environ.get("PIONIR_PRODUCTS_DIR") or "").strip()
+                else None
+            ),
+            scrooge_repo=(
+                Path(os.environ["PIONIR_SCROOGE_REPO"]).expanduser()
+                if (os.environ.get("PIONIR_SCROOGE_REPO") or "").strip()
+                else None
+            ),
+            apibuilds_dir=(
+                Path(os.environ["PIONIR_APIBUILDS_DIR"]).expanduser()
+                if (os.environ.get("PIONIR_APIBUILDS_DIR") or "").strip()
                 else None
             ),
             embed_model=_embed_model_from_env(),

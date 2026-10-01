@@ -155,6 +155,10 @@ class WorkContext:
     # where the Fiverr desk keeps each gig's listing and each order's files
     # (config.CrewSettings.fiverr_dir); None: the Fiverr workers cannot run
     fiverr_dir: Path | None = None
+    # where the API builder keeps its backlog and worktrees (config.CrewSettings.apibuilds_dir),
+    # and the Scrooge repository it stages branches in (scrooge_repo); None: it cannot run
+    apibuilds_dir: Path | None = None
+    scrooge_repo: Path | None = None
     # When the owner's daily digest is (pionir.batching.DigestSettings, the very settings
     # Pionir's server stamps each batched approval's ``digest_date`` with). A daily poster
     # drafts in time for it (blog.DailyPoster.draft_due); None: a plain 24-hour spacing.

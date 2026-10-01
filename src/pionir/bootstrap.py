@@ -35,6 +35,7 @@ from .adapters import (
     WorkSummarySettings,
     load_stdio_adapters,
 )
+from .adapters.apibuild import ApiBuildAdapter, apibuild_settings
 from .adapters.clients import client_settings
 from .adapters.galatea import resolve_served_model
 from .adapters.products import product_settings
@@ -296,6 +297,9 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         # product.gumroad_publish always parks for approval; a product's zip is scanned for
         # every secret Pionir is configured with, like a client delivery.
         runtime.register(ProductAdapter(product_settings(configured)))
+    # apibuild.verify always parks for approval; the Scrooge repo is looked at when a task
+    # runs (and by `status`), never at boot.
+    runtime.register(ApiBuildAdapter(apibuild_settings(configured)))
     if configured.specialists_file is not None:
         for adapter in load_stdio_adapters(configured.specialists_file):
             runtime.register(adapter)

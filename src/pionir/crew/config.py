@@ -99,6 +99,10 @@ class CrewSettings:
     # files prepared for him to upload on Fiverr (``orders/<n>/out/``). Pionir's fiverr.card
     # reads the same folder. None -> ~/.pionir/fiverr
     fiverr_dir: Path | None = None
+    # The API builder's backlog and worktrees (crew/apibuild), and the Scrooge repository it
+    # stages ``api/<id>`` branches in. None -> ~/.pionir/apibuilds and C:/src/Scrooge
+    apibuilds_dir: Path | None = None
+    scrooge_repo: Path | None = None
     # When the owner's daily digest is (pionir.batching.DigestSettings, read by from_pionir
     # from the same place Pionir's server reads it). The daily posters draft in time for it,
     # so each day's post is in that morning's digest. None: they draft every 24 hours.
@@ -145,6 +149,10 @@ class CrewSettings:
             object.__setattr__(self, "builds_dir", Path.home() / ".pionir" / "builds")
         if self.builds_sandbox is None:
             object.__setattr__(self, "builds_sandbox", Path(DEFAULT_SANDBOX_ROOT))
+        if self.apibuilds_dir is None:
+            object.__setattr__(self, "apibuilds_dir", Path.home() / ".pionir" / "apibuilds")
+        if self.scrooge_repo is None:
+            object.__setattr__(self, "scrooge_repo", Path("C:/src/Scrooge"))
 
     @classmethod
     def from_pionir(cls, settings: PionirSettings, **overrides) -> CrewSettings:
@@ -184,6 +192,8 @@ class CrewSettings:
             ("PIONIR_FIVERR_DIR", "fiverr_dir", Path),
             ("PIONIR_CREW_BUILDS_DIR", "builds_dir", Path),
             ("PIONIR_DAEDALUS_SANDBOX", "builds_sandbox", Path),
+            ("PIONIR_APIBUILDS_DIR", "apibuilds_dir", Path),
+            ("PIONIR_SCROOGE_REPO", "scrooge_repo", Path),
             ("PIONIR_CREW_PIONIR_URL", "pionir_url", str),
             ("PIONIR_CREW_JOB_FOLLOW_SECONDS", "job_follow_seconds", float),
         ):
@@ -207,6 +217,8 @@ class CrewSettings:
         d["deliveries_dir"] = str(self.deliveries_dir)
         d["products_dir"] = str(self.products_dir)
         d["fiverr_dir"] = str(self.fiverr_dir)
+        d["apibuilds_dir"] = str(self.apibuilds_dir)
+        d["scrooge_repo"] = str(self.scrooge_repo)
         d["pionir_token_file"] = str(self.pionir_token_file) if self.pionir_token_file else None
         d["builds_dir"] = str(self.builds_dir)
         d["builds_sandbox"] = str(self.builds_sandbox)

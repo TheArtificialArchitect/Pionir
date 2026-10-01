@@ -78,6 +78,7 @@ EXPECTED = {
     "product.gumroad_publish": ("digest", "new listing only"),
     "product.gumroad_unpublish": ("card", None),
     "product.gumroad_list": ("auto", None),
+    "apibuild.verify": ("card", None),
     # Proteus (trading): brakes run at once; arming is money - its own card, every call.
     "proteus.status": ("auto", None),
     "proteus.logs": ("auto", None),
