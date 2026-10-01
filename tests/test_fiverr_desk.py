@@ -289,6 +289,26 @@ class ScroogeContractTests(_Case):
         self.assertEqual(rec["orders"], {})
         self.assertEqual(self.pionir.acks, ["1", "2", "3"])
 
+    def test_a_buyer_message_about_no_order_reaches_the_owner(self) -> None:
+        # Events 6-8 on the live desk were buyer messages with no order, acknowledged and
+        # dropped without a card: the owner never saw a buyer ask.
+        self.pionir.events = [scrooge_ev(6, "message", order_no="", buyer="cakefan22",
+                                         subject="Can you do a rush?",
+                                         text="Hi, can you research kettles by Friday?")]
+        self.assertIsInstance(self.run_desk(), Ok)
+        keys = self.pionir.posted("inquiry:")
+        self.assertEqual(keys, ["inquiry:6"])
+        body = self.pionir.cards["inquiry:6"][0]["body"]
+        self.assertIn("research kettles by Friday", body)
+        self.assertEqual(self.pionir.acks, ["6"])
+        self.run_desk()                                  # a later run does not post it twice
+        self.assertEqual(len(self.pionir.cards["inquiry:6"]), 1)
+
+    def test_account_mail_still_gets_no_card(self) -> None:
+        self.pionir.events = [scrooge_ev(1, "unknown", order_no="", subject="W-9")]
+        self.assertIsInstance(self.run_desk(), Ok)
+        self.assertEqual(self.pionir.posted("inquiry:"), [])
+
 
 class StateMachineTests(_Case):
     def test_the_allowed_moves_are_the_machine(self) -> None:

@@ -363,7 +363,7 @@ class FiverrDesk(_Base):
     @staticmethod
     def _blank() -> dict:
         return {"orders": {}, "events_seen": [], "cursor": None, "acks_pending": [],
-                "replies_seen": [], "counts": {"events": 0, "unknown_events": 0,
+                "replies_seen": [], "inquiries": {}, "counts": {"events": 0, "unknown_events": 0,
                                                "ignored_events": 0, "malformed_events": 0,
                                                "claude_waits": 0}}
 
@@ -427,6 +427,7 @@ class FiverrDesk(_Base):
             out.append(self._event(ctx, "fiverr.checks_unavailable",
                                    {"why": _clip(exc, 200)}))
         self._retry_cards(ctx, rec, out)
+        self._inquiry_cards(ctx, rec, out)
         self._order_cards(ctx, rec, out)
         if guard is not None:
             self._produce_one(ctx, rec, guard, out)
@@ -462,6 +463,7 @@ class FiverrDesk(_Base):
                 if why.startswith(NO_ORDER):
                     rec["counts"]["ignored_events"] += 1
                     log.info("%s: %s; acknowledged, nothing to apply", self.worker_id, why)
+                    self._keep_inquiry(ctx, rec, ev)
                 else:
                     rec["counts"]["malformed_events"] += 1
                     log.warning("%s: %s", self.worker_id, why)
@@ -474,6 +476,40 @@ class FiverrDesk(_Base):
                 continue
             events.append(norm)
         return Ok(events)
+
+    # ---- buyer messages about no order (a question before buying) -----------------------------
+    def _keep_inquiry(self, ctx: WorkContext, rec: dict, ev: dict) -> None:
+        """A buyer's message that names no order is a question or a request BEFORE an order.
+        It was acknowledged and dropped without a word, so the owner never saw a buyer ask.
+        It is kept here until its card is up."""
+        if not isinstance(ev, dict) or ev.get("kind") != "message":
+            return
+        eid = str(ev.get("id"))
+        if eid in rec["inquiries"]:
+            return
+        rec["inquiries"][eid] = {
+            "at": ctx.now, "posted": False,
+            "buyer": untrusted_text(_field(ev, "buyer"), 60),
+            "subject": untrusted_text(_field(ev, "subject"), 200),
+            "text": untrusted_text(_field(ev, "text"), MAX_TEXT, lines=True)}
+
+    def _inquiry_cards(self, ctx: WorkContext, rec: dict, out: list) -> None:
+        for eid, q in sorted(rec["inquiries"].items()):
+            if q.get("posted"):
+                continue
+            quoted = q["text"].replace("```", "'''")[:1500]
+            posted, why = post_card(ctx, {
+                "key": f"inquiry:{eid}", "ref": f"inquiry-{eid}", "kind": "message",
+                "title": "Fiverr: a buyer wrote to you (no order yet)",
+                "body": f"From {shown(q['buyer'], 60)}, subject {shown(q['subject'], 200)}. "
+                "No order is attached, so nothing was prepared. **Reply to them yourself on "
+                "Fiverr.**\n```text\n" + quoted + "\n```"},
+                f"tell the owner a buyer wrote with no order (event {eid})")
+            if posted:
+                q["posted"] = True
+                out.append(self._event(ctx, "fiverr.inquiry", {"event": eid}))
+            else:
+                log.warning("%s: inquiry card %s not posted: %s", self.worker_id, eid, why)
 
     # ---- applying one event ------------------------------------------------------------------
     def _order(self, rec: dict, ev: dict, now: float) -> dict:
