@@ -161,7 +161,7 @@ $secure = $null
 if ($null -eq $existing) {
     $secure = ConvertTo-SecureString (New-Password) -AsPlainText -Force
     New-LocalUser -Name $User -Password $secure -PasswordNeverExpires -UserMayNotChangePassword `
-        -AccountNeverExpires -Description "Pionir: contained user for overnight builds (no admin)" | Out-Null
+        -AccountNeverExpires -Description "Pionir overnight builds, not an admin" | Out-Null
     Did "created the user $User"
     $needPassword = $true
 } else {

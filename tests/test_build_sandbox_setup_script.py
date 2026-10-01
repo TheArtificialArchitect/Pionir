@@ -33,6 +33,12 @@ class SetupScriptTests(unittest.TestCase):
     def setUp(self) -> None:
         self.text = _text()
 
+    def test_the_user_description_fits_windows_limit(self) -> None:
+        # New-LocalUser refuses a -Description over 48 characters; the first run failed on it
+        for m in re.finditer(r'-Description "([^"]*)"', self.text):
+            self.assertLessEqual(len(m.group(1)), 48, m.group(1))
+        self.assertIn("-Description", self.text)
+
     def test_it_is_windows_powershell_5_1(self) -> None:
         # no PowerShell 7 operators: the owner runs it in Windows PowerShell 5.1
         code = "\n".join(line for line in self.text.splitlines()
