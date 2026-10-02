@@ -114,7 +114,7 @@ $RegKey = "HKCU:\Software\Pionir\BuildSandbox"
 $Requirements = Join-Path $PSScriptRoot "build-sandbox-requirements.txt"
 $NotLoopback = @("0.0.0.0-126.255.255.255", "128.0.0.0-255.255.255.255",
                  "::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff")
-$Loopback = @("127.0.0.0-127.255.255.255", "::1")
+$Loopback = @("127.0.0.0-127.255.255.255")      # Windows refuses ::1 in a rule; IPv4 loopback is the best-effort target
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $script:Problems = @()
 
@@ -426,25 +426,30 @@ try {
     foreach ($exe in @($PyExe, (Join-Path $PyDir "pythonw.exe"))) {
         $name = "Pionir builds - block outbound - " + (Split-Path $exe -Leaf)
         New-NetFirewallRule -DisplayName $name -Group $RuleGroup -Direction Outbound -Action Block `
-            -Program $exe -RemoteAddress $NotLoopback -Profile Any | Out-Null
+            -Program $exe -RemoteAddress $NotLoopback -Profile Any -ErrorAction Stop | Out-Null
         Did "rule: $name (every address but loopback)"; $rules += $name
     }
     if ($NodeEnabled) {
         $name = "Pionir builds - block outbound - " + (Split-Path $NodeExe -Leaf)
         New-NetFirewallRule -DisplayName $name -Group $RuleGroup -Direction Outbound -Action Block `
-            -Program $NodeExe -RemoteAddress $NotLoopback -Profile Any | Out-Null
+            -Program $NodeExe -RemoteAddress $NotLoopback -Profile Any -ErrorAction Stop | Out-Null
         Did "rule: $name (every address but loopback)"; $rules += $name; $nodeRules += $name
     }
     $sddl = "D:(A;;CC;;;$UserSid)"
     $name = "Pionir builds - block outbound - user $User"
     New-NetFirewallRule -DisplayName $name -Group $RuleGroup -Direction Outbound -Action Block `
-        -LocalUser $sddl -RemoteAddress $NotLoopback -Profile Any | Out-Null
+        -LocalUser $sddl -RemoteAddress $NotLoopback -Profile Any -ErrorAction Stop | Out-Null
     Did "rule: $name (any program the user runs: git, PowerShell, anything)"; $rules += $name
     $name = "Pionir builds - block loopback - user $User"
-    New-NetFirewallRule -DisplayName $name -Group $RuleGroup -Direction Outbound -Action Block `
-        -LocalUser $sddl -RemoteAddress $Loopback -Protocol TCP `
-        -RemotePort @("1-$($GatePort - 1)", "$($GatePort + 1)-65535") -Profile Any | Out-Null
-    Did "rule: $name (best effort: Windows does not filter loopback for ordinary programs; loopback is $LoopbackDecision)"; $rules += $name
+    try {
+        New-NetFirewallRule -DisplayName $name -Group $RuleGroup -Direction Outbound -Action Block `
+            -LocalUser $sddl -RemoteAddress $Loopback -Protocol TCP `
+            -RemotePort @("1-$($GatePort - 1)", "$($GatePort + 1)-65535") -Profile Any -ErrorAction Stop | Out-Null
+        Did "rule: $name (best effort: Windows does not filter loopback for ordinary programs; loopback is $LoopbackDecision)"; $rules += $name
+    } catch {
+        $script:Problems += "loopback rule not created: $($_.Exception.Message)"
+        Write-Host "    PROBLEM  loopback rule NOT created ($($_.Exception.Message)); it was best effort only, loopback is $LoopbackDecision" -ForegroundColor Yellow
+    }
 } catch {
     Fail "Windows refused a firewall rule ($($_.Exception.Message)); the user cannot be contained without it"
 }
