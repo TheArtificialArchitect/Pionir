@@ -59,9 +59,14 @@ and its work is retried by the existing rules.
   nothing is a one-way door.
 - Tests never touch the real ledger or `~/.pionir`.
 
-## Open decisions for Ian (defaults in brackets, built on unless you say otherwise)
-1. Fines for failure [none at first].
-2. Who rates excellence [no-edit approvals + revenue; you may add a rating on any card].
-3. Homes for [named agents only, not workers].
-4. Currency name [Pionir coin - rename freely].
-5. Start with [ledger + payout table + a read-only dashboard tab, no store yet].
+## Decided by Ian (2026-10-01)
+1. The currency is **Bolts** (Zeus's bolt). Symbol: a bolt count, whole numbers only.
+2. **Workers get accounts and homes too**, not only named agents: the point is that every
+   agent can work, earn and upgrade, and that the ones who come up with better things earn
+   more and get better things. Personality stays out of workers' *speech*; a home and a
+   balance are data, not personality.
+3. Defaults accepted: no fines at first; excellence = no-edit approvals + revenue (+ Ian's
+   rating on any card); build step one first (ledger + payout table + read-only dashboard
+   tab, no store yet).
+4. Upgrades stay bounded: nothing bought can pass a hard gate (money, customers, publishing,
+   deploys), and every power-raising purchase expires or can be revoked.
