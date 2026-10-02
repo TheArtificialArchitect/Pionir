@@ -528,6 +528,13 @@ class DesktopTests(_Case):
             bs.spawn(["python", "-c", "1"], cwd=self.root, env={}, stdout=self.root / "o",
                      stderr=self.root / "e", limits=bs.JobLimits(), logon=None)
 
+    def test_a_command_line_windows_would_refuse_for_a_logon_is_refused_in_words(self) -> None:
+        with self.assertRaises(bs.SandboxError) as ctx:
+            bs.spawn([sys.executable, "-c", "x" * 2000], cwd=self.root, env={},
+                     stdout=self.root / "o", stderr=self.root / "e", limits=bs.JobLimits(),
+                     logon=("pionir-builds", ".", "pw"))
+        self.assertIn("1024", str(ctx.exception))
+
 
 class ReapTests(_Case):
     def setup(self, *, listing: str, code: int = 0):
@@ -577,6 +584,8 @@ class PreflightReportTests(_Case):
         calls = []
 
         def runner(argv, **kw):
+            kw["asked"] = Path(argv[4]).read_text(encoding="utf-8")   # the work dir is removed after
+            kw["code"] = Path(argv[3]).read_text(encoding="utf-8")
             calls.append((argv, kw))
             return bs.RunResult(None if timed_out else code, timed_out, stdout, "boom")
 
@@ -598,8 +607,12 @@ class PreflightReportTests(_Case):
         self.assertEqual(bs.preflight_problems(doc), [])
         (argv, kw), = calls
         self.assertEqual(kw["logon"], ("pionir-builds", ".", "pw"))      # AS the user
-        self.assertEqual(argv[1:4], ["-I", "-S", "-c"])
-        asked = json.loads(argv[5])
+        self.assertEqual(argv[1:3], ["-I", "-S"])
+        self.assertEqual(kw["code"], bs.PREFLIGHT_CODE)
+        # CreateProcessWithLogonW takes at most 1024 characters of command line (error 87):
+        # nothing that grows with the secrets folder may ride in argv
+        self.assertLess(len(subprocess.list2cmdline(argv)), bs.MAX_LOGON_COMMAND_LINE)
+        asked = json.loads(kw["asked"])
         self.assertEqual([Path(f).name for f in asked["files"]], ["daedalus-token.txt"])
         self.assertIn(str(Path.home()), asked["dirs"])
         self.assertEqual(doc["files"], 1)

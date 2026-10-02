@@ -229,10 +229,12 @@ JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JOB_OBJECT_UILIMIT_ALL = 0x000000FF
 CREATE_SUSPENDED = 0x00000004
 CREATE_NEW_CONSOLE = 0x00000010
+CREATE_NO_WINDOW = 0x08000000
 CREATE_UNICODE_ENVIRONMENT = 0x00000400
 EXTENDED_STARTUPINFO_PRESENT = 0x00080000
 PROC_THREAD_ATTRIBUTE_HANDLE_LIST = 0x00020002
 LOGON_WITH_PROFILE = 0x00000001
+MAX_LOGON_COMMAND_LINE = 1024
 STARTF_USESHOWWINDOW = 0x00000001
 STARTF_USESTDHANDLES = 0x00000100
 TOKEN_QUERY = 0x0008
@@ -828,8 +830,13 @@ def spawn(argv: list, *, cwd, env: dict, stdout: Path, stderr: Path, limits: Job
         std = [msvcrt.get_osfhandle(f.fileno()) for f in (nul, out, err)]
         for h in std:
             os.set_handle_inheritable(h, True)
-        cmdline = ctypes.create_unicode_buffer(
-            subprocess.list2cmdline([str(a) for a in argv]))
+        line = subprocess.list2cmdline([str(a) for a in argv])
+        if logon is not None and len(line) > MAX_LOGON_COMMAND_LINE:
+            raise SandboxError(
+                f"a command line of {len(line)} characters is over the {MAX_LOGON_COMMAND_LINE} "
+                "CreateProcessWithLogonW accepts (Windows would only say 'the parameter is "
+                "incorrect'); put the data in a file")
+        cmdline = ctypes.create_unicode_buffer(line)
         desk = ctypes.create_unicode_buffer(desktop.path)
         pi = _PROCESS_INFORMATION()
         if logon is None:
@@ -868,7 +875,9 @@ def spawn(argv: list, *, cwd, env: dict, stdout: Path, stderr: Path, limits: Job
             user, domain, password = logon
             _check(_adv.CreateProcessWithLogonW(
                 user, domain, password, LOGON_WITH_PROFILE, str(argv[0]), cmdline,
-                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NEW_CONSOLE,
+                # NO_WINDOW, not NEW_CONSOLE: a console on an explicit private desktop dies
+                # at start-up (0xC0000142, and a system error box on the owner's screen)
+                CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
                 _env_block(env), str(cwd), ctypes.byref(si), ctypes.byref(pi)),
                 "CreateProcessWithLogonW")
         if not _k32.AssignProcessToJobObject(job, pi.hProcess):
@@ -1002,7 +1011,8 @@ try:
             out["integrity"] = int(a.GetSidSubAuthority(sid, count - 1)[0])
 except Exception as exc:
     out["error"] = type(exc).__name__
-ask = json.loads(sys.argv[1])
+with open(sys.argv[1], encoding="utf-8") as _f:
+    ask = json.load(_f)
 for p in ask.get("files", []):
     try:
         with open(p, "rb") as f:
@@ -1042,8 +1052,13 @@ def preflight(python, *, work: Path, logon, sid, secrets_dir: Path, runner=None)
         work.mkdir(parents=True, exist_ok=True)
         system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
         env = minimal_env(work=work / "env", path_dirs=[Path(python).parent, system32])
-        done = (runner or run)([str(python), "-I", "-S", "-c", PREFLIGHT_CODE,
-                                json.dumps(targets)],
+        # CreateProcessWithLogonW refuses a command line over 1024 characters (error 87), and
+        # the secrets list is longer than that: the code and the list go in files, not argv
+        script = work / "preflight.py"
+        script.write_text(PREFLIGHT_CODE, encoding="utf-8")
+        asked = work / "preflight-targets.json"
+        asked.write_text(json.dumps(targets), encoding="utf-8")
+        done = (runner or run)([str(python), "-I", "-S", str(script), str(asked)],
                                cwd=work, env=env, out_dir=work / "out", timeout=60,
                                limits=JobLimits(active_processes=2, job_memory_mb=256,
                                                 cpu_seconds=30),
