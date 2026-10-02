@@ -24,6 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from pionir import atomic
 from pionir.shared_gpu import hold_file_lock
 
 log = logging.getLogger("pionir.economy")
@@ -317,7 +318,7 @@ class Ledger:
             fh.write(json.dumps({"seq": row.seq, "hash": row.hash}).encode("ascii"))
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, self.head_path)
+        atomic.replace(tmp, self.head_path)
 
     def _quarantine(self, scan: _Scan) -> None:
         dest = self.path.with_name(f"{self.path.name}.torn-{int(self._now())}")
