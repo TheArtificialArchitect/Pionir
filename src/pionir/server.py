@@ -1256,6 +1256,11 @@ class PionirApp:
                            "batched_pending": sum(1 for r in pending if r.get("batch")),
                            "requested": bool(request and request.get("answered") is not True)}}
 
+    def economy_view(self) -> dict[str, Any]:
+        """The Bolts tab: read-only, play currency. Nothing here writes or authorises."""
+        from .economy.view import economy_payload
+        return economy_payload(self.runtime.settings.economy_path)
+
     def _digest_request(self) -> dict[str, Any] | None:
         return read_request(self.runtime.settings.state_root)
 
@@ -1540,6 +1545,8 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                     self._send(app.audit(min(max(n, 1), 500)))
                 elif route.path == "/api/approvals":
                     self._send(app.approvals_view())
+                elif route.path == "/api/economy":
+                    self._send(app.economy_view())
                 elif route.path == "/api/proteus":
                     self._send(app.proteus_view())
                 elif route.path == "/api/voice_link":

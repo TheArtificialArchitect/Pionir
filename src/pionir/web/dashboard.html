@@ -86,6 +86,16 @@
   /* activity feed */
   .feed{padding:4px 12px 6px;display:flex;flex-direction:column;gap:0;min-height:60px;}
   .empty{padding:22px 12px;color:var(--faint);font-family:var(--f-mono);font-size:12.5px;}
+  #view-bolts{display:flex;flex-direction:column;gap:16px;}
+  .bolts-cols{display:grid;grid-template-columns:1fr 1.6fr;gap:16px;align-items:start;}
+  @media(max-width:820px){.bolts-cols{grid-template-columns:1fr;}}
+  .bolts-chain{padding:10px 18px 4px;font-family:var(--f-mono);font-size:15px;color:var(--signal);}
+  .bolts-chain.bad{color:#e2726e;}
+  .bolts-meta{padding:2px 18px 14px;font-family:var(--f-mono);font-size:12px;color:var(--faint);line-height:1.7;}
+  .bolts-table{padding:6px 12px 12px;font-family:var(--f-mono);font-size:12px;}
+  .bolts-table .r{display:flex;justify-content:space-between;gap:12px;padding:6px 6px;border-bottom:1px solid var(--line);}
+  .bolts-table .r span:first-child{overflow:hidden;text-overflow:ellipsis;}
+  .bolts-table .r b{font-weight:500;font-variant-numeric:tabular-nums;color:var(--ink);}
   .jrow{padding:12px 8px;cursor:pointer;display:flex;flex-direction:column;gap:7px;transition:background .14s;
     border-bottom:1px solid var(--line);}
   .jrow:last-child{border-bottom:none;}
@@ -180,9 +190,21 @@
   <div class="tabs">
     <button class="tab active" data-view="brain">Brain</button>
     <button class="tab" data-view="voice" id="tab-voice" style="display:none">Voice · the glass</button>
+    <button class="tab" data-view="bolts">Bolts</button>
   </div>
 
   <div id="view-voice" hidden><iframe id="voice-frame" title="Galatea"></iframe></div>
+
+  <div id="view-bolts" hidden>
+    <div class="panel"><h2>Bolts · play currency, never money</h2>
+      <div id="bolts-chain" class="bolts-chain">loading…</div>
+      <div id="bolts-today" class="bolts-meta"></div>
+    </div>
+    <div class="bolts-cols">
+      <div class="panel"><h2>Balances</h2><div id="bolts-balances" class="bolts-table"></div></div>
+      <div class="panel"><h2>Recent ledger rows</h2><div id="bolts-recent" class="bolts-table"></div></div>
+    </div>
+  </div>
 
   <div id="view-brain">
     <div class="brainrow">
@@ -267,6 +289,8 @@ function hhmmss(s){ return (s||"").slice(11,19); }
 function setView(v){
   $id("view-brain").hidden = v!=="brain";
   $id("view-voice").hidden = v!=="voice";
+  $id("view-bolts").hidden = v!=="bolts";
+  if(v==="bolts") pollBolts();
   document.querySelectorAll(".tab").forEach(t=>t.classList.toggle("active", t.dataset.view===v));
   if(v==="voice"){
     const f=$id("voice-frame");
@@ -463,6 +487,41 @@ async function pollDoctor(){
     renderRail();
   }catch(e){}
 }
+// ---- Bolts: read-only. Every zero is shown as a zero. ----
+function boltsRows(el, rows, empty){
+  el.replaceChildren();
+  if(!rows.length){ const d=document.createElement("div"); d.className="empty"; d.textContent=empty; el.appendChild(d); return; }
+  for(const [left,right,title] of rows){
+    const r=document.createElement("div"); r.className="r"; if(title) r.title=title;
+    const a=document.createElement("span"); a.textContent=left;
+    const b=document.createElement("b"); b.textContent=right;
+    r.append(a,b); el.appendChild(r);
+  }
+}
+async function pollBolts(){
+  try{
+    const e=await jget("/api/economy");
+    const c=e.chain||{};
+    const chain=$id("bolts-chain");
+    chain.className="bolts-chain"+(c.ok?"":" bad");
+    chain.textContent="Chain "+(c.label||"UNKNOWN")+" · "+(c.rows||0)+" rows"+(c.problem?" · "+c.problem:"");
+    const minted=(e.today||{}).minted||0, caps=e.caps||{}, ref=e.refused||{};
+    const by=Object.entries(ref.by_reason||{}).map(([k,v])=>k+" "+v).join(", ");
+    const per=((e.today||{}).per_account||[]).map(x=>x.account+" "+x.minted+"/"+(caps.per_account||0)).join(", ");
+    $id("bolts-today").textContent=
+      "Minted today "+minted+" of "+(caps.global||0)+" global cap · per account: "+(per||"none yet")+
+      " · refused today "+(ref.total||0)+(by?" ("+by+")":"")+
+      " · total supply "+(e.total_supply||0)+
+      (c.torn?" · torn final line "+c.torn_bytes+" bytes":"")+
+      (c.quarantined?" · "+c.quarantined+" torn tail(s) set aside":"")+
+      (ref.unreadable_lines?" · "+ref.unreadable_lines+" unreadable refusal line(s)":"");
+    boltsRows($id("bolts-balances"),(e.balances||[]).map(x=>[x.account,String(x.balance)]),"No Bolts paid yet: 0 everywhere.");
+    boltsRows($id("bolts-recent"),(e.recent||[]).map(r=>[
+      "#"+r.seq+" "+r.account+" · "+r.reason,(r.delta>0?"+":"")+r.delta,r.event_id]),"No ledger rows yet.");
+  }catch(err){ $id("bolts-chain").className="bolts-chain bad"; $id("bolts-chain").textContent="Bolts: Pionir is not answering."; }
+}
+setInterval(()=>{ if(!$id("view-bolts").hidden) pollBolts(); },10000);
+
 pollState(); pollAudit(); pollDoctor();
 setInterval(pollState,4000); setInterval(pollAudit,5000); setInterval(pollDoctor,20000);
 </script>

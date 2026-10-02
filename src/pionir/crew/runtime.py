@@ -161,7 +161,10 @@ class Crew:
                            builds_dir=getattr(self.cfg, "builds_dir", None),
                            builds_sandbox=getattr(self.cfg, "builds_sandbox", None),
                            apibuilds_dir=getattr(self.cfg, "apibuilds_dir", None),
-                           scrooge_repo=getattr(self.cfg, "scrooge_repo", None))
+                           scrooge_repo=getattr(self.cfg, "scrooge_repo", None),
+                           economy_dir=getattr(self.cfg, "economy_dir", None),
+                           approvals_path=getattr(self.cfg, "approvals_path", None),
+                           outputs=self.store.read_outputs)
 
     def _words(self, worker, purpose: str, system: str, user: str, schema: dict) -> Result:
         """The ONLY way a worker reaches a model: the shared brain, JSON-schema output,

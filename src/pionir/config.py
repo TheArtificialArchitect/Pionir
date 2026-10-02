@@ -313,6 +313,9 @@ class PionirSettings:
     # reads the same variables, PIONIR_SCROOGE_REPO and PIONIR_APIBUILDS_DIR.
     scrooge_repo: Path | None = None
     apibuilds_dir: Path | None = None
+    # The Bolts ledger's folder (economy/): None means ~/.pionir/economy. The crew reads the
+    # same variable, PIONIR_ECONOMY_DIR.
+    economy_dir: Path | None = None
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
     # The local embedding model for hybrid recall. Default on: it is ~0.32 GB and
@@ -487,6 +490,20 @@ class PionirSettings:
         except RuntimeError:
             return self.state_root / "apibuilds"
         return home / ".pionir" / "apibuilds"
+
+    @property
+    def economy_path(self) -> Path:
+        if self.economy_dir is not None:
+            return self.economy_dir
+        try:
+            home = Path.home()
+        except RuntimeError:
+            return self.state_root / "economy"
+        return home / ".pionir" / "economy"
+
+    @property
+    def approvals_queue_path(self) -> Path:
+        return self.state_root / "approvals" / "queue.json"
 
     @property
     def fiverr_path(self) -> Path:
@@ -683,6 +700,11 @@ class PionirSettings:
             apibuilds_dir=(
                 Path(os.environ["PIONIR_APIBUILDS_DIR"]).expanduser()
                 if (os.environ.get("PIONIR_APIBUILDS_DIR") or "").strip()
+                else None
+            ),
+            economy_dir=(
+                Path(os.environ["PIONIR_ECONOMY_DIR"]).expanduser()
+                if (os.environ.get("PIONIR_ECONOMY_DIR") or "").strip()
                 else None
             ),
             embed_model=_embed_model_from_env(),

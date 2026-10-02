@@ -24,7 +24,8 @@ class DefaultCatalogueTests(unittest.TestCase):
                                      "posting.devto",
                                      "posting.instagram", "posting.results",
                                      "products.api_builder", "products.shelf",
-                                     "treasury.fiverr", "treasury.ledger", "watch.health"))
+                                     "treasury.bolts", "treasury.fiverr", "treasury.ledger",
+                                     "watch.health"))
         live = sorted(w.worker_id for w in reg.all() if w.live)
         self.assertEqual(live, ["builds.daedalus",
                                 "contracts.delivery", "contracts.finder", "contracts.orders",
@@ -32,7 +33,7 @@ class DefaultCatalogueTests(unittest.TestCase):
                                 "posting.devto",
                                 "posting.instagram",
                                 "posting.results", "products.api_builder", "products.shelf",
-                                "treasury.fiverr",
+                                "treasury.bolts", "treasury.fiverr",
                                 "treasury.ledger", "watch.health"])
 
     def test_adding_a_worker_is_adding_an_entry(self) -> None:

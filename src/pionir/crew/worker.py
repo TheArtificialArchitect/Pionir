@@ -170,6 +170,12 @@ class WorkContext:
     # sandbox workspace, where each product gets a fresh repo (CrewSettings.builds_sandbox)
     builds_dir: Path | None = None
     builds_sandbox: Path | None = None
+    # the Bolts ledger's folder (config.CrewSettings.economy_dir), Pionir's approvals queue
+    # file, and the crew store's read of its own outputs - all READ except the ledger, which
+    # only the treasury.bolts worker appends to. None: that worker cannot run.
+    economy_dir: Path | None = None
+    approvals_path: Path | None = None
+    outputs: Callable[..., list] | None = None
 
 
 @runtime_checkable

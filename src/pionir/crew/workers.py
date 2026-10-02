@@ -386,6 +386,13 @@ def fiverr_earnings(spec, **params):
     return FiverrEarnings(spec, **params)
 
 
+def bolts_collector(spec, **params):
+    """REAL. ``treasury.bolts`` (bolts.py): pays Bolts, once, for outcomes already on record.
+    No model, no network; a play currency that authorises nothing."""
+    from .bolts import BoltsWorker
+    return BoltsWorker(spec, **params)
+
+
 # The whole list of worker implementations. A catalogue ``impl`` not named here is an
 # error at load time, never a worker that silently does not exist.
 IMPLS = {
@@ -405,4 +412,5 @@ IMPLS = {
     "fiverr_desk": fiverr_desk,
     "fiverr_earnings": fiverr_earnings,
     "daedalus_builds": daedalus_builds,
+    "bolts_collector": bolts_collector,
 }

@@ -121,6 +121,12 @@ class CrewSettings:
     # too). None -> ~/.pionir/builds and C:\src\daedalus-work.
     builds_dir: Path | None = None
     builds_sandbox: Path | None = None
+    # The Bolts ledger's folder, and Pionir's approvals queue file (read by the treasury.bolts
+    # worker, never written). from_pionir sets both from Pionir's settings (~/.pionir/economy,
+    # state_root/approvals/queue.json); None here -> under state_dir, so a test crew never
+    # reaches the owner's real files.
+    economy_dir: Path | None = None
+    approvals_path: Path | None = None
 
     def __post_init__(self) -> None:
         if self.tick_seconds <= 0:
@@ -163,6 +169,11 @@ class CrewSettings:
             object.__setattr__(self, "apibuilds_dir", Path.home() / ".pionir" / "apibuilds")
         if self.scrooge_repo is None:
             object.__setattr__(self, "scrooge_repo", Path("C:/src/Scrooge"))
+        if self.economy_dir is None:
+            object.__setattr__(self, "economy_dir", Path(self.state_dir) / "economy")
+        if self.approvals_path is None:
+            object.__setattr__(self, "approvals_path",
+                               Path(self.state_dir) / "approvals" / "queue.json")
 
     @classmethod
     def from_pionir(cls, settings: PionirSettings, **overrides) -> CrewSettings:
@@ -170,6 +181,8 @@ class CrewSettings:
         and the very lock file the scheduler takes."""
         overrides.setdefault("state_dir", settings.state_root / "crew")
         overrides.setdefault("gpu_lock_path", settings.gpu_lock_path)
+        overrides.setdefault("economy_dir", settings.economy_path)
+        overrides.setdefault("approvals_path", settings.approvals_queue_path)
         from ..auth import token_path
         overrides.setdefault("pionir_token_file", token_path(settings.client_token_path, "crew"))
         if "digest" not in overrides:
@@ -233,6 +246,8 @@ class CrewSettings:
         d["scrooge_repo"] = str(self.scrooge_repo)
         d["pionir_token_file"] = str(self.pionir_token_file) if self.pionir_token_file else None
         d["builds_dir"] = str(self.builds_dir)
+        d["economy_dir"] = str(self.economy_dir)
+        d["approvals_path"] = str(self.approvals_path)
         d["builds_sandbox"] = str(self.builds_sandbox)
         d["catalogue_path"] = str(self.catalogue_path) if self.catalogue_path else None
         d["affiliates"] = [p.public() for p in self.affiliates]

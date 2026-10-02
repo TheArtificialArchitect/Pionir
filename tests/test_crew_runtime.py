@@ -122,7 +122,7 @@ class ForegroundRunTests(unittest.TestCase):
             self.assertIn("treasury.ledger", text)
             self.assertIn("LIVE but NOT CONFIGURED", text)        # no token file in the temp dir
             self.assertIn("posting.blog", text)
-            self.assertIn("15 live, 0 placeholder(s)", text)
+            self.assertIn("16 live, 0 placeholder(s)", text)
             self.assertIn("stopped cleanly", lines[-1])
             self.assertTrue(crew.stopping)
             self.assertGreater(crew.steps, 0)

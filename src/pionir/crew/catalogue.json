@@ -28,9 +28,12 @@
         {"name": "fiverr", "impl": "fiverr_earnings", "kind": "fiverr", "cadence_seconds": 3600,
          "provider": "none", "entities": ["Fiverr"],
          "note": "the Fiverr-reported gross (from Fiverr's order emails, via the Fiverr desk's record); not our revenue records",
-         "params": {"desk_worker": "fiverr.desk"}}
+         "params": {"desk_worker": "fiverr.desk"}},
+        {"name": "bolts", "impl": "bolts_collector", "kind": "bolts", "cadence_seconds": 900,
+         "provider": "none", "entities": ["Bolts"],
+         "note": "pays Bolts (a play currency, never money) once for each outcome already on record; reads only, no model"}
       ],
-      "leader_notes": "treasury.ledger is Scrooge's ledger: our revenue. treasury.fiverr is different: fiverr.earnings holds the Fiverr-reported gross - the prices Fiverr's order emails state, before Fiverr's fee - for orders not cancelled and for completed orders. Always call it Fiverr-reported gross, report it separately, and never add it to our revenue or call it revenue: Fiverr keeps its fee and pays out on its own schedule, and Scrooge's ledger never sees it. Orders whose price was not a plain US dollar amount are counted, never valued. When treasury.fiverr has not run or cannot read the desk's record, Fiverr earnings are UNKNOWN, never zero."
+      "leader_notes": "treasury.ledger is Scrooge's ledger: our revenue. treasury.fiverr is different: fiverr.earnings holds the Fiverr-reported gross - the prices Fiverr's order emails state, before Fiverr's fee - for orders not cancelled and for completed orders. Always call it Fiverr-reported gross, report it separately, and never add it to our revenue or call it revenue: Fiverr keeps its fee and pays out on its own schedule, and Scrooge's ledger never sees it. Orders whose price was not a plain US dollar amount are counted, never valued. When treasury.fiverr has not run or cannot read the desk's record, Fiverr earnings are UNKNOWN, never zero. treasury.bolts is a play-currency tally: Bolts are never revenue and never money, so never add them to any figure above or call them earnings; report them as Bolts only. When a source it reads is UNKNOWN, say UNKNOWN, never zero."
     },
     {
       "id": "watch",
