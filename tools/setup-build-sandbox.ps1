@@ -129,7 +129,9 @@ function Fail([string]$text) {
 }
 function Run-Icacls([string[]]$argv, [switch]$Soft) {
     Write-Host ("    icacls " + ($argv -join " ")) -ForegroundColor DarkGray
-    $out = & icacls.exe @argv 2>&1
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"      # PS 5.1 turns native stderr into a terminating error under Stop: -Soft could never soften
+    try { $out = & icacls.exe @argv 2>&1 } finally { $ErrorActionPreference = $eap }
     $failed = ($out | Select-String -Pattern "Failed processing (\d+) files" |
         ForEach-Object { [int]$_.Matches[0].Groups[1].Value } | Measure-Object -Sum).Sum
     if ($LASTEXITCODE -ne 0 -or $failed) {
@@ -395,7 +397,7 @@ Step "Deny $User the other data folders any signed-in user can write"
 $broad = @("S-1-1-0", "S-1-5-11", "S-1-5-32-545", "S-1-5-4")      # Everyone, Auth Users, Users, Interactive
 $skip = @("Windows", "Program Files", "Program Files (x86)", "ProgramData", "Users",
           '$Recycle.Bin', "System Volume Information", "Recovery", "PerfLogs", "Config.Msi",
-          "Documents and Settings", "OneDriveTemp")
+          "Documents and Settings", "OneDriveTemp", "WindowsApps")
 $writeBits = [Security.AccessControl.FileSystemRights]"WriteData, AppendData, Write, Modify, FullControl"
 $dataRoots = @()
 foreach ($drive in Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3") {
