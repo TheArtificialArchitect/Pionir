@@ -204,6 +204,10 @@
       <div class="panel"><h2>Balances</h2><div id="bolts-balances" class="bolts-table"></div></div>
       <div class="panel"><h2>Recent ledger rows</h2><div id="bolts-recent" class="bolts-table"></div></div>
     </div>
+    <div class="bolts-cols">
+      <div class="panel"><h2>Homes · bought with Bolts, earned trophies</h2><div id="bolts-homes" class="bolts-table"></div></div>
+      <div class="panel"><h2>The shop · decoration and space only</h2><div id="bolts-shop" class="bolts-table"></div></div>
+    </div>
   </div>
 
   <div id="view-brain">
@@ -518,6 +522,13 @@ async function pollBolts(){
     boltsRows($id("bolts-balances"),(e.balances||[]).map(x=>[x.account,String(x.balance)]),"No Bolts paid yet: 0 everywhere.");
     boltsRows($id("bolts-recent"),(e.recent||[]).map(r=>[
       "#"+r.seq+" "+r.account+" · "+r.reason,(r.delta>0?"+":"")+r.delta,r.event_id]),"No ledger rows yet.");
+    const nameOf=Object.fromEntries((e.shop||[]).map(i=>[i.id,i.name]));
+    boltsRows($id("bolts-homes"),(e.homes||[]).map(h=>[
+      h.account+" · "+h.tier+" · "+(h.rooms||[]).length+" room(s) · "+(h.furnishings||[]).length+"/"+h.furnishing_slots+" furnished · "+(h.trophies||[]).length+" trophy(ies)",
+      h.balance+" left",
+      "rooms: "+(h.rooms||[]).map(r=>nameOf[r]||r).join(", ")+"\nfurnishings: "+((h.furnishings||[]).map(r=>nameOf[r]||r).join(", ")||"none")+"\ntrophies: "+((h.trophies||[]).map(t=>t.name).join(", ")||"none yet")]),
+      "No homes yet: a home appears when an account earns its first Bolts.");
+    boltsRows($id("bolts-shop"),(e.shop||[]).map(i=>[i.name+" · "+i.kind,String(i.price),i.blurb||""]),"The shop is empty.");
   }catch(err){ $id("bolts-chain").className="bolts-chain bad"; $id("bolts-chain").textContent="Bolts: Pionir is not answering."; }
 }
 setInterval(()=>{ if(!$id("view-bolts").hidden) pollBolts(); },10000);

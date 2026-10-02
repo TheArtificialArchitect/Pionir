@@ -10,6 +10,7 @@ from __future__ import annotations
 from ..economy.collector import Collector
 from ..economy.ledger import Ledger
 from ..economy.payouts import RefusalLog
+from ..economy.shop import settle_all
 from .figures import Figure
 from .result import Ok, Result
 from .worker import ErrorKind, WorkContext, make_output, never_raises
@@ -28,6 +29,7 @@ class BoltsWorker(_Base):
                               state_dir=ctx.state_dir, outputs=ctx.outputs, now=now)
         result = collector.collect()
         status = ledger.verify_chain()
+        bought = settle_all(ledger) if status.ok else []
         if not status.ok:
             return self._err(ErrorKind.MALFORMED,
                              f"the Bolts ledger is {status.label} ({status.problem}); "
@@ -42,6 +44,8 @@ class BoltsWorker(_Base):
             "sources": [{"name": s.name, "status": s.status, "detail": s.detail,
                          "events": s.events, "paid": s.paid, "refused": s.refused}
                         for s in result.sources],
+            "bought": [{"account": b.row.account, "item": b.item.id, "price": b.item.price}
+                       for b in bought if b.row is not None],
             "unknown_sources": [s.name for s in unknown],
             "refused_today": counts["by_reason"],
         }
@@ -49,6 +53,7 @@ class BoltsWorker(_Base):
             Figure(result.bolts_paid, "count", "Bolts paid this run", window="run"),
             Figure(len(result.paid), "count", "payouts made this run", window="run"),
             Figure(counts["total"], "count", "payouts refused today", window="today"),
+            Figure(len(bought), "count", "things bought for homes this run", window="run"),
             Figure(len(unknown), "count", "sources UNKNOWN this run", window="run"),
         ]
         return Ok((make_output(self, kind="bolts.run", valid_at=ctx.now, observed_at=ctx.now,

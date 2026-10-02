@@ -70,3 +70,18 @@ and its work is retried by the existing rules.
    tab, no store yet).
 4. Upgrades stay bounded: nothing bought can pass a hard gate (money, customers, publishing,
    deploys), and every power-raising purchase expires or can be revoked.
+
+## Built: homes and the cosmetic store (2026-10-02)
+`economy/shop.py`. A home is *derived* from the ledger (rows whose reason is `buy:<item>`,
+negative delta only), never stored: one store, no desync, and a home cannot hold anything
+unpaid. A purchase is one negative row with event id `buy:<account>:<item>`, so a repeat
+buys and charges nothing. Tiers lean-to -> cottage (120) -> house (350) -> manor (900) in
+order; each tier allows 0/1/3/5 extra rooms; furnishing slots are 4 per room. Trophies are
+earned from payout rows, never sold. The crew worker settles every account's wishlist each
+run (a per-account order, so homes differ) and stops at the first thing it cannot afford.
+Shown on the dashboard and the desktop Bolts tab, read-only.
+
+**Not built, on purpose:** the store sells decoration and space only. The resources and
+autonomy items in section 3 (review calls, GPU priority, approval-free repeats) stay
+unbuilt: they would touch the gate's territory and need a gate-aware design and Ian's
+approval first. Nothing in the gate reads a home or a balance (`tests/test_economy_gate.py`).

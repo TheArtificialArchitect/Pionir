@@ -287,6 +287,18 @@ class WorkerTests(Case):
         self.assertEqual(by_measure["sources UNKNOWN this run"], 0)
         self.assertEqual(self.ledger.balance("posting.blog"), 10)
 
+    def test_a_run_furnishes_homes_with_what_accounts_hold_and_a_rerun_buys_nothing(self) -> None:
+        self.healthy()
+        self.ledger.append("daedalus", 90, "build_staged", "seed:daedalus")
+        (out,) = self.worker().run(self.ctx()).value
+        bought = out.payload["bought"]
+        self.assertTrue(bought)
+        self.assertEqual(self.ledger.balance("daedalus"), 90 - sum(b["price"] for b in bought))
+        by_measure = {f.measures: f.value for f in out.figures}
+        self.assertEqual(by_measure["things bought for homes this run"], len(bought))
+        (again,) = self.worker().run(self.ctx()).value
+        self.assertEqual(again.payload["bought"], [])
+
     def test_an_unreadable_source_shows_in_the_figures_as_unknown(self) -> None:
         self.healthy()
         self.queue.unlink()
