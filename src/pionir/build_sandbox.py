@@ -31,8 +31,9 @@ the record has no node keys), and ``run_ts_checks`` runs the two checks containe
 invoked directly (never npm, npx or a .cmd shim) on a ``node_modules`` made of one junction
 per package into the read-only tools.
 
-Every process here starts SUSPENDED on a private window station and desktop, is put in a job
-object (kill-on-close: if Pionir dies, the whole tree dies; no breakaway; every UI
+Every process here starts SUSPENDED (on a private desktop when run as this user; as the
+sandbox user Windows allows only the default desktop, so the job's UI limits and LOW
+integrity stand in for it), is put in a job object (kill-on-close: if Pionir dies, the whole tree dies; no breakaway; every UI
 restriction; a cap on processes, memory and CPU time) and only then resumed. Its output goes
 to FILES, never pipes (a child that fills a pipe nobody reads hangs for ever), and a timeout
 or ``kill`` terminates the whole job - every descendant with it. Before anything starts and
@@ -822,7 +823,12 @@ def spawn(argv: list, *, cwd, env: dict, stdout: Path, stderr: Path, limits: Job
     desktop = None
     handles = []
     try:
-        desktop = PrivateDesktop(sid or current_sid())
+        # CreateProcessWithLogonW cannot start this account on an explicit desktop (user32
+        # start-up fails, whatever the DACL), so a logon run gets no lpDesktop: the Secondary
+        # Logon service puts it on WinSta0\Default and the job's UI limits plus its LOW
+        # integrity keep it from the owner's windows, clipboard and atoms.
+        if logon is None:
+            desktop = PrivateDesktop(sid or current_sid())
         out = open(stdout, "wb")                         # noqa: SIM115 - closed below
         err = open(stderr, "wb")                         # noqa: SIM115
         nul = open(os.devnull, "rb")                     # noqa: SIM115
@@ -837,7 +843,7 @@ def spawn(argv: list, *, cwd, env: dict, stdout: Path, stderr: Path, limits: Job
                 "CreateProcessWithLogonW accepts (Windows would only say 'the parameter is "
                 "incorrect'); put the data in a file")
         cmdline = ctypes.create_unicode_buffer(line)
-        desk = ctypes.create_unicode_buffer(desktop.path)
+        desk = ctypes.create_unicode_buffer(desktop.path) if desktop is not None else None
         pi = _PROCESS_INFORMATION()
         if logon is None:
             six = _STARTUPINFOEXW()
@@ -848,7 +854,8 @@ def spawn(argv: list, *, cwd, env: dict, stdout: Path, stderr: Path, limits: Job
             si.cb = ctypes.sizeof(si)
         si.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW
         si.wShowWindow = 0
-        si.lpDesktop = ctypes.cast(desk, wintypes.LPWSTR)
+        if desk is not None:
+            si.lpDesktop = ctypes.cast(desk, wintypes.LPWSTR)
         si.hStdInput, si.hStdOutput, si.hStdError = std
         if logon is None:
             # only the three standard handles are inherited, whatever else is open
@@ -875,8 +882,7 @@ def spawn(argv: list, *, cwd, env: dict, stdout: Path, stderr: Path, limits: Job
             user, domain, password = logon
             _check(_adv.CreateProcessWithLogonW(
                 user, domain, password, LOGON_WITH_PROFILE, str(argv[0]), cmdline,
-                # NO_WINDOW, not NEW_CONSOLE: a console on an explicit private desktop dies
-                # at start-up (0xC0000142, and a system error box on the owner's screen)
+                # NO_WINDOW: no console flashes on the owner's desktop
                 CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
                 _env_block(env), str(cwd), ctypes.byref(si), ctypes.byref(pi)),
                 "CreateProcessWithLogonW")
