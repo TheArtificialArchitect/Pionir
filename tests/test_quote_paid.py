@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import tempfile
 import unittest
 import urllib.parse
@@ -604,6 +605,10 @@ class DeliveryDeskBalanceTests(_Desk):
         folder.mkdir(parents=True, exist_ok=True)
         data = make_zip(GOOD_FILES)
         (folder / ZIP_NAME).write_bytes(data)
+        # the clock here is the fake T0; a zip stamped with the real clock stops being "settled"
+        # (older than SETTLE_SECONDS) only once the real date passes T0 + 10**6, which it did
+        stamp = T0 - 10**5
+        os.utime(folder / ZIP_NAME, (stamp, stamp))
         return sha(data)
 
     def job(self, job):
