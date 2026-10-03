@@ -16,6 +16,7 @@ from pionir.crew.grounding import (
     check_report,
     claims_in,
     health_claims,
+    topic_claims,
     unbacked_claims,
     unbacked_figures,
     unknown_names,
@@ -183,6 +184,64 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(check_report(["Revenue is $12 so far this month."],
                                       [Figure(1200, "usd_cents", "revenue")], [REVENUE],
                                       set()), [])
+
+
+def _contracts_figures() -> list:
+    now = lambda v, m: Figure(v, "count", m, window="now")      # noqa: E731
+    return [now(1, "orders listed"), now(1, "orders with status quote_requested"),
+            now(0, "orders with status paid"), Figure(0, "count", "new paid orders",
+                                                      window="this_run"),
+            now(1, "quote requests waiting for the owner"),
+            now(0, "client emails pending the owner's approval")]
+
+
+class CountedEventTests(unittest.TestCase):
+    """Report #871 told Moss of a paid order and a client email that never existed."""
+
+    REPORT_871 = ("Contracts Division Report: 1 new paid order, one client email pending, "
+                  "1 quote request waiting for the owner.")
+
+    def test_report_871_wording_is_rejected_against_its_own_figures(self) -> None:
+        problems = check_report([self.REPORT_871], [], _contracts_figures(), set(),
+                                {"contracts", "division", "report"})
+        joined = " | ".join(problems)
+        self.assertIn("1 new paid order", joined)
+        self.assertIn("one client email pending", joined)
+        self.assertNotIn("quote request waiting", joined)    # that one is true
+
+    def test_the_true_quote_request_alone_passes(self) -> None:
+        self.assertEqual(topic_claims("There is one quote request waiting for the owner.",
+                                      _contracts_figures()), [])
+
+    def test_no_new_paid_orders_passes_when_zero_and_fails_when_one(self) -> None:
+        self.assertEqual(topic_claims("Contracts Division Report: No New Paid Orders",
+                                      _contracts_figures()), [])
+        one = [f if f.measures != "new paid orders" else Figure(1, "count", "new paid orders",
+                                                                 window="this_run")
+               for f in _contracts_figures()]
+        self.assertTrue(topic_claims("Contracts Division Report: No New Paid Orders", one))
+
+    def test_number_words_and_digits_both_count(self) -> None:
+        figs = _contracts_figures()
+        self.assertTrue(topic_claims("Two quote requests are waiting.", figs))
+        self.assertTrue(topic_claims("2 quote requests are waiting.", figs))
+        self.assertTrue(topic_claims("A new paid order arrived.", figs))
+
+    def test_a_dollar_order_with_no_recorded_order_is_rejected(self) -> None:
+        zero = [Figure(0, "count", "orders listed", window="now")]
+        self.assertTrue(topic_claims("A $200 order came in.", zero))
+        self.assertTrue(check_report(["A $200 order came in."], [], zero, set()))
+
+    def test_a_claimed_count_with_no_figure_at_all_fails_closed(self) -> None:
+        other = [Figure(3, "count", "drafts blocked")]
+        self.assertTrue(topic_claims("2 paid orders were delivered.", other))
+        self.assertEqual(topic_claims("No paid orders this run.", other), [])
+
+    def test_plain_prose_and_outreach_email_are_not_claims(self) -> None:
+        figs = _contracts_figures()
+        for text in ("We should send an email to Kim.", "Drafted 3 emails today.",
+                     "1 of 3 orders is paid.", "Write a quote for the next build."):
+            self.assertEqual(topic_claims(text, figs), [], text)
 
 
 if __name__ == "__main__":

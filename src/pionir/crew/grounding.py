@@ -365,6 +365,97 @@ def unknown_names(text: str, known: Iterable[str], vocabulary: Iterable[str] = (
     return out
 
 
+# ---- counted events in words -------------------------------------------------------
+#
+# "1 new paid order" and "one client email pending" slipped through every check above:
+# the digit is followed by two words that are not result nouns, so it was read as a BARE
+# number and backed by any figure that happened to equal 1 (the quote request the same
+# report listed), and "one" is not a number word the claims reader counts at all. So the
+# crew's leader told Moss of a paid order and a client email that never existed. A phrase
+# that counts an order, quote, client email, payment, delivery, refund or invoice is
+# therefore read as its own claim and held to the recorded count FIGURES for that thing:
+#
+# - the count is a digit, a number word, "one", "a"/"an" (only with an event cue: a $ amount,
+#   "new", "paid", "pending"... - "send an email" claims nothing) or "no"/"zero";
+# - the figures that can back it are the recorded counts whose measure names the same noun
+#   AND carries the phrase's qualifiers ("new", "paid", "pending", "client"...); when none
+#   carries them, any count for that noun; it is backed when any of them has the stated value;
+# - a stated count above zero for a thing no figure counts at all is unbacked (fail closed:
+#   money and client mail are never taken on a sentence's word); a stated zero with no
+#   figure is left alone.
+
+_COUNT_WORDS = {
+    "zero": 0, "no": 0, "one": 1, "a": 1, "an": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "dozen": 12,
+}
+_TOPICS = ("order", "quote", "email", "payment", "deliver", "refund", "invoice")
+_QUALIFIERS = frozenset(words("""
+new paid unpaid pending waiting held open approved sent failed denied flagged expired
+abandoned client customer request
+"""))
+_QUAL_ALIAS = {"awaiting": "waiting", "requested": "request", "requests": "request"}
+_EVENT_CUES = frozenset(words("new paid unpaid pending waiting awaiting held flagged request"))
+_TOPIC_RX = re.compile(
+    r"(?<![\w$.,/-])(?P<q>\d{1,6}|zero|no|one|an?|two|three|four|five|six|seven|eight|nine|"
+    r"ten|eleven|twelve|dozen)"
+    r"(?P<mods>(?:\s+(?!(?:order|quote|email|payment|deliver|refund|invoice)\w*\b)"
+    r"\$?[A-Za-z0-9][\w'’-]*){0,4}?)"
+    r"\s+(?P<noun>orders?|quote\s+requests?|quotes?|emails?|payments?|deliver(?:y|ies)|"
+    r"refunds?|invoices?)\b"
+    r"(?P<tail>(?:\s+[A-Za-z][\w'’-]*){0,3})", re.IGNORECASE)
+
+
+def _qual(word: str) -> str:
+    w = word.lower().strip("'’")
+    return _QUAL_ALIAS.get(w, w)
+
+
+def topic_word(key: str) -> str:
+    return "delivery" if key == "deliver" else key
+
+
+def topic_claims(text: str, recorded: Iterable[Figure]) -> list:
+    """Reasons a counted event in ``text`` ("1 new paid order", "one client email pending",
+    "no new paid orders") contradicts the recorded count figures. Empty: nothing to say."""
+    counts = [f for f in recorded if f.unit == "count"]
+    out = []
+    for m in _TOPIC_RX.finditer(text or ""):
+        q_word = m.group("q").lower()
+        value = float(q_word) if q_word.isdigit() else float(_COUNT_WORDS[q_word])
+        mods = m.group("mods").split()
+        if any(re.fullmatch(r"\$?\d[\d,.]*", w) or w.lower() in _COUNT_WORDS or w.lower() == "of"
+               for w in mods if not w.startswith("$")):
+            continue                                  # "1 of 3 orders", "2 or 3 emails"
+        noun_phrase = re.sub(r"\s+", " ", m.group("noun").lower())
+        key = next(k for k in _TOPICS if noun_phrase.startswith(k[:5]))
+        quals = {_qual(w) for w in mods + m.group("tail").split()} & _QUALIFIERS
+        if noun_phrase.startswith("quote request"):
+            quals.add("request")
+        cue = (any(w.startswith("$") for w in mods)
+               or bool({_qual(w) for w in mods + m.group("tail").split()} & _EVENT_CUES)
+               or noun_phrase.startswith("quote request"))
+        if q_word in ("a", "an") and not cue:
+            continue                                  # "send an email" counts nothing
+        if key == "email" and not (quals & {"client", "customer", "pending", "waiting"}):
+            continue                                  # an outreach email is not client mail
+        if key == "quote" and not noun_phrase.startswith("quote request") \
+                and q_word in ("a", "an") and not quals:
+            continue
+        topic = [f for f in counts if topic_word(key) in _measure_words(f.measures)]
+        strict = [f for f in topic if quals <= {_qual(w) for w in _measure_words(f.measures)}]
+        pool = strict or topic
+        said = m.group(0).strip()
+        if not pool:
+            if value > 0:
+                out.append(f"states {said!r}, but no figure counts {topic_word(key)}s")
+            continue
+        if not any(same(float(f.value), value) for f in pool):
+            have = ", ".join(sorted({f"{f.measures} = {float(f.value):g}" for f in pool})[:3])
+            out.append(f"states {said!r}, but the figures record {have}")
+    return out
+
+
 def check_report(texts: Iterable[str], stated: Iterable[Figure], recorded: Iterable[Figure],
                  known: Iterable[str], vocabulary: Iterable[str] = (),
                  values: Iterable[float] = ()) -> list:
@@ -385,6 +476,8 @@ def check_report(texts: Iterable[str], stated: Iterable[Figure], recorded: Itera
             problems.append(f"names {n!r}, which nothing recorded")
     for f in unbacked_figures(stated, recorded):
         problems.append(f"lists {f.display()}, which no worker recorded")
+    for text in texts:
+        problems.extend(topic_claims(text, recorded))
     return list(dict.fromkeys(problems))            # each reason once, in order
 
 
