@@ -27,6 +27,9 @@ _SCHEMA = """Reply with ONE JSON object and nothing else:
  "scenes": [{"type": "card" | "image" | "timeline", "heading": str,
              "image": "<image id>" (only for type "image"),
              "lines": [{"text": str, "sources": ["<passage id>", ...]}]}]}"""
+_RUN_SCHEMA = """A scene of type "run" shows a command that was really run: give it
+"run": "<run id>" (the id after "run-" in the passage id) and cite that run passage in at
+least one of its lines. State only numbers the run's output or measurements contain."""
 
 _RULES = """Rules, all checked by a program that rejects the whole script on one breach:
 - Use ONLY facts written in the passages below. Cite the passage id(s) a line rests on.
@@ -48,7 +51,9 @@ def build_prompt(niche: Niche, pack: Pack, feedback: list[str]) -> str:
              f"Target length {niche.length_minutes[0]}-{niche.length_minutes[1]} minutes when "
              f"read aloud (about 150 words a minute), as scenes of 3-8 lines.",
              _SCHEMA, _RULES, "PASSAGES:"]
-    for p in pack.passages:
+    if "run" in niche.scene_mix and pack.runs:
+        parts.insert(-1, _RUN_SCHEMA)
+    for p in pack.all_passages:
         parts.append(f"[{p.id}] ({p.source_id}) {p.title}\n{p.text}")
     if pack.images:
         parts.append("IMAGES you may use for an image scene (id: credit): " + "; ".join(

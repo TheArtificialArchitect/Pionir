@@ -8,7 +8,7 @@ nothing posts. Every number below is either **measured on this machine
 today** or **cited with a source and date**; anything I could not confirm first-hand is
 marked UNCONFIRMED.
 
-## Status (updated 2026-10-02): slice 1 is built, nothing uploads
+## Status (updated 2026-10-03): slice 1 and 2 are built; the uploader is disabled until you set it up
 
 **Decisions (Ian, 2026-10-02).** Fully faceless and synthetic. Narration is Moss's Kokoro
 `af_nicole`, CPU only. Every description carries the disclosure line (`video/disclosure.py`).
@@ -74,6 +74,48 @@ the sponsor page with its "channel too new" fail-closed state; the tutorial scen
 renders real sandbox terminal frames and the local-AI run-log passages published as pages first
 on dokazindustries.com; wiring the three niches into the crew catalogue; deploying the staging
 site (manual, after Ian reads it).
+
+## Slice 2 (2026-10-03): the parts that need no channel and no Google project
+
+Built and tested with fixtures and a fake transport only. **Nothing here was run against a live
+source, a live Google API, the sandbox's real user, or the network; nothing deployed or pushed.**
+
+- **Fetching (`video/fetch.py`).** `python -m pionir video fetch --niche N --source S --ref R
+  --pack FILE`. Readers for Internet Archive, Commons, LoC (and HAER), Chronicling America
+  (1928 or earlier), UW collections and Google Patents (25+ years old). Politeness lives in
+  `PoliteFetcher`: a user agent naming this site, one request per host per two seconds (longer if
+  robots says Crawl-delay), 429/503 backoff honouring Retry-After, no redirect off an allowlisted
+  host, body caps with a cut-off body refused, robots.txt obeyed (fail closed unless it is a plain
+  404), and a seven-day disk cache under `<video_dir>/cache`. Every item needs a **positive**
+  public-domain or licence signal or it is refused; each carries source id, URL, licence basis and
+  attribution. **Known exemption:** Wikimedia's robots.txt disallows its own documented API, so
+  four documented API paths (commons `/w/api.php`, archive.org `/metadata/`, loc.gov `/item/?fo=json`,
+  UW `/digital/api/`) skip the robots check only; spacing, user agent and backoff still apply.
+  **Unverified:** the JSON/HTML shapes for LoC, UW (CONTENTdm) and Google Patents were written
+  from documentation and are fixture-tested only; expect a first live fetch to need a tweak.
+- **Tutorial scenes (`video/tutorial.py`, scene type `run`).** Steps are specs (argv, files to lay
+  down, regex measurements). `python -m pionir video tutorial --steps F --pack P` runs them in the
+  build sandbox (no host fallback) and records real stdout, exit code and measured numbers into
+  the pack as runs. A run is also a citable passage (`run-<id>`), so grounding backs every number.
+  A failed, timed-out, silent or unrun command blocks the script; a tutorial must contain a run
+  scene; a live niche accepts only runs whose runner is `sandbox`.
+- **Sponsor page (`video/sponsor.py`).** `site/sponsor/index.html`, staging only. Audience
+  numbers come only from `<video_dir>/analytics.json` (Ian copies real Studio figures; `as_of`,
+  `source`), and show only when the file is valid, no more than 45 days old, not future-dated, and
+  at least one video is recorded as public; otherwise "the channel is too new". Packages are plain
+  text; a price appears only if `sponsor.json` sets one. Contact is a `mailto:` or an https form
+  action from `sponsor.json`, else "not open yet". No logos, testimonials, ratings, or offers;
+  JSON-LD is Organization + Service only.
+- **Uploader (`video/upload.py`, wired into `VideoAdapter.execute`).** Runs only after Ian's
+  approve (the `approval.owner` grant), for a `live: true` non-example niche, a package that still
+  verifies, and secrets in `~/.pionir/secrets` (`youtube-client.json`, `youtube-token.json`).
+  Resumable, **always Private**, declared synthetic, session persisted in `upload-state.json` so a
+  retry can never create a second video, backoff on 5xx/dropped connections, one token refresh on
+  401, and a clean stop on quota errors (a `videos.insert` costs 1,600 of the 10,000 daily units).
+  The manifest records `privacy: private`; the pages treat a video as published only after Ian
+  makes it public in Studio and runs `python -m pionir video published <id>`. Captions are not
+  uploaded (they need a wider OAuth scope); the thumbnail is.
+- **For Ian:** `docs/VIDEO_SETUP_FOR_IAN.md` and `toolsideo-youtube-consent.ps1` (not run).
 
 ## 0. The honest summary
 

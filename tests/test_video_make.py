@@ -340,7 +340,7 @@ class ApprovalGateTests(unittest.TestCase):
         self.assertIsNone(load_package(self.video_dir, self.made.package.id)
                           .manifest["uploaded"])
 
-    def test_approving_uploads_nothing_and_says_so_with_no_network_touched(self) -> None:
+    def test_approving_a_video_whose_niche_is_not_live_config_uploads_nothing(self) -> None:
         card = self.app.approvals.pending()[0]
         card_id = card.get("id") or card["approval_id"]
         with mock.patch("socket.socket.connect", side_effect=AssertionError("network used")), \
@@ -350,12 +350,12 @@ class ApprovalGateTests(unittest.TestCase):
         result = self.app.approvals.get(card_id)["result"]
         text = json.dumps(result)
         self.assertIn('"uploaded": false', text)
-        self.assertIn("not built", text)
+        self.assertIn("niche is not in the niche config", text)
         self.assertEqual(sha256_file(self.made.package.video),
                          self.made.package.manifest["video_sha256"])
         self.assertIsNone(load_package(self.video_dir, self.made.package.id).manifest["uploaded"])
 
-    def test_the_adapter_has_no_network_or_credential_code_at_all(self) -> None:
+    def test_the_adapter_module_itself_holds_no_socket_or_credential_code(self) -> None:
         source = Path(video_adapter.__file__).read_text(encoding="utf-8")
         for needle in ("urllib", "http.client", "requests", "socket", "googleapiclient",
                        "oauth", "token"):
@@ -365,10 +365,12 @@ class ApprovalGateTests(unittest.TestCase):
             self.assertNotIn(needle, code.lower(), needle)
 
     def test_status_is_local_and_reports_the_staged_video(self) -> None:
-        status = self.adapter.status()
+        adapter = VideoAdapter(VideoSettings(video_dir=self.video_dir,
+                                             secrets_dir=self.root / "no-secrets"))
+        status = adapter.status()
         self.assertEqual(status["staged"], 1)
         self.assertEqual(status["live"], [])
-        self.assertIn("not built", status["uploader"])
+        self.assertEqual(status["uploader"], "secrets not set up")
 
     def test_status_says_unavailable_when_the_niche_file_is_bad(self) -> None:
         bad = self.root / "bad.json"

@@ -10,6 +10,9 @@ and model-free, and it fails closed:
   checks that stop a division leader reporting revenue nobody recorded),
 * the only lines allowed to cite nothing are short connectives ("Now, the second reason."),
   at most a fifth of the script, and they may contain no digit and no name,
+* a ``run`` scene (a tutorial's terminal screen) must name a run in the pack, and that run must
+  have succeeded: a command that was never run, or ran and failed or timed out, blocks the
+  script, as does any failed run left in the pack, and a tutorial niche must show at least one,
 * a title, heading or summary is shown to viewers and is checked like a line against all the
   passages the script cites.
 
@@ -34,7 +37,7 @@ MAX_SCENES = 60
 _WORD = re.compile(r"[A-Za-z][A-Za-z'’-]*")
 _DIGIT = re.compile(r"\d")
 _FIELDS = {"title", "summary", "scenes"}
-_SCENE_FIELDS = {"type", "heading", "image", "lines"}
+_SCENE_FIELDS = {"type", "heading", "image", "run", "lines"}
 _LINE_FIELDS = {"text", "sources", "connective"}
 
 
@@ -61,6 +64,7 @@ class Scene:
     heading: str
     image: str | None
     lines: tuple[Line, ...]
+    run: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +117,13 @@ def check_script(raw: Any, niche: Niche, pack: Pack) -> Script:
     if len(scenes_raw) > MAX_SCENES:
         problems.append(f"{len(scenes_raw)} scenes is more than the {MAX_SCENES} allowed")
 
+    for failed in pack.runs:
+        if not failed.ok:
+            how = "timed out" if failed.timed_out else f"exited {failed.exit_code}"
+            if not failed.timed_out and failed.exit_code == 0:
+                how = "printed nothing"
+            problems.append(f"run {failed.id!r} ({failed.command}) {how}: a script is not built "
+                            "on a pack that holds a failed run")
     scenes: list[Scene] = []
     cited_order: list[str] = []
     line_checks: list[tuple[str, Line]] = []
@@ -141,6 +152,20 @@ def check_script(raw: Any, niche: Niche, pack: Pack) -> Script:
         elif image is not None:
             problems.append(f"{where}: only an image scene may name an image")
             image = None
+        run_id = sraw.get("run")
+        if kind == "run":
+            if "run" not in niche.scene_mix:
+                problems.append(f"{where}: niche {niche.id!r} does not use run scenes")
+            run = pack.run(run_id) if isinstance(run_id, str) else None
+            if run is None:
+                problems.append(f"{where}: run {run_id!r} is not a run in the pack (a command "
+                                "that was never run cannot be shown)")
+                run_id = None
+            elif not run.ok:
+                problems.append(f"{where}: run {run_id!r} did not succeed, so it cannot be shown")
+        elif run_id is not None:
+            problems.append(f"{where}: only a run scene may name a run")
+            run_id = None
         lines_raw = sraw.get("lines")
         if not isinstance(lines_raw, list) or not lines_raw:
             problems.append(f"{where}: no lines")
@@ -176,9 +201,15 @@ def check_script(raw: Any, niche: Niche, pack: Pack) -> Script:
                     problems.append(f"{lwhere}: cites {pid!r}, which is not a passage in the pack")
                 elif pid not in cited_order:
                     cited_order.append(pid)
+        if kind == "run" and run_id and not any(
+                pack.run(run_id).passage_id in line.sources for line in lines):
+            problems.append(f"{where}: no line cites the run it shows ({pack.run(run_id).passage_id})")
         if isinstance(kind, str) and lines:
-            scenes.append(Scene(kind, heading.strip(), image, tuple(lines)))
+            scenes.append(Scene(kind, heading.strip(), image, tuple(lines),
+                                run_id if kind == "run" else None))
 
+    if niche.kind == "tutorial" and not any(s.type == "run" for s in scenes):
+        problems.append("a tutorial must show at least one command that was run (no run scene)")
     connectives = 0
     for lwhere, line in line_checks:
         passages = [p for p in (pack.passage(i) for i in line.sources) if p is not None]

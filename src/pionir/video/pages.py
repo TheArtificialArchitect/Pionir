@@ -10,8 +10,10 @@ What a page claims is limited to what the package proves:
   ``<``, ``>``, ``&`` and the line separators escaped so a hostile title cannot leave its
   ``<script>`` element,
 * only ``https`` source links become links; anything else is printed as inert text,
-* ``uploadDate`` and ``embedUrl`` appear only when the manifest records a real upload, so a page
-  never says a video is on YouTube before it is,
+* ``uploadDate`` and ``embedUrl`` appear only when the manifest records a real PUBLIC upload
+  (an upload is private until Ian makes it public in Studio and records that with
+  ``pionir video published``), so a page never says a video is on YouTube before anyone can
+  watch it,
 * there are no view counts, ratings, dates of publication or any other figure the pipeline did
   not measure itself (the duration comes from the rendered file),
 * an example niche's video gets no page at all, and a package that fails ``verify_package`` is
@@ -24,7 +26,7 @@ import json
 import re
 import shutil
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -91,14 +93,16 @@ def _upload(manifest: dict[str, Any]) -> tuple[str, str] | None:
     uploaded = manifest.get("uploaded")
     if not isinstance(uploaded, dict):
         return None
-    date, youtube_id = uploaded.get("upload_date"), uploaded.get("youtube_id")
+    stamp, youtube_id = uploaded.get("upload_date"), uploaded.get("youtube_id")
+    if uploaded.get("privacy") != "public":
+        return None
     try:
-        datetime.fromisoformat(str(date).replace("Z", "+00:00"))
+        datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
     except ValueError:
         return None
     if not isinstance(youtube_id, str) or not _YOUTUBE_ID.match(youtube_id):
         return None
-    return str(date), f"https://www.youtube.com/embed/{youtube_id}"
+    return str(stamp), f"https://www.youtube.com/embed/{youtube_id}"
 
 
 def _base(base_url: str) -> str:
@@ -150,7 +154,8 @@ def _video_page(m: dict[str, Any], script: dict[str, Any], base: str, series_slu
     related = "".join(
         f'<li><a href="../{_e(o["id"])}/">{_e(o["title"])}</a></li>'
         for o in siblings if o["id"] != m["id"])
-    nav = ['<a href="../../">All series</a>', '<a href="../">' + _e(m["series"]) + "</a>"]
+    nav = ['<a href="../../">All series</a>', '<a href="../">' + _e(m["series"]) + "</a>",
+           '<a href="../../sponsor/">Sponsor</a>']
     if prev:
         nav.append(f'<a rel="prev" href="../{_e(prev["id"])}/">Previous: {_e(prev["title"])}</a>')
     if nxt:
@@ -204,7 +209,8 @@ def _hub_page(series: str, series_slug: str, items: list[dict[str, Any]], base: 
           "url": f"{base}/{series_slug}/",
           "hasPart": [{"@type": "VideoObject", "name": i["title"],
                        "url": f"{base}/{series_slug}/{i['id']}/"} for i in items]}
-    body = (f'<nav><a href="../">All series</a></nav><h1>{_e(series)}</h1><ul>{rows}</ul>'
+    body = (f'<nav><a href="../">All series</a> &middot; <a href="../sponsor/">Sponsor</a></nav>'
+            f'<h1>{_e(series)}</h1><ul>{rows}</ul>'
             f'<p class="disclosure">{_e(DISCLOSURE)}</p>')
     return _shell(series, body,
                   f'<script type="application/ld+json">{json_ld(ld)}</script>')
@@ -216,12 +222,16 @@ def _index_page(groups: dict[str, tuple[str, list[dict[str, Any]]]], base: str) 
                    "</span></li>" for slug, (series, items) in groups.items())
     ld = {"@context": "https://schema.org", "@type": "CollectionPage", "name": "Videos",
           "url": f"{base}/"}
-    body = f'<h1>Videos</h1><ul>{rows}</ul><p class="disclosure">{_e(DISCLOSURE)}</p>'
+    body = (f'<h1>Videos</h1><ul>{rows}</ul><p><a href="sponsor/">Sponsor these videos</a></p>'
+            f'<p class="disclosure">{_e(DISCLOSURE)}</p>')
     return _shell("Videos", body, f'<script type="application/ld+json">{json_ld(ld)}</script>')
 
 
-def build_site(video_dir: Path, *, base_url: str = DEFAULT_BASE_URL) -> Site:
-    """Write the staging site for every staged, verified, non-example package."""
+def build_site(video_dir: Path, *, base_url: str = DEFAULT_BASE_URL,
+               today: date | None = None) -> Site:
+    """Write the staging site for every staged, verified, non-example package, and the sponsor
+    media-kit page (see sponsor.py)."""
+    from . import sponsor
     base = _base(base_url)
     video_dir = Path(video_dir)
     out = video_dir / SITE
@@ -274,4 +284,12 @@ def build_site(video_dir: Path, *, base_url: str = DEFAULT_BASE_URL) -> Site:
         site.pages.append(folder / "index.html")
     (out / "index.html").write_text(_index_page(groups, base), encoding="utf-8")
     site.pages.append(out / "index.html")
+    published = sum(1 for manifest, _s, _d in staged if _upload(manifest))
+    config = sponsor.load_config(video_dir)
+    analytics, _why = sponsor.load_analytics(video_dir, today=today or date.today(),
+                                             published=published)
+    (out / "sponsor").mkdir()
+    (out / "sponsor" / "index.html").write_text(
+        sponsor.sponsor_page(config, analytics, groups, base), encoding="utf-8")
+    site.pages.append(out / "sponsor" / "index.html")
     return site

@@ -63,6 +63,7 @@ def slugify(text: str, limit: int = 48) -> str:
 def script_document(script: Script) -> dict[str, Any]:
     return {"title": script.title, "summary": script.summary,
             "scenes": [{"type": s.type, "heading": s.heading, "image": s.image,
+                        **({"run": s.run} if s.run else {}),
                         "lines": [{"text": line.text, "sources": list(line.sources),
                                    "connective": line.connective} for line in s.lines]}
                        for s in script.scenes]}

@@ -124,9 +124,18 @@ class PageContentTests(PagesBase):
         self.assertNotIn("<iframe", page)
         self.assertIn("not published on YouTube yet", page)
 
+    def test_a_private_upload_is_not_published_so_no_date_or_embed(self) -> None:
+        self.edit_manifest(uploaded={"upload_date": "2027-01-05T10:00:00Z",
+                                     "youtube_id": "abcDEF12345", "privacy": "private"})
+        page = self.page()
+        (ld,) = ld_blocks(page)
+        self.assertNotIn("uploadDate", ld)
+        self.assertNotIn("embedUrl", ld)
+        self.assertNotIn("<iframe", page)
+
     def test_a_recorded_upload_adds_the_date_and_the_embed(self) -> None:
         self.edit_manifest(uploaded={"upload_date": "2027-01-05T10:00:00Z",
-                                     "youtube_id": "abcDEF12345"})
+                                     "youtube_id": "abcDEF12345", "privacy": "public"})
         page = self.page()
         (ld,) = ld_blocks(page)
         self.assertEqual(ld["uploadDate"], "2027-01-05T10:00:00Z")
@@ -319,7 +328,8 @@ class SafetyTests(PagesBase):
     def test_an_empty_queue_builds_an_empty_index_without_crashing(self) -> None:
         shutil.rmtree(queue_dir(self.video_dir))
         site = build_site(self.video_dir, base_url=BASE)
-        self.assertEqual([p.name for p in site.pages], ["index.html"])
+        self.assertEqual(sorted(p.relative_to(site.root).as_posix() for p in site.pages),
+                         ["index.html", "sponsor/index.html"])
 
 
 if __name__ == "__main__":

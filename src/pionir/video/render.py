@@ -18,7 +18,7 @@ from ..social.card import ACCENT, BACKGROUND, BOLD, INK, MUTED, REGULAR, SEMIBOL
 from .disclosure import DISCLOSURE, credit_lines
 from .narrate import Cue, Narration
 from .niche import Niche
-from .passages import ImageRef, Pack
+from .passages import ImageRef, Pack, RunEvidence
 from .script import Scene, Script
 
 FPS = 25
@@ -187,6 +187,53 @@ def draw_timeline(scene: Scene, series: str, size: tuple[int, int], path: Path) 
     image.save(path)
 
 
+def _mono(size: int):
+    from PIL import ImageFont
+    for name in ("consola.ttf", "Consolas.ttf", "DejaVuSansMono.ttf", "cour.ttf"):
+        try:
+            return ImageFont.truetype(name, size)
+        except OSError:
+            continue
+    return _font(size, REGULAR)
+
+
+RUN_ROWS = 15
+RUN_COLS = 92
+
+
+def run_rows(run: RunEvidence) -> list[str]:
+    """The terminal rows drawn for a run: the command, then the last rows of what it printed."""
+    rows = [("$ " + run.command)[:RUN_COLS]]
+    out = [line[:RUN_COLS] for line in run.stdout.strip().splitlines()]
+    keep = RUN_ROWS - len(rows) - (1 if run.measured else 0)
+    if len(out) > keep:
+        out = ["..."] + out[-(keep - 1):]
+    rows += out
+    if run.measured:
+        rows.append(("measured: " + ", ".join(f"{m.name} {m.value:g} {m.unit}".strip()
+                                              for m in run.measured))[:RUN_COLS])
+    return rows
+
+
+def draw_run(scene: Scene, run: RunEvidence, series: str, size: tuple[int, int],
+             path: Path) -> None:
+    from PIL import ImageDraw
+    image = _canvas(size)
+    draw = ImageDraw.Draw(image)
+    _label(draw, size, series)
+    head = _font(54, BOLD)
+    width = size[0] - 192
+    top = _centered_block(draw, size, wrap_px(scene.heading, head, width)[:2], head, 130, INK)
+    draw.rounded_rectangle((96, top + 10, size[0] - 96, size[1] - CAPTION_BAND + 40), radius=14,
+                           fill=(18, 18, 22), outline=MUTED, width=2)
+    font = _mono(32)
+    y = top + 34
+    for row in run_rows(run):
+        draw.text((130, y), row, font=font, fill=ACCENT if row.startswith("$ ") else INK)
+        y += 40
+    image.save(path)
+
+
 def draw_image(scene: Scene, ref: ImageRef, series: str, size: tuple[int, int], path: Path) -> None:
     from PIL import Image, ImageDraw
     with Image.open(ref.path) as source:
@@ -316,6 +363,12 @@ def render_video(script: Script, narration: Narration, niche: Niche, pack: Pack,
             draw_image(scene, ref, series, size, png)
         elif scene.type == "timeline":
             draw_timeline(scene, series, size, png)
+        elif scene.type == "run":
+            run = pack.run(scene.run or "")
+            if run is None or not run.ok:
+                raise RenderUnavailable(f"scene {n + 1}: run {scene.run!r} is not a successful "
+                                        "run in the pack")
+            draw_run(scene, run, series, size, png)
         else:
             draw_card(scene, series, size, png)
         scene_pngs.append(png)

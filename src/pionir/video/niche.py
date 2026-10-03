@@ -25,7 +25,7 @@ DEFAULT_PATH = Path(__file__).with_name("niches.json")
 MIN_CADENCE_DAYS = 7
 KINDS = ("history", "explainer", "tutorial")
 # Scene types the renderer can draw today. A niche may only mix what exists.
-SCENE_TYPES = ("image", "card", "timeline")
+SCENE_TYPES = ("image", "card", "timeline", "run")
 
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{1,40}$")
 _VOICE = re.compile(r"^[abefhijpz][fm]_[a-z]{2,20}$")

@@ -15,7 +15,8 @@
         {"id": "loc", "name": "Library of Congress", "hosts": ["www.loc.gov", "tile.loc.gov"], "license": "public domain unless the item says otherwise"},
         {"id": "chronicling_america", "name": "Chronicling America", "hosts": ["chroniclingamerica.loc.gov"], "license": "public domain"},
         {"id": "spl", "name": "Seattle Public Library digital collections", "hosts": ["cdm16118.contentdm.oclc.org", "www.spl.org"], "license": "public domain material only, recorded per item"},
-        {"id": "seattle_archives", "name": "Seattle Municipal Archives", "hosts": ["digitalcollections.seattle.gov", "www.seattle.gov"], "license": "public domain material only, recorded per item"}
+        {"id": "seattle_archives", "name": "Seattle Municipal Archives", "hosts": ["digitalcollections.seattle.gov", "www.seattle.gov"], "license": "public domain material only, recorded per item"},
+        {"id": "commons", "name": "Wikimedia Commons", "hosts": ["commons.wikimedia.org", "upload.wikimedia.org"], "license": "public domain or CC0, or a CC BY/CC BY-SA file with its attribution recorded"}
       ],
       "scene_mix": {"image": 0.6, "card": 0.2, "timeline": 0.2}
     },
@@ -32,7 +33,8 @@
       "sources": [
         {"id": "patents", "name": "Google Patents (expired US patents)", "hosts": ["patents.google.com"], "license": "public domain"},
         {"id": "loc_haer", "name": "Library of Congress HAER and HABS", "hosts": ["www.loc.gov", "tile.loc.gov"], "license": "public domain unless the item says otherwise"},
-        {"id": "internet_archive", "name": "Internet Archive", "hosts": ["archive.org"], "license": "public domain items only, recorded on each passage"}
+        {"id": "internet_archive", "name": "Internet Archive", "hosts": ["archive.org"], "license": "public domain items only, recorded on each passage"},
+        {"id": "commons", "name": "Wikimedia Commons", "hosts": ["commons.wikimedia.org", "upload.wikimedia.org"], "license": "public domain or CC0, or a CC BY/CC BY-SA file with its attribution recorded"}
       ],
       "scene_mix": {"image": 0.6, "card": 0.15, "timeline": 0.25}
     },
@@ -50,7 +52,7 @@
         {"id": "run_logs", "name": "Dokaz sandbox run logs and benchmark notes", "hosts": ["dokazindustries.com"], "license": "own work"},
         {"id": "ollama_docs", "name": "Ollama documentation", "hosts": ["docs.ollama.com", "github.com"], "license": "MIT"}
       ],
-      "scene_mix": {"card": 0.6, "timeline": 0.2, "image": 0.2}
+      "scene_mix": {"run": 0.45, "card": 0.35, "timeline": 0.2}
     }
   ]
 }
