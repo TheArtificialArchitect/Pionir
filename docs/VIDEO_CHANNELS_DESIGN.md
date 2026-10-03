@@ -1,11 +1,79 @@
-# Video channels: design (research only, nothing built)
+# Video channels: design and build status
 
 Written 2026-10-02. Goal (Ian): a YouTube video maker and poster. Tutorials and history
 facts, a couple of niches each run by its own bot, paid by ads and sponsorships, ending in a
-page brands can sponsor. This file is research and design only. No account exists, no Google
-API has been called, nothing posts. Every number below is either **measured on this machine
+page brands can sponsor. Sections 0-6 are the original research and design; the Status
+section below says what slice 1 built. No account exists, no Google API has been called,
+nothing posts. Every number below is either **measured on this machine
 today** or **cited with a source and date**; anything I could not confirm first-hand is
 marked UNCONFIRMED.
+
+## Status (updated 2026-10-02): slice 1 is built, nothing uploads
+
+**Decisions (Ian, 2026-10-02).** Fully faceless and synthetic. Narration is Moss's Kokoro
+`af_nicole`, CPU only. Every description carries the disclosure line (`video/disclosure.py`).
+Ian creates each channel and the Google project and clicks Public himself. Pages use
+`VideoObject` JSON-LD and interlinked pages like the Techne and dokaz sites.
+
+**Review date: 2027-10-02.** The operation runs a full year before it is judged. Until then
+nothing in this file is a reason to stop it early, and nothing in it is a promise of revenue.
+
+**Three niches, one channel each, one video per niche per week (3 a week in all).**
+`src/pionir/video/niches.json`, every one `live: false` until its channel exists:
+
+| Niche id | Series | Sources |
+|---|---|---|
+| `seattle-local-history` | Seattle and Eastside history | UW digital collections, Library of Congress, Chronicling America, Seattle Public Library, Seattle Municipal Archives |
+| `forgotten-engineering` | How it worked | Google Patents (public domain), LoC HAER/HABS, Internet Archive |
+| `local-ai-12gb` | Local AI on a 12 GB card | our own run logs and VRAM benchmarks, Ollama docs |
+
+Cadence is `cadence_days: 7` per niche (one a week per channel); the loader refuses anything
+faster, so a config typo cannot turn a channel into a flood. Flip a niche to `live: true` only
+after its channel exists: until then its videos are built but never offered for approval.
+
+**What is built (slice 1).** `python -m pionir video niches | make | site`.
+- Niche config loader and validation (`video/niche.py`).
+- Script stage (`video/script.py`, `writer.py`): a local model (Ollama, `num_gpu: 0`, no cloud,
+  no GPU lease) writes from a passage pack; software rejects the script unless every spoken line
+  cites a passage from an allowlisted source, every number and name appears in the cited text,
+  and at most 20% of lines are unsourced connectives. Fail closed: a rejected script spends no
+  voice or render time.
+- Narration (Kokoro, CPU provider only) with sentence-exact timing; SRT captions; ffmpeg
+  assembly from the scene list (cards, timelines, Ken Burns on public-domain images, credit line).
+- Approval queue: every finished video is a parked privileged action
+  `video.youtube_upload` (card, approved every time, never routed). The payload is
+  `{video_id, title, series, duration_seconds, sha256}`; a video edited after its card was shown
+  cannot be approved through. The upload itself is a stub: approving records the yes and
+  uploads nothing.
+- Static pages (`video/pages.py`): transcript, numbered sources, disclosure, `VideoObject`
+  JSON-LD (`uploadDate` and `embedUrl` only once a real upload is recorded), series hubs,
+  previous/next and related links. Written to `<video_dir>/site` only; never deployed.
+- Tests fail when each rule is reverted (checked by mutation).
+
+**Measured sample.** A real 640x360 render with live Kokoro narration of a four-scene test
+script: 24.9 s, 280 KB, h264 + aac, built in 11 s on CPU (no GPU used).
+
+**Review load.** Three approvals a week, one per channel, each a card with the title, length,
+sources and folder. Each approval is also a watch-through, so budget roughly 10-15 minutes per
+video: about 30-45 minutes a week. Cards are independent (approving one leaves the other two
+waiting), and narration is CPU and serial, which is fine at three a week.
+
+**Why 1 a week per channel stays inside the mass-produced-content guidance.** YouTube's
+"inauthentic content" policy targets mass-produced, repetitive, template-made video. One
+sourced, distinct video per channel per week, each with its own script, cited sources and a
+person approving it, is a modest cadence and the opposite of a flood. The risk is not volume
+but sameness, so the guards are variation in scene mix per niche, a hard cap on unsourced
+lines, and the cadence floor in the loader. Three channels in one series each would be a
+different case; three different niches is not. This is judgement from the published
+policy, not a guarantee: YouTube decides, and the year before judging includes watching for any
+demonetisation notice.
+
+**Left for slice 2.** Real passage fetching (today a hand-built pack file); the YouTube
+uploader (sends Private, Ian clicks Public in Studio, then records `uploaded`); analytics read;
+the sponsor page with its "channel too new" fail-closed state; the tutorial scene type that
+renders real sandbox terminal frames and the local-AI run-log passages published as pages first
+on dokazindustries.com; wiring the three niches into the crew catalogue; deploying the staging
+site (manual, after Ian reads it).
 
 ## 0. The honest summary
 

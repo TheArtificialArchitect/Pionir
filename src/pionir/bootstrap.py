@@ -36,6 +36,7 @@ from .adapters import (
     load_stdio_adapters,
 )
 from .adapters.apibuild import ApiBuildAdapter, apibuild_settings
+from .adapters.video import VideoAdapter, video_settings
 from .adapters.clients import client_settings
 from .adapters.galatea import resolve_served_model
 from .adapters.products import product_settings
@@ -306,6 +307,8 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
     # apibuild.verify always parks for approval; the Scrooge repo is looked at when a task
     # runs (and by `status`), never at boot.
     runtime.register(ApiBuildAdapter(apibuild_settings(configured)))
+    # video.youtube_upload always parks for approval and, in slice 1, uploads nothing.
+    runtime.register(VideoAdapter(video_settings(configured)))
     if configured.specialists_file is not None:
         for adapter in load_stdio_adapters(configured.specialists_file):
             runtime.register(adapter)

@@ -313,6 +313,9 @@ class PionirSettings:
     # reads the same variables, PIONIR_SCROOGE_REPO and PIONIR_APIBUILDS_DIR.
     scrooge_repo: Path | None = None
     apibuilds_dir: Path | None = None
+    # The video pipeline's folder (video/): staged videos and the page staging area. None means
+    # ~/.pionir/video. PIONIR_VIDEO_DIR overrides it.
+    video_dir: Path | None = None
     # The Bolts ledger's folder (economy/): None means ~/.pionir/economy. The crew reads the
     # same variable, PIONIR_ECONOMY_DIR.
     economy_dir: Path | None = None
@@ -480,6 +483,16 @@ class PionirSettings:
     @property
     def scrooge_path(self) -> Path:
         return self.scrooge_repo if self.scrooge_repo is not None else Path("C:/src/Scrooge")
+
+    @property
+    def video_path(self) -> Path:
+        if self.video_dir is not None:
+            return self.video_dir
+        try:
+            home = Path.home()
+        except RuntimeError:
+            return self.state_root / "video"
+        return home / ".pionir" / "video"
 
     @property
     def apibuilds_path(self) -> Path:
@@ -700,6 +713,11 @@ class PionirSettings:
             apibuilds_dir=(
                 Path(os.environ["PIONIR_APIBUILDS_DIR"]).expanduser()
                 if (os.environ.get("PIONIR_APIBUILDS_DIR") or "").strip()
+                else None
+            ),
+            video_dir=(
+                Path(os.environ["PIONIR_VIDEO_DIR"]).expanduser()
+                if (os.environ.get("PIONIR_VIDEO_DIR") or "").strip()
                 else None
             ),
             economy_dir=(

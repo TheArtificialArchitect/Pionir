@@ -16,6 +16,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+video = [
+  "kokoro-onnx",  # video/narrate.py: the narration voice, CPU only (model files live under Galatea)
+]
 dev = [
   "pytest>=8.0",
   "ruff>=0.6",

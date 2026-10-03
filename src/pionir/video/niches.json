@@ -1,0 +1,56 @@
+{
+  "niches": [
+    {
+      "id": "seattle-local-history",
+      "example": false,
+      "live": false,
+      "title": "Seattle and the Eastside: what actually happened, and where to still see it",
+      "kind": "history",
+      "voice": "af_nicole",
+      "length_minutes": [8, 12],
+      "cadence_days": 7,
+      "series": ["Seattle and Eastside history"],
+      "sources": [
+        {"id": "uw_collections", "name": "University of Washington Digital Collections", "hosts": ["digitalcollections.lib.washington.edu"], "license": "rights recorded per item"},
+        {"id": "loc", "name": "Library of Congress", "hosts": ["www.loc.gov", "tile.loc.gov"], "license": "public domain unless the item says otherwise"},
+        {"id": "chronicling_america", "name": "Chronicling America", "hosts": ["chroniclingamerica.loc.gov"], "license": "public domain"},
+        {"id": "spl", "name": "Seattle Public Library digital collections", "hosts": ["cdm16118.contentdm.oclc.org", "www.spl.org"], "license": "public domain material only, recorded per item"},
+        {"id": "seattle_archives", "name": "Seattle Municipal Archives", "hosts": ["digitalcollections.seattle.gov", "www.seattle.gov"], "license": "public domain material only, recorded per item"}
+      ],
+      "scene_mix": {"image": 0.6, "card": 0.2, "timeline": 0.2}
+    },
+    {
+      "id": "forgotten-engineering",
+      "example": false,
+      "live": false,
+      "title": "Forgotten engineering: how canals, telegraphs, lighthouses and bridges worked",
+      "kind": "explainer",
+      "voice": "af_nicole",
+      "length_minutes": [8, 12],
+      "cadence_days": 7,
+      "series": ["How it worked"],
+      "sources": [
+        {"id": "patents", "name": "Google Patents (expired US patents)", "hosts": ["patents.google.com"], "license": "public domain"},
+        {"id": "loc_haer", "name": "Library of Congress HAER and HABS", "hosts": ["www.loc.gov", "tile.loc.gov"], "license": "public domain unless the item says otherwise"},
+        {"id": "internet_archive", "name": "Internet Archive", "hosts": ["archive.org"], "license": "public domain items only, recorded on each passage"}
+      ],
+      "scene_mix": {"image": 0.6, "card": 0.15, "timeline": 0.25}
+    },
+    {
+      "id": "local-ai-12gb",
+      "example": false,
+      "live": false,
+      "title": "Local AI on a 12 GB card: only what was run and measured",
+      "kind": "tutorial",
+      "voice": "af_nicole",
+      "length_minutes": [8, 12],
+      "cadence_days": 7,
+      "series": ["Local AI on a 12 GB card"],
+      "sources": [
+        {"id": "run_logs", "name": "Dokaz sandbox run logs and benchmark notes", "hosts": ["dokazindustries.com"], "license": "own work"},
+        {"id": "ollama_docs", "name": "Ollama documentation", "hosts": ["docs.ollama.com", "github.com"], "license": "MIT"}
+      ],
+      "scene_mix": {"card": 0.6, "timeline": 0.2, "image": 0.2}
+    }
+  ]
+}

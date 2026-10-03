@@ -11,7 +11,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from . import benchmark, bridge_auth, bryofeed, recallcheck, routecheck, workcli
+from . import benchmark, bridge_auth, bryofeed, recallcheck, routecheck, videocli, workcli
 from .batching import DigestSettings, approval_level, batch_condition
 from .bootstrap import PionirRuntime, build_runtime
 from .config import PionirSettings
@@ -256,6 +256,7 @@ def _parser() -> argparse.ArgumentParser:
         help="also run the probes through the local embedder to show the hybrid lift",
     )
     workcli.add_parsers(commands)
+    videocli.add_parsers(commands)
     return parser
 
 
@@ -826,6 +827,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "work":
         # Its own database, opened directly: no runtime, no server, no network.
         return workcli.run(args, PionirSettings.from_environment())
+    if args.command == "video":
+        # Builds files and parks at most one approval card; no server, no upload.
+        try:
+            return videocli.run(args, PionirSettings.from_environment())
+        except (PionirError, ValueError, OSError) as error:
+            _print({"status": "error", "error_type": type(error).__name__,
+                    "message": str(error)})
+            return 1
     if args.command == "bryo-feed":
         # A standalone poller: it reads the running server over HTTP and needs no
         # runtime of its own (no Cortex, no GPU lock), so it short-circuits here.
