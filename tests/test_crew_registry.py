@@ -23,7 +23,8 @@ class DefaultCatalogueTests(unittest.TestCase):
                                      "fiverr.gigs", "posting.blog",
                                      "posting.devto",
                                      "posting.instagram", "posting.results",
-                                     "products.api_builder", "products.shelf",
+                                     "products.api_builder", "products.demand",
+                                     "products.shelf",
                                      "treasury.bolts", "treasury.fiverr", "treasury.ledger",
                                      "watch.health"))
         live = sorted(w.worker_id for w in reg.all() if w.live)
@@ -32,7 +33,8 @@ class DefaultCatalogueTests(unittest.TestCase):
                                 "fiverr.desk", "fiverr.gigs", "posting.blog",
                                 "posting.devto",
                                 "posting.instagram",
-                                "posting.results", "products.api_builder", "products.shelf",
+                                "posting.results", "products.api_builder",
+                                "products.demand", "products.shelf",
                                 "treasury.bolts", "treasury.fiverr",
                                 "treasury.ledger", "watch.health"])
 

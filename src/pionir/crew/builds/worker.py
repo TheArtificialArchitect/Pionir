@@ -3,7 +3,8 @@
 The owner's product line is small paid developer tools ($9-19 on Gumroad). This worker turns
 the product backlog (backlog.py) into staged products, one at a time:
 
-1. **Pick** (by day, from the backlog; Moss's division goal can put a product first) and,
+1. **Pick** (by day, from the backlog; Moss's division goal can put a product first, and
+   failing that the highest measured demand in products.demand's ``demand.json`` does) and,
    inside the overnight window only (window.py, default 01:00-07:00), create the product's
    OWN fresh sandbox repo (sandbox.py, ``<builds_sandbox>\\<slug>``) and ask Pionir to run
    ``coding.daedalus_build`` in it - unparked only through the crew client's one grant
@@ -59,9 +60,10 @@ from datetime import datetime
 from pathlib import Path
 
 from pionir import build_sandbox
-from pionir.auth import compat_from_environment
 from pionir.adapters.deliveries import DeliveryProblem
+from pionir.auth import compat_from_environment
 
+from .. import demand
 from ..blog import _clip, _Unreadable, read_record, record_path, save_record
 from ..delivery import _PASSING, PASSING_TYPES
 from ..figures import Figure
@@ -671,7 +673,8 @@ class BuildsWorker(_Base):
                 return                                      # one new product a night
             if doc is None:
                 return
-            entry = bl.choose(doc["products"], set(products), ctx.goal)
+            entry = bl.choose(doc["products"], set(products), ctx.goal,
+                              demand.build_preference(ctx.state_dir, ctx.now))
             if entry is None:
                 return
             if not self._tools_ready(ctx, rec, night, entry, events):

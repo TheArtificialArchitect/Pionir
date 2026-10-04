@@ -562,6 +562,32 @@ class StartTests(_Case):
         self.run_at(at(1, 1, 30))
         self.assertTrue(self.pionir.builds()[0].payload["repo"].endswith("cron-explain"))
 
+    def demand(self, computed_at, *ranked) -> None:
+        """products.demand's ranking, as it writes it: these backlog slugs, best first."""
+        self.state.mkdir(parents=True, exist_ok=True)
+        ranking = [{"id": f"build:{slug}", "kind": "build", "ref": slug, "score": 100 - i,
+                    "product": "convert"} for i, slug in enumerate(ranked)]
+        ranking.append({"id": "build:cron-explain", "kind": "build", "ref": "cron-explain",
+                        "score": None, "product": None})
+        (self.state / "demand.json").write_text(json.dumps(
+            {"computed_at": computed_at, "ranking": ranking}), encoding="utf-8")
+
+    def test_the_highest_measured_demand_is_built_first_without_a_goal(self) -> None:
+        self.demand(at(1, 0, 0), "json-to-xlsx", "csv-to-sqlite")
+        self.run_at(at(1, 1, 30))
+        self.assertTrue(self.pionir.builds()[0].payload["repo"].endswith("json-to-xlsx"))
+
+    def test_moss_goal_still_wins_over_the_demand(self) -> None:
+        self.demand(at(1, 0, 0), "json-to-xlsx")
+        self.goal = "Build cron-explain before anything else."
+        self.run_at(at(1, 1, 30))
+        self.assertTrue(self.pionir.builds()[0].payload["repo"].endswith("cron-explain"))
+
+    def test_a_stale_demand_ranking_is_ignored(self) -> None:
+        self.demand(at(1, 1, 30) - 4 * 86400, "json-to-xlsx")
+        self.run_at(at(1, 1, 30))
+        self.assertTrue(self.pionir.builds()[0].payload["repo"].endswith("exif-strip"))
+
 
 class ReviewTests(_Case):
     def test_an_approved_build_is_staged_exactly_as_the_shelf_publishes(self) -> None:
