@@ -14,7 +14,8 @@ from itertools import pairwise
 from crew_support import temp_dir
 from test_crew_fakes import ScriptedWorker, catalogue, make_crew
 
-from pionir.crew.pool import ProviderGate, jitter
+from pionir.crew.log import log
+from pionir.crew.pool import QUIET_NOT_CONFIGURED_SECONDS, ProviderGate, jitter
 
 
 class _Case(unittest.TestCase):
@@ -106,6 +107,39 @@ class ConcurrencyTests(_Case):
         first = crew.dispatcher.dispatch(only=["alpha.slow"])
         second = crew.dispatcher.dispatch(only=["alpha.slow"])
         self.assertEqual((first.attempted, second.attempted, second.busy), (1, 0, 1))
+
+
+class QuietNotConfiguredTests(_Case):
+    """Reverted: a worker that is not set up logs a warning on every run (products.api_builder,
+    542 identical lines in 72 h), or - the other way - a quiet log loses the failure itself."""
+
+    def warnings(self, crew, runs: int) -> int:
+        with self.assertLogs("pionir.crew", level="WARNING") as logs:
+            log.warning("marker")               # assertLogs needs at least one line
+            for _ in range(runs):
+                report = crew.dispatcher.dispatch(only=["alpha.w"], wait=True)
+                self.assertEqual(report.failed, 1)
+        return sum("worker alpha.w:" in line for line in logs.output)
+
+    def test_a_not_configured_worker_logs_once_an_hour_but_every_run_is_recorded(self) -> None:
+        crew = self.crew({"alpha": [{"name": "w", "params": {"mode": "unset"}}]})
+        now = [1_000_000.0]
+        crew.dispatcher._clock = lambda: now[0]
+        self.assertEqual(self.warnings(crew, 5), 1)
+        runs = crew.store.runs("alpha.w")
+        self.assertEqual(len(runs), 5)                          # vitals see every failure
+        self.assertTrue(all(r["error_kind"] == "not_configured" for r in runs))
+        now[0] += QUIET_NOT_CONFIGURED_SECONDS
+        self.assertEqual(self.warnings(crew, 2), 1)             # an hour on: said again
+
+    def test_a_change_of_state_is_always_logged(self) -> None:
+        crew = self.crew({"alpha": [{"name": "w", "params": {"mode": "unset"}}]})
+        worker = crew.registry.require("alpha.w")
+        self.assertEqual(self.warnings(crew, 2), 1)
+        worker.mode = "err"                                     # another failure: logged
+        self.assertEqual(self.warnings(crew, 2), 2)
+        worker.mode = "unset"                                   # not set up again: logged
+        self.assertEqual(self.warnings(crew, 2), 1)
 
 
 class SingleWriterTests(_Case):

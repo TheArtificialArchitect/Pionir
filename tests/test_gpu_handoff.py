@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from pionir.adapters.daedalus import DaedalusAdapter
+from pionir.adapters.daedalus import DaedalusAdapter, DaedalusSettings
 from pionir.contracts import AgentManifest, Capability, ModelRequirement, Task, TaskResult
 from pionir.errors import ResourceUnavailable
 from pionir.runtime import Executive
@@ -76,6 +76,23 @@ class DaedalusRequirementTests(unittest.TestCase):
     def test_daedalus_fits_the_budget_of_this_card(self) -> None:
         requirement = DaedalusAdapter().manifest.capabilities[0].model
         self.assertLessEqual(requirement.total_vram_mb, ResourceBudget().usable_vram_mb)
+
+    def test_daedalus_is_admitted_with_the_free_vram_that_refused_three_night_builds(self) -> None:
+        # 2026-10-03/04: 10_000 MB asked, 9_819-9_969 MB free, three starts refused - for a
+        # model Ollama splits between the card and RAM anyway
+        requirement = DaedalusAdapter().manifest.capabilities[0].model
+        self.assertEqual(requirement.estimated_vram_mb, 9_000)
+        with tempfile.TemporaryDirectory() as tmp:
+            card = _Card([], free_when_empty=9_819)
+            lease = _scheduler(card, SharedGpuLock(Path(tmp) / "gpu.lock")).acquire(requirement)
+            lease.release()
+
+    def test_the_estimate_is_a_setting(self) -> None:
+        settings = DaedalusSettings(estimated_vram_mb=8_500)
+        self.assertEqual(DaedalusAdapter(settings).manifest.capabilities[0].model
+                         .estimated_vram_mb, 8_500)
+        with self.assertRaises(ValueError):
+            DaedalusSettings(estimated_vram_mb=0)
 
 
 class ProtectedYieldsToTheLeaseTests(unittest.TestCase):

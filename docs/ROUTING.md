@@ -30,8 +30,10 @@ under her own timeout, and on a 202 poll `GET /api/task/<task_id>?wait=60` until
 Daedalus runs `qwen3-coder:30b`. It is not a CPU tenant: measured 2026-09-13,
 Ollama loads it at ~18-19 GB with ~10 GB on the card, and the load evicts
 `gemma3:12b` (the voice). Its capability declares `requires_gpu=True`,
-`estimated_vram_mb=10_000`, `context_vram_mb=0` - the on-card share, which fits
-the budget (12 288 - 1 830 = 10 458 MB); declaring the whole 18-19 GB would make
+`estimated_vram_mb=9_000` (`DaedalusSettings.estimated_vram_mb`), `context_vram_mb=0` -
+an admission estimate of the on-card share, which fits the budget (12 288 - 1 830 =
+10 458 MB). Ollama sizes that share to what is free, so it is not a hard need: 10 000
+refused three night builds (2026-10-03/04) with 9 819-9 969 MB free. Declaring the whole 18-19 GB would make
 a model that does run here unadmittable, and raising its context measured RAM,
 not VRAM. So a coding job takes the shared GPU lease, whose holder record reads
 `owner=pionir purpose="daedalus: qwen3-coder:30b"`.

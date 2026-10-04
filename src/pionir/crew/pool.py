@@ -38,6 +38,11 @@ from .worker import ErrorKind, Output, WorkerError
 
 JITTER_SPREAD = 0.30
 DEFAULT_MIN_INTERVAL = 0.3
+# A worker that is not configured fails the same way every run (products.api_builder logged
+# "node is not set up" 542 times in 72 h): the log says it once, again when the reason
+# changes or after this long, and once more after it recovers. EVERY attempt is still
+# recorded as a failure, so vitals and alerts see each one.
+QUIET_NOT_CONFIGURED_SECONDS = 3600.0
 
 
 def jitter(worker_id: str) -> float:
@@ -120,6 +125,7 @@ class Dispatcher:
                                         thread_name_prefix="pionir-crew-worker")
         self._lock = threading.Lock()
         self._in_flight: set = set()
+        self._quiet: dict = {}                  # worker_id -> (message, logged at)
         self.max_workers = max_workers
 
     def due(self, now: float | None = None, only: Sequence[str] | None = None) -> tuple:
@@ -213,9 +219,22 @@ class Dispatcher:
         finally:
             with self._lock:
                 self._in_flight.discard(worker.worker_id)
-        if error is not None:
+        if self._worth_logging(worker.worker_id, error):
             log.warning("worker %s: %s", worker.worker_id, error)
         return error, written
+
+    def _worth_logging(self, worker_id: str, error) -> bool:
+        """Every error but a repeated not_configured one; see QUIET_NOT_CONFIGURED_SECONDS."""
+        with self._lock:
+            if error is None or error.kind != ErrorKind.NOT_CONFIGURED:
+                self._quiet.pop(worker_id, None)
+                return error is not None
+            now = self._clock()
+            prev = self._quiet.get(worker_id)
+            if prev and prev[0] == error.message and now - prev[1] < QUIET_NOT_CONFIGURED_SECONDS:
+                return False
+            self._quiet[worker_id] = (error.message, now)
+            return True
 
     def in_flight(self) -> list:
         with self._lock:

@@ -218,6 +218,10 @@ class DaedalusSettings(LoopbackHttpSettings):
     # Observability only; resolved live from /health at boot. qwen3-coder:30b fills the
     # card (measured 2026-09-13: ~10 GB on it, the rest in RAM), so a job takes the lease.
     model_id: str = "qwen3-coder:30b"
+    # The VRAM the scheduler must see free before a job is admitted. An ADMISSION estimate,
+    # not a hard need: Ollama splits qwen3-coder:30b between the card and RAM by what is free.
+    # 10_000 refused three night builds on 2026-10-03/04 with 9_819-9_969 MB free.
+    estimated_vram_mb: int = 9_000
     # The Builds division's sandbox workspace: coding.daedalus_build reaches only repos
     # directly inside it (sandbox_repo_problem), through the build Daedalus on build_port.
     sandbox_root: str = DEFAULT_SANDBOX_ROOT
@@ -243,6 +247,8 @@ class DaedalusSettings(LoopbackHttpSettings):
             raise ValueError("Daedalus's longest build must be at least a minute")
         if self.cancel_grace_seconds < 0:
             raise ValueError("Daedalus's cancel grace cannot be negative")
+        if self.estimated_vram_mb <= 0:
+            raise ValueError("Daedalus's VRAM estimate must be positive")
 
 
 def _default_setup(settings: DaedalusSettings):
@@ -352,10 +358,11 @@ class DaedalusAdapter:
         model = ModelRequirement(
             model_id=self.settings.model_id,
             # Measured 2026-09-13: Ollama loads qwen3-coder:30b at ~18-19 GB, ~10 GB on the
-            # card, evicting gemma3:12b. 10_000 is the on-card share, and it admits (the
-            # budget allows 12_288 - 1_830 = 10_458 MB). Fitting means sidelining the
-            # voice's model - only under the lease, put back when the lease ends.
-            estimated_vram_mb=10_000,
+            # card, evicting gemma3:12b. Ollama fits the on-card share to what is free, so the
+            # default 9_000 (settings.estimated_vram_mb) is what admission asks for - within
+            # the budget (12_288 - 1_830 = 10_458 MB). Fitting means sidelining the voice's
+            # model - only under the lease, put back when the lease ends.
+            estimated_vram_mb=self.settings.estimated_vram_mb,
             context_vram_mb=0,
             requires_gpu=True,
             exclusive_card=True,
