@@ -70,6 +70,13 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn("--require-hashes", self.text)
         self.assertIn('Fail "pip install failed 3 times', install)
 
+    def test_the_install_runs_from_the_host_python_because_the_sandbox_one_is_firewalled(self) -> None:
+        install = _section(self.text, "$HostPy = ", "Did \"copied Python and installed")
+        self.assertIn("& $HostPy @pipArgs", install)
+        self.assertNotIn("& $PyExe @pipArgs", install)
+        self.assertIn('"--target", $SitePackages', install)
+        self.assertIn("--only-binary=:all:", install)
+
     def test_loopback_is_reported_as_accepted_never_a_stop(self) -> None:
         loop = _section(self.text, "# loopback: reported, never a stop",
                         "if (-not $contained)")

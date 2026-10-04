@@ -246,12 +246,17 @@ if ($ready) { Had "$PyExe has Daedalus's server packages" } else {
     if ($LASTEXITCODE -ge 8) { Fail "robocopy exited $LASTEXITCODE" }
     & $PyExe -I -m ensurepip --default-pip | Out-Null
     if ($LASTEXITCODE -ne 0) { Fail "ensurepip failed" }
+    # The HOST python fetches and installs; the sandbox python is firewalled (step 6 blocks its outbound
+    # traffic, and that rule outlives a run), so on a rerun it could never reach PyPI: WinError 10013.
+    # --target puts the pinned, hashed wheels straight into the sandbox's site-packages.
+    $HostPy = Join-Path $PythonSource "python.exe"
+    $SitePackages = Join-Path $PyDir "Lib\site-packages"
     $pipArgs = @("-I", "-m", "pip", "install", "--isolated", "--require-hashes", "--only-binary=:all:",
-                 "--no-cache-dir", "--no-deps", "--disable-pip-version-check",
-                 "--no-warn-script-location", "-r", $Requirements)
-    Write-Host ("    $PyExe " + ($pipArgs -join " ")) -ForegroundColor DarkGray
+                 "--no-cache-dir", "--no-deps", "--disable-pip-version-check", "--upgrade",
+                 "--target", $SitePackages, "-r", $Requirements)
+    Write-Host ("    $HostPy " + ($pipArgs -join " ")) -ForegroundColor DarkGray
     for ($try = 1; $try -le 3; $try++) {      # PyPI sometimes lists a project as empty for a moment; the pins and hashes are unchanged
-        & $PyExe @pipArgs
+        & $HostPy @pipArgs
         if ($LASTEXITCODE -eq 0) { break }
         if ($try -lt 3) { Write-Host "    pip did not finish (attempt $try of 3); trying again in 10 s" -ForegroundColor Yellow; Start-Sleep -Seconds 10 }
     }
