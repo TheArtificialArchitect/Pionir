@@ -212,6 +212,11 @@ class _Case(unittest.TestCase):
             return self.suite
 
         self.worker.run_tests = fake_tests
+        # the long-standing tests below describe a one-slice, 45-minute build on a sandbox
+        # whose Python has pytest; the slice, budget and pytest rules have their own tests
+        self.worker.slices = 1
+        self.worker.budget = 45 * 60
+        self.worker.probe_module = lambda python, module: True
         self.setup = FakeSetup(self.sandbox)
         self.configured = True
         self.worker.load_sandbox = lambda root: (

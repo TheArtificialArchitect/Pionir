@@ -47,8 +47,11 @@ def _runtime(tmp: str):
     ))
 
 
+_ANCHOR = datetime.now(UTC)      # one clock reading, so two stamps never straddle a second boundary
+
+
 def _z(delta: timedelta) -> str:
-    return (datetime.now(UTC) + delta).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return (_ANCHOR + delta).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 READS = ["/api/work/summary", "/api/work/jobs", "/api/work/sessions", "/api/work/log"]

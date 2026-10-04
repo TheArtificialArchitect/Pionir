@@ -235,7 +235,7 @@ Run-Icacls @($InstallDir, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F",
 Did "${InstallDir}: Administrators and SYSTEM Full; you and $User read-only"
 $ready = $false
 if (Test-Path $PyExe) {
-    & $PyExe -I -c "import fastapi, uvicorn, requests, yaml" 2>$null
+    & $PyExe -I -c "import fastapi, uvicorn, requests, yaml, pytest" 2>$null
     $ready = ($LASTEXITCODE -eq 0)
 }
 if ($ready) { Had "$PyExe has Daedalus's server packages" } else {

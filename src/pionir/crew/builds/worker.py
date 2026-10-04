@@ -11,7 +11,7 @@ the product backlog (backlog.py) into staged products, one at a time:
    adapter refuses any repo that is not a sandbox repo this worker made, rewrites its git
    config first, and runs the job on a contained Daedalus of its own. Pionir takes its exclusive GPU lease for the job (Moss's model steps aside),
    so: at most ONE job at a time, never one that cannot finish before the window ends
-   (``budget_minutes``, default 45; its ``not_after`` is the window's end at the latest, and
+   (``budget_minutes``, default 75, per slice; its ``not_after`` is the window's end at the latest, and
    Pionir cancels it there), at most one NEW product per night. The job is submitted with
    ``follow=0`` and followed on later runs through ``ctx.task``, so the one hands thread is
    never held for most of an hour.
@@ -33,6 +33,13 @@ the product backlog (backlog.py) into staged products, one at a time:
    for each staged or shelved product, and the backlog card, which - like the nightly
    report - takes his replies (``add``/``remove``/``top``; only his count).
 
+**Slices.** A product is built in ``slices`` jobs (default 2: the core and its tests, then the
+command line, README and the rest). Each landed slice is a commit that survives whatever the
+next job does (a failed or timed-out job's own work is discarded by Daedalus's gate), the slice
+index lives in the product's record, and only the last slice is reviewed. A Python build does
+not start at all while the sandbox's interpreter cannot import pytest: Daedalus's G2 runs it,
+and without it every build burned its whole budget and failed at the gate.
+
 **Contained** (pionir/build_sandbox.py): nothing here runs as the owner. Daedalus builds on a
 second instance Pionir starts as the ``pionir-builds`` user for each job; our own test run of
 the generated code runs as that user too, with its firewalled interpreter, in a job object.
@@ -47,6 +54,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -86,6 +94,46 @@ KEEP_NIGHTS = 30
 KEEP_REPLIES = 500
 
 
+def _probe_module(python, module: str) -> bool:
+    """True when the sandbox's own interpreter can import ``module``. Isolated mode, short
+    timeout, nothing else run; an interpreter that cannot even start counts as missing."""
+    try:
+        done = subprocess.run([str(python), "-I", "-c", f"import {module}"],
+                              capture_output=True, timeout=30, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0
+
+
+def _slice_lead(slice_no: int, total: int, minutes: int) -> str:
+    """The pacing paragraph at the head of a build: how long this job has and, when a
+    product is built in slices, which slice it is."""
+    pace = (f"You have about {minutes} minutes for this job, and it is stopped at that point: "
+            "write a test, run it, move on, and do not re-read files you already read.")
+    if total <= 1:
+        return pace
+    if slice_no < total:
+        return (f"SLICE {slice_no} OF {total} - the core only. {pace} Write the importable "
+                "package (all the real logic) and its unit tests and get every test passing. "
+                "Do NOT write the command-line entry point, README.md or CHANGELOG.md yet: "
+                "the next slice does. Stop as soon as the tests pass.")
+    return (f"SLICE {slice_no} OF {total} - finish it. {pace} The earlier slice (the core and "
+            "its tests) is already committed: read it, do not rewrite it. Add the "
+            "command-line entry point, README.md, CHANGELOG.md and every acceptance test the "
+            "core does not cover yet. Keep all tests passing.")
+
+
+def _where_it_stopped(error) -> str:
+    """The "how far it got" sentence the adapter put in a timeout, for the report."""
+    text = str(error or "")
+    for lead in ("After the cancel: ", "At the last look (it had not stopped yet): "):
+        at = text.find(lead)
+        if at >= 0:
+            tail = text[at + len(lead):].split(" The outcome", 1)[0].strip().rstrip(".")
+            return f" ({lead[:-2].lower()}: {tail})" if tail else ""
+    return ""
+
+
 def _hm(t: float) -> str:
     return datetime.fromtimestamp(t).strftime("%H:%M")
 
@@ -95,8 +143,8 @@ class BuildsWorker(_Base):
 
     record_what = "the Builds worker's own record of every product it built"
 
-    def __init__(self, spec, *, window: str = "01:00-07:00", budget_minutes: int = 45,
-                 max_attempts: int = 2, ssh_dir: str | None = "~/.ssh", test_timeout_seconds: float = review.TEST_TIMEOUT,
+    def __init__(self, spec, *, window: str = "01:00-07:00", budget_minutes: int = 75,
+                 max_attempts: int = 2, slices: int = 2, ssh_dir: str | None = "~/.ssh", test_timeout_seconds: float = review.TEST_TIMEOUT,
                  review_timeout_seconds: float = REVIEW_TIMEOUT) -> None:
         super().__init__(spec)
         self.window = Window.parse(window)
@@ -106,11 +154,15 @@ class BuildsWorker(_Base):
         if not 1 <= int(max_attempts) <= 3:
             raise ValueError("max_attempts must be 1 to 3 (a build and its repairs)")
         self.max_attempts = int(max_attempts)
+        if not 1 <= int(slices) <= 2:
+            raise ValueError("slices must be 1 or 2 (the core, then the rest)")
+        self.slices = int(slices)
         self.ssh_dir = ssh_dir
         self.test_timeout = float(test_timeout_seconds)
         self.review_timeout = float(review_timeout_seconds)
         # the outside world, injected (tests replace these)
         self.run_tests = review.run_tests
+        self.probe_module = _probe_module       # (python, module) -> bool, injectable
         self.git_run = None                 # None: subprocess.run
         # the contained sandbox user, as the setup script left it (None: not configured)
         self.load_sandbox = lambda root: build_sandbox.load_setup(root)
@@ -291,9 +343,10 @@ class BuildsWorker(_Base):
             self._failed_attempt(ctx, rec, p, f"Daedalus's own gate did not pass: "
                                  f"{_clip(why, 300)}", events)
         elif out.status == "failed" and out.error_type == "AdapterTimeout":
-            a.update(outcome="timed_out", why=_clip(out.error, 300))
+            a.update(outcome="timed_out", why=_clip(out.error, 600))
             self._failed_attempt(ctx, rec, p, f"it did not finish in its "
-                                 f"{self.budget // 60}-minute budget and was stopped", events)
+                                 f"{self.budget // 60}-minute budget and was stopped"
+                                 f"{_where_it_stopped(out.error)}", events)
         elif out.status == "failed" and (out.error_type in PASSING_TYPES or (
                 not out.error_type and _PASSING.search(out.error or ""))):
             # lost touch WHILE Daedalus ran it: it may still be running and commit, so wait
@@ -346,10 +399,13 @@ class BuildsWorker(_Base):
 
     def _landed(self, ctx, rec, p, a, output, events) -> None:
         """Daedalus says its gate passed: the commit must be in the sandbox's own branch."""
+        prior = p.get("slice_head") or p["base"]
+        on_branch = False
         try:
             head = sandbox.head(p["repo"], **self._git())
             commit = str(output.get("commit") or "")
-            if head == p["base"] and commit:
+            if head == prior and commit:
+                on_branch = True
                 # Daedalus left it on a branch of its own: take that commit by id. The
                 # owner's side never checks out or merges a build repo.
                 head = sandbox.built_commit(p["repo"], p["base"], commit, **self._git())
@@ -358,13 +414,25 @@ class BuildsWorker(_Base):
             self._failed_attempt(ctx, rec, p, f"its commit could not be found in the sandbox "
                                  f"({_clip(exc, 200)})", events)
             return
-        if head == p["base"] or head == p.get("reviewed_head"):
+        if head == prior or head == p.get("reviewed_head"):
             a.update(outcome="gate_failed", why="Daedalus reported a pass but committed nothing")
             self._failed_attempt(ctx, rec, p, "Daedalus reported a pass but committed nothing "
                                  "new", events)
             return
         a.update(outcome="built", commit=head, job_id=output.get("job_id"),
                  branch=output.get("branch"), files=list(output.get("files") or [])[:40])
+        slice_no, total = int(p.get("slice") or 1), int(p.get("slices") or 1)
+        if slice_no < total and not on_branch:
+            # the core is committed on the branch the next slice starts from: kept whatever
+            # happens next, and reviewed only once the whole product is there
+            p.update(state="queued", head=head, slice_head=head, slice=slice_no + 1,
+                     waiting=None, retry_after=0.0, review_failures=0, repair_reasons=[])
+            self._night_log(ctx, f"{p['slug']}: slice {slice_no} of {total} landed "
+                                 f"({head[:10]}), starting the next")
+            events.append(self._event(ctx, "build.slice_landed", {
+                "slug": p["slug"], "slice": slice_no, "of": total, "commit": head[:12],
+                "files": len(a["files"])}))
+            return
         p.update(state="built", head=head, waiting=None, review_failures=0)
         self._night_log(ctx, f"{p['slug']}: built ({head[:10]}), waiting for review")
         events.append(self._event(ctx, "build.built", {
@@ -389,12 +457,19 @@ class BuildsWorker(_Base):
         self._save(ctx, rec)
 
     def _counted(self, p: dict) -> int:
-        return sum(1 for a in p["attempts"] if a.get("outcome") in COUNTED)
+        """Real attempts at the slice in hand: a slice that landed does not use up the
+        retries of the next one."""
+        here = int(p.get("slice") or 1)
+        return sum(1 for a in p["attempts"]
+                   if a.get("outcome") in COUNTED and int(a.get("slice") or 1) == here)
 
     def _failed_attempt(self, ctx, rec, p, why: str, events: list) -> None:
         if self._counted(p) < self.max_attempts:
-            p.update(state="repair", repair_reasons=[_clip(why, 400)], waiting=None,
-                     retry_after=0.0)
+            reviewed = bool(p.get("reviewed_head"))      # a review already rejected a version
+            p.update(state="repair", waiting=None, retry_after=0.0,
+                     repair_from="review" if reviewed else "attempt",
+                     repair_reasons=[_clip(why, 400)] + (
+                         list(p.get("repair_reasons") or [])[:11] if reviewed else []))
             self._night_log(ctx, f"{p['slug']}: attempt failed - {_clip(why, 120)}")
             events.append(self._event(ctx, "build.attempt_failed", {
                 "slug": p["slug"], "why": _clip(why, 200), "repair_next": True}))
@@ -510,7 +585,7 @@ class BuildsWorker(_Base):
         self._night_log(ctx, f"{p['slug']}: REJECTED by {by} - {_clip(text, 160)}")
         if self._counted(p) < self.max_attempts:
             p.update(state="repair", repair_reasons=[_clip(r, 400) for r in reasons[:12]],
-                     waiting=None, retry_after=0.0)
+                     waiting=None, retry_after=0.0, repair_from="review")
         else:
             self._shelve(ctx, rec, p, f"rejected by {by} after its repair: {text}", events)
         self._save(ctx, rec)
@@ -588,12 +663,41 @@ class BuildsWorker(_Base):
             entry = bl.choose(doc["products"], set(products), ctx.goal)
             if entry is None:
                 return
+            if not self._tools_ready(ctx, rec, night, entry, events):
+                return                                      # before a repo is even made
             p = self._new_product(ctx, rec, entry, night, events)
             if p is None:
                 return
+        elif not self._tools_ready(ctx, rec, night, p["entry"], events, p):
+            return
         if self._landed_meanwhile(ctx, rec, p, events):
             return
         self._submit(ctx, rec, p, night, events)
+
+    def _tools_ready(self, ctx, rec, night, entry: dict, events: list, p: dict | None = None) -> bool:
+        """A Python build is gated on its tests (Daedalus's G2 runs pytest): with no pytest in
+        the sandbox's interpreter every such build fails at the gate after burning its whole
+        budget (both nights of 2026-10-02/03). So it does not start - the owner is told once a
+        night, with the fix, and nothing is spent."""
+        if entry.get("language") != "python" or self._setup is None:
+            return True
+        if self.probe_module(self._setup.python, "pytest"):
+            return True
+        why = ("the build sandbox's Python has no pytest, and Daedalus's gate runs every "
+               "build's tests with it; run tools" + chr(92) + "setup-build-sandbox.ps1 again as "
+               "administrator (it installs the pinned pytest) - nothing was started")
+        if p is not None:
+            p.update(waiting=_clip(why, 300))
+        day = rec["nights"][night.key]
+        if not day.get("tools_warned"):
+            day["tools_warned"] = True
+            self._night_log(ctx, f"waiting - {_clip(why, 140)}")
+            events.append(self._event(ctx, "build.waiting", {"slug": entry.get("slug"),
+                                                             "why": _clip(why, 200)}))
+            self._card(ctx, rec, f"builds:tools:{night.key}", "problem",
+                       "Tonight's build did not start: pytest is missing",
+                       f"**{entry.get('slug')}** was next in the backlog, but {why}.")
+        return False
 
     def _recover_orphans(self, ctx, rec, events) -> None:
         """A product left ``building`` with no job in flight (a crash between two saves, an
@@ -637,7 +741,8 @@ class BuildsWorker(_Base):
         slug = entry["slug"]
         p = {"slug": slug, "entry": dict(entry), "state": "queued", "night": night.key,
              "created_at": ctx.now, "repo": None, "base": None, "attempts": [],
-             "reviews": [], "review_failures": 0, "repair_reasons": [], "waiting": None}
+             "reviews": [], "review_failures": 0, "repair_reasons": [], "waiting": None,
+             "slice": 1, "slices": self.slices, "slice_head": None}
         rec["products"][slug] = p
         rec["nights"][night.key]["started"] = slug
         try:
@@ -676,8 +781,9 @@ class BuildsWorker(_Base):
     def _intent(self, p: dict, kind: str) -> str:
         e = p["entry"]
         verify = self._verify(e)
-        if kind == "repair":
-            reasons = "\n".join(f"- {r}" for r in p.get("repair_reasons") or [])
+        reasons_list = p.get("repair_reasons") or []
+        if kind == "repair" and p.get("repair_from", "review") == "review":
+            reasons = "\n".join(f"- {r}" for r in reasons_list)
             text = (f"This repository ({p['repo']}) holds {e['name']}; BRIEF.md is its "
                     "specification. A review REJECTED the current version. Fix EVERY problem "
                     "below, keep everything that already works, and keep all tests passing.\n\n"
@@ -686,9 +792,17 @@ class BuildsWorker(_Base):
         else:
             features = "\n".join(f"- {f}" for f in e["features"])
             tests = "\n".join(f"- {t}" for t in e["acceptance"])
-            text = (f"Build a complete, sellable product in this repository ({p['repo']}). It "
-                    "holds only a seed commit; BRIEF.md is the full specification - read it "
-                    f"first.\n\nProduct: {e['name']}\n{e['summary']}\n\n{e['brief']}\n\n"
+            slice_no, total = int(p.get("slice") or 1), int(p.get("slices") or 1)
+            lead = _slice_lead(slice_no, total, self.budget // 60)
+            if kind == "repair" and reasons_list:
+                lead += (" The previous attempt at this did not finish (" + reasons_list[0]
+                         + "). Nothing from it was kept: work in small steps, write a test, "
+                         "run it, and get the tests passing early.")
+            holds = ("holds only a seed commit" if slice_no == 1
+                     else "already holds the first slice, committed")
+            text = (f"{lead}\n\nBuild a complete, sellable product in this repository "
+                    f"({p['repo']}). It {holds}; BRIEF.md is the full specification - read "
+                    f"it first.\n\nProduct: {e['name']}\n{e['summary']}\n\n{e['brief']}\n\n"
                     f"Features the listing promises (each must be true):\n{features}\n\n"
                     f"Acceptance tests (write each as a real test):\n{tests}\n\n"
                     f"Honest limits (the README says these): {e['limits']}\n\n"
@@ -699,7 +813,7 @@ class BuildsWorker(_Base):
                     "specification: " + ("fix every problem listed below" if kind == "repair"
                                          else "build everything it asks for")
                     + f".\n\nRules:\n{sandbox.RULES}\nAll tests must pass with: {verify}\n\n"
-                    + "\n".join(f"- {r}" for r in (p.get("repair_reasons") or []))[:3000])
+                    + "\n".join(f"- {r}" for r in reasons_list)[:3000])
         return text[:7900]
 
     def _submit(self, ctx: WorkContext, rec: dict, p: dict, night, events: list) -> None:
@@ -711,7 +825,7 @@ class BuildsWorker(_Base):
                    "verify": self._verify(p["entry"]), "budget_seconds": self.budget,
                    "not_after": deadline, "build_id": build_id}
         a = {"n": n, "kind": kind, "submitted_at": ctx.now, "not_after": deadline,
-             "night": night.key, "build_id": build_id}
+             "night": night.key, "build_id": build_id, "slice": int(p.get("slice") or 1)}
         p["attempts"].append(a)
         # one product a night: a repair of an earlier night's product counts as tonight's
         rec["nights"][night.key]["started"] = rec["nights"][night.key].get("started") \

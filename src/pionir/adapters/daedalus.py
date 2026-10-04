@@ -108,6 +108,33 @@ class AdapterTimeout(AdapterUnavailable):
         self.job_id = job_id
 
 
+def _how_far(last: Mapping[str, Any] | None, stopped: Mapping[str, Any] | None) -> str:
+    """One plain sentence on how far a cancelled job got: its steps, the gate stage it
+    stopped at, the files it had written. Daedalus's own words, never a guess."""
+
+    job = stopped or last
+    if not job:
+        return "Daedalus could not be asked how far it got."
+    result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    gate = result.get("gate") if isinstance(result.get("gate"), dict) else {}
+    parts = []
+    steps = result.get("steps")
+    if isinstance(steps, list) and steps:
+        parts.append(f"{len(steps)} steps taken")
+    stage = job.get("stage_failed") or gate.get("stage_failed")
+    if stage:
+        reason = str(gate.get("reason") or "").strip().replace(chr(10), " ")[:120]
+        parts.append(f"its gate then failed at {stage}" + (f" ({reason})" if reason else ""))
+    files = job.get("files")
+    if isinstance(files, list) and files:
+        parts.append(f"{len(files)} files written")
+    events = job.get("events")
+    if not parts and isinstance(events, int):
+        parts.append(f"{events} events logged")
+    where = "after the cancel" if stopped else "at the last look (it had not stopped yet)"
+    return f"{where.capitalize()}: " + (", ".join(parts) if parts else "no detail") + "."
+
+
 def sandbox_repo_problem(repo: Any, root: str | os.PathLike) -> str | None:
     """Why ``repo`` is not a sandbox repo the Builds worker may build in, or None.
 
@@ -679,11 +706,16 @@ class DaedalusAdapter:
                    grace: float = 0.0) -> Mapping[str, Any]:
         """Poll the job until it finishes. A few failed polls in a row are tolerated. Any
         other way out - the deadline, Daedalus gone for good, an error, an interrupt -
-        cancels the job and waits for it to stop before this returns or raises."""
+        cancels the job and waits for it to stop before this returns or raises. A deadline
+        raises AdapterTimeout saying how far the job got, from what Daedalus reported once
+        it stopped, so a timeout is never a bare "it was too slow"."""
 
         deadline = self._monotonic() + timeout
         failures = 0
         finished = False
+        timed_out = False
+        last: dict[str, Any] | None = None
+        stopped: dict[str, Any] | None = None
         try:
             while True:
                 try:
@@ -696,35 +728,41 @@ class DaedalusAdapter:
                             f"Daedalus became unreachable while running job {job_id}: {error}"
                         ) from error
                     job = None
+                if job is not None:
+                    last = job
                 if job is not None and str(job.get("state") or "") in FINISHED_STATES:
                     finished = True
                     return job
                 if self._monotonic() >= deadline:
-                    raise AdapterTimeout(
-                        f"Daedalus job {job_id} did not finish within {timeout:.0f} seconds; "
-                        f"it was cancelled - the outcome is at GET /jobs/{job_id}",
-                        job_id=job_id,
-                    )
+                    timed_out = True
+                    break
                 self._sleep(self.settings.poll_interval_seconds)
         finally:
             if not finished:
                 self._cancel(client, job_id)
                 if grace > 0:
-                    self._wind_down(client, job_id, grace)
+                    stopped = self._wind_down(client, job_id, grace)
+        if timed_out:
+            raise AdapterTimeout(
+                f"Daedalus job {job_id} did not finish within {timeout:.0f} seconds; it was "
+                f"cancelled. {_how_far(last, stopped)} The outcome is at GET /jobs/{job_id}",
+                job_id=job_id,
+            )
+        raise AssertionError("unreachable")  # pragma: no cover
 
-    def _wind_down(self, client, job_id: str, grace: float) -> str | None:
+    def _wind_down(self, client, job_id: str, grace: float) -> dict[str, Any] | None:
         """After a cancel, wait up to ``grace`` seconds for the job to stop - still under
-        the lease. The state it reached, or None if it had not stopped."""
+        the lease. The job's final detail, or None if it had not stopped."""
 
         until = self._monotonic() + grace
         while self._monotonic() < until:
             self._sleep(self.settings.poll_interval_seconds)
             try:
-                state = str(self._poll(client, job_id).get("state") or "")
+                job = self._poll(client, job_id)
             except (AdapterUnavailable, AdapterProtocolError):
                 continue
-            if state in FINISHED_STATES:
-                return f"stopped: {state}"
+            if str(job.get("state") or "") in FINISHED_STATES:
+                return job
         return None
 
     def _cancel(self, client, job_id: str) -> None:
