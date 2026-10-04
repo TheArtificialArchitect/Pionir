@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 
-from . import atomic, library, secretscrub, workapi
+from . import atomic, library, mailapi, secretscrub, workapi
 from .approvals import ApprovalQueue
 from .auth import (
     ANONYMOUS,
@@ -1256,6 +1256,20 @@ class PionirApp:
                            "batched_pending": sum(1 for r in pending if r.get("batch")),
                            "requested": bool(request and request.get("answered") is not True)}}
 
+    def mail_run(self, capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """One read-only mailbox capability, through the executive (audit, breaker, permission
+        rules) and nothing else: no job record, so the mail is never written to disk. An
+        error is returned as data naming its type only - never the message text."""
+        invalid = self._validation_error(capability, payload, [])
+        if invalid is not None:
+            return {"ok": False, "error": invalid["message"]}
+        try:
+            result = self.runtime.executive.execute(Task(capability, payload, frozenset()))
+        except Exception as error:  # noqa: BLE001 - a failure is an answer, not a stack trace
+            _log.warning("mail read failed: %s", type(error).__name__)
+            return {"ok": False, "error": f"the mailbox read failed ({type(error).__name__})"}
+        return dict(result.output)
+
     def economy_view(self) -> dict[str, Any]:
         """The Bolts tab: read-only, play currency. Nothing here writes or authorises."""
         from .economy.view import economy_payload
@@ -1533,6 +1547,9 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
             if route.path.startswith("/api/work/"):
                 self._work(route)
                 return
+            if route.path.startswith("/api/mail/"):
+                self._mail(route)
+                return
             try:
                 if route.path == "/api/state":
                     self._send(app.state())
@@ -1595,6 +1612,24 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                 store=lambda: (Path(path) if path is not None else None,
                                getattr(cortex, "embedder", None)),
                 known=lambda: app.auth.tokens.values())
+            self._send(document, status)
+
+        def _mail(self, route: Any) -> None:
+            """The Mail tab (pionir/mailapi.py): read-only, the owner's surfaces only -
+            signed (the desktop) or the dashboard's session."""
+            head = self.headers
+            if any(head.get(h) is not None for h in SIGN_HEADERS):
+                client, refused = app.auth.from_signed(
+                    head.get("X-Pionir-Client"), "GET", self.path, head.get("X-Pionir-Ts"),
+                    head.get("X-Pionir-Nonce"), head.get("X-Pionir-Sig"), body=b"")
+            else:
+                client, refused = app.auth.from_headers(head.get("Authorization"),
+                                                        head.get("Cookie"),
+                                                        head.get(PROOF_HEADER))
+            status, document = mailapi.serve(
+                route.path, route.query, client=client, refused=refused,
+                allows=lambda who, capability: app.auth.grant(who).allows_capability(capability),
+                run=app.mail_run, known=lambda: app.auth.tokens.values())
             self._send(document, status)
 
         def _work(self, route: Any) -> None:

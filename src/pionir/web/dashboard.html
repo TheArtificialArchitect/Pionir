@@ -96,6 +96,28 @@
   .bolts-table .r{display:flex;justify-content:space-between;gap:12px;padding:6px 6px;border-bottom:1px solid var(--line);}
   .bolts-table .r span:first-child{overflow:hidden;text-overflow:ellipsis;}
   .bolts-table .r b{font-weight:500;font-variant-numeric:tabular-nums;color:var(--ink);}
+  #view-mail{display:flex;flex-direction:column;gap:16px;}
+  .mail-cols{display:grid;grid-template-columns:1fr 1.5fr;gap:16px;align-items:start;}
+  @media(max-width:820px){.mail-cols{grid-template-columns:1fr;}}
+  .mail-state{padding:10px 18px 4px;font-family:var(--f-mono);font-size:13px;color:var(--faint);line-height:1.6;}
+  .mail-state.bad{color:#e2726e;}
+  .mail-bar{padding:8px 18px 12px;display:flex;gap:10px;align-items:center;font-family:var(--f-mono);font-size:12px;color:var(--faint);}
+  .mail-bar button{font:inherit;color:var(--ink);background:var(--raised);border:1px solid var(--line2);border-radius:8px;padding:4px 10px;cursor:pointer;}
+  .mail-list{padding:6px 12px 12px;font-family:var(--f-mono);font-size:12px;}
+  .mail-list .m{display:flex;flex-direction:column;gap:3px;padding:8px 6px;border-bottom:1px solid var(--line);cursor:pointer;}
+  .mail-list .m:hover,.mail-list .m.sel{background:var(--panel2);}
+  .mail-list .m .from{color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .mail-list .m.unread .from::before{content:"\25CF  ";color:var(--signal);}
+  .mail-list .m.unread .from{font-weight:600;}
+  .mail-list .m .subj{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .mail-list .m .when{color:var(--faint);font-size:11px;}
+  .mail-msg{padding:10px 18px 16px;font-family:var(--f-mono);font-size:12.5px;line-height:1.6;}
+  .mail-msg .hd{color:var(--muted);overflow-wrap:anywhere;}
+  .mail-msg .subject{color:var(--ink);font-size:14px;margin:6px 0 10px;overflow-wrap:anywhere;}
+  .mail-msg .note{color:var(--faint);font-size:11px;margin:8px 0;}
+  .mail-msg .body{white-space:pre-wrap;overflow-wrap:anywhere;color:var(--ink);border-top:1px solid var(--line);padding-top:10px;}
+  .mail-msg .sub{color:var(--faint);margin-top:12px;font-size:11px;letter-spacing:.1em;text-transform:uppercase;}
+  .mail-msg .item{color:var(--muted);overflow-wrap:anywhere;}
   .jrow{padding:12px 8px;cursor:pointer;display:flex;flex-direction:column;gap:7px;transition:background .14s;
     border-bottom:1px solid var(--line);}
   .jrow:last-child{border-bottom:none;}
@@ -191,6 +213,7 @@
     <button class="tab active" data-view="brain">Brain</button>
     <button class="tab" data-view="voice" id="tab-voice" style="display:none">Voice · the glass</button>
     <button class="tab" data-view="bolts">Bolts</button>
+    <button class="tab" data-view="mail">Mail</button>
   </div>
 
   <div id="view-voice" hidden><iframe id="voice-frame" title="Galatea"></iframe></div>
@@ -207,6 +230,17 @@
     <div class="bolts-cols">
       <div class="panel"><h2>Homes · bought with Bolts, earned trophies</h2><div id="bolts-homes" class="bolts-table"></div></div>
       <div class="panel"><h2>The shop · decoration and space only</h2><div id="bolts-shop" class="bolts-table"></div></div>
+    </div>
+  </div>
+
+  <div id="view-mail" hidden>
+    <div class="panel"><h2>Mail · pantheonunknown, read only</h2>
+      <div id="mail-state" class="mail-state">open this tab to load the inbox</div>
+      <div class="mail-bar"><button id="mail-refresh" type="button">Refresh</button><span id="mail-count"></span></div>
+    </div>
+    <div class="mail-cols">
+      <div class="panel"><h2>Newest</h2><div id="mail-list" class="mail-list"></div></div>
+      <div class="panel"><h2>Message</h2><div id="mail-msg" class="mail-msg"><div class="empty">Pick a message to read it.</div></div></div>
     </div>
   </div>
 
@@ -294,7 +328,9 @@ function setView(v){
   $id("view-brain").hidden = v!=="brain";
   $id("view-voice").hidden = v!=="voice";
   $id("view-bolts").hidden = v!=="bolts";
+  $id("view-mail").hidden = v!=="mail";
   if(v==="bolts") pollBolts();
+  if(v==="mail") loadMail();
   document.querySelectorAll(".tab").forEach(t=>t.classList.toggle("active", t.dataset.view===v));
   if(v==="voice"){
     const f=$id("voice-frame");
@@ -532,6 +568,87 @@ async function pollBolts(){
   }catch(err){ $id("bolts-chain").className="bolts-chain bad"; $id("bolts-chain").textContent="Bolts: Pionir is not answering."; }
 }
 setInterval(()=>{ if(!$id("view-bolts").hidden) pollBolts(); },10000);
+
+// ---- Mail: read only. Everything a sender wrote is set with textContent, never as markup;
+// links are plain text (no anchor, nothing fetched) and attachments are names only. A failure
+// is shown as a failure with its fix hint, never as an empty inbox. ----
+let MAIL_SEL=null, MAIL_BUSY=false;
+function mailEl(tag, cls, text){ const e=document.createElement(tag); if(cls) e.className=cls; if(text!=null) e.textContent=text; return e; }
+function mailState(text, bad){ const el=$id("mail-state"); el.className="mail-state"+(bad?" bad":""); el.textContent=text; }
+function mailWhy(j, status){
+  const state=j&&j.state, hint=(j&&(j.error||j.reason))||("HTTP "+status);
+  if(state==="not_configured") return "Mail is not set up: "+hint;
+  if(state==="unavailable") return "Gmail could not be reached: "+hint;
+  if(state==="not_found") return "That message is gone: "+hint;
+  return "Mail failed: "+hint;
+}
+async function mailGet(url){
+  const r=await fetch(url,{cache:"no-store",headers:authHeaders()});
+  let j=null; try{ j=await r.json(); }catch(e){ j=null; }
+  return {ok:r.ok&&!!j&&j.ok===true, status:r.status, j:j||{}};
+}
+function mailWhen(iso){ return typeof iso==="string"&&iso?iso.slice(0,16).replace("T"," ")+" UTC":"date unknown"; }
+async function loadMail(){
+  if(MAIL_BUSY) return; MAIL_BUSY=true;
+  try{
+    mailState("loading the inbox...",false);
+    const res=await mailGet("/api/mail/inbox?limit=30");
+    const list=$id("mail-list");
+    if(!res.ok){
+      list.replaceChildren(mailEl("div","empty","The inbox could not be read, so nothing is listed."));
+      $id("mail-count").textContent="";
+      mailState(mailWhy(res.j,res.status),true);
+      return;
+    }
+    const msgs=Array.isArray(res.j.messages)?res.j.messages:[];
+    list.replaceChildren();
+    if(!msgs.length) list.appendChild(mailEl("div","empty","The inbox is empty."));
+    for(const m of msgs){
+      const u=m.untrusted||{};
+      const row=mailEl("div","m"+(m.unread===true?" unread":"")+(m.id===MAIL_SEL?" sel":""));
+      row.setAttribute("role","button"); row.tabIndex=0;
+      row.append(mailEl("div","from",u.from||"(unknown sender)"),mailEl("div","subj",u.subject||"(no subject)"),
+        mailEl("div","when",mailWhen(m.date)+(m.unread===null?" · read state unknown":"")));
+      const open=()=>openMail(m.id,row);
+      row.onclick=open; row.onkeydown=ev=>{ if(ev.key==="Enter"||ev.key===" "){ ev.preventDefault(); open(); } };
+      list.appendChild(row);
+    }
+    $id("mail-count").textContent=msgs.length+" of "+(res.j.total==null?"?":res.j.total)+" shown · "+msgs.filter(m=>m.unread===true).length+" unread";
+    mailState("Inbox of "+(res.j.mailbox||"the mailbox")+" · reading never marks anything read.",false);
+  }catch(err){
+    $id("mail-list").replaceChildren(mailEl("div","empty","The inbox could not be read, so nothing is listed."));
+    mailState("Mail: Pionir is not answering.",true);
+  }finally{ MAIL_BUSY=false; }
+}
+async function openMail(id,row){
+  MAIL_SEL=id;
+  document.querySelectorAll("#mail-list .m").forEach(r=>r.classList.toggle("sel",r===row));
+  const box=$id("mail-msg"); box.replaceChildren(mailEl("div","empty","opening..."));
+  try{
+    const res=await mailGet("/api/mail/message/"+encodeURIComponent(id));
+    if(!res.ok){ box.replaceChildren(mailEl("div","empty",mailWhy(res.j,res.status))); return; }
+    const j=res.j, u=j.untrusted||{};
+    box.replaceChildren(
+      mailEl("div","hd","From: "+(u.from||"(unknown)")),
+      mailEl("div","hd","To: "+(u.to||"(unknown)")),
+      mailEl("div","hd",mailWhen(j.date)),
+      mailEl("div","subject",u.subject||"(no subject)"),
+      mailEl("div","note","Written by the sender: plain text only. Links and files are listed, never opened."),
+      mailEl("div","body",u.body||"(no readable text)"));
+    if(j.truncated) box.appendChild(mailEl("div","note","The message is longer than what is shown."));
+    const urls=Array.isArray(u.urls)?u.urls:[];
+    box.appendChild(mailEl("div","sub","Links in it (text only, "+urls.length+")"));
+    for(const x of urls) box.appendChild(mailEl("div","item",String(x)));
+    if(!urls.length) box.appendChild(mailEl("div","item","none"));
+    const atts=Array.isArray(u.attachments)?u.attachments:[];
+    box.appendChild(mailEl("div","sub","Attachments (names only, "+(j.attachment_count==null?atts.length:j.attachment_count)+")"));
+    for(const a of atts) box.appendChild(mailEl("div","item",(a.name||"(unnamed)")+(a.type?" · "+a.type:"")+(a.size!=null?" · "+a.size+" bytes":"")));
+    if(!atts.length) box.appendChild(mailEl("div","item","none"));
+  }catch(err){ box.replaceChildren(mailEl("div","empty","Mail: Pionir is not answering.")); }
+}
+$id("mail-refresh").onclick=()=>loadMail();
+setInterval(()=>{ if(!$id("view-mail").hidden && !document.hidden) loadMail(); },60000);
+// ---- end Mail ----
 
 pollState(); pollAudit(); pollDoctor();
 setInterval(pollState,4000); setInterval(pollAudit,5000); setInterval(pollDoctor,20000);
