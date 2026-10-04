@@ -1,9 +1,15 @@
 # Money upgrades — 2026-10-04
 
-Everything below is built, tested and merged to `main` in Pionir and Scrooge.
-**Pionir is pushed. Scrooge is merged locally but NOT deployed** — the safety
-classifier blocks me from reading the production database, so the migrations and the
-deploy are yours (section B). Run the steps in order.
+Everything below is built, tested and merged to `main` in Pionir (2873 tests OK) and
+Scrooge (1506 OK; load timeouts pass when rerun alone). **Neither is pushed and Scrooge is
+NOT deployed** — the safety classifier blocked my production-database read and my push, so
+those steps are yours. Run the steps in order.
+
+### 0. Push Pionir
+
+```powershell
+cd C:\src\Pionir; git push origin main; gh run list --limit 1
+```
 
 ---
 
