@@ -8,6 +8,8 @@ it from scratch under a prompt that said a review had rejected it; the worker ke
 from __future__ import annotations
 
 import json
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -65,8 +67,43 @@ class PreflightTests(_Case):
             self.assertTrue(worker_module._probe_module(Path("py.exe"), "pytest"))
         finally:
             worker_module.subprocess.run = real
-        self.assertEqual(seen[0][0], ["py.exe", "-I", "-c", "import pytest"])
+        self.assertEqual(seen[0][0][:3], ["py.exe", "-I", "-c"])
+        self.assertIn("import sys, pytest as m", seen[0][0][3])
         self.assertIn("timeout", seen[0][1])
+
+    def test_an_unreadable_package_is_a_namespace_package_and_never_a_pass(self) -> None:
+        # 2026-10-04: pip --target, run elevated, left site-packages readable by administrators
+        # only; as pionir-builds Python imported pytest and fastapi as EMPTY namespace packages,
+        # so "import pytest" succeeded and the preflight passed a sandbox that could not build
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "fakepkg_ns").mkdir()                    # a folder, no __init__.py
+            (Path(tmp) / "fakepkg_real").mkdir()
+            (Path(tmp) / "fakepkg_real" / "__init__.py").write_text("X = 1\n")
+            real = worker_module.subprocess.run
+
+            def run(cmd, **kw):                 # -I drops PYTHONPATH: put tmp on sys.path
+                cmd = [cmd[0], "-I", "-c", f"import sys; sys.path.insert(0, {tmp!r}); " + cmd[3]]
+                return real(cmd, **kw)
+
+            worker_module.subprocess.run = run
+            try:
+                self.assertEqual(worker_module._probe_module(sys.executable, "fakepkg_ns"),
+                                 worker_module.NAMESPACE)
+                self.assertIs(worker_module._probe_module(sys.executable, "fakepkg_real"), True)
+                self.assertIs(worker_module._probe_module(sys.executable, "fakepkg_absent"), False)
+            finally:
+                worker_module.subprocess.run = real
+
+    def test_a_namespace_pytest_holds_the_build_and_points_the_owner_at_the_acl_reset(
+            self) -> None:
+        self.worker.probe_module = lambda python, module: worker_module.NAMESPACE
+        self.run_at(at(1, 1, 30))
+        self.assertEqual(self.pionir.builds(), [])
+        (card,) = [c for k, c in self.pionir.cards.items() if k.startswith("builds:tools:")]
+        self.assertIn("unreadable", card["title"])
+        self.assertIn("/reset /T /C /Q", card["body"])
+        self.assertIn("site-packages", card["body"])
+        self.assertIn("setup-build-sandbox.ps1", card["body"])
 
 
 class RetryTests(_Case):

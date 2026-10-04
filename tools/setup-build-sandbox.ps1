@@ -233,11 +233,14 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Run-Icacls @($InstallDir, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F",
     "*S-1-5-32-544:(OI)(CI)F", "*${OwnerSid}:(OI)(CI)RX", "*${UserSid}:(OI)(CI)RX")
 Did "${InstallDir}: Administrators and SYSTEM Full; you and $User read-only"
+$SitePackages = Join-Path $PyDir "Lib\site-packages"
 $ready = $false
 if (Test-Path $PyExe) {
     $eap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"      # a missing package is the expected answer here: PS 5.1 would turn its stderr into a terminating error under Stop
-    try { & $PyExe -I -c "import fastapi, uvicorn, requests, yaml, pytest" *> $null; $ready = ($LASTEXITCODE -eq 0) }
+    # a real module FILE each: a package folder with no readable files imports as an empty
+    # namespace package ("import fastapi" succeeds; "from fastapi import FastAPI" does not)
+    try { & $PyExe -I -c "import fastapi, uvicorn, requests, yaml, pytest; assert fastapi.FastAPI and pytest.__file__ and uvicorn.__file__ and yaml.__file__ and requests.__file__" *> $null; $ready = ($LASTEXITCODE -eq 0) }
     finally { $ErrorActionPreference = $eap }
 }
 if ($ready) { Had "$PyExe has Daedalus's server packages" } else {
@@ -250,7 +253,6 @@ if ($ready) { Had "$PyExe has Daedalus's server packages" } else {
     # traffic, and that rule outlives a run), so on a rerun it could never reach PyPI: WinError 10013.
     # --target puts the pinned, hashed wheels straight into the sandbox's site-packages.
     $HostPy = Join-Path $PythonSource "python.exe"
-    $SitePackages = Join-Path $PyDir "Lib\site-packages"
     $pipArgs = @("-I", "-m", "pip", "install", "--isolated", "--require-hashes", "--only-binary=:all:",
                  "--no-cache-dir", "--no-deps", "--disable-pip-version-check", "--upgrade",
                  "--target", $SitePackages, "-r", $Requirements)
@@ -263,6 +265,13 @@ if ($ready) { Had "$PyExe has Daedalus's server packages" } else {
     if ($LASTEXITCODE -ne 0) { Fail "pip install failed 3 times (a hash did not match, or PyPI did not answer)" }
     Did "copied Python and installed the pinned, hashed wheels"
 }
+# pip stages each wheel in a temp folder that only SYSTEM, Administrators and you may read, and
+# run elevated, the files it moves into site-packages KEEP that ACL: as $User every package was
+# "Access is denied", so Python imported fastapi and pytest as empty namespace packages (the build
+# Daedalus died; a pytest probe passed). Every time, installed now or before: give them back the
+# install folder's own inherited permissions. Step 8 then imports them AS $User.
+Run-Icacls @($SitePackages, "/reset", "/T", "/C", "/Q")
+Did "${SitePackages}: every package inherits the install folder's permissions ($User may read them)"
 Write-Host "    robocopy $DaedalusSrc -> $DaedalusCopy" -ForegroundColor DarkGray
 & robocopy.exe $DaedalusSrc $DaedalusCopy /MIR /NFL /NDL /NJH /NJS /NP /XD __pycache__ .git gym | Out-Null
 if ($LASTEXITCODE -ge 8) { Fail "robocopy of Daedalus exited $LASTEXITCODE" }
@@ -601,7 +610,14 @@ for name, port in (t.get('loopback') or {}).items():
         connect('127.0.0.1', int(port)); loopback[name] = 'reachable'
     except Exception as exc:
         loopback[name] = 'not reachable (' + type(exc).__name__ + ')'
-json.dump({'integrity': rid, 'checks': checks, 'loopback': loopback},
+imports = {}
+for mod in ('fastapi', 'uvicorn', 'requests', 'yaml', 'pytest'):
+    try:
+        m = __import__(mod)
+        imports[mod] = 'ok' if getattr(m, '__file__', None) else 'unreadable (an empty namespace package: its files are not readable)'
+    except Exception as exc:
+        imports[mod] = 'cannot import (' + type(exc).__name__ + ': ' + str(exc)[:120] + ')'
+json.dump({'integrity': rid, 'checks': checks, 'loopback': loopback, 'imports': imports},
           open(r'$probeDir\python.json', 'w'), indent=1)
 "@
 [IO.File]::WriteAllText((Join-Path $probeDir "probe.py"), $pyProbe, $utf8NoBom)
@@ -683,11 +699,13 @@ setTimeout(() => { if (!done) { checks['reach the internet (1.1.1.1:443)'] = 'bl
 $results = [ordered]@{}
 $loopbackSeen = [ordered]@{}
 $rid = $null
+$pyImports = $null
 if (Test-Path "$probeDir\python.json") {
     $got = Get-Content "$probeDir\python.json" -Raw | ConvertFrom-Json
     foreach ($p in $got.checks.PSObject.Properties) { $results["python: " + $p.Name] = [string]$p.Value }
     foreach ($p in $got.loopback.PSObject.Properties) { $loopbackSeen[$p.Name] = [string]$p.Value }
     $rid = $got.integrity
+    $pyImports = $got.imports
 } else { $results["python probe"] = "did not run as $User" }
 $results["powershell.exe: reach the internet"] = if (Test-Path "$probeDir\powershell.txt") { (Get-Content "$probeDir\powershell.txt" -Raw).Trim() } else { "did not run" }
 $results["git.exe: reach the internet"] = $gitResult
@@ -762,6 +780,20 @@ foreach ($svc in $LoopbackServices) {
 }
 if (-not $contained) {
     Fail "the containment did not hold (above). Pionir will not use the sandbox. (Loopback is not part of this: it is $LoopbackDecision.)"
+}
+# Daedalus's packages, imported AS $User: the check in step 3 runs as you (an administrator),
+# who could read files $User could not
+$unreadable = @()
+if ($null -eq $pyImports) { $unreadable += "the probe reported no imports" }
+else {
+    foreach ($p in $pyImports.PSObject.Properties) {
+        if ([string]$p.Value -eq "ok") { Did "python: imports $($p.Name) from its files as $User" }
+        else { $unreadable += "$($p.Name): $($p.Value)" }
+    }
+}
+if ($unreadable.Count) {
+    foreach ($u in $unreadable) { Write-Host "    NOT READY  python as ${User}: $u" -ForegroundColor Red }
+    Fail "$User cannot import Daedalus's packages (above). In this elevated PowerShell: icacls `"$SitePackages`" /reset /T /C /Q - then run this again."
 }
 
 # ---- 9. Pionir's own preflight, through the path a build takes -----------------------------

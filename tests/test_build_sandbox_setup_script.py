@@ -77,6 +77,33 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn('"--target", $SitePackages', install)
         self.assertIn("--only-binary=:all:", install)
 
+    def test_the_packages_get_readable_permissions_on_every_run(self) -> None:
+        # 2026-10-04: pip --target, run elevated, kept its staging folder's ACL (SYSTEM,
+        # Administrators, the owner) on every package: pionir-builds was "Access is denied",
+        # and a rerun said ALREADY and skipped the install - so the reset must not live in it
+        reset = '\nRun-Icacls @($SitePackages, "/reset", "/T", "/C", "/Q")\n'
+        self.assertIn(reset, self.text)                 # top level: the ALREADY path too
+        self.assertNotIn('"/Q") -Soft', self.text[self.text.index(reset):][:len(reset) + 8])
+        self.assertLess(self.text.index('Did "copied Python and installed'),
+                        self.text.index(reset))
+        self.assertLess(self.text.index(reset), self.text.index("# ---- 8. prove it"))
+
+    def test_the_readiness_check_wants_real_module_files(self) -> None:
+        probe = _section(self.text, 'if (Test-Path $PyExe) {', 'if ($ready)')
+        self.assertIn("assert fastapi.FastAPI and pytest.__file__", probe)
+
+    def test_the_packages_are_imported_as_the_sandbox_user_before_the_record(self) -> None:
+        probe = _section(self.text, '$pyProbe = @"', '"@')
+        self.assertIn("for mod in ('fastapi', 'uvicorn', 'requests', 'yaml', 'pytest'):", probe)
+        self.assertIn("getattr(m, '__file__', None)", probe)        # a namespace package fails
+        self.assertIn("'imports': imports", probe)
+        verdict = _section(self.text, "# Daedalus's packages, imported AS $User",
+                           "# ---- 9. Pionir's own preflight")
+        self.assertIn('if ([string]$p.Value -eq "ok")', verdict)
+        self.assertIn('if ($null -eq $pyImports) { $unreadable += ', verdict)
+        self.assertIn('/reset /T /C /Q', verdict[verdict.index("Fail "):])
+        self.assertLess(self.text.index(verdict), self.text.index("WriteAllText($Record"))
+
     def test_loopback_is_reported_as_accepted_never_a_stop(self) -> None:
         loop = _section(self.text, "# loopback: reported, never a stop",
                         "if (-not $contained)")

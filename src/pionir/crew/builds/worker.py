@@ -94,14 +94,25 @@ KEEP_NIGHTS = 30
 KEEP_REPLIES = 500
 
 
-def _probe_module(python, module: str) -> bool:
-    """True when the sandbox's own interpreter can import ``module``. Isolated mode, short
-    timeout, nothing else run; an interpreter that cannot even start counts as missing."""
+NAMESPACE = "namespace"               # _probe_module: only an empty namespace package was found
+_NAMESPACE_EXIT = 3
+
+
+def _probe_module(python, module: str) -> bool | str:
+    """True when the sandbox's own interpreter imports ``module`` from a real file. Isolated
+    mode, short timeout, nothing else run; an interpreter that cannot even start counts as
+    missing (False). A module with no ``__file__`` is an empty NAMESPACE package - what Python
+    makes of a package folder whose files it may not read (2026-10-04: pip's staging ACL left
+    site-packages readable by administrators only) - and is ``NAMESPACE``, never a pass."""
+    code = (f"import sys, {module} as m; "
+            f"sys.exit(0 if getattr(m, '__file__', None) else {_NAMESPACE_EXIT})")
     try:
-        done = subprocess.run([str(python), "-I", "-c", f"import {module}"],
+        done = subprocess.run([str(python), "-I", "-c", code],
                               capture_output=True, timeout=30, check=False)
     except (OSError, subprocess.SubprocessError):
         return False
+    if done.returncode == _NAMESPACE_EXIT:
+        return NAMESPACE
     return done.returncode == 0
 
 
@@ -681,11 +692,21 @@ class BuildsWorker(_Base):
         night, with the fix, and nothing is spent."""
         if entry.get("language") != "python" or self._setup is None:
             return True
-        if self.probe_module(self._setup.python, "pytest"):
+        got = self.probe_module(self._setup.python, "pytest")
+        if got is True:
             return True
-        why = ("the build sandbox's Python has no pytest, and Daedalus's gate runs every "
-               "build's tests with it; run tools" + chr(92) + "setup-build-sandbox.ps1 again as "
-               "administrator (it installs the pinned pytest) - nothing was started")
+        if got == NAMESPACE:
+            site = Path(self._setup.python).parent / "Lib" / "site-packages"
+            why = ("the build sandbox's Python finds pytest only as an empty namespace package: "
+                   f"its files in {site} are unreadable to {build_sandbox.USER} (the "
+                   "build Daedalus cannot import fastapi either); in an administrator "
+                   f"PowerShell run: icacls \"{site}\" /reset /T /C /Q - or run "
+                   "tools" + chr(92) + "setup-build-sandbox.ps1 again as administrator (it "
+                   "resets them) - nothing was started")
+        else:
+            why = ("the build sandbox's Python has no pytest, and Daedalus's gate runs every "
+                   "build's tests with it; run tools" + chr(92) + "setup-build-sandbox.ps1 again as "
+                   "administrator (it installs the pinned pytest) - nothing was started")
         if p is not None:
             p.update(waiting=_clip(why, 300))
         day = rec["nights"][night.key]
@@ -695,7 +716,8 @@ class BuildsWorker(_Base):
             events.append(self._event(ctx, "build.waiting", {"slug": entry.get("slug"),
                                                              "why": _clip(why, 200)}))
             self._card(ctx, rec, f"builds:tools:{night.key}", "problem",
-                       "Tonight's build did not start: pytest is missing",
+                       "Tonight's build did not start: pytest is "
+                       + ("unreadable" if got == NAMESPACE else "missing"),
                        f"**{entry.get('slug')}** was next in the backlog, but {why}.")
         return False
 
