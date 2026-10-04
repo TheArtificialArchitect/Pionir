@@ -101,6 +101,7 @@ payload = json.loads(rest)
 spec = importlib.util.spec_from_file_location("r", os.environ["FAKE_REMOTE"])
 r = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(r)
+os.chdir(vps)                             # see vpsfake.install: '/x' paths are on the root's drive
 vpsfake.install(r, vps)
 step = payload["step"]
 s = sim.state()
@@ -935,6 +936,9 @@ class ScriptShape(unittest.TestCase):
 class RemoteHalf(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp(prefix="pionir-remote-"))
+        # see vpsfake.install: the remote half reads '/x' paths, on the current drive
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.dir)
         self.r = load_remote()
         self.sim = vpsfake.install(self.r, self.dir)
 

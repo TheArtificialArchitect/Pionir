@@ -61,6 +61,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import threading
 import time
@@ -1203,8 +1204,22 @@ def _make_junction(target: Path, link: Path) -> None:
     _winapi.CreateJunction(str(target), str(link))
 
 
+def _is_junction(path) -> bool:
+    """``os.path.isjunction`` (Python 3.12+), also on 3.11: a mount-point reparse point. The
+    same test 3.12 makes; never True off Windows, where there are no junctions."""
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is not None:
+        return isjunction(path)
+    try:
+        st = os.lstat(path)
+    except (OSError, ValueError):
+        return False
+    return getattr(st, "st_reparse_tag", 0) == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT",
+                                                        0xA0000003)
+
+
 def _is_link(path: Path) -> bool:
-    return os.path.islink(path) or os.path.isjunction(path)
+    return os.path.islink(path) or _is_junction(path)
 
 
 def link_node_modules(dest, setup, *, make_link=None) -> int:

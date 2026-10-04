@@ -38,6 +38,9 @@ from pionir.crew.registry import default_registry
 from pionir.crew.result import Err, Ok
 from pionir.crew.worker import ErrorKind, WorkContext
 from pionir.errors import AdapterProtocolError
+from support import use_long_tempdir
+
+use_long_tempdir()
 
 T0 = 1_790_000_000.0
 HAVE_GIT = shutil.which("git") is not None

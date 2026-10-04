@@ -20,6 +20,9 @@ from types import SimpleNamespace
 from unittest import mock
 
 from pionir import build_sandbox as bs
+from support import use_long_tempdir
+
+use_long_tempdir()
 
 WINDOWS = os.name == "nt"
 SID = "S-1-5-21-1-2-3-1009"
@@ -259,8 +262,9 @@ class NodeRecordTests(_Case):
         self.assertIsNone(bs.firewall_problem(good_rule(node), RULE, node))
         extra = [{**good_rule(node), "enabled": "False"}, good_rule(node)]
         self.assertIsNone(bs.firewall_problem(extra, RULE, node))
-        self.assertIsNone(bs.firewall_problem(
-            [{**good_rule(node), "program": str(node).upper(), "enabled": True}], RULE, node))
+        if WINDOWS:     # the program path matches as Windows does: ignoring case
+            self.assertIsNone(bs.firewall_problem(
+                [{**good_rule(node), "program": str(node).upper(), "enabled": True}], RULE, node))
         self.assertIsNotNone(bs.firewall_problem(None, RULE, node))
 
     def test_the_firewall_is_read_with_the_name_in_the_environment_not_the_command(self) -> None:
@@ -675,10 +679,10 @@ class NodeModulesLinkTests(_Case):
         made = bs.link_node_modules(self.dest, self.setup)
         modules = self.dest / "node_modules"
         self.assertEqual(made, 4)
-        self.assertFalse(os.path.isjunction(modules))
+        self.assertFalse(bs._is_junction(modules))
         for rel in ("typescript", "vitest", "vite", "@cloudflare/workers-types"):
-            self.assertTrue(os.path.isjunction(modules / rel), rel)
-        self.assertFalse(os.path.isjunction(modules / "@cloudflare"))
+            self.assertTrue(bs._is_junction(modules / rel), rel)
+        self.assertFalse(bs._is_junction(modules / "@cloudflare"))
         self.assertFalse((modules / ".bin").exists())
         # read through a link
         self.assertEqual((modules / "vitest" / "vitest.mjs").read_text(encoding="utf-8"),

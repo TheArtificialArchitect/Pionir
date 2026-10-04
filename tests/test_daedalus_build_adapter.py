@@ -34,6 +34,9 @@ from pionir.adapters.daedalus import (
 from pionir.contracts import RiskLevel, Task
 from pionir.crew.builds import backlog, sandbox
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
+from support import use_long_tempdir
+
+use_long_tempdir()
 
 T0 = 1_800_000_000.0
 
@@ -195,6 +198,7 @@ class SandboxRuleTests(_Case):
                     r"%USERPROFILE%\cron-explain"):
             self.assertIsNotNone(sandbox_repo_problem(bad, str(self.root)), bad)
 
+    @unittest.skipUnless(os.name == "nt", "drive letters are Windows")
     def test_another_drive_is_refused(self) -> None:
         self.make_sandbox()
         drive = os.path.splitdrive(str(self.root))[0].upper()

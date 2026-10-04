@@ -18,6 +18,9 @@ from test_crew_builds import BUILD, CARD, JobOutcome, _Case, approve, at, commit
 from pionir.adapters.daedalus import AdapterTimeout, DaedalusAdapter, DaedalusSettings
 from pionir.crew.builds import worker as worker_module
 from pionir.crew.registry import default_registry
+from support import use_long_tempdir
+
+use_long_tempdir()
 
 
 class PreflightTests(_Case):

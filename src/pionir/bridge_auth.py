@@ -8,7 +8,7 @@ back to ``MELETE_TOKEN``), Melete checks ``MELETE_TOKEN`` (melete/config.py); ea
 
 - ``ensure_tokens`` makes ``daedalus-token.txt`` and ``melete-token.txt`` in the owner's
   secrets folder when they are missing: 32 random bytes, url-safe, the file readable by the
-  owner only (its inherited permissions removed). ``pionir.ps1`` runs it
+  owner only (every other entry on it removed). ``pionir.ps1`` runs it
   (``python -m pionir bridge-tokens``) before any pane starts, then starts each bridge with
   its token and hands Pionir both (``PIONIR_DAEDALUS_TOKEN`` / ``PIONIR_MELETE_TOKEN``);
   Pionir's config also reads the files when those variables are unset.
@@ -29,7 +29,6 @@ from __future__ import annotations
 import ctypes
 import os
 import secrets
-import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -90,19 +89,39 @@ def _owner_sid() -> str | None:
 
 
 def owner_only(path: Path) -> None:
-    """Remove the file's inherited permissions and leave the owner alone on it."""
+    """Leave the owner alone on the file: its whole access list replaced by one entry, the
+    owner with full control, protected from inheritance.
+
+    The list is SET, not edited: ``icacls /inheritance:r /grant:r`` only removes entries
+    marked inherited, and a file can carry SYSTEM and Administrators as EXPLICIT entries -
+    the process's default list when its folder passes nothing down, or copies Windows Server
+    makes from a parent created without auto-inheritance (Python's ``mkdir(mode=0o700)``)."""
     if os.name != "nt":
         os.chmod(path, 0o600)
         return
     sid = _owner_sid()
     if not sid:
         raise OSError("cannot tell who the owner is")
-    system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
-    done = subprocess.run([str(system32 / "icacls.exe"), str(path), "/inheritance:r",
-                           "/grant:r", f"*{sid}:F"], capture_output=True, text=True,
-                          errors="replace", timeout=30, check=False)
-    if done.returncode != 0:
-        raise OSError(f"icacls could not restrict {path}: {done.stdout.strip()[-200:]}")
+    from ctypes import wintypes
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.DWORD)]
+    adv.SetFileSecurityW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.c_void_p]
+    k32.LocalFree.argtypes = [ctypes.c_void_p]
+    sd = ctypes.c_void_p()
+    # D:P = a protected DACL (nothing inherited); FA = full access, for the owner's SID only
+    if not adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            f"D:P(A;;FA;;;{sid})", 1, ctypes.byref(sd), None):
+        raise OSError(f"cannot build an owner-only access list (error {ctypes.get_last_error()})")
+    try:
+        dacl_info = 0x00000004 | 0x80000000     # DACL_ | PROTECTED_DACL_SECURITY_INFORMATION
+        if not adv.SetFileSecurityW(str(path), dacl_info, sd):
+            raise OSError(f"could not restrict {path} to its owner "
+                          f"(error {ctypes.get_last_error()})")
+    finally:
+        k32.LocalFree(sd)
 
 
 def ensure_tokens(directory: Path | None = None) -> dict[str, str]:

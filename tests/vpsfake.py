@@ -315,6 +315,15 @@ def _parse_env(text: str) -> dict:
 
 
 def install(remote, root) -> Sim:
+    """Point the remote half at a fake droplet under ``root``.
+
+    The droplet's paths are ``root`` spelt with forward slashes (``C:/.../vps/x.env``), and
+    some reach remote.py through its POSIX parsers (``systemctl show -p EnvironmentFiles``
+    keeps only the part from the first ``/``), which drop the drive letter. Windows resolves
+    such a ``/...`` path against the CURRENT drive, so whatever runs the remote half against
+    a fake root must run with the root's drive current: the callers chdir into ``root``. (A
+    box whose checkout and temp folder share a drive passes either way; a CI runner with the
+    checkout on D: and TEMP on C: does not.)"""
     root = Path(root)
     sim = Sim(root)
     for d in ("root", "etc/ufw", "etc/default", "net", "sites-enabled", "keyrings", "apt", "proc",

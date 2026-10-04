@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,9 @@ from pionir.crew.products import check_listing
 from pionir.crew.registry import default_registry
 from pionir.crew.result import Err, Ok
 from pionir.crew.worker import WorkContext
+from support import use_long_tempdir
+
+use_long_tempdir()
 
 # Built from pieces so no provider-shaped key sits in the source (GitHub push protection).
 SECRET = "sk_" + "live_" + "BUILDSOWNERSECRETVALUE9876"
@@ -401,6 +405,7 @@ class ReviewUnitTests(unittest.TestCase):
         self.assertTrue(review.network_problems({"src/a.js": b"await fetch('x')"}))
         self.assertTrue(review.network_problems({"src/p/a.py": b"def (:\n"}))   # unparseable
 
+    @unittest.skipUnless(sys.platform == "win32", "contained runs are Windows job objects")
     def test_our_test_run_is_real_and_counts_the_tests(self) -> None:
         e = dict(backlog.SEED[0])
         ok = review.run_tests(as_bytes(product(e)), "python", setup=self.setup(), timeout=120)
@@ -411,6 +416,7 @@ class ReviewUnitTests(unittest.TestCase):
         bad = review.run_tests(as_bytes(broken), "python", setup=self.setup(), timeout=120)
         self.assertFalse(bad.passed)
 
+    @unittest.skipUnless(sys.platform == "win32", "contained runs are Windows job objects")
     def test_a_test_run_never_sees_the_owners_environment(self) -> None:
         e = dict(backlog.SEED[0])
         probe = {"tests/test_env.py": "import os, unittest\n\n\nclass E(unittest.TestCase):\n"
@@ -1094,7 +1100,7 @@ class ContainedRunTests(unittest.TestCase):
                                spawner=spawner)
         self.assertFalse(run.passed)
         self.assertEqual(seen["argv"][0], str(self.setup.python))
-        self.assertEqual(seen["env"]["PATH"].split(";")[0], str(self.setup.python_dir))
+        self.assertEqual(seen["env"]["PATH"].split(os.pathsep)[0], str(self.setup.python_dir))
         self.assertTrue(str(seen["cwd"]).startswith(str(self.setup.runs_dir)))
         self.assertEqual(seen["limits"].active_processes, 8)
         self.assertEqual(self.setup.logons, 1)

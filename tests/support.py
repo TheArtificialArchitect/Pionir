@@ -6,6 +6,9 @@ imported, never collected.
 
 from __future__ import annotations
 
+import os
+import tempfile
+
 from pionir.scheduler import ModelLeaseScheduler, ResourceBudget
 from pionir.shared_gpu import SharedGpuLock
 
@@ -36,3 +39,14 @@ def offline_scheduler(
         vram_probe=None,
         residency_probe=None,
     )
+
+
+def use_long_tempdir() -> None:
+    r"""Make every temporary folder under the long, real spelling of the temp folder.
+
+    GitHub's Windows runners set TEMP to an 8.3 short path (``C:\Users\RUNNER~1\...``).
+    The build sandbox refuses such a path on purpose - a ``~`` could expand to another path,
+    and a folder that resolves to a different spelling is treated as a link - so fixtures made
+    under the short form fail there while passing on a box whose user name is short. A no-op
+    where the temp folder already is its own real path (the dev box, Linux)."""
+    tempfile.tempdir = os.path.realpath(tempfile.gettempdir())
