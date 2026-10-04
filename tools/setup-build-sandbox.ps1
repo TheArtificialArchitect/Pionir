@@ -235,8 +235,10 @@ Run-Icacls @($InstallDir, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F",
 Did "${InstallDir}: Administrators and SYSTEM Full; you and $User read-only"
 $ready = $false
 if (Test-Path $PyExe) {
-    & $PyExe -I -c "import fastapi, uvicorn, requests, yaml, pytest" 2>$null
-    $ready = ($LASTEXITCODE -eq 0)
+    $eap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"      # a missing package is the expected answer here: PS 5.1 would turn its stderr into a terminating error under Stop
+    try { & $PyExe -I -c "import fastapi, uvicorn, requests, yaml, pytest" *> $null; $ready = ($LASTEXITCODE -eq 0) }
+    finally { $ErrorActionPreference = $eap }
 }
 if ($ready) { Had "$PyExe has Daedalus's server packages" } else {
     Write-Host "    robocopy $PythonSource -> $PyDir (without its site-packages)" -ForegroundColor DarkGray

@@ -58,6 +58,12 @@ class SetupScriptTests(unittest.TestCase):
                               check=False)
         self.assertEqual(done.stdout.strip(), "0", done.stdout + done.stderr)
 
+    def test_the_package_probe_cannot_stop_the_script_when_a_package_is_missing(self) -> None:
+        probe = _section(self.text, 'if (Test-Path $PyExe) {', 'if ($ready)')
+        self.assertIn('$ErrorActionPreference = "Continue"', probe)
+        self.assertIn("finally { $ErrorActionPreference = $eap }", probe)
+        self.assertNotIn("2>$null", probe)
+
     def test_loopback_is_reported_as_accepted_never_a_stop(self) -> None:
         loop = _section(self.text, "# loopback: reported, never a stop",
                         "if (-not $contained)")
