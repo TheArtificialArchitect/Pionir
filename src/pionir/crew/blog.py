@@ -21,8 +21,14 @@ One run:
    already used is never used again (the record).
 4. **Words from the shared brain only** (``ctx.words``: JSON schema, temperature 0,
    charged to this division). This module imports no model.
-5. **The worker inserts the links itself**, each carrying the blog's UTM tags, and only
-   THEN runs ``contentcheck.check`` - on the exact dict that would be submitted.
+5. **The worker repairs, then inserts the links itself.** ``repair`` mends two things the
+   model writes against its instructions by a fixed rule: a Markdown link loses its target
+   (the anchor text stays, and is checked), and an address on an RFC 2606 documentation
+   host (example.com, *.example) becomes ``your-site``; any other URL is left to block.
+   What was repaired is recorded (``repaired``). The footer links - the docs page, every
+   API, and the paid offer that fits the topic (a live Gumroad product, else /hire) - each
+   carry the blog's UTM tags, and only THEN does ``contentcheck.check`` run - on the exact
+   dict that would be submitted.
 6. **Blocked**: recorded with its reasons, loudly, and NOT submitted. One fresh draft is
    allowed per run, with the reasons in the prompt; a topic blocked on an earlier day
    starts its first draft with its last block's reasons (the model runs at temperature 0,
@@ -158,11 +164,14 @@ description, body_md, tags. Nothing else.
 Hard rules. A draft that breaks any one of them is thrown away unread:
 - Markdown only: no HTML tags, no HTML comments, no angle brackets at all.
 - Only ## and ### headings, paragraphs, - or 1. lists, **bold**, *italic*, `code` and ```
-  fences. No # or #### headings, no tables, no > quotes, no --- rules, no images.
+  fences. No # heading and nothing deeper than ###: no #### headings. No tables, no > \
+quotes, no --- rules, no images.
 - Write NO links, NO URLs and NO website or domain names. The links are added for you.
 - Name no person, place, city, country, company, customer or website. The only names you \
 may write with a capital letter are: {names}. Every other word is lower case unless it \
 starts a sentence.
+- Write an acronym as the acronym (SVG, JSON, PDF) and never spell it out: write SVG, \
+never the words it stands for. Use only acronyms from the names above.
 - Title and headings in sentence case: only the first word capitalised.
 - No numbers about the business: no counts of customers, users or sales, no revenue, no \
 prices, no money amounts. Never write "we made", "we earned", "we sold" or "our revenue".
@@ -172,11 +181,89 @@ examples.
 - Invent NO example data at all: no sample people, companies, addresses, invoice or order \
 numbers, dates or IDs. Describe a field by what it holds ("the customer's name", "the \
 invoice number"), never by an example value.
+- When an example needs an id, a name, a company, an address, an email address or a \
+handle, write a placeholder in curly braces, lower case with hyphens, such as \
+{{invoice-number}}, {{company-name}} or {{customer-email}}, instead of inventing one.
 - Code is optional. If you show any, show only a JSON request body in a fenced block, \
-with lower-case keys and no keys, tokens, headers or URLs.
+with lower-case keys, placeholders as values, and no keys, tokens, headers or URLs.
 - title: 10 to 120 characters. description: one or two sentences, 60 to 280 characters. \
 body_md: 400 to 1200 words. slug: a few lower-case words joined by hyphens. tags: up to \
 five lower-case words, hyphens instead of spaces."""
+
+
+@dataclass(frozen=True)
+class Offer:
+    """A paid offer a post's footer points to: a page where money really changes hands."""
+    url: str               # without a query: the worker adds the post's UTM tags
+    label: str             # the link's text (checked like every other word)
+
+
+# "I build it for you": the contract-work page on api.dokaz.net (Scrooge worker/src/hire.ts).
+HIRE = Offer(f"{SITE}/hire", "have us build it for you")
+# The most relevant paid product for a topic, where one exists. Only products that are
+# really on sale: the Gumroad listing (product.gumroad_list, 2026-10-04) has obol-pro,
+# metron, approval-gate, card-press and post-guard live. A topic none of them serves gets
+# HIRE. A product taken off sale must be taken out of here in the same change.
+OFFERS = {
+    "invoice-pdf-from-json": Offer("https://dokaz.gumroad.com/l/obol-pro",
+                                   "Obol on Gumroad: invoices and estimates with no "
+                                   "subscription"),
+}
+
+
+def offer_for(topic: Topic) -> Offer:
+    """The paid offer a post on this topic points to: its product, or else /hire."""
+    return OFFERS.get(topic.key, HIRE)
+
+
+# ---- repairing the model's words before they are assembled ----------------------------
+# Two things the model writes against its instructions that a fixed rule can mend without
+# loosening the check: a Markdown link (its anchor text stays and is checked like any other
+# words; only the target goes), and an address on a host RFC 2606 / 6761 reserves for
+# documentation (example.com/.org/.net and their subdomains, the .example TLD), which can
+# never be anyone's site. Every other URL, domain or address is left exactly as written,
+# so it still blocks. The full check then runs on the assembled post.
+_MD_LINK = re.compile(r"(?<!!)\[([^\[\]\n]+)\]\(\s*<?[^)\s>]*>?(?:\s+\"[^\"\n]*\")?\s*\)")
+_RESERVED_HOST = (r"(?:(?:[a-z0-9-]+\.)*example\.(?:com|org|net)|(?:[a-z0-9-]+\.)+example)"
+                  r"(?![\w-]|\.[a-z0-9])")
+_RESERVED_URL = re.compile(rf"(?i)\b[a-z][a-z0-9+.-]*://{_RESERVED_HOST}(?::\d+)?"
+                           r"(?:[/?#][^\s<>()\[\]{}\"'`]*)?")
+# not after "@" (user@example.com is a reserved address the check already allows) nor
+# inside a longer host or path
+_RESERVED_BARE = re.compile(rf"(?i)(?<![\w@./:-]){_RESERVED_HOST}")
+PLACEHOLDER_SITE = "your-site"
+REPAIRED = "repaired"      # the draft's (and the record's) note of what was repaired
+
+
+def repair(field: str, text: str) -> tuple:
+    """(text, what was repaired) - see above. Deterministic; never adds anything."""
+    done: list = []
+
+    def unlink(m: re.Match) -> str:
+        done.append(f"{field}: unlinked {_clip(m.group(1), 60)!r}")
+        return m.group(1)
+
+    def reserved(m: re.Match) -> str:
+        found = m.group(0)
+        tail = len(found) - len(found.rstrip(".,;:!?"))
+        found, rest = found[:len(found) - tail], found[len(found) - tail:]
+        done.append(f"{field}: {_clip(found, 60)!r} -> {PLACEHOLDER_SITE!r}")
+        return PLACEHOLDER_SITE + rest
+
+    text = _MD_LINK.sub(unlink, text)
+    text = _RESERVED_URL.sub(reserved, text)
+    text = _RESERVED_BARE.sub(reserved, text)
+    return text, done
+
+
+# A reason about a link names the hosts a post may link to; echoed back, it reads as an
+# invitation to link to them. Every link in a post is the worker's, so the model is told
+# plainly to write none. Only reasons ABOUT a link (contentcheck's "link '...'", Pionir's
+# "links may only go to ..."): Pionir's raw-HTML reason also mentions links, and is kept.
+_LINK_REASON = re.compile(r"(?i)\blink '|\blinks (?:may|must|cannot)\b|bare www|"
+                          r"names the website|bare address")
+NO_LINKS = ("you wrote a URL, a link or a website name: remove every URL and link; "
+            "write none")
 
 
 def slugify(text: str, limit: int = MAX_SLUG) -> str:
@@ -737,14 +824,27 @@ class BlogWorker(DailyPoster):
         if reasons:
             lines.append("Your previous draft was thrown away for these reasons. Write a new "
                          "draft that breaks none of them:")
-            lines += [f"- {r}" for r in reasons[:12]]
+            # every link reason becomes one plain instruction: the allowed hosts it names
+            # are for the worker's own links, never an invitation to the model
+            said = [NO_LINKS if _LINK_REASON.search(r) else r for r in reasons]
+            lines += [f"- {r}" for r in list(dict.fromkeys(said))[:12]]
         return "\n".join(lines)
 
     def assemble(self, raw, topic: Topic, rec: dict, now: float) -> dict:
-        """The exact post that would be published: the model's words, a slug of its own
-        that was never used, and the links the worker inserts - with UTM tags."""
+        """The exact post that would be published: the model's words (repaired, see
+        ``repair``), a slug of its own that was never used, and the links the worker inserts
+        - with UTM tags. What was repaired is kept as ``repaired`` (only when anything was):
+        it is never published, and ``check_draft`` checks everything else."""
         raw = raw if isinstance(raw, dict) else {}
-        title = raw.get("title")
+        repaired: list = []
+        words = {}
+        for key in ("title", "description", "body_md"):
+            v = raw.get(key)
+            if isinstance(v, str):
+                v, done = repair(key, v)
+                repaired += done
+            words[key] = v
+        title = words["title"]
         base = slugify(raw.get("slug") or title or topic.key) or slugify(topic.key)
         slug, n, used = base, 2, set(rec["used_slugs"])
         while slug in used:
@@ -752,7 +852,7 @@ class BlogWorker(DailyPoster):
             slug = base[:MAX_SLUG - len(suffix)].strip("-") + suffix
             n += 1
         draft_id = f"{_day(now)}-{slug}"
-        body = raw.get("body_md")
+        body = words["body_md"]
         if isinstance(body, str):
             body = body.strip() + "\n\n" + self.links(topic, draft_id)
         tags = raw.get("tags")
@@ -763,29 +863,42 @@ class BlogWorker(DailyPoster):
                 if s and s not in clean:
                     clean.append(s)
             tags = clean[:5]
-        return {"draft_id": draft_id, "slug": slug,
-                "title": title.strip() if isinstance(title, str) else title,
-                "description": (raw.get("description").strip()
-                                if isinstance(raw.get("description"), str)
-                                else raw.get("description")),
-                "body_md": body, "tags": tags}
+        description = words["description"]
+        draft = {"draft_id": draft_id, "slug": slug,
+                 "title": title.strip() if isinstance(title, str) else title,
+                 "description": (description.strip() if isinstance(description, str)
+                                 else description),
+                 "body_md": body, "tags": tags}
+        if repaired:
+            draft[REPAIRED] = repaired
+        return draft
 
     @staticmethod
     def links(topic: Topic, draft_id: str) -> str:
+        """The worker's own footer: the topic's docs page, every API, and the paid offer
+        that fits the topic (``offer_for``) - each with the post's UTM tags, so a visit,
+        and a Gumroad sale, is tied to the post that sent it (TRAFFIC.md)."""
         q = contentcheck.utm_query(draft_id)
         lines = ["## Try it", "", f"- [{topic.label}]({SITE}{topic.path}?{q})"]
         if topic.path != "/":
             lines.append(f"- [all Dokaz APIs]({SITE}/?{q})")
+        offer = offer_for(topic)
+        lines.append(f"- [{offer.label}]({offer.url}?{q})")
         return "\n".join(lines) + "\n"
 
     def check_draft(self, draft: dict) -> list:
-        return contentcheck.check(draft)
+        # everything but the record's own note of what was repaired: exactly the payload
+        # ``_job`` submits once it passes (an unknown field still blocks)
+        return contentcheck.check({k: v for k, v in draft.items() if k != REPAIRED})
 
     def published_link(self, result, post: dict) -> str | None:
         return published_url(result, post["slug"])
 
     def _describe(self, draft: dict) -> dict:
-        return {"slug": draft["slug"], "title": draft.get("title")}
+        out = {"slug": draft["slug"], "title": draft.get("title")}
+        if draft.get(REPAIRED):
+            out[REPAIRED] = list(draft[REPAIRED])
+        return out
 
     def _job(self, draft: dict) -> Job:
         payload = {k: draft[k] for k in contentcheck.FIELDS}      # exactly what was checked

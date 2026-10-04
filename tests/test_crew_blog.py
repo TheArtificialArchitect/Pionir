@@ -366,6 +366,211 @@ class TopicAndSlugTests(_Case):
         self.assertEqual(brain.calls, [])
 
 
+INVOICE = next(t for t in SEEDS if t.key == "invoice-pdf-from-json")
+QR = next(t for t in SEEDS if t.key == "qr-codes-from-an-api")
+
+
+def body_plus(extra: str) -> dict:
+    d = good()
+    d["body_md"] = BODY + "\n" + extra + "\n"
+    return d
+
+
+class RepairTests(unittest.TestCase):
+    """The raw model words are repaired by a fixed rule before assembly - a Markdown link
+    loses its target, an RFC 2606 documentation host becomes ``your-site`` - and nothing
+    else: every other URL still blocks, and the full check runs on the final post."""
+
+    def setUp(self) -> None:
+        self.worker = default_registry().require("posting.blog")
+        self.rec = {"used_slugs": [], "used_topics": []}
+
+    def assemble(self, raw, topic=None) -> dict:
+        return self.worker.assemble(raw, topic or SEEDS[0], self.rec, T0)
+
+    def test_a_model_link_is_unlinked_and_its_anchor_text_kept(self) -> None:
+        # live: the model linked api.dokaz.net itself, without the post's UTM tags
+        d = self.assemble(body_plus(
+            "Read the [Email Verify guide](https://api.dokaz.net/docs/email-verification-api) "
+            "first."))
+        self.assertIn("Read the Email Verify guide first.", d["body_md"])
+        self.assertNotIn("](https://api.dokaz.net/docs/email-verification-api)", d["body_md"])
+        self.assertEqual(self.worker.check_draft(d), [])
+        self.assertEqual(d["repaired"], ["body_md: unlinked 'Email Verify guide'"])
+
+    def test_a_documentation_host_in_a_code_fence_and_in_prose_becomes_a_placeholder(self) -> None:
+        # live: the QR post encoded https://www.example.com and was blocked twice for it
+        d = self.assemble(body_plus(
+            'Point the code at www.example.com or shop.example.\n\n```json\n'
+            '{"data": "https://www.example.com/menu?table=4", "format": "svg"}\n```'), QR)
+        self.assertNotIn("example", d["body_md"].replace("examples", ""))
+        self.assertIn('{"data": "your-site", "format": "svg"}', d["body_md"])
+        self.assertIn("Point the code at your-site or your-site.", d["body_md"])
+        self.assertEqual(self.worker.check_draft(d), [])
+        self.assertEqual(len(d["repaired"]), 3)
+
+    def test_a_reserved_email_address_is_left_alone(self) -> None:
+        # user@example.com is an address the check already allows; "user@your-site" would
+        # be an @-handle
+        d = self.assemble(body_plus("A test address such as user@example.com never bounces."))
+        self.assertIn("user@example.com", d["body_md"])
+        self.assertNotIn("repaired", d)
+        self.assertEqual(self.worker.check_draft(d), [])
+
+    def test_a_real_off_site_url_still_blocks(self) -> None:
+        for extra in ("See https://mailcheck-tools.com/docs for more.",
+                      "See [https://mailcheck-tools.com](https://mailcheck-tools.com).",
+                      "See www.mailcheck-tools.com for more.",
+                      "See https://api.dokaz.net/docs/qr-code-api for more."):
+            d = self.assemble(body_plus(extra))
+            reasons = self.worker.check_draft(d)
+            self.assertTrue(reasons, extra)
+            self.assertTrue(any("mailcheck-tools.com" in r or "utm_source" in r
+                                for r in reasons), (extra, reasons))
+
+    def test_the_workers_own_utm_links_are_untouched(self) -> None:
+        d = self.assemble(body_plus("Read the [guide](https://www.example.com/guide)."))
+        footer = BlogWorker.links(SEEDS[0], d["draft_id"])
+        self.assertTrue(d["body_md"].endswith(footer))
+        self.assertEqual(d["body_md"].count("utm_source=blog"), footer.count("utm_source=blog"))
+        self.assertEqual(self.worker.check_draft(d), [])
+
+    def test_repaired_text_still_fails_on_every_other_reason(self) -> None:
+        d = self.assemble(body_plus("Ask [Jane Doe](https://example.com/jane) at "
+                                    "jane@realmail.com about invoice INV-2024-001."))
+        self.assertIn("Ask Jane Doe at", d["body_md"])
+        reasons = self.worker.check_draft(d)
+        self.assertTrue(any("Jane Doe" in r for r in reasons), reasons)
+        self.assertTrue(any("email address" in r for r in reasons), reasons)
+        self.assertTrue(any("INV-2024-001" in r for r in reasons), reasons)
+
+    def test_the_record_keeps_what_was_repaired(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        state = Path(tmp.name)
+        hands = FakeHands()
+        raw = body_plus("Ask [Jane Doe](https://example.com/jane).")
+        ctx = WorkContext(now=T0, http=None, secrets_dir=state, words=FakeBrain(raw, raw),
+                          job=hands.job, approval=hands.approval, state_dir=state)
+        self.worker.run(ctx)
+        rec = json.loads(self.worker.record_path(state).read_text(encoding="utf-8"))
+        self.assertEqual(rec["blocked"][0]["repaired"], ["body_md: unlinked 'Jane Doe'"])
+        self.assertEqual(hands.jobs, [])
+        # and a passing repaired draft is submitted without the note: it is never published
+        hands2, raw2 = FakeHands(), body_plus("Read the [guide](https://www.example.com).")
+        state2 = state / "two"
+        ctx = WorkContext(now=T0, http=None, secrets_dir=state2, words=FakeBrain(raw2),
+                          job=hands2.job, approval=hands2.approval, state_dir=state2)
+        self.worker.run(ctx)
+        (job,) = hands2.jobs
+        self.assertEqual(set(job.payload), set(contentcheck.FIELDS))
+        rec = json.loads(self.worker.record_path(state2).read_text(encoding="utf-8"))
+        self.assertEqual(rec["posts"][0]["repaired"], ["body_md: unlinked 'guide'"])
+
+
+class OfferTests(unittest.TestCase):
+    """Every post's footer links to a paid offer: the live Gumroad product its topic fits,
+    or the /hire page - with the post's UTM tags, so the visit or the sale is tied to it."""
+
+    def setUp(self) -> None:
+        self.worker = default_registry().require("posting.blog")
+
+    def test_every_post_links_a_paid_offer_with_its_utm_tags_and_passes_both_checks(self) -> None:
+        from pionir.adapters.content import check_draft as pionir_check
+        for topic in SEEDS:
+            d = self.worker.assemble(good(slug=topic.key), topic, {"used_slugs": []}, T0)
+            want = (blog_module.OFFERS[topic.key].url if topic.key in blog_module.OFFERS
+                    else "https://api.dokaz.net/hire")
+            q = contentcheck.utm_query(d["draft_id"])
+            self.assertIn(f"]({want}?{q})", d["body_md"], topic.key)
+            self.assertEqual(self.worker.check_draft(d), [], topic.key)
+            pionir_check(d)                        # Pionir's own validator: no exception
+
+    def test_the_invoice_post_links_the_live_invoice_product(self) -> None:
+        d = self.worker.assemble(good(), INVOICE, {"used_slugs": []}, T0)
+        self.assertIn("https://dokaz.gumroad.com/l/obol-pro?utm_source=blog&utm_medium="
+                      "referral&utm_campaign=", d["body_md"])
+        self.assertNotIn("/hire", d["body_md"])
+        q = BlogWorker.links(QR, "2026-10-04-qr")
+        self.assertIn("https://api.dokaz.net/hire?utm_source=blog", q)
+        self.assertNotIn("gumroad", q)
+
+    def test_the_results_loop_reads_the_offers_campaign_as_the_posts(self) -> None:
+        from urllib.parse import parse_qs, urlsplit
+
+        from pionir.crew import devto, results
+        d = self.worker.assemble(good(), INVOICE, {"used_slugs": []}, T0)
+        (url,) = [u for u in contentcheck.links_in(d["body_md"]) if "gumroad" in u]
+        q = parse_qs(urlsplit(url).query)
+        stored = "/".join(results.utm_part(q[k][0])
+                          for k in ("utm_source", "utm_medium", "utm_campaign"))
+        self.assertEqual(results.split_campaign(stored),
+                         ("blog", "referral", results._post_campaign(d)))
+        # the dev.to copy of the post retags it like every other Dokaz link
+        self.assertIn("obol-pro?utm_source=devto&", devto.swap_source(d["body_md"]))
+
+    def test_only_live_products_are_offered(self) -> None:
+        live = {"obol-pro", "metron", "approval-gate", "card-press", "post-guard"}
+        for key, offer in blog_module.OFFERS.items():
+            self.assertIn(key, {t.key for t in SEEDS})
+            self.assertTrue(offer.url.startswith("https://dokaz.gumroad.com/l/"), key)
+            self.assertIn(offer.url.rsplit("/", 1)[1], live, key)
+
+
+class PromptTests(unittest.TestCase):
+    PLACEHOLDERS = ("{invoice-number}", "{company-name}", "{customer-email}",
+                    "{customer-name}", "{street-address}", "{customer-handle}", "{order-id}")
+
+    def test_the_placeholders_the_prompt_asks_for_pass_both_validators(self) -> None:
+        from pionir.adapters.content import check_draft as pionir_check
+        w = default_registry().require("posting.blog")
+        lines = [f"The field holds {p} until you fill it in." for p in self.PLACEHOLDERS]
+        code = ",\n".join(f'  "{p[1:-1].replace("-", "_")}": "{p}"' for p in self.PLACEHOLDERS)
+        d = w.assemble(body_plus("\n".join(lines) + "\n\n```json\n{\n" + code + "\n}\n```"),
+                       INVOICE, {"used_slugs": []}, T0)
+        self.assertEqual(w.check_draft(d), [])
+        pionir_check(d)
+        # the form the prompt does NOT ask for: an angle bracket reads as raw HTML to both
+        d = w.assemble(body_plus("The field holds <invoice-number> until then."), INVOICE,
+                       {"used_slugs": []}, T0)
+        self.assertTrue(any("raw HTML" in r for r in w.check_draft(d)))
+        with self.assertRaises(ValueError):
+            pionir_check(d)
+
+    def test_the_system_prompt_offers_those_placeholders_and_the_new_rules(self) -> None:
+        system = default_registry().require("posting.blog")._system()
+        for p in ("{invoice-number}", "{company-name}", "{customer-email}"):
+            self.assertIn(p, system)
+        self.assertIn("never spell it out", system)
+        self.assertIn("no #### headings", system)
+
+    def test_a_link_reason_is_fed_back_as_write_no_links_without_the_host_list(self) -> None:
+        hosts = "api.dokaz.net, dokaz.gumroad.com, dokazindustries.com, www.dokazindustries.com"
+        reasons = [
+            (f"Pionir's publish check refuses it: body_md: links may only go to {hosts}; "
+             "not 'www.example.com'"),
+            (f"body_md: link 'https://www.example.com' goes to www.example.com; posts link "
+             f"only to {hosts}"),
+            ("body_md: link 'https://api.dokaz.net' does not carry utm_source=blog (this "
+             "post's UTM tags, TRAFFIC.md)"),
+            ("body_md: 'www.foo.com' is a bare www address; links are full https URLs with "
+             "UTM tags"),
+            "body_md: names the website 'foo.com'",
+            ("names 'Scalable', which is not on the allowlist of names a post may use (a "
+             "person, place or company blocks the post)"),
+            ("Pionir's publish check refuses it: body_md: raw HTML tags are not allowed "
+             "(Markdown only; write links as [text](url))"),
+        ]
+        prompt = BlogWorker._prompt(QR, None, reasons)
+        self.assertIn("remove every URL and link; write none", prompt)
+        self.assertEqual(prompt.count("write none"), 1)
+        self.assertNotIn("dokaz.gumroad.com", prompt)
+        self.assertNotIn("api.dokaz.net", prompt)
+        self.assertNotIn("utm_source", prompt)
+        self.assertIn("'Scalable'", prompt)             # every other reason, as it was
+        self.assertIn("raw HTML tags are not allowed", prompt)
+
+
 class WordsOnlyThroughTheBrainTests(unittest.TestCase):
     def test_the_blog_and_check_modules_import_nothing_that_can_call_a_model(self) -> None:
         for mod in (blog_module, contentcheck):
