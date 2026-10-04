@@ -171,7 +171,7 @@ class FeedbackKindEmailTests(unittest.TestCase):
                     body.replace("{referral_code}", "X")):
             with self.assertRaises(ValueError):
                 check_email({**self.email, "body_text": bad})
-        with self.assertRaisesRegex(ValueError, r"kind: absent (a plain email), 'recovery' or 'feedback_request'"):
+        with self.assertRaisesRegex(ValueError, r"kind: absent \(a plain email\), 'recovery' or 'feedback_request'"):
             check_email({**self.email, "kind": "newsletter"})
         with self.assertRaisesRegex(ValueError, "subject"):
             check_email({**self.email, "subject": "Hi {referral_code}"})
