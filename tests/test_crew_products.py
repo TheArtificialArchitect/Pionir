@@ -541,6 +541,60 @@ class SalesTests(_Case):
         result = self.run_at(T0 + 5400)
         self.assertEqual(self.rows(result, "product.new_sales"), [])
 
+    def test_gumroads_whole_float_cents_are_read_as_live_products(self) -> None:
+        # the real shape: Gumroad sends sales_usd_cents as a float, and every live product
+        # was once counted malformed for it
+        p = {"id": "g1", "slug": "invoice-kit", "name": "Invoice Renamer Kit",
+             "published": True, "price_cents": 1900, "sales_count": 0,
+             "sales_usd_cents": 0.0, "url": "https://dokaz.gumroad.com/l/invoice-kit"}
+        self.pionir.listed = [p]
+        result = self.run_at(T0)
+        (row,) = self.rows(result, "product.sales")
+        self.assertEqual(row.payload["malformed_rows"], 0)
+        self.assertEqual([x["slug"] for x in row.payload["live"]], ["invoice-kit"])
+        self.assertIs(type(row.payload["live"][0]["sales_usd_cents"]), int)
+        self.pionir.listed = [{**p, "sales_count": 1, "sales_usd_cents": 2900.0}]
+        result = self.run_at(T0 + 1800)
+        (news,) = self.rows(result, "product.new_sales")
+        self.assertEqual((news.payload["new_sales"], news.payload["sales_usd_cents"]),
+                         (1, 2900))
+        figs = {f.measures: f.value for f in news.figures}
+        self.assertEqual(figs["new revenue"], 2900)
+
+    def test_malformed_rows_raise_the_alert_until_the_sales_read_clean(self) -> None:
+        good = {"id": "g1", "slug": "invoice-kit", "name": "Invoice Renamer Kit",
+                "published": True, "sales_count": 1, "sales_usd_cents": 1900}
+        self.assertIsNone(self.worker.pulse(self.state, T0).get("alert"))   # never read yet
+        for bad in ({**good, "sales_usd_cents": 2900.5}, {**good, "sales_count": "many"}):
+            with self.subTest(bad=bad):
+                self.pionir.listed = [bad]
+                result = self.run_at(T0)
+                (row,) = self.rows(result, "product.sales")
+                self.assertEqual(row.payload["malformed_rows"], 1)
+                alert = self.worker.pulse(self.state, T0).get("alert")
+                self.assertIn("1 of 1 Gumroad product rows are MALFORMED", alert or "")
+        self.pionir.listed = [good]
+        self.run_at(T0 + 1800)
+        self.assertIsNone(self.worker.pulse(self.state, T0 + 1800)["alert"])
+
+    def test_a_malformed_row_reaches_the_vitals(self) -> None:
+        from pionir.crew.vitals import Vitals
+
+        self.pionir.listed = [{"slug": "invoice-kit", "published": True, "sales_count": 1,
+                               "sales_usd_cents": "lots"}]
+        self.run_at(T0)
+        pulse = self.worker.pulse(self.state, T0)
+
+        class _NoHealth:
+            def health(self, cadences, now):
+                return []
+
+        vitals = Vitals(_NoHealth(), dict, lambda: T0,
+                        outputs=lambda: {pulse["worker"]: pulse["alert"]})
+        (alarm,) = vitals.check(force=True)
+        self.assertEqual(alarm["who"], "products.shelf")
+        self.assertIn("MALFORMED", alarm["says"])
+
     def test_the_sales_are_read_every_run_even_with_nothing_staged(self) -> None:
         self.run_at(T0)
         self.run_at(T0 + 1800)

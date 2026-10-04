@@ -277,17 +277,74 @@ class ScroogeContractTests(_Case):
                           norm["price_text"], norm["text"]),
                          ("7", "FO1ABC23", "cakefan22", RESEARCH.title, "$24", "A kettle."))
 
-    def test_fiverr_account_mail_is_acknowledged_and_ignored_not_malformed(self) -> None:
+    def test_fiverr_account_mail_is_not_malformed_and_no_order(self) -> None:
         # the three live events: a W-9 notice, a W-9 confirmation, a marketing email
         self.pionir.events = [scrooge_ev(i, "unknown", order_no="",
                                          subject="Your account needs a W-9 form")
                               for i in (1, 2, 3)]
         self.assertIsInstance(self.run_desk(), Ok)
         rec = self.record()
-        self.assertEqual((rec["counts"]["ignored_events"], rec["counts"]["malformed_events"]),
+        self.assertEqual((rec["counts"]["unknown_events"], rec["counts"]["malformed_events"]),
                          (3, 0))
         self.assertEqual(rec["orders"], {})
-        self.assertEqual(self.pionir.acks, ["1", "2", "3"])
+        self.assertEqual(self.pionir.acks, ["1", "2", "3"])     # each once its card was up
+
+    def test_well_formed_mail_about_no_order_is_still_acknowledged_and_ignored(self) -> None:
+        self.pionir.events = [scrooge_ev(1, "review", order_no="", subject="A review")]
+        self.assertIsInstance(self.run_desk(), Ok)
+        self.assertEqual(self.record()["counts"]["ignored_events"], 1)
+        self.assertEqual(self.pionir.cards, {})
+        self.assertEqual(self.pionir.acks, ["1"])
+
+    def test_an_unreadable_email_reaches_the_owner_as_data(self) -> None:
+        # Scrooge marks a Fiverr email it cannot classify kind=unknown; the desk counted it as
+        # ignored and acknowledged it, so the owner never saw it
+        self.pionir.events = [scrooge_ev(
+            9, "unknown", order_no="", buyer="ev`il <@123> @everyone",
+            subject="Your **order** is‮ at risk", text="Click https://x.test ```now```")]
+        got = self.run_desk()
+        self.assertIsInstance(got, Ok)
+        self.assertEqual(self.pionir.posted("unreadable:"), ["unreadable:9"])
+        (card,) = self.pionir.cards["unreadable:9"]
+        self.assertEqual(card["kind"], "note")
+        self.assertIn("unreadable", card["title"])
+        body = card["body"]
+        self.assertIn("From `ev'il <@123> @everyone`", body)          # inside code, no backtick
+        self.assertIn("subject `Your **order** is at risk`", body)   # bidi override stripped
+        self.assertNotIn("‮", body)
+        self.assertIn("```text\nClick https://x.test '''now'''\n```", body)
+        self.assertEqual(self.pionir.acks, ["9"])
+        self.assertTrue([o for o in got.value if o.kind == "fiverr.unreadable"])
+        self.run_desk(T0 + 60)                                       # never twice
+        self.assertEqual(len(self.pionir.cards["unreadable:9"]), 1)
+        self.assertEqual(self.pionir.acks, ["9"])
+
+    def test_an_unreadable_email_is_acknowledged_only_once_its_card_is_up(self) -> None:
+        self.pionir.discord_down = True
+        self.pionir.events = [scrooge_ev(4, "unknown", order_no="", subject="Odd mail")]
+        self.run_desk()
+        self.run_desk(T0 + 60)
+        self.assertEqual(self.pionir.acks, [])
+        self.assertFalse(self.record()["unreadable"]["4"]["posted"])
+        self.pionir.discord_down = False
+        self.run_desk(T0 + 120)
+        self.assertEqual(self.pionir.posted("unreadable:"), ["unreadable:4"])
+        self.assertEqual(self.pionir.acks, ["4"])
+
+    def test_an_unreadable_email_naming_an_order_is_a_problem_card(self) -> None:
+        self.pionir.reserve = True              # served again: still not acked before its card
+        self.pionir.refuse_card = "unreadable:"
+        self.pionir.events = [scrooge_ev(5, "unknown", buyer="cakefan22", subject="Re: order")]
+        self.run_desk()
+        self.run_desk(T0 + 60)
+        self.assertEqual(self.pionir.acks, [])
+        self.pionir.refuse_card = None
+        self.run_desk(T0 + 120)
+        (card,) = self.pionir.cards["unreadable:5"]
+        self.assertEqual((card["kind"], card["ref"]), ("problem", "FO1ABC23"))
+        self.assertIn("order `FO1ABC23`", card["body"])
+        self.assertEqual(self.pionir.acks, ["5"])
+        self.assertEqual(self.record()["counts"]["unknown_events"], 1)
 
     def test_a_buyer_message_about_no_order_reaches_the_owner(self) -> None:
         # Events 6-8 on the live desk were buyer messages with no order, acknowledged and

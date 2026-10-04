@@ -834,6 +834,19 @@ class UnpublishAndListTests(_Case):
              "url": None}]})
         self.assertEqual(self.world.steps(), ["list", "list"])
 
+    def test_whole_float_counts_are_ints_and_a_fraction_is_passed_on(self) -> None:
+        # Gumroad's real answer: sales_usd_cents is a float (0.0)
+        self.world.add(name="Invoice Kit", custom_permalink=SLUG, published=True, price=1900,
+                       sales_count=0, sales_usd_cents=0.0)
+        self.world.add(name="Odd Kit", custom_permalink="odd-kit", published=True,
+                       price=1900.0, sales_count=1, sales_usd_cents=2900.5)
+        out = self.app.run_task(LIST, {})
+        whole, odd = out["result"]["products"]
+        self.assertEqual(whole["sales_usd_cents"], 0)
+        self.assertIs(type(whole["sales_usd_cents"]), int)
+        self.assertIs(type(odd["price_cents"]), int)
+        self.assertEqual(odd["sales_usd_cents"], 2900.5)
+
 
 # ---- the token never leaks -------------------------------------------------------------------
 class SecretTests(_Case):

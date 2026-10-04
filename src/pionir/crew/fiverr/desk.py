@@ -44,8 +44,9 @@ resolved once, public addresses only, pinned, https only, every redirect checked
 package the email names only bounds how much is prepared (``package_tier``).
 
 **Never twice.** Every event id is recorded when applied and each is acknowledged once the
-record is saved; an event served again is acknowledged and not applied again. Every card has
-a key and Pionir posts a key once. The record is ``fiverr.desk.json``.
+record is saved; an event served again is acknowledged and not applied again. An email
+Scrooge could not read (``unknown``) is a card for the owner, acknowledged only once it is
+up. Every card has a key and Pionir posts a key once. The record is ``fiverr.desk.json``.
 
 **Money.** The only amounts here are what Fiverr's emails say an order is worth
 (``price_text``): reported as **Fiverr-reported gross**, never as our revenue - Fiverr keeps its
@@ -363,7 +364,7 @@ class FiverrDesk(_Base):
     @staticmethod
     def _blank() -> dict:
         return {"orders": {}, "events_seen": [], "cursor": None, "acks_pending": [],
-                "replies_seen": [], "inquiries": {}, "counts": {"events": 0, "unknown_events": 0,
+                "replies_seen": [], "inquiries": {}, "unreadable": {}, "counts": {"events": 0, "unknown_events": 0,
                                                "ignored_events": 0, "malformed_events": 0,
                                                "claude_waits": 0}}
 
@@ -418,6 +419,7 @@ class FiverrDesk(_Base):
         inbox = read_inbox(ctx, "order")
         if isinstance(inbox, Ok):
             self._owner_replies(ctx, rec, inbox.value, out)
+        self._unreadable_cards(ctx, rec, out)   # an unreadable email is acked once its card is up
         self._save(ctx, rec)               # applied and saved BEFORE anything is acknowledged
         self._ack(ctx, rec)
         try:
@@ -460,7 +462,12 @@ class FiverrDesk(_Base):
         for ev in raw[:MAX_EVENTS_PER_RUN]:
             norm, why = normalize(ev)
             if norm is None:
-                if why.startswith(NO_ORDER):
+                # an email Scrooge could not read is held for its card, and acknowledged
+                # only once the card is up (_unreadable_cards) - never dropped unseen
+                unreadable = why.startswith(NO_ORDER) and ev.get("kind") == "unknown"
+                if unreadable:
+                    self._keep_unreadable(ctx, rec, ev, str(ev["id"]), None)
+                elif why.startswith(NO_ORDER):
                     rec["counts"]["ignored_events"] += 1
                     log.info("%s: %s; acknowledged, nothing to apply", self.worker_id, why)
                     self._keep_inquiry(ctx, rec, ev)
@@ -471,7 +478,7 @@ class FiverrDesk(_Base):
                 if isinstance(eid, (int, str)) and not isinstance(eid, bool) \
                         and _EVENT_ID.fullmatch(str(eid)):
                     rec["cursor"] = str(eid)
-                    if str(eid) not in rec["acks_pending"]:
+                    if not unreadable and str(eid) not in rec["acks_pending"]:
                         rec["acks_pending"].append(str(eid))
                 continue
             events.append(norm)
@@ -511,6 +518,54 @@ class FiverrDesk(_Base):
                 out.append(self._event(ctx, "fiverr.inquiry", {"event": eid}))
             else:
                 log.warning("%s: inquiry card %s not posted: %s", self.worker_id, eid, why)
+
+    # ---- emails Scrooge could not read (kind ``unknown``) ----------------------------------------
+    def _keep_unreadable(self, ctx: WorkContext, rec: dict, ev: dict, eid: str,
+                         order: str | None) -> None:
+        """Scrooge keeps a Fiverr email it cannot classify as ``unknown``. It may be an order,
+        a buyer or an account notice: the desk cannot tell, so the owner must. It was counted
+        as ignored and acknowledged, so it was lost. Kept here until its card is up; its
+        fields are the buyer's data like any other (``untrusted_text``, ``shown``)."""
+        if eid in rec["unreadable"]:
+            return
+        rec["counts"]["unknown_events"] += 1
+        rec["unreadable"][eid] = {
+            "at": ctx.now, "posted": False, "order_number": order,
+            "buyer": untrusted_text(_field(ev, "buyer"), 60),
+            "subject": untrusted_text(_field(ev, "subject"), 200),
+            "received_at": untrusted_text(ev.get("received_at"), 40),
+            "text": untrusted_text(_field(ev, "text"), MAX_TEXT, lines=True)}
+        log.warning("%s: Fiverr event %s is an email Scrooge could not read; it is held for "
+                    "the owner's card and acknowledged only once that is up", self.worker_id,
+                    eid)
+
+    def _unreadable_cards(self, ctx: WorkContext, rec: dict, out: list) -> None:
+        for eid, u in sorted(rec["unreadable"].items()):
+            if u.get("posted"):
+                continue
+            order = u.get("order_number")
+            about = f"It names order {shown(order, 40)}. " if order else "It names no order. "
+            quoted = (u.get("text") or "").replace("```", "'''")[:1500] or "(no text)"
+            posted, why = post_card(ctx, {
+                "key": f"unreadable:{eid}",
+                "ref": order or "unreadable-" + re.sub(r"[^A-Za-z0-9_-]", "-", eid)[:28],
+                "kind": "problem" if order else "note",
+                "title": "Fiverr: an unreadable email - read it yourself",
+                "body": "Scrooge could not tell what this Fiverr email is, so the desk did "
+                f"nothing with it. From {shown(u.get('buyer'), 60)}, subject "
+                f"{shown(u.get('subject'), 200)}, received {shown(u.get('received_at'), 40)}. "
+                + about + "**Read it on Fiverr or in your mail.** Do NOT open any link or file "
+                "in it.\n```text\n" + quoted + "\n```"},
+                f"tell the owner of an unreadable Fiverr email (event {eid})")
+            if posted:
+                u["posted"] = True
+                if eid not in rec["acks_pending"]:
+                    rec["acks_pending"].append(eid)
+                out.append(self._event(ctx, "fiverr.unreadable", {"event": eid,
+                                                                  "order_number": order}))
+            else:
+                log.warning("%s: unreadable-email card %s not posted (not acknowledged "
+                            "either): %s", self.worker_id, eid, why)
 
     # ---- applying one event ------------------------------------------------------------------
     def _order(self, rec: dict, ev: dict, now: float) -> dict:
@@ -554,12 +609,14 @@ class FiverrDesk(_Base):
     def _apply(self, ctx: WorkContext, rec: dict, ev: dict, out: list) -> None:
         eid = ev["id"]
         rec["cursor"] = eid
+        held = rec["unreadable"].get(eid)
         if eid in rec["events_seen"]:
-            if eid not in rec["acks_pending"]:
+            if eid not in rec["acks_pending"] and (held is None or held.get("posted")):
                 rec["acks_pending"].append(eid)     # served again: acknowledged, not applied
             return
         rec["events_seen"].append(eid)
-        rec["acks_pending"].append(eid)
+        if ev["kind"] != "unknown":                 # unknown: acked once its card is up
+            rec["acks_pending"].append(eid)
         rec["counts"]["events"] += 1
         o = self._order(rec, ev, ctx.now)
         kind = ev["kind"]
@@ -605,7 +662,7 @@ class FiverrDesk(_Base):
             o["reviews"].append({"event": eid, "at": ctx.now, "text": ev["text"][:1000]})
             out.append(self._event(ctx, "fiverr.review", {"order_number": o["order_number"]}))
         else:
-            rec["counts"]["unknown_events"] += 1
+            self._keep_unreadable(ctx, rec, ev, eid, o["order_number"])
 
     # ---- the owner's replies to order cards ----------------------------------------------------
     def _owner_replies(self, ctx: WorkContext, rec: dict, replies: list, out: list) -> None:

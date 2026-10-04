@@ -73,6 +73,16 @@ def _int(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+def _whole(v):
+    """A count as Gumroad may send it: an int, or a whole float (``0.0``) as that int. A
+    fraction, a bool, a string or nothing is None - never rounded into a figure."""
+    if _int(v):
+        return v
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    return None
+
+
 # ---- the check: fail closed, on the listing exactly as it would be submitted ----------------
 def check_listing(listing, folder: Path) -> list:
     """Every reason this listing may not be submitted from ``folder``; empty is the only pass."""
@@ -487,20 +497,23 @@ class ProductShelf(_Base):
         listed = out.result.get("products") if isinstance(out.result, dict) else None
         if not isinstance(listed, list):
             return self._unavailable(ctx, f"Pionir answered {LIST} without a product list")
-        rows, malformed = [], 0
+        rows, malformed, reasons = [], 0, []
         for p in listed[:200]:
-            if (isinstance(p, dict) and isinstance(p.get("slug"), str) and p["slug"].strip()
-                    and isinstance(p.get("published"), bool)
-                    and _int(p.get("sales_count")) and p["sales_count"] >= 0
-                    and _int(p.get("sales_usd_cents")) and p["sales_usd_cents"] >= 0):
-                rows.append(p)
+            why = _row_fault(p)
+            if why is None:
+                rows.append({**p, "sales_count": _whole(p["sales_count"]),
+                             "sales_usd_cents": _whole(p["sales_usd_cents"]),
+                             "price_cents": _whole(p.get("price_cents"))})
             else:
                 malformed += 1
+                reasons.append(why)
         slugs = [p["slug"] for p in rows]
         twice = {s for s in slugs if slugs.count(s) > 1}
         if twice:           # ambiguous: never add up a product listed twice
             malformed += sum(1 for p in rows if p["slug"] in twice)
+            reasons.append("a product is listed twice")
             rows = [p for p in rows if p["slug"] not in twice]
+        self._read_rows(ctx, rec, len(listed[:200]), malformed, reasons)
         live = sorted((p for p in rows if p["published"]), key=lambda p: p["slug"])
         figures, products = [], []
         for p in live:
@@ -533,6 +546,41 @@ class ProductShelf(_Base):
                            figures=figures, entities=self._entities(names),
                            provenance={"source": "real", "provider": self.provider,
                                        "capability": LIST})
+
+    def _read_rows(self, ctx: WorkContext, rec: dict, read: int, malformed: int,
+                   reasons: list) -> None:
+        """Keep what this read made of Gumroad's rows, for the pulse. A malformed row is a
+        product whose sales are not counted and whose new sales are never announced, while
+        the run still succeeds - so it is said loudly, every run, until it reads clean."""
+        rec["sales_read"] = {"at": ctx.now, "rows": read, "malformed_rows": malformed,
+                             "reasons": sorted(set(reasons))[:3]}
+        if malformed:
+            log.error("%s: %d of %d Gumroad product rows are MALFORMED (%s); their sales are "
+                      "NOT counted and no new sale of theirs is announced", self.worker_id,
+                      malformed, read, "; ".join(sorted(set(reasons))[:3]))
+
+    # ---- its pulse: whether the sales it reads are really read, for the vitals ---------------
+    def pulse(self, state_dir, now: float, digest=None) -> dict:
+        """``alert`` is set while the last sales read had malformed rows: those products'
+        sales are silently missing from every figure, and its runs still succeed."""
+        out: dict = {"worker": self.worker_id, "capability": LIST}
+        if state_dir is None:
+            return {**out, "alert": "no state dir: it cannot keep its record"}
+        try:
+            rec = self.load(state_dir)
+        except _Unreadable as exc:
+            return {**out, "alert": f"its record is unreadable ({exc})"}
+        read = rec.get("sales_read") if isinstance(rec.get("sales_read"), dict) else {}
+        bad = read.get("malformed_rows")
+        out.update({"sales_read_at": read.get("at"), "rows_read": read.get("rows"),
+                    "malformed_rows": bad, "alert": None})
+        if _int(bad) and bad > 0:
+            why = "; ".join(str(r) for r in read.get("reasons") or [])
+            out["alert"] = (f"{bad} of {read.get('rows')} Gumroad product rows are MALFORMED"
+                            + (f" - {_clip(why, 160)} -" if why else "")
+                            + " so their sales are not counted and no new sale of theirs is "
+                            "announced. Its runs succeed, so nothing else says so")
+        return out
 
     def _new_sales(self, ctx: WorkContext, rec: dict, p: dict, slug: str, events: list,
                    names: set) -> None:
@@ -645,6 +693,21 @@ class ProductShelf(_Base):
                            figures=figures, entities=self._entities(names),
                            provenance={"source": "real", "provider": self.provider,
                                        "record": self.record_what})
+
+
+def _row_fault(p) -> str | None:
+    """Why one row of Gumroad's product list cannot be counted, or None when it can."""
+    if not isinstance(p, dict):
+        return "a row is not an object"
+    if not isinstance(p.get("slug"), str) or not p["slug"].strip():
+        return "a row has no slug"
+    if not isinstance(p.get("published"), bool):
+        return "published is not true or false"
+    for key in ("sales_count", "sales_usd_cents"):
+        v = _whole(p.get(key))
+        if v is None or v < 0:
+            return f"{key} is not a whole number of at least 0"
+    return None
 
 
 def _name_words(name) -> set:
