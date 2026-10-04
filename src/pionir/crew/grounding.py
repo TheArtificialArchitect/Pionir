@@ -414,7 +414,10 @@ _EVENT_CUES = frozenset(words("new paid unpaid pending waiting awaiting held fla
 _TOPIC_RX = re.compile(
     r"(?<![\w$.,/-])(?P<q>\d{1,6}|zero|no|one|an?|two|three|four|five|six|seven|eight|nine|"
     r"ten|eleven|twelve|dozen)"
-    r"(?P<mods>(?:\s+(?!(?:order|quote|email|payment|deliver|refund|invoice)\w*\b)"
+    # a modifier is any word but a counted noun itself: "refunded", "delivered", "quoted" are
+    # qualifiers, not nouns (a "refund\w*" exclusion let "1 refunded order" escape the check)
+    r"(?P<mods>(?:\s+(?!(?:orders?|quotes?|emails?|payments?|deliver(?:y|ies)|refunds?|"
+    r"invoices?)\b)"
     r"\$?[A-Za-z0-9][\w'’-]*){0,4}?)"
     r"\s+(?P<noun>orders?|quote\s+requests?|quotes?|emails?|payments?|deliver(?:y|ies)|"
     r"refunds?|invoices?)\b"

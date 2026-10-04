@@ -273,6 +273,19 @@ class CountedEventTests(unittest.TestCase):
                      "1 paid order is waiting."):
             self.assertTrue(check_report([text], [], live, set(), set()), text)
 
+    def test_a_refunded_or_delivered_order_is_a_claim(self) -> None:
+        # "refunded"/"delivered" begin like the nouns "refund"/"delivery"; read as such they
+        # ended the modifiers and "1 refunded order" was no claim at all, backed or not
+        now = lambda v, m: Figure(v, "count", m, window="now")      # noqa: E731
+        live = [now(1, "orders listed"), now(0, "orders with status refunded"),
+                now(0, "orders with status delivered")]
+        for text in ("1 refunded order needs a look.", "There are 2 delivered orders."):
+            self.assertTrue(topic_claims(text, live), text)
+        self.assertTrue(check_report(["1 refunded order needs a look."], [], live, set(), set()))
+        backed = live + [now(1, "orders with status refunded")]
+        self.assertEqual(check_report(["1 refunded order needs a look."], [], backed, set(),
+                                      set()), [])
+
     def test_plain_prose_and_outreach_email_are_not_claims(self) -> None:
         figs = _contracts_figures()
         for text in ("We should send an email to Kim.", "Drafted 3 emails today.",
