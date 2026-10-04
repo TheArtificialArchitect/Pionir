@@ -25,6 +25,7 @@ log = logging.getLogger("pionir.economy")
 APPROVAL_CAPABILITIES: dict[str, tuple[str, str]] = {
     "content.publish": ("post_approved", "posting.blog"),
     "content.crosspost_devto": ("post_approved", "posting.devto"),
+    "content.newsletter_send": ("post_approved", "posting.newsletter"),
     "social.instagram_post": ("post_approved", "posting.instagram"),
     "product.gumroad_publish": ("product_published", "products.shelf"),
 }

@@ -24,6 +24,8 @@ from .adapters import (
     InstagramSettings,
     MeleteAdapter,
     MeleteSettings,
+    NewsletterAdapter,
+    NewsletterSettings,
     NyxStatusAdapter,
     NyxStatusSettings,
     OwnerNotifyAdapter,
@@ -246,6 +248,14 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         # and the token file is read then. content.publish always parks for approval.
         runtime.register(ContentAdapter(ContentSettings(
             base_url=configured.content_url, token_file=configured.content_token_path,
+        )))
+        # The newsletter to every confirmed subscriber, on the same Scrooge with the same
+        # publish token (read when a send runs). content.newsletter_send always parks for
+        # its own approval card; the ledger of newsletters sent is read and written then.
+        runtime.register(NewsletterAdapter(NewsletterSettings(
+            content=ContentSettings(base_url=configured.content_url,
+                                    token_file=configured.content_token_path),
+            ledger_file=configured.newsletter_ledger_path,
         )))
         # The paid client orders on the same Scrooge, with its own ops token (read when a
         # client.* task runs). client.email, client.find_report and client.deliver always

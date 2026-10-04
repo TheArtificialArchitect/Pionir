@@ -533,6 +533,12 @@ class PionirSettings:
         return self.state_root / "devto" / "posts.json"
 
     @property
+    def newsletter_ledger_path(self) -> Path:
+        # content.newsletter_send's ledger: each newsletter_id Scrooge has taken, never
+        # sent twice (adapters/newsletter.py). Registered with content_url.
+        return self.state_root / "newsletter" / "sends.json"
+
+    @property
     def cortex_path(self) -> Path:
         return self.state_root / "cortex" / "memory.db"
 

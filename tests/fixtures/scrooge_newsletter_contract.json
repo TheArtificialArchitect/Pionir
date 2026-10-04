@@ -1,0 +1,60 @@
+{
+  "_about": "The newsletter's JSON contract between Scrooge (worker/src/newsletter.ts) and Pionir (content.newsletter_send, posting.newsletter). The same file is in both repos (Scrooge worker/test/fixtures/newsletter-contract.json, Pionir tests/fixtures/scrooge_newsletter_contract.json); each side's test holds its real code to it. Change both together.",
+  "queue_request": {
+    "newsletter_id": "weekly-2026-w40",
+    "subject": "Dokaz weekly: two new posts and a new tool",
+    "body_md": "This week from Dokaz Industries.\n\n## New on the blog\n\n- [How to make a QR code API call](https://api.dokaz.net/blog/qr-code-api-howto?utm_source=newsletter&utm_medium=email&utm_campaign=weekly-2026-w40) - a two-minute walk through the QR endpoint, with curl and a browser.\n\n## Need something built?\n\nWe build small custom tools and automations to a written brief. [Hire us](https://api.dokaz.net/hire?utm_source=newsletter&utm_medium=email&utm_campaign=weekly-2026-w40)\n"
+  },
+  "queue_response": {
+    "ok": true,
+    "newsletter_id": "weekly-2026-w40",
+    "send_id": "nl_0123456789abcdef01234567",
+    "status": "queued",
+    "recipients": 2,
+    "queued_at": "2026-10-04T12:00:00.000Z"
+  },
+  "duplicate_response": {
+    "ok": false,
+    "error": "newsletter_id: already queued at 2026-10-04T12:00:00.000Z (send nl_0123456789abcdef01234567)",
+    "send_id": "nl_0123456789abcdef01234567",
+    "status": "queued"
+  },
+  "refused_response": {
+    "ok": false,
+    "error": "body_md: every link to a Dokaz page must carry utm_source=newsletter&utm_medium=email&utm_campaign=weekly-2026-w40"
+  },
+  "not_configured_response": {
+    "ok": false,
+    "error": "newsletter sending is not configured: POSTAL_ADDRESS is not set"
+  },
+  "stats": {
+    "subscribers": { "pending": 1, "confirmed": 2, "unsubscribed": 1 },
+    "sends": 1,
+    "last_send": {
+      "newsletter_id": "weekly-2026-w40",
+      "send_id": "nl_0123456789abcdef01234567",
+      "subject": "Dokaz weekly: two new posts and a new tool",
+      "status": "done",
+      "recipients": 2,
+      "sent": 2,
+      "failed": 0,
+      "skipped": 0,
+      "queued_at": "2026-10-04T12:00:00.000Z",
+      "finished_at": "2026-10-04T12:05:00.000Z"
+    },
+    "sender": { "ok": true, "why": null },
+    "sent_today": 2,
+    "daily_cap": 50
+  },
+  "stats_empty": {
+    "subscribers": { "pending": 0, "confirmed": 0, "unsubscribed": 0 },
+    "sends": 0,
+    "last_send": null,
+    "sender": { "ok": false, "why": "POSTAL_ADDRESS is not set" },
+    "sent_today": 0,
+    "daily_cap": 50
+  },
+  "stats_unavailable": {
+    "error": "stats failed (no such table: newsletter_subscribers) - is the migration applied?"
+  }
+}

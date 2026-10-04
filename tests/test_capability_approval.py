@@ -52,6 +52,8 @@ EXPECTED = {
     "content.publish": ("digest", None),
     "content.unpublish": ("card", None),
     "content.crosspost_devto": ("digest", None),
+    # an email to the whole newsletter list: its own card, never the digest
+    "content.newsletter_send": ("card", None),
     "crew.digest": ("auto", None),
     "crew.divisions": ("auto", None),
     "crew.compute": ("auto", None),

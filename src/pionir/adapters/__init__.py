@@ -10,6 +10,7 @@ from .devto import DevtoAdapter, DevtoSettings
 from .galatea import GalateaAdapter, GalateaSettings
 from .instagram import InstagramAdapter, InstagramSettings
 from .melete import MeleteAdapter, MeleteSettings
+from .newsletter import NewsletterAdapter, NewsletterSettings
 from .nyx_status import NyxStatusAdapter, NyxStatusSettings
 from .owner import OwnerNotifyAdapter, OwnerNotifySettings
 from .products import ProductAdapter, ProductSettings
@@ -38,6 +39,8 @@ __all__ = [
     "InstagramSettings",
     "MeleteAdapter",
     "MeleteSettings",
+    "NewsletterAdapter",
+    "NewsletterSettings",
     "NyxStatusAdapter",
     "NyxStatusSettings",
     "OwnerNotifyAdapter",

@@ -22,7 +22,8 @@ class DefaultCatalogueTests(unittest.TestCase):
                                      "contracts.finder", "contracts.orders", "fiverr.desk",
                                      "fiverr.gigs", "posting.blog",
                                      "posting.devto",
-                                     "posting.instagram", "posting.results",
+                                     "posting.instagram", "posting.newsletter",
+                                     "posting.results",
                                      "products.api_builder", "products.shelf",
                                      "treasury.bolts", "treasury.fiverr", "treasury.ledger",
                                      "watch.health"))
@@ -31,7 +32,7 @@ class DefaultCatalogueTests(unittest.TestCase):
                                 "contracts.delivery", "contracts.finder", "contracts.orders",
                                 "fiverr.desk", "fiverr.gigs", "posting.blog",
                                 "posting.devto",
-                                "posting.instagram",
+                                "posting.instagram", "posting.newsletter",
                                 "posting.results", "products.api_builder", "products.shelf",
                                 "treasury.bolts", "treasury.fiverr",
                                 "treasury.ledger", "watch.health"])
@@ -39,11 +40,11 @@ class DefaultCatalogueTests(unittest.TestCase):
     def test_adding_a_worker_is_adding_an_entry(self) -> None:
         cat = load_catalogue()
         cat["divisions"][2]["workers"].append(
-            {"name": "newsletter", "impl": "placeholder", "kind": "post",
+            {"name": "podcast", "impl": "placeholder", "kind": "post",
              "cadence_seconds": 3600, "provider": "none"})
         reg = build_registry(cat)
-        self.assertIn("posting.newsletter", reg.ids())
-        self.assertIn("posting.newsletter", reg.cadences("posting"))
+        self.assertIn("posting.podcast", reg.ids())
+        self.assertIn("posting.podcast", reg.cadences("posting"))
 
 
 class LoudFailureTests(unittest.TestCase):

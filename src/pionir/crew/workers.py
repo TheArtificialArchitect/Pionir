@@ -20,6 +20,9 @@ whole list, and a name not in it fails loudly at load time.
   its ``traffic`` object: what the posts did, per post and per channel, last 30 days.
 - ``devto_crossposter`` - REAL (devto.py). Cross-posts each published blog post to dev.to
   once, unchanged but for its links' ``utm_source``, for the owner's approval. No words.
+- ``newsletter_sender`` - REAL (newsletter.py). Once a week, the newsletter assembled from
+  the posts published and the products on sale - no words, no model - checked and submitted
+  as ``content.newsletter_send`` for the owner's approval; the audience from the dash.
 - ``order_desk`` - REAL (orders.py). Reads the client orders through Pionir and answers each
   by fixed template (acknowledgement, quote acknowledgement or decline) for the owner's
   approval. No words: no model can put a promise, a price or a date in a client's email.
@@ -322,6 +325,13 @@ def devto_crossposter(spec, **params):
     return DevtoWorker(spec, **params)
 
 
+def newsletter_sender(spec, **params):
+    """REAL. ``posting.newsletter`` (newsletter.py): once a week, what was published, to the
+    confirmed subscribers, as ``content.newsletter_send`` for the owner's approval."""
+    from .newsletter import NewsletterWorker
+    return NewsletterWorker(spec, **params)
+
+
 def order_desk(spec, **params):
     """REAL. ``contracts.orders`` (orders.py): every client order answered by fixed
     template, as ``client.email`` for the owner's approval."""
@@ -403,6 +413,7 @@ IMPLS = {
     "instagram_writer": instagram_writer,
     "traffic_reader": traffic_reader,
     "devto_crossposter": devto_crossposter,
+    "newsletter_sender": newsletter_sender,
     "order_desk": order_desk,
     "delivery_desk": delivery_desk,
     "finder": finder,
