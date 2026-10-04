@@ -559,8 +559,13 @@ class Staged:
 def _row(product: Mapping[str, Any]) -> dict[str, Any]:
     def number(key: str) -> Any:
         value = product.get(key)
-        return value if isinstance(value, (int, float)) and not isinstance(value, bool) \
-            else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        # Gumroad sends some counts as floats (``sales_usd_cents: 0.0``): a whole float is
+        # the int it means; a fractional one is passed on as it came, for the crew to refuse
+        if isinstance(value, float) and value.is_integer():
+            return int(value)
+        return value
     return {"id": product.get("id"), "slug": product.get("custom_permalink"),
             "name": product.get("name"), "published": product.get("published") is True,
             "price_cents": number("price"), "sales_count": number("sales_count"),
