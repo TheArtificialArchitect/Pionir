@@ -25,6 +25,9 @@ whole list, and a name not in it fails loudly at load time.
   approval. No words: no model can put a promise, a price or a date in a client's email.
 - ``delivery_desk`` - REAL (delivery.py). Ships each order's finished zip, dropped by the
   owner in its order's folder, as ``client.deliver`` by fixed template for his approval.
+- ``feedback_desk`` - REAL (feedback.py). One feedback request per delivered order, by fixed
+  template as ``client.email`` (kind ``feedback_request``), and each consented testimonial proposed
+  as ``client.testimonial_publish`` - every one for the owner's approval. No words.
 - ``finder`` - REAL (finder.py). Researches each paid "Find it for me" order through Claude
   on the owner's Max (web tools only, the daily Claude cap), checks the answer fail-closed,
   and submits the report by fixed template as ``client.find_report`` for his approval.
@@ -344,6 +347,13 @@ def finder(spec, **params):
     return Finder(spec, **params)
 
 
+def feedback_desk(spec, **params):
+    """REAL. ``contracts.feedback`` (feedback.py): one feedback request per delivered order by
+    fixed template, and each consented testimonial proposed for /hire, for the owner's approval."""
+    from .feedback import FeedbackDesk
+    return FeedbackDesk(spec, **params)
+
+
 def product_shelf(spec, **params):
     """REAL. ``products.shelf`` (products.py): each staged product published on Gumroad, for
     the owner's approval, and the live products' sales as Gumroad reports them."""
@@ -406,6 +416,7 @@ IMPLS = {
     "order_desk": order_desk,
     "delivery_desk": delivery_desk,
     "finder": finder,
+    "feedback_desk": feedback_desk,
     "product_shelf": product_shelf,
     "api_builder": api_builder,
     "fiverr_gigs": fiverr_gigs,

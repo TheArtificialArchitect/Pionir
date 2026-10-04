@@ -18,7 +18,10 @@ order that still owes half its price, HELD FOR THE BALANCE: the email carries th
 pay link, never the files); a ``client.quote`` card opens with SENDS A QUOTE and shows the
 owner's price, the deposit split, the delivery time, the pay link's validity and the whole
 email; a ``client.quote_reminder`` card opens with SENDS THE QUOTE REMINDER; a
-``client.release`` card opens with RELEASES A HELD DELIVERY; a
+``client.release`` card opens with RELEASES A HELD DELIVERY; a feedback-request
+``client.email`` says it is the order's ONE feedback request and where its link and code go; a
+``client.testimonial_publish`` card opens with PUBLISHES A CLIENT TESTIMONIAL and shows the
+exact display name, rating and words that go on /hire; a
 ``product.gumroad_publish`` card opens with PUTS A PRODUCT ON SALE and the price, shows the
 whole listing - the FULL description, the zip's file list, the secrets scan and any
 executables it ships - and carries the cover image as an attachment),
@@ -92,6 +95,7 @@ from uuid import uuid4
 from . import atomic
 from .adapters.clients import DELIVER as CLIENT_DELIVER
 from .adapters.clients import EMAIL as CLIENT_EMAIL
+from .adapters.clients import FEEDBACK_KIND, FEEDBACK_LINK_PLACEHOLDER, REFERRAL_CODE_PLACEHOLDER
 from .adapters.clients import FIND_REPORT as CLIENT_FIND_REPORT
 from .adapters.clients import LINK_PLACEHOLDER, PAY_LINK_PLACEHOLDER
 from .adapters.clients import QUOTE as CLIENT_QUOTE
@@ -102,6 +106,8 @@ from .adapters.devto import CROSSPOST as DEVTO_CROSSPOST
 from .adapters.instagram import POST as INSTAGRAM_POST
 from .adapters.products import PUBLISH as PRODUCT_PUBLISH
 from .adapters.products import price_text
+from .adapters.testimonials import HIRE_PAGE
+from .adapters.testimonials import PUBLISH_TESTIMONIAL as CLIENT_TESTIMONIAL
 from .batching import DigestSettings, answer_request, local_now, read_request
 from .fiverr import FiverrReplies
 from .fiverr import store_for as fiverr_store_for
@@ -589,6 +595,36 @@ def _client_email_lines(payload: Mapping[str, Any]) -> list[str]:
     ]
 
 
+FEEDBACK_KIND_LINE = (
+    f"📝 **The order's ONE feedback request** - Scrooge puts the client's private "
+    f"feedback link where `{FEEDBACK_LINK_PLACEHOLDER}` is and their referral code where "
+    f"`{REFERRAL_CODE_PLACEHOLDER}` is, and refuses it if the order was refunded, was delivered "
+    "under 3 days ago, or was already asked.")
+
+
+def testimonial_line() -> str:
+    """The first line of a client.testimonial_publish card."""
+    return (f"📣 **PUBLISHES A CLIENT TESTIMONIAL** on {HIRE_PAGE} - exactly the name, "
+            "rating and words below, if you approve. The client ticked the box to allow it.")
+
+
+def _testimonial_lines(payload: Mapping[str, Any]) -> list[str]:
+    body = payload.get("body")
+    text = body if isinstance(body, str) else str(body)
+    rating = payload.get("rating")
+    stars = ("★" * rating + "☆" * (5 - rating)
+             if isinstance(rating, int) and not isinstance(rating, bool) and 1 <= rating <= 5
+             else str(rating))
+    return [
+        f"**Order:** `{_fence_safe(str(payload.get('order_id')))}` · testimonial "
+        f"`{_fence_safe(str(payload.get('testimonial_id')))}`",
+        f"**Rating:** {stars}",
+        f"**Shown as:** `{_fence_safe(str(payload.get('display_name')))}`",
+        f"**The words, in full ({len(text):,} characters), exactly as they will be shown:**",
+        _FENCE + "text", _fence_safe(text), _FENCE,
+    ]
+
+
 def find_report_line(to: Any) -> str:
     """The first line of a client.find_report card: who the report goes to."""
     shown = f"`{_fence_safe(str(to))}`" if isinstance(to, str) and to else "(no address)"
@@ -1031,7 +1067,10 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
     quotes = row.get("capability") == CLIENT_QUOTE
     reminds = row.get("capability") == CLIENT_REMIND
     releases = row.get("capability") == CLIENT_RELEASE
+    testimonial = row.get("capability") == CLIENT_TESTIMONIAL
     lines: list[str] = []
+    if testimonial:
+        lines.append(testimonial_line())
     if quotes:
         lines.append(quote_line(payload.get("to")))
     if reminds:
@@ -1056,6 +1095,8 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
         lines.append(client_email_line(payload.get("to")))
         if payload.get("kind") == "recovery":
             lines.append(RECOVERY_LINE)
+        if payload.get("kind") == FEEDBACK_KIND:
+            lines.append(FEEDBACK_KIND_LINE)
     if finds:
         lines.append(find_report_line(payload.get("to")))
     if publishes:
@@ -1121,6 +1162,11 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
         if isinstance(payload.get("body_text"), str):
             shown = {**payload, "body_text": f"(the full email above, "
                                              f"{len(payload['body_text']):,} characters)"}
+    if testimonial:
+        lines += _testimonial_lines(payload)
+        if isinstance(payload.get("body"), str):
+            shown = {**payload, "body": f"(the full words above, {len(payload['body']):,} "
+                                        "characters)"}
     if finds:
         lines += _find_report_lines(payload)
         if isinstance(payload.get("body_text"), str):

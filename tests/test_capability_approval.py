@@ -49,6 +49,8 @@ EXPECTED = {
     "client.quote": ("card", None),
     "client.quote_reminder": ("card", None),
     "client.release": ("card", None),
+    "client.testimonials": ("auto", None),
+    "client.testimonial_publish": ("card", None),
     "content.publish": ("digest", None),
     "content.unpublish": ("card", None),
     "content.crosspost_devto": ("digest", None),

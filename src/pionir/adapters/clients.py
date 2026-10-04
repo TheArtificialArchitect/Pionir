@@ -56,7 +56,14 @@ around it. So:
   email becomes that pay link. If Scrooge and the payload disagree about holding, nothing
   is emailed.
 
-All eight are ``routable=False``: reached only by name.
+- ``client.email`` with ``kind: "feedback_request"``: the ONE feedback request of a delivered
+  order (crew/feedback.py writes it by fixed template). ``{feedback_link}`` (exactly once) and
+  ``{referral_code}`` (1-3 times) stay in the body the owner approves; Scrooge mints the private
+  link and the code, and refuses a second request, an early one (under 3 days after delivery) or
+  one to a refunded order. ``EMAIL_KINDS`` is Scrooge's list too (a contract test pins both).
+
+All eight are ``routable=False``: reached only by name. (``client.testimonials`` and
+``client.testimonial_publish`` are in testimonials.py.)
 
 An email is checked here before anything is parked or sent - a bad one is refused by
 Pionir with ``AdapterProtocolError`` naming the field and why, in Scrooge's
@@ -136,6 +143,16 @@ RECOVERY_KIND = "recovery"
 # order's stored Stripe recovery link. It is checked here with a Dokaz link in its place.
 RECOVERY_PLACEHOLDER = "{recovery_link}"
 SAMPLE_RECOVERY_LINK = "https://api.dokaz.net/hire"
+# The feedback request is a templated kind Scrooge fills in (worker/src/feedback.ts EMAIL_KINDS).
+FEEDBACK_KIND = "feedback_request"
+EMAIL_KINDS = (FEEDBACK_KIND,)
+# Where the feedback link (exactly once) and the referral code (1-3 times) go in a feedback request.
+FEEDBACK_LINK_PLACEHOLDER = "{feedback_link}"
+REFERRAL_CODE_PLACEHOLDER = "{referral_code}"
+# Their shapes, for checking the email before it is parked (Scrooge's real ones:
+# https://api.dokaz.net/feedback/<64 hex> and 8 of A-H J-N P-Z 2-9).
+SAMPLE_FEEDBACK_LINK = "https://api.dokaz.net/feedback/" + "0" * 64
+SAMPLE_REFERRAL_CODE = "ABCDEFGH"
 DELIVER_FIELDS = frozenset({"order_id", "to", "zip_name", "zip_sha256", "subject",
                             "body_text"})
 # client.deliver may also say the order owes its balance (the delivery is held).
@@ -243,9 +260,20 @@ def check_email(payload: Mapping[str, Any]) -> dict[str, str]:
     missing = sorted(EMAIL_FIELDS - set(payload))
     if missing:
         raise ValueError(f"{missing[0]}: required")
+    kind = payload.get("kind")
+    if kind in EMAIL_KINDS:
+        return _check_kind_email(payload)
     recovery = "kind" in payload
-    if recovery and payload["kind"] != RECOVERY_KIND:
-        raise ValueError(f"kind: absent (a plain email) or {RECOVERY_KIND!r}")
+    if recovery and kind != RECOVERY_KIND:
+        raise ValueError(f"kind: absent (a plain email), {RECOVERY_KIND!r} or "
+                         f"{FEEDBACK_KIND!r}")
+    for key in ("subject", "body_text"):
+        text = payload[key]
+        if isinstance(text, str) and (FEEDBACK_LINK_PLACEHOLDER in text
+                                      or REFERRAL_CODE_PLACEHOLDER in text):
+            raise ValueError(f"{key}: {FEEDBACK_LINK_PLACEHOLDER} and "
+                             f"{REFERRAL_CODE_PLACEHOLDER} are filled in only for "
+                             f"kind {FEEDBACK_KIND!r}")
     email = {"order_id": check_order_id(payload["order_id"]),
              "to": check_address(payload["to"])}
     for key, (low, high), control in (("subject", SUBJECT_LENGTH, _CONTROL_LINE),
@@ -277,6 +305,32 @@ def check_email(payload: Mapping[str, Any]) -> dict[str, str]:
     if recovery:
         email["kind"] = RECOVERY_KIND
     return email
+
+
+def _check_kind_email(payload: Mapping[str, Any]) -> dict[str, str]:
+    """A templated kind: the feedback request. Checked with the link and the code in place of
+    their placeholders, by client.email's rules; returned with the placeholders kept."""
+    kind = payload.get("kind")
+    if kind not in EMAIL_KINDS:
+        raise ValueError(f"kind: one of {', '.join(EMAIL_KINDS)}")
+    body, subject = payload.get("body_text"), payload.get("subject")
+    if not isinstance(body, str):
+        raise ValueError("body_text: required, a string")  # noqa: TRY004
+    links = body.count(FEEDBACK_LINK_PLACEHOLDER)
+    if links != 1:
+        raise ValueError(f"body_text: must contain {FEEDBACK_LINK_PLACEHOLDER} exactly once "
+                         f"(it becomes the client's private feedback link; found {links})")
+    codes = body.count(REFERRAL_CODE_PLACEHOLDER)
+    if not 1 <= codes <= 3:
+        raise ValueError(f"body_text: must contain {REFERRAL_CODE_PLACEHOLDER} one to three "
+                         f"times (found {codes})")
+    if isinstance(subject, str) and "{" in subject:
+        raise ValueError("subject: carries no placeholder")
+    email = check_email({"order_id": payload["order_id"], "to": payload["to"],
+                         "subject": subject,
+                         "body_text": body.replace(FEEDBACK_LINK_PLACEHOLDER, SAMPLE_FEEDBACK_LINK)
+                         .replace(REFERRAL_CODE_PLACEHOLDER, SAMPLE_REFERRAL_CODE)})
+    return {**email, "body_text": body, "kind": kind}
 
 
 _ZIP_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.(?i:zip)")
@@ -673,6 +727,9 @@ class ClientSettings:
     base_url: str = DEFAULT_CONTENT_URL
     token_file: Path = Path("~/.pionir/secrets/scrooge-ops-token.txt")
     timeout_seconds: int = 30
+    # client.testimonial_publish (testimonials.py): putting a testimonial on the public /hire page
+    # is the PUBLISH token's power on Scrooge, as for a blog post - never the ops token's.
+    publish_token_file: Path | None = None
     # client.deliver: where the owner drops each order's zip (<dir>/<order_id>/<name>.zip),
     # and where the owner's secrets are - every value in them is looked for in the zip.
     # The ops token file is always among them.
@@ -706,6 +763,9 @@ class ClientSettings:
         if self.timeout_seconds < 5:
             raise ValueError("the orders timeout must be at least 5 seconds")
         object.__setattr__(self, "token_file", Path(self.token_file).expanduser())
+        if self.publish_token_file is not None:
+            object.__setattr__(self, "publish_token_file",
+                               Path(self.publish_token_file).expanduser())
         object.__setattr__(self, "deliveries_dir", Path(self.deliveries_dir).expanduser())
         for name in ("secrets_dir", "ssh_dir"):
             value = getattr(self, name)
@@ -738,6 +798,7 @@ def client_settings(configured: Any) -> ClientSettings:
     quotes = QuoteSettings.from_environment()
     return ClientSettings(base_url=configured.content_url or DEFAULT_CONTENT_URL,
                           token_file=configured.ops_token_path,
+                          publish_token_file=configured.content_token_path,
                           deliveries_dir=configured.deliveries_path,
                           secrets_dir=configured.secrets_path,
                           secret_files=tuple(token_files),
