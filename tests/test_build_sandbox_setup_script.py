@@ -64,6 +64,12 @@ class SetupScriptTests(unittest.TestCase):
         self.assertIn("finally { $ErrorActionPreference = $eap }", probe)
         self.assertNotIn("2>$null", probe)
 
+    def test_the_pinned_install_is_retried_but_still_fails_closed(self) -> None:
+        install = _section(self.text, "for ($try = 1;", "Did \"copied Python and installed")
+        self.assertIn("$try -le 3", install)
+        self.assertIn("--require-hashes", self.text)
+        self.assertIn('Fail "pip install failed 3 times', install)
+
     def test_loopback_is_reported_as_accepted_never_a_stop(self) -> None:
         loop = _section(self.text, "# loopback: reported, never a stop",
                         "if (-not $contained)")

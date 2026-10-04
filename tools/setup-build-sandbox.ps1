@@ -250,8 +250,12 @@ if ($ready) { Had "$PyExe has Daedalus's server packages" } else {
                  "--no-cache-dir", "--no-deps", "--disable-pip-version-check",
                  "--no-warn-script-location", "-r", $Requirements)
     Write-Host ("    $PyExe " + ($pipArgs -join " ")) -ForegroundColor DarkGray
-    & $PyExe @pipArgs
-    if ($LASTEXITCODE -ne 0) { Fail "pip install failed (a hash did not match, or PyPI did not answer)" }
+    for ($try = 1; $try -le 3; $try++) {      # PyPI sometimes lists a project as empty for a moment; the pins and hashes are unchanged
+        & $PyExe @pipArgs
+        if ($LASTEXITCODE -eq 0) { break }
+        if ($try -lt 3) { Write-Host "    pip did not finish (attempt $try of 3); trying again in 10 s" -ForegroundColor Yellow; Start-Sleep -Seconds 10 }
+    }
+    if ($LASTEXITCODE -ne 0) { Fail "pip install failed 3 times (a hash did not match, or PyPI did not answer)" }
     Did "copied Python and installed the pinned, hashed wheels"
 }
 Write-Host "    robocopy $DaedalusSrc -> $DaedalusCopy" -ForegroundColor DarkGray
