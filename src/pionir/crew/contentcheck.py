@@ -31,6 +31,12 @@ The rules, one function each:
                   revenue" / "we made", no counts of customers or users, no money amounts
 - ``_internal``   none of the owner's internal systems is named in public text
 
+``check_newsletter(newsletter)`` runs the same rules on the weekly newsletter
+(``{newsletter_id, subject, body_md}``): Pionir's ``adapters.newsletter.check_newsletter``
+first, then ``_markup``, ``_renderable``, ``_links`` with the newsletter's own tags
+(``utm_source=newsletter``, ``utm_medium=email``), ``_personal``, the names rule (the subject
+read as a heading), ``_business`` and ``_internal``.
+
 ``check_social(post)`` runs the same crew's rules on an Instagram post (no Markdown, no links
 at all, a Title-Case headline on a card): Pionir's ``social.post.check_post`` first, then
 ``_no_links``, ``_personal``, the names rule, ``_business`` and ``_internal`` on the headline,
@@ -75,6 +81,11 @@ UTM_CAMPAIGN_MAX = 40
 # ``devto`` (TRAFFIC.md lists it). A caller names one; any other blocks the post.
 UTM_SOURCE_DEVTO = "devto"
 UTM_SOURCES = frozenset({UTM_SOURCE, UTM_SOURCE_DEVTO})
+# The newsletter's tags (TRAFFIC.md lists both): an email to subscribers, not a referral.
+UTM_SOURCE_NEWSLETTER = "newsletter"
+UTM_MEDIUM_EMAIL = "email"
+NEWSLETTER_FIELDS = ("newsletter_id", "subject", "body_md")
+NEWSLETTER_LIMITS = {"subject": (10, 120), "body_md": (200, 20000)}
 
 # The owner's internal systems. Never in public text, in any case, in any field.
 INTERNAL_NAMES = ("Pionir", "Moss", "Galatea", "Atani", "Scrooge", "Skopos", "Hearth", "Bryo",
@@ -292,7 +303,8 @@ def links_in(text: str) -> list:
     return out
 
 
-def _link_reason(url: str, campaign: str | None, source: str = UTM_SOURCE) -> str | None:
+def _link_reason(url: str, campaign: str | None, source: str = UTM_SOURCE,
+                 medium: str = UTM_MEDIUM) -> str | None:
     try:
         parts = urlsplit(url)
         host = (parts.hostname or "").lower()
@@ -307,7 +319,7 @@ def _link_reason(url: str, campaign: str | None, source: str = UTM_SOURCE) -> st
     if host == "api.dokaz.net" and parts.path.startswith("/v1/"):
         return None          # an API endpoint, not a page: TRAFFIC.md never counts /v1/*
     q = parse_qs(parts.query, keep_blank_values=True)
-    want = {"utm_source": source, "utm_medium": UTM_MEDIUM}
+    want = {"utm_source": source, "utm_medium": medium}
     if campaign:
         want["utm_campaign"] = campaign
     for key, value in want.items():
@@ -319,13 +331,14 @@ def _link_reason(url: str, campaign: str | None, source: str = UTM_SOURCE) -> st
     return None
 
 
-def _links(draft: dict, texts: list, source: str = UTM_SOURCE) -> list:
+def _links(draft: dict, texts: list, source: str = UTM_SOURCE,
+           medium: str = UTM_MEDIUM) -> list:
     did = draft.get("draft_id")
     campaign = utm_campaign(did) if isinstance(did, str) and _DRAFT_ID.fullmatch(did) else None
     reasons = []
     for field, text in texts:
         for url in links_in(text):
-            why = _link_reason(url, campaign, source)
+            why = _link_reason(url, campaign, source, medium)
             if why:
                 reasons.append(f"{field}: {why}")
         for m in _WWW.finditer(text):
@@ -755,6 +768,87 @@ def check(draft, *, utm_source: str = UTM_SOURCE) -> list:
             seen.add(r)
             out.append(r)
     return out
+
+
+# ---- the newsletter ----------------------------------------------------------------------------
+#
+# One email to every confirmed subscriber, assembled by the newsletter worker from posts and
+# products already published (crew/newsletter.py). Every word in it was already public, but it
+# is checked again, here, on the exact text that would be sent: the newsletter's own frame is
+# new text, and a public page and an email in someone's inbox are not the same exposure.
+
+def _newsletter_fields(newsletter) -> list:
+    if not isinstance(newsletter, dict):
+        return [f"the newsletter is {type(newsletter).__name__}, not an object"]
+    reasons = []
+    extra = sorted(set(newsletter) - set(NEWSLETTER_FIELDS))
+    if extra:
+        reasons.append(f"unknown field(s) {', '.join(extra)}; a newsletter has exactly "
+                       f"{', '.join(NEWSLETTER_FIELDS)}")
+    for key in NEWSLETTER_FIELDS:
+        if key not in newsletter:
+            reasons.append(f"{key} is missing")
+    nid = newsletter.get("newsletter_id")
+    if "newsletter_id" in newsletter and (not isinstance(nid, str)
+                                          or not _DRAFT_ID.fullmatch(nid)):
+        reasons.append(f"newsletter_id {_snip(nid)!r} must be 1-64 of a-z 0-9 -")
+    for key, (lo, hi) in NEWSLETTER_LIMITS.items():
+        v = newsletter.get(key)
+        if key not in newsletter:
+            continue
+        if not isinstance(v, str):
+            reasons.append(f"{key} is {type(v).__name__}, not text")
+        elif not lo <= len(v) <= hi:
+            reasons.append(f"{key} is {len(v)} characters; it must be {lo}-{hi}")
+        elif key == "subject" and ("\n" in v or "\r" in v):
+            reasons.append("subject must be one line")
+    return reasons
+
+
+def check_newsletter(newsletter, *, names: frozenset = frozenset()) -> list:
+    """Every reason this newsletter may not be sent, in words. Empty means it passed.
+
+    ``names``: extra capitalised names the names rule accepts - the newsletter worker passes
+    the names of the products already on sale (the owner's own listing text, approved by him
+    when each went on sale), and nothing else. Fail closed like ``check``."""
+    from pionir.adapters.newsletter import check_newsletter as pionir_check
+
+    reasons = _newsletter_fields(newsletter)
+    if not isinstance(newsletter, dict):
+        return reasons
+    texts = [(k, newsletter[k]) for k in ("subject", "body_md", "newsletter_id")
+             if isinstance(newsletter.get(k), str)]
+    try:
+        pionir_check(newsletter)
+    except Exception as exc:  # noqa: BLE001 - Pionir's refusal, or its check failing, both block
+        reasons.append(f"Pionir's newsletter check refuses it: {exc}")
+    try:
+        reasons += _markup(texts)
+        reasons += _renderable({"body_md": newsletter.get("body_md")})
+        reasons += _links({"draft_id": newsletter.get("newsletter_id")}, texts,
+                          UTM_SOURCE_NEWSLETTER, UTM_MEDIUM_EMAIL)
+        reasons += _personal(texts)
+        prose = [(k, _URL.sub(" ", newsletter[k])) for k in ("subject", "body_md")
+                 if isinstance(newsletter.get(k), str)]
+        allow = load_allowlist() | frozenset(n.strip().lower() for n in names
+                                             if isinstance(n, str) and n.strip())
+        seen: set = set()
+        for _field, text in prose:
+            for m in _COMPANY.finditer(text):
+                if m.group(0).lower() not in seen:
+                    seen.add(m.group(0).lower())
+                    reasons.append(f"names the company {m.group(0)!r} (a person, place or "
+                                   "company blocks the newsletter)")
+        for name in unknown_names(prose, allow, headings=frozenset({"subject"})):
+            if name.lower() not in seen:
+                seen.add(name.lower())
+                reasons.append(f"names {name!r}, which is not on the allowlist of names a "
+                               "newsletter may use (a person, place or company blocks it)")
+        reasons += _business(texts, who="the newsletter")
+        reasons += _internal(texts)
+    except Exception as exc:  # noqa: BLE001 - a check that cannot run is a block, never a pass
+        reasons.append(f"the content check could not run: {type(exc).__name__}: {exc}")
+    return list(dict.fromkeys(reasons))
 
 
 # ---- social posts ------------------------------------------------------------------------------

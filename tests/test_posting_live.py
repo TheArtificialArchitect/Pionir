@@ -247,8 +247,10 @@ class CrewHealthTests(unittest.TestCase):
         self.crew.vitals.check(force=True)
         doc = self.crew.api_health()
         pulses = {p["worker"]: p for p in doc["posting"]}
-        self.assertEqual(set(pulses), {"posting.blog", "posting.instagram", "posting.devto"})
+        self.assertEqual(set(pulses), {"posting.blog", "posting.instagram", "posting.devto",
+                                       "posting.newsletter"})
         self.assertIsNotNone(pulses["posting.blog"]["alert"])
+        self.assertIsNone(pulses["posting.newsletter"]["alert"])   # nothing new: no alarm
         self.assertIn(("posting.blog", "no_output"),
                       {(a["who"], a["check"]) for a in doc["alerts"]})
         json.dumps(doc)                                   # it goes out as JSON

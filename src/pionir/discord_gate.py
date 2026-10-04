@@ -9,7 +9,9 @@ command and payload, who asked, and any money it spends in bold at the top; a
 ``social.instagram_post`` card opens with POSTS PUBLICLY TO INSTAGRAM, shows the full
 caption and carries the rendered image itself as an attachment; a
 ``content.crosspost_devto`` card opens with CROSS-POSTS TO DEV.TO and shows the whole
-article; a ``client.email`` card opens with EMAILS A CLIENT, names the recipient and shows
+article; a ``content.newsletter_send`` card opens with EMAILS EVERY CONFIRMED SUBSCRIBER and
+shows the subject, the whole body and the footer Scrooge adds to every copy; a
+``client.email`` card opens with EMAILS A CLIENT, names the recipient and shows
 the whole message; a ``client.find_report`` card opens with SENDS A FIND REPORT, lists every
 link it sends the client to with its domain in bold first, and shows the whole report; a
 ``client.deliver`` card opens with DELIVERS TO A CLIENT and shows the
@@ -104,6 +106,8 @@ from .adapters.clients import REMIND as CLIENT_REMIND
 from .adapters.content import PUBLISH, public_url
 from .adapters.devto import CROSSPOST as DEVTO_CROSSPOST
 from .adapters.instagram import POST as INSTAGRAM_POST
+from .adapters.newsletter import FOOTER_HEADERS, FOOTER_LINES
+from .adapters.newsletter import SEND as NEWSLETTER_SEND
 from .adapters.products import PUBLISH as PRODUCT_PUBLISH
 from .adapters.products import price_text
 from .adapters.testimonials import HIRE_PAGE
@@ -561,6 +565,30 @@ def _devto_lines(payload: Mapping[str, Any]) -> list[str]:
     lines += [(f"**The article, in full ({len(text):,} characters), exactly as dev.to will "
                "receive it:**"), _FENCE + "markdown", _fence_safe(text), _FENCE]
     return lines
+
+
+NEWSLETTER_LINE = ("\U0001f4e7 **EMAILS EVERY CONFIRMED SUBSCRIBER** - the email below goes "
+                   "to the whole newsletter list if you approve. It cannot be unsent. Read "
+                   "all of it.")
+
+
+def _newsletter_lines(payload: Mapping[str, Any]) -> list[str]:
+    """The email as every subscriber will get it: the subject, the WHOLE body verbatim
+    (split across messages, never cut), and the footer Scrooge adds to every copy - its
+    per-copy unsubscribe link and the postal address shown as placeholders."""
+
+    body = payload.get("body_md")
+    text = body if isinstance(body, str) else str(body)
+    return [
+        f"**Newsletter:** `{_fence_safe(str(payload.get('newsletter_id')))}`",
+        f"**Subject:** {_escape(str(payload.get('subject')))}",
+        (f"**The email, in full ({len(text):,} characters), exactly as it will be sent "
+         "(Markdown; each subscriber gets it as text and as HTML):**"),
+        _FENCE + "markdown", _fence_safe(text), _FENCE,
+        "**Scrooge adds to the end of every copy, after a blank line:**",
+        _FENCE, _fence_safe("\n".join(FOOTER_LINES)), _FENCE,
+        f"**And the headers:** {FOOTER_HEADERS}",
+    ]
 
 
 def client_email_line(to: Any) -> str:
@@ -1060,6 +1088,7 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
     publishes = row.get("capability") == PUBLISH
     posts = row.get("capability") == INSTAGRAM_POST
     crossposts = row.get("capability") == DEVTO_CROSSPOST
+    newsletters = row.get("capability") == NEWSLETTER_SEND
     emails = row.get("capability") == CLIENT_EMAIL
     delivers = row.get("capability") == CLIENT_DELIVER
     finds = row.get("capability") == CLIENT_FIND_REPORT
@@ -1105,6 +1134,8 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
         lines.append(INSTAGRAM_LINE)
     if crossposts:
         lines.append(DEVTO_LINE)
+    if newsletters:
+        lines.append(NEWSLETTER_LINE)
     money = money_line(row)
     if money:
         lines.append(money)
@@ -1144,6 +1175,11 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
         lines += _devto_lines(payload)
         if isinstance(payload.get("body_md"), str):
             shown = {**payload, "body_md": f"(the full article above, "
+                                           f"{len(payload['body_md']):,} characters)"}
+    if newsletters:
+        lines += _newsletter_lines(payload)
+        if isinstance(payload.get("body_md"), str):
+            shown = {**payload, "body_md": f"(the full email above, "
                                            f"{len(payload['body_md']):,} characters)"}
     if emails or reminds:
         lines += _client_email_lines(payload)
@@ -1198,7 +1234,8 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
 NUMBERS = tuple(f"{n}️⃣" for n in range(1, 10)) + ("\U0001f51f",)
 DIGEST_MAX_ITEMS = len(NUMBERS)
 _DIGEST_KINDS = {PUBLISH: "Blog post", DEVTO_CROSSPOST: "dev.to cross-post",
-                 INSTAGRAM_POST: "Instagram post", PRODUCT_PUBLISH: "Gumroad listing"}
+                 INSTAGRAM_POST: "Instagram post", PRODUCT_PUBLISH: "Gumroad listing",
+                 NEWSLETTER_SEND: "Newsletter"}
 _LONGEST_LINK = "https://discord.com/channels/" + "/".join(["9" * 20] * 3)
 # How many passes a digest part (a post, an edit) Discord refuses is tried before it is
 # given up and the owner told - so one refused part never stops the digests for good.
@@ -1230,6 +1267,8 @@ def digest_title(row: Mapping[str, Any]) -> str:
         title = payload.get("title")
     elif capability == INSTAGRAM_POST:
         title = payload.get("headline")
+    elif capability == NEWSLETTER_SEND:
+        title = payload.get("subject")
     elif capability == PRODUCT_PUBLISH:
         name = payload.get("name")
         if isinstance(name, str) and name.strip():
