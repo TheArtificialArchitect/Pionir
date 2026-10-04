@@ -90,6 +90,9 @@ class Claim:
     measures: str         # for a count, the singular noun it counts ("reply")
     text: str             # as written
     whole: bool = True    # written without a decimal point (money may then be rounded)
+    # for a count, every counted noun in the words after it: "1 client order" counts an
+    # order, and "client" is only its modifier - either may be what a figure measures
+    nouns: frozenset = frozenset()
 
     @property
     def cents(self) -> float:
@@ -140,6 +143,11 @@ def _typed(money: str, pct: bool, following: list) -> tuple:
     return None, ""
 
 
+def _nouns(following: list) -> frozenset:
+    """The counted nouns among the two words after a number ("client order", "open order")."""
+    return frozenset(singular(w) for w in following[:2] if w in RESULT_NOUNS)
+
+
 def claims_in(text: str) -> list:
     """The figures a sentence asserts - the ones that must be backed. Clock times,
     durations and bare years are not claims about results and are left out."""
@@ -157,12 +165,14 @@ def claims_in(text: str) -> list:
             continue                          # a year
         unit, measures = _typed(money, bool(m.group("pct")), following)
         out.append(Claim(value, unit, measures, m.group(0).strip(),
-                         whole="." not in m.group("num") and not m.group("mult")))
+                         whole="." not in m.group("num") and not m.group("mult"),
+                         nouns=_nouns(following) if unit == "count" else frozenset()))
     for m in _WORDNUM_RX.finditer(text):
         following = _next_words(text, m.end())
         unit, measures = _typed("", False, following)
         if unit is not None:
-            out.append(Claim(float(_WORDNUM[m.group(1).lower()]), unit, measures, m.group(0)))
+            out.append(Claim(float(_WORDNUM[m.group(1).lower()]), unit, measures, m.group(0),
+                             nouns=_nouns(following) if unit == "count" else frozenset()))
     return out
 
 
@@ -219,7 +229,9 @@ def backs(fig: Figure, claim: Claim) -> bool:
     if not same(float(fig.value), claim.value):
         return False
     if claim.unit == "count":
-        return claim.measures in _measure_words(fig.measures)
+        # the same value counting the same thing: the noun the number counts, or the head
+        # noun it modifies ("1 client order" is backed by "orders listed = 1")
+        return bool(({claim.measures} | claim.nouns) & _measure_words(fig.measures))
     return True
 
 
@@ -390,9 +402,12 @@ _COUNT_WORDS = {
     "twelve": 12, "dozen": 12,
 }
 _TOPICS = ("order", "quote", "email", "payment", "deliver", "refund", "invoice")
+# an order's status ("declined", "refunded"...) is a qualifier too: without it "one declined
+# order awaiting a manual refund" was held only to the order counts that say "waiting" (all
+# 0) and refused over its own "orders with status declined = 1"
 _QUALIFIERS = frozenset(words("""
 new paid unpaid pending waiting held open approved sent failed denied flagged expired
-abandoned client customer request
+abandoned client customer request declined refunded delivered cancelled quoted
 """))
 _QUAL_ALIAS = {"awaiting": "waiting", "requested": "request", "requests": "request"}
 _EVENT_CUES = frozenset(words("new paid unpaid pending waiting awaiting held flagged request"))

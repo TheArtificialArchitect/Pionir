@@ -237,6 +237,42 @@ class CountedEventTests(unittest.TestCase):
         self.assertTrue(topic_claims("2 paid orders were delivered.", other))
         self.assertEqual(topic_claims("No paid orders this run.", other), [])
 
+    def test_a_count_of_a_modified_noun_is_backed_by_the_head_noun(self) -> None:
+        # leader.contracts, 11 of 76 runs: "1 client order is listed" was refused with
+        # "states '1', which no worker recorded" over its own "orders listed = 1" - the
+        # number was read as counting "client", the modifier, not the order
+        live = _contracts_figures() + [Figure(0, "count", "orders with status declined",
+                                              window="now"),
+                                       Figure(1, "count", "quote acknowledgements sent",
+                                              window="now")]
+        for text in ("1 client order is listed, requiring owner approval.",
+                     "The order desk has 1 open order and 1 quote acknowledgement sent.",
+                     "There is 1 customer order with status quote_requested."):
+            self.assertEqual(check_report([text], [], live, set(), set()), [], text)
+        for text in ("3 client orders are listed.",          # the wrong number still fails
+                     "1 client is waiting.",                 # nothing counts clients
+                     "1 client email reply arrived."):       # nor emails or replies
+            self.assertIn("which no worker recorded",
+                          " ".join(check_report([text], [], live, set(), set())), text)
+
+    def test_a_declined_order_is_held_to_the_declined_count(self) -> None:
+        # leader.contracts on 2026-10-04, refused over its own "orders with status
+        # declined = 1": "one declined order awaiting a manual" was held only to the order
+        # counts that say waiting (all 0), since "declined" was not a qualifier
+        now = lambda v, m: Figure(v, "count", m, window="now")      # noqa: E731
+        live = [now(1, "orders listed"), now(1, "orders with status declined"),
+                now(0, "orders with status paid"), now(0, "orders with status refunded"),
+                now(0, "new paid orders"), now(0, "find orders waiting for research"),
+                now(0, "flagged orders awaiting the owner"),
+                now(0, "paid orders waiting for acknowledgement")]
+        for text in ("There is one declined order awaiting a manual refund in Stripe.",
+                     "There is 1 declined paid order awaiting a refund.",
+                     "1 order with status declined."):
+            self.assertEqual(check_report([text], [], live, set(), set()), [], text)
+        for text in ("Two declined orders await a refund.", "1 new paid order arrived.",
+                     "1 paid order is waiting."):
+            self.assertTrue(check_report([text], [], live, set(), set()), text)
+
     def test_plain_prose_and_outreach_email_are_not_claims(self) -> None:
         figs = _contracts_figures()
         for text in ("We should send an email to Kim.", "Drafted 3 emails today.",
