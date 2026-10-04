@@ -400,6 +400,9 @@ class WiringTests(unittest.TestCase):
         w = reg.require("products.demand")
         self.assertEqual((w.division, w.provider, w.cadence_seconds),
                          ("products", "dokaz", 86400))
+        # it reads what the other workers recorded, so it runs after them in a dispatch -
+        # and never holds a dokaz slot ahead of the site's health check
+        self.assertEqual(w.stage, 1)
         (div,) = [d for d in load_catalogue()["divisions"] if d["id"] == "products"]
         for kind in ("demand.ranking", "demand.card", "demand.card_unposted"):
             self.assertIn(kind, div["brief_quota"])

@@ -139,7 +139,7 @@
         {"name": "shelf", "impl": "product_shelf", "uses": ["product.gumroad_publish", "product.gumroad_list"], "kind": "product", "cadence_seconds": 1800,
          "provider": "none", "entities": ["Gumroad"],
          "note": "each product staged in its own folder published on Gumroad, for the owner's approval, and the live products' sales as Gumroad reports them; no model"},
-        {"name": "demand", "impl": "demand_ranker", "uses": ["builds.card"], "kind": "demand", "cadence_seconds": 86400,
+        {"name": "demand", "impl": "demand_ranker", "uses": ["builds.card"], "kind": "demand", "cadence_seconds": 86400, "stage": 1,
          "provider": "dokaz", "entities": ["Dokaz", "Scrooge"],
          "note": "what to build and sell next, ranked daily from measured demand only (API usage and traffic from the dash; UNKNOWN never zero), written to demand.json for the Builds pick and the blog's topics; at most one suggestion card a day, never an edit to a backlog; no model",
          "params": {"url": "https://api.dokaz.net/dash/api.json", "token_file": "scrooge-read-token.txt"}},

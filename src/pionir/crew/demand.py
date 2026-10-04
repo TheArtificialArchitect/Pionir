@@ -42,6 +42,9 @@ the owner edits those.
 views while no paid download covers it, it posts ONE card through Pionir's ``builds.card``
 ("demand seen: X - suggest Y"): at most one card per ``CARD_EVERY``, never the same suggestion
 again within ``REPEAT_AFTER``. A suggestion only - nothing is added, built or sold from it.
+
+It is stage 1 in the catalogue: in a dispatch it runs after the workers whose records it reads,
+and never holds a slot on the dokaz host ahead of the site's health check.
 """
 from __future__ import annotations
 
