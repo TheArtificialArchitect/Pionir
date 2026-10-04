@@ -564,6 +564,14 @@ def client_email_line(to: Any) -> str:
             "you approve.")
 
 
+# A client.email with kind "recovery": the ONE checkout-recovery email an order can get.
+RECOVERY_LINE = ("\U0001f6d2 **CHECKOUT RECOVERY** - this client started an order and the Stripe "
+                 "checkout expired unpaid. This is the ONE recovery email the order can ever get "
+                 "(approve or deny, it is never offered again); Scrooge puts the order's own "
+                 "Stripe recovery link where `{recovery_link}` stands, and refuses it if the "
+                 "order has paid meanwhile.")
+
+
 def _client_email_lines(payload: Mapping[str, Any]) -> list[str]:
     """The email as the owner must see it before it is sent: the order, the recipient,
     the subject and the WHOLE message, verbatim in a plain-text block (split across
@@ -1046,6 +1054,8 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
             lines.append(HOLD_LINE)
     if emails:
         lines.append(client_email_line(payload.get("to")))
+        if payload.get("kind") == "recovery":
+            lines.append(RECOVERY_LINE)
     if finds:
         lines.append(find_report_line(payload.get("to")))
     if publishes:

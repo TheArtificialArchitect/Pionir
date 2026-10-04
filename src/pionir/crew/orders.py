@@ -9,10 +9,11 @@ reported by ``contracts.finder``, finder.py). Paid in full up front through Stri
 only, no calls; every client email approved by the owner on Discord first. A paid ``find``
 order gets its own acknowledgement (``FIND_ACK_*``, still the ACK kind).
 
-**No model, no words.** Every email this worker sends is one of the three templates below
-(``ACK_*``, ``QUOTE_*``, ``DECLINE_*``) with the order's own id, package and the name the
-client gave filled in. It cannot invent a promise, a price or a date: there is nowhere for
-one to come from. The owner can read and edit the templates here.
+**No model, no words.** Every email this worker sends is one of the templates below
+(``ACK_*``, ``QUOTE_*``, ``DECLINE_*``, ``QUOTE_PAID_*``, ``REMINDER_*``, ``RECOVERY_*``) with
+the order's own id, package and the name the client gave filled in. It cannot invent a
+promise, a price or a date: there is nowhere for one to come from. The owner can read and
+edit the templates here.
 
 One run:
 
@@ -34,7 +35,16 @@ One run:
      balance due on delivery; its sending moves the order to ``in_progress``;
    - ``quoted``, from day 10 of its quote while the pay link is still open and unpaid: the
      ONE reminder (``client.quote_reminder``; Scrooge also refuses a second);
-   - awaiting payment: nothing (older than ``ABANDONED_AFTER``: an abandoned checkout);
+   - awaiting payment: nothing (older than ``ABANDONED_AFTER``: an abandoned checkout) -
+     except an order whose Stripe checkout EXPIRED unpaid with a recovery link (Scrooge
+     records ``expired_at`` and ``recovery_url`` from ``checkout.session.expired``): the ONE
+     checkout-recovery email (``RECOVERY_*``, ``client.email`` with ``kind: "recovery"``),
+     only for a package and amount that are sold, a brief that is not flagged, a link with
+     at least ``RECOVERY_MIN_LEFT`` to run, and no recovery email yet. Its body carries
+     ``{recovery_link}``, which Scrooge fills with the order's own link - never this desk.
+     Sent or denied, it is never offered again (Scrooge refuses a second one too); an order
+     that paid meanwhile is never offered it. The tally counts checkouts expired, recovery
+     emails pending, sent and denied, and orders RECOVERED: paid after their recovery email;
    - every other status is the owner's already: nothing.
 
    **Quote cards.** Every custom order waiting on a price (``quote_requested`` or ``quoted``,
@@ -94,6 +104,9 @@ RETRY_UNDELIVERED = 3
 RETRYABLE = {"unreachable": RETRY_UNREACHABLE, "undelivered": RETRY_UNDELIVERED}
 RETRY_STATUS = 5                            # runs a status update is retried
 ABANDONED_AFTER = 3 * 86400                 # an unpaid checkout older than this is abandoned
+# A recovery email is offered only while its Stripe link has at least this long to run, so
+# the owner has time to answer the card before the link dies.
+RECOVERY_MIN_LEFT = 86400
 
 STATUSES = ("awaiting_payment", "paid", "in_progress", "delivered", "declined", "refunded",
             "quote_requested", "quoted", "balance_due", "balance_paid")
@@ -101,6 +114,9 @@ PAID_OR_LATER = frozenset({"paid", "in_progress", "delivered", "balance_due", "b
 
 ACK, QUOTE_ACK, DECLINE = "acknowledgement", "quote_acknowledgement", "decline"
 QUOTE_PAID_ACK, REMINDER = "quote_paid_acknowledgement", "quote_reminder"
+RECOVERY = "checkout_recovery"
+# Scrooge's name for it (POST /dash/orders/email ``kind``), and where it puts the link
+RECOVERY_KIND, RECOVERY_LINK = "recovery", "{recovery_link}"
 # the order status an email's sending moves the order to, and the statuses it moves it from
 AFTER_SENT = {ACK: ("in_progress", ("paid",)),
               QUOTE_PAID_ACK: ("in_progress", ("paid",)),
@@ -238,6 +254,28 @@ link, in our quote email, is valid until {expires} (UTC).
 
 If you'd like to go ahead, use that link. If you have a question, or the quote doesn't suit \
 you, just reply to this email.
+
+Thank you,
+Dokaz"""
+
+
+# The ONE checkout-recovery email of an order whose Stripe checkout expired unpaid. The link
+# is {recovery_link} as written: Scrooge puts the order's own Stripe recovery link there.
+# {expires} is the day Stripe stops honouring that link (Scrooge's recovery_expires_at).
+RECOVERY_SUBJECT = "Your Dokaz order {order_id} is still waiting for payment"
+RECOVERY_BODY = """Hello {name},
+
+You started an order with us, but the checkout closed before the payment went through, so \
+nothing was charged.
+
+Order: {order_id}
+Package: {package} ({price})
+
+If you'd still like us to do it, you can finish the payment here:
+{recovery_link}
+
+The link opens the same checkout and works until {expires} (UTC). If you've changed your \
+mind, there's nothing to do: this is the only reminder we'll send about it.
 
 Thank you,
 Dokaz"""
@@ -592,6 +630,13 @@ def build_email(kind: str, order: dict, flags: tuple = ()) -> dict:
         subject = REMINDER_SUBJECT.format(order_id=oid)
         body = REMINDER_BODY.format(name=name, order_id=oid, price=price_text(q["total_cents"]),
                                     expires=_day(q["first"].get("expires_at")))
+    elif kind == RECOVERY:
+        pkg = PACKAGES[package_of(order)]
+        subject = RECOVERY_SUBJECT.format(order_id=oid)
+        body = RECOVERY_BODY.format(name=name, order_id=oid, package=pkg.title,
+                                    price=price_text(pkg.price_cents),
+                                    recovery_link=RECOVERY_LINK,
+                                    expires=_day(order.get("recovery_expires_at")))
     elif kind == DECLINE:
         subject = DECLINE_SUBJECT.format(order_id=oid)
         category = " and ".join(s.plain for s in flags[:2]) or "work outside what we do"
@@ -816,6 +861,8 @@ class OrderDesk(_Base):
         status = order.get("status")
         if status == "quoted":
             return (REMINDER, ()) if _reminder_due(order, now) else (None, ())
+        if status == "awaiting_payment":
+            return (RECOVERY, ()) if _recovery_due(order, now) else (None, ())
         if status == "paid" and package_of(order) == "custom":
             q = quote_of(order)
             if q is None or q["first"].get("state") != "paid" \
@@ -878,6 +925,9 @@ class OrderDesk(_Base):
                 continue
             if quote_id:
                 email = {**email, "quote_id": quote_id}
+            if kind == RECOVERY:
+                # Scrooge's kind: it fills {recovery_link} and allows this once per order
+                email = {**email, "kind": RECOVERY_KIND}
             self._submit(ctx, rec, entry, email, events)
             submitted += 1
         return ready, held
@@ -1127,6 +1177,15 @@ class OrderDesk(_Base):
                 gave_up += 1
         pending = [{"order_id": e["order_id"], "email": e["kind"]} for e in emails
                    if e.get("status") == "pending_approval"]
+        # checkout recovery: Scrooge's own fields are the truth for expired and recovered
+        expired_checkouts = sum(1 for o in orders if o.get("expired_at"))
+        recovered = [o for o in orders if _recovered(o)]
+        recovered_cents = sum(o["amount_cents"] for o in recovered
+                              if isinstance(o.get("amount_cents"), int)
+                              and not isinstance(o.get("amount_cents"), bool))
+
+        def recovery(status: str) -> int:
+            return sum(1 for e in emails if e.get("kind") == RECOVERY and e.get("status") == status)
         figures = [Figure(len(orders), "count", "orders listed", window="now")]
         figures += [Figure(by_status[s], "count", f"orders with status {s}", window="now")
                     for s in STATUSES]
@@ -1160,6 +1219,15 @@ class OrderDesk(_Base):
             Figure(refund_cents, "usd_cents", "refunds to issue by hand in Stripe",
                    window="now"),
             Figure(abandoned, "count", "abandoned checkouts", window="now"),
+            Figure(expired_checkouts, "count", "checkouts expired", window="orders_listed"),
+            Figure(recovery("pending_approval"), "count",
+                   "recovery emails pending the owner's approval", window="now"),
+            Figure(recovery("sent"), "count", "recovery emails approved and sent",
+                   window="all_time"),
+            Figure(recovery("denied"), "count", "recovery emails denied", window="all_time"),
+            Figure(len(recovered), "count", "orders recovered (paid after their recovery email)",
+                   window="orders_listed"),
+            Figure(recovered_cents, "usd_cents", "recovered revenue", window="orders_listed"),
             Figure(revenue, "usd_cents", "paid revenue", window="orders_listed"),
             Figure(len(pending), "count", "client emails pending the owner's approval",
                    window="now"),
@@ -1204,9 +1272,10 @@ def _already_sent(order: dict, subject) -> bool:
 
 
 def _allowed_amounts(kind: str, order: dict, pkg):
-    """The money amounts an email of this kind may state: the package price for an ACK;
-    for a quote email, exactly what Scrooge recorded as quoted and paid; else none."""
-    if kind == ACK and pkg:
+    """The money amounts an email of this kind may state: the package price for an ACK or a
+    recovery email; for a quote email, exactly what Scrooge recorded as quoted and paid; else
+    none."""
+    if kind in (ACK, RECOVERY) and pkg:
         return pkg.price_cents
     q = quote_of(order)
     if kind == QUOTE_PAID_ACK and q is not None:
@@ -1227,3 +1296,28 @@ def _reminder_due(order: dict, now: float | None) -> bool:
         return False
     remind_from, expires = _epoch(q.get("remind_from")), _epoch(first.get("expires_at"))
     return remind_from is not None and expires is not None and remind_from <= now < expires
+
+
+def _recovery_due(order: dict, now: float | None) -> bool:
+    """An unpaid order whose Stripe checkout expired with a recovery link that still has
+    ``RECOVERY_MIN_LEFT`` to run, for a package and amount that are sold and a brief that is
+    not flagged, and no recovery email yet (Scrooge's ``recovery_sent_at``)."""
+    if now is None or order.get("status") != "awaiting_payment" or order.get("paid_at") \
+            or order.get("recovery_sent_at"):
+        return False
+    url = order.get("recovery_url")
+    if not isinstance(url, str) or not url.startswith("https://") \
+            or _epoch(order.get("expired_at")) is None:
+        return False
+    until = _epoch(order.get("recovery_expires_at"))
+    if until is None or now + RECOVERY_MIN_LEFT >= until:
+        return False
+    # the price the email states is the package's, and only a sold package at its own price
+    # is invited back; a brief the owner would decline is never invited to pay
+    return held_reason(order) is None and not screen(order.get("brief"))
+
+
+def _recovered(order: dict) -> bool:
+    """Paid after its recovery email went: both times are Scrooge's own."""
+    sent, paid = _epoch(order.get("recovery_sent_at")), _epoch(order.get("paid_at"))
+    return sent is not None and paid is not None and paid > sent

@@ -10,6 +10,11 @@ around it. So:
   EVERY call, and the Discord card shows the recipient, the subject and the whole message
   before he answers. Scrooge only ever emails the address stored on the order; ``to`` is a
   check that the owner saw the right address (Scrooge answers 409 if it does not match).
+  With ``kind: "recovery"`` it is the ONE checkout-recovery email of an order whose Stripe
+  checkout expired unpaid: its body carries ``{recovery_link}`` exactly once, and Scrooge
+  puts the order's own Stripe recovery link there - never a link from the payload. Scrooge
+  refuses it unless the order is still awaiting payment with a live link, and refuses a
+  second one for good. A plain email may not carry ``{recovery_link}``.
 - ``client.set_status`` is REVERSIBLE_WRITE and does NOT require approval: it only moves
   the order's status in Scrooge's records - nobody is contacted, nothing is paid out.
 
@@ -124,6 +129,13 @@ ORDER_STATUSES = ("awaiting_payment", "paid", "in_progress", "delivered", "decli
 # (awaiting_payment -> paid) and a quote request are Scrooge's to record, never Pionir's.
 SETTABLE_STATUSES = ("in_progress", "delivered", "declined", "refunded", "quoted")
 EMAIL_FIELDS = frozenset({"order_id", "to", "subject", "body_text"})
+# client.email may also say which kind of email it is: absent is a plain email.
+EMAIL_OPTIONAL = frozenset({"kind"})
+RECOVERY_KIND = "recovery"
+# Where the checkout-recovery email's link goes: exactly once, filled in by Scrooge with the
+# order's stored Stripe recovery link. It is checked here with a Dokaz link in its place.
+RECOVERY_PLACEHOLDER = "{recovery_link}"
+SAMPLE_RECOVERY_LINK = "https://api.dokaz.net/hire"
 DELIVER_FIELDS = frozenset({"order_id", "to", "zip_name", "zip_sha256", "subject",
                             "body_text"})
 # client.deliver may also say the order owes its balance (the delivery is held).
@@ -224,13 +236,16 @@ def _plain_text_problem(text: str) -> str | None:
 
 def check_email(payload: Mapping[str, Any]) -> dict[str, str]:
     """The email exactly as it will be sent, or ValueError("<field>: <why>")."""
-    unknown = sorted(set(payload) - EMAIL_FIELDS)
+    unknown = sorted(set(payload) - EMAIL_FIELDS - EMAIL_OPTIONAL)
     if unknown:
         raise ValueError(f"{unknown[0]}: not an email field (allowed: "
-                         f"{', '.join(sorted(EMAIL_FIELDS))})")
+                         f"{', '.join(sorted(EMAIL_FIELDS | EMAIL_OPTIONAL))})")
     missing = sorted(EMAIL_FIELDS - set(payload))
     if missing:
         raise ValueError(f"{missing[0]}: required")
+    recovery = "kind" in payload
+    if recovery and payload["kind"] != RECOVERY_KIND:
+        raise ValueError(f"kind: absent (a plain email) or {RECOVERY_KIND!r}")
     email = {"order_id": check_order_id(payload["order_id"]),
              "to": check_address(payload["to"])}
     for key, (low, high), control in (("subject", SUBJECT_LENGTH, _CONTROL_LINE),
@@ -239,6 +254,14 @@ def check_email(payload: Mapping[str, Any]) -> dict[str, str]:
         if not isinstance(text, str):
             # ValueError like every other email rule: one "<field>: <why>" refusal type
             raise ValueError(f"{key}: required, a string")  # noqa: TRY004
+        found = text.count(RECOVERY_PLACEHOLDER)
+        if key == "body_text" and recovery and found != 1:
+            raise ValueError(f"body_text: a recovery email must contain {RECOVERY_PLACEHOLDER} "
+                             f"exactly once (Scrooge puts the order's recovery link there; "
+                             f"found {found})")
+        if found and not (key == "body_text" and recovery):
+            raise ValueError(f"{key}: {RECOVERY_PLACEHOLDER} belongs only in the body of the "
+                             f"one recovery email (kind {RECOVERY_KIND!r})")
         if not low <= len(text) <= high:
             raise ValueError(f"{key}: {low}-{high} characters (this is {len(text)})")
         if not text.strip():
@@ -247,10 +270,12 @@ def check_email(payload: Mapping[str, Any]) -> dict[str, str]:
             raise ValueError(f"{key}: contains a control character"
                              + (" (only line breaks are allowed)" if key == "body_text"
                                 else " or line break (one line only)"))
-        problem = _plain_text_problem(text)
+        problem = _plain_text_problem(text.replace(RECOVERY_PLACEHOLDER, SAMPLE_RECOVERY_LINK))
         if problem:
             raise ValueError(f"{key}: {problem}")
         email[key] = text
+    if recovery:
+        email["kind"] = RECOVERY_KIND
     return email
 
 

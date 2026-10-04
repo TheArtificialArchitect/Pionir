@@ -1,0 +1,30 @@
+{
+  "about": "The checkout-recovery contract between Scrooge (producer: GET /dash/orders, POST /dash/orders/email) and Pionir (consumer: crew contracts.orders, adapter client.email). The SAME file lives in Scrooge at worker/test/fixtures/checkout-recovery-contract.json and in Pionir at tests/fixtures/scrooge_checkout_recovery_contract.json. Both test suites pin the sha256 of its canonical JSON (keys sorted, no spaces): change one copy and both pins, or the other side fails.",
+  "now": "2026-10-04T12:00:00.000Z",
+  "listed_order": {
+    "id": "a1b2c3d4e5f6",
+    "created_at": "2026-10-02T09:00:00.000Z",
+    "name": "Ana Lima",
+    "email": "ana@example.com",
+    "package": "small",
+    "brief": "A script that renames the invoice PDFs in a folder by their date.",
+    "status": "awaiting_payment",
+    "amount_cents": 14900,
+    "paid_at": null,
+    "expired_at": "2026-10-03T08:55:00.000Z",
+    "recovery_url": "https://buy.stripe.com/r/live_contract0000",
+    "recovery_expires_at": "2026-11-02T08:55:00.000Z",
+    "recovery_sent_at": null,
+    "messages": [],
+    "quote": null,
+    "held_delivery": null
+  },
+  "recovery_email_request": {
+    "order_id": "a1b2c3d4e5f6",
+    "to": "ana@example.com",
+    "subject": "Your Dokaz order a1b2c3d4e5f6 is still waiting for payment",
+    "body_text": "Hello Ana Lima,\n\nYou started an order with us, but the checkout closed before the payment went through, so nothing was charged.\n\nOrder: a1b2c3d4e5f6\nPackage: Small ($149)\n\nIf you'd still like us to do it, you can finish the payment here:\n{recovery_link}\n\nThe link opens the same checkout and works until 2026-11-02 (UTC). If you've changed your mind, there's nothing to do: this is the only reminder we'll send about it.\n\nThank you,\nDokaz",
+    "kind": "recovery"
+  },
+  "recovery_email_response_keys": ["id", "kind", "ok", "provider_id", "recovery_sent_at"]
+}
