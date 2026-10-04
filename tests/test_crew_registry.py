@@ -19,7 +19,7 @@ class DefaultCatalogueTests(unittest.TestCase):
                          ("treasury", "watch", "posting", "contracts", "products", "fiverr",
                           "builds"))
         self.assertEqual(reg.ids(), ("builds.daedalus", "contracts.delivery",
-                                     "contracts.finder", "contracts.orders", "fiverr.desk",
+                                     "contracts.feedback", "contracts.finder", "contracts.orders", "fiverr.desk",
                                      "fiverr.gigs", "posting.blog",
                                      "posting.devto",
                                      "posting.instagram", "posting.results",
@@ -28,7 +28,7 @@ class DefaultCatalogueTests(unittest.TestCase):
                                      "watch.health"))
         live = sorted(w.worker_id for w in reg.all() if w.live)
         self.assertEqual(live, ["builds.daedalus",
-                                "contracts.delivery", "contracts.finder", "contracts.orders",
+                                "contracts.delivery", "contracts.feedback", "contracts.finder", "contracts.orders",
                                 "fiverr.desk", "fiverr.gigs", "posting.blog",
                                 "posting.devto",
                                 "posting.instagram",

@@ -252,6 +252,11 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         # park for approval; a delivery's zip is scanned for every secret Pionir is
         # configured with.
         runtime.register(ClientAdapter(client_settings(configured)))
+        # Client testimonials on the same Scrooge: read with the ops token, put live on /hire
+        # with the publish token. client.testimonial_publish always parks for approval.
+        from .adapters.testimonials import TestimonialAdapter
+
+        runtime.register(TestimonialAdapter(client_settings(configured)))
         if configured.quote_cards:
             # The one quote card per custom order, in the Discord gate's channel with its
             # bot token (read when a card is posted: no network at boot). The owner's reply
