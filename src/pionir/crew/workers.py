@@ -42,6 +42,9 @@ whole list, and a name not in it fails loudly at load time.
 - ``daedalus_builds`` - REAL (builds/). One small developer tool a night, built by Daedalus in
   a fresh sandbox repo inside the overnight GPU window, reviewed by Claude (and by our own
   checks), and staged for products.shelf - which still submits it for the owner's approval.
+- ``demand_ranker`` - REAL (demand.py). Scores what to build and sell next from measured demand
+  only (the dash's API usage and traffic; UNKNOWN never zero), writes ``demand.json`` for the
+  Builds backlog pick and the blog's topic choice, and posts at most one suggestion card a day.
 """
 from __future__ import annotations
 
@@ -371,6 +374,14 @@ def product_shelf(spec, **params):
     return ProductShelf(spec, **params)
 
 
+def demand_ranker(spec, **params):
+    """REAL. ``products.demand`` (demand.py): what to build and sell next, ranked from measured
+    demand only, with at most one owner card a day suggesting a product. Never edits a
+    backlog. Imported lazily: demand.py builds on ``DashReader`` above."""
+    from .demand import DemandWorker
+    return DemandWorker(spec, **params)
+
+
 def api_builder(spec, **params):
     """REAL. ``products.api_builder`` (apibuild/worker.py): a paid API product written by the
     Write-only Claude runner, checked, staged on a branch of the Scrooge repo, and verified
@@ -429,6 +440,7 @@ IMPLS = {
     "finder": finder,
     "feedback_desk": feedback_desk,
     "product_shelf": product_shelf,
+    "demand_ranker": demand_ranker,
     "api_builder": api_builder,
     "fiverr_gigs": fiverr_gigs,
     "fiverr_desk": fiverr_desk,

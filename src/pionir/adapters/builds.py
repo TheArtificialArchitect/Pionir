@@ -11,6 +11,8 @@ its cards:
   always says the product is NOT on sale and still goes through the shelf and his approval.
   No files are attached. Idempotent per key: a card already posted is answered with its
   message id.
+  products.demand (crew/demand.py) posts its suggestion cards through it too (kind
+  ``demand``, no replies): their head says nothing was added to a backlog, built or sold.
 - ``builds.inbox`` (READ_ONLY): the owner's replies to the cards that take one (the nightly
   report and the backlog card), as the Discord gate recorded them - only replies whose
   author is the configured owner (``pionir.fiverr.FiverrReplies`` over this record), checked
@@ -48,6 +50,8 @@ HEADS = {
               "through the product shelf and your ✅ like every product.",
     "shelved": "\U0001f6d1 **BUILDS — SHELVED** — nothing was staged or put on sale.",
     "problem": "⚠️ **BUILDS — NEEDS YOU**",
+    "demand": "\U0001f4a1 **DEMAND SEEN** — a suggestion only: nothing was added to any "
+              "backlog, built or put on sale.",
 }
 KINDS = tuple(HEADS)
 INBOX_KINDS = ("night", "backlog")

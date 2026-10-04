@@ -102,6 +102,19 @@ class CardTests(_Case):
         with self.assertRaises(AdapterProtocolError):
             a.validate(Task(INBOX, {"kind": "staged"}))
 
+    def test_a_demand_card_says_it_is_only_a_suggestion_and_takes_no_reply(self) -> None:
+        a = self.adapter()
+        out = self.run_task(a, CARD, self.card(key="demand:saturated-convert:20730",
+                                               kind="demand", title="Demand seen: Convert",
+                                               body="demand seen: X - suggest Y",
+                                               replies=False))
+        self.assertTrue(out["ok"], out)
+        content = self.posted()[-1]
+        self.assertTrue(content.startswith(HEADS["demand"]))
+        self.assertIn("nothing was added to any backlog", content)
+        with self.assertRaises(AdapterProtocolError):
+            a.validate(Task(CARD, self.card(kind="demand", replies=True)))
+
     def test_a_card_is_posted_once_per_key(self) -> None:
         a = self.adapter()
         first = self.run_task(a, CARD, self.card())

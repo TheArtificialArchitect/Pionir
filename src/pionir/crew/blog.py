@@ -16,7 +16,9 @@ One run:
    23:04, 04:45, 10:26 - so some digests got none: the 10:26 draft came an hour after the
    09:00 digest.) With no digest known, it is every ``draft_every_seconds``.
 3. **A topic**: the evergreen seed, tied to a real product, that the division's goal as
-   Moss set it matches best - otherwise, or with no goal, the next seed in the rotation.
+   Moss set it matches best - otherwise, or with no goal, for the blog the first seed about
+   the product with the highest measured demand (products.demand's ``demand.json``), and
+   failing that the next seed in the rotation.
    The goal steers among the seeds; it is never a post's subject itself. A topic or slug
    already used is never used again (the record).
 4. **Words from the shared brain only** (``ctx.words``: JSON schema, temperature 0,
@@ -594,11 +596,13 @@ class DailyPoster(_Base):
             "draft_id": post["draft_id"], "status": status, "why": _clip(why, 160)}))
 
     # ---- 2-6. one draft, checked, and submitted if it passed ------------------------------
-    def choose_topic(self, rec: dict, goal: str | None) -> Topic | None:
+    def choose_topic(self, rec: dict, goal: str | None, demand=()) -> Topic | None:
         """The free seed the goal's words match best; with no goal, or a goal that matches
-        no seed, the next seed in the rotation. The goal only steers among the seeds: it is
-        an instruction to the division, never a post's subject (Moss's "report only what the
-        workers measured ... publish one good post a day" once would have been one)."""
+        no seed, the first free seed about the highest-demand product in ``demand`` (API
+        product ids, best first: ``demand_products``); else the next seed in the rotation.
+        The goal only steers among the seeds: it is an instruction to the division, never a
+        post's subject (Moss's "report only what the workers measured ... publish one good
+        post a day" once would have been one). The goal always wins over the demand."""
         used = set(rec["used_topics"])
         free = [t for t in SEEDS if t.key not in used]
         if goal:
@@ -607,7 +611,17 @@ class DailyPoster(_Base):
                             key=lambda x: (-x[0], x[1]))
             if scored and scored[0][0] > 0:
                 return scored[0][2]
+        if demand:
+            from .demand import prefer_topic
+            topic = prefer_topic(free, demand)
+            if topic is not None:
+                return topic
         return free[0] if free else None
+
+    def demand_products(self, ctx: WorkContext) -> list:
+        """The API products measured demand ranks first (products.demand), for the topic
+        choice; none here - a worker that is steered by demand says so."""
+        return []
 
     def _draft_and_submit(self, ctx: WorkContext, rec: dict, events: list) -> Result | None:
         if ctx.words is None:
@@ -616,7 +630,7 @@ class DailyPoster(_Base):
         if ctx.job is None:
             return self._err(ErrorKind.NOT_CONFIGURED, "no hands: a post reaches the owner "
                              "only through Pionir", retryable=False)
-        topic = self.choose_topic(rec, ctx.goal)
+        topic = self.choose_topic(rec, ctx.goal, self.demand_products(ctx))
         if topic is None:
             log.warning("%s: every topic has been used; nothing to draft until a goal or a "
                         "new seed topic is given", self.worker_id)
@@ -807,6 +821,11 @@ class BlogWorker(DailyPoster):
 
     def _blank(self) -> dict:
         return {**super()._blank(), "used_slugs": []}
+
+    def demand_products(self, ctx: WorkContext) -> list:
+        """The blog is steered by demand: a fresh ranking's products, best first."""
+        from .demand import product_preference
+        return product_preference(ctx.state_dir, ctx.now)
 
     def _system(self) -> str:
         return SYSTEM.format(names=self._names())

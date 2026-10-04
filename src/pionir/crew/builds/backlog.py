@@ -12,7 +12,8 @@ in it is one the owner's backlog made and Claude's review checks against the cod
 The owner edits it by REPLYING to a Builds card (``apply_reply``, owner-only - Pionir records
 no one else's reply): ``add <slug>`` with the fields below, ``remove <slug>`` or
 ``top <slug>``. Moss reprioritises through the division's goal: an entry whose slug the goal
-names is taken first (``choose``). An entry already started is never picked again.
+names is taken first (``choose``); with no entry named, the one with the highest measured
+demand (products.demand's ``demand.json``) is. An entry already started is never picked again.
 """
 from __future__ import annotations
 
@@ -424,9 +425,11 @@ def fingerprint(entries) -> str:
     return hashlib.sha256(canon.encode()).hexdigest()[:12]
 
 
-def choose(entries: list, taken: set, goal: str | None) -> dict | None:
+def choose(entries: list, taken: set, goal: str | None, demand=()) -> dict | None:
     """The next product: among the entries not yet taken, the one Moss's goal names first
-    (by where in the goal its slug appears), else the first in the backlog's order."""
+    (by where in the goal its slug appears); else the first of ``demand`` - slugs ranked by
+    measured demand, best first (crew/demand.py ``build_preference``) - that is free; else the
+    first in the backlog's order. The goal always wins over the demand."""
     free = [e for e in entries if e["slug"] not in taken]
     if not free:
         return None
@@ -438,6 +441,10 @@ def choose(entries: list, taken: set, goal: str | None) -> dict | None:
             named.append((m.start(), e))
     if named:
         return min(named, key=lambda p: p[0])[1]
+    by_slug = {e["slug"]: e for e in free}
+    for slug in demand or ():
+        if slug in by_slug:
+            return by_slug[slug]
     return free[0]
 
 
