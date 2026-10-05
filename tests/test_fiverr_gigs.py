@@ -108,6 +108,23 @@ class ListingTests(unittest.TestCase):
         self.assertIn("AI-assisted", SERVICES["website"].description)
         self.assertIn("AI-assisted", SERVICES["research"].description)
 
+    def test_the_two_gigs_with_impressions_use_the_words_buyers_search(self) -> None:
+        # Fiverr ranks on title, tags and the opening of the description; the 2026-10 rewrite
+        # moved them to buyer search language. Reverting the rewrite fails this.
+        research, website = SERVICES["research"], SERVICES["website"]
+        self.assertIn("find any hard to find product", research.title)
+        self.assertTrue({"product finder", "find a product"} <= set(research.tags))
+        self.assertTrue(research.description.startswith("Can't find a product"))
+        self.assertIn("design", website.title)
+        self.assertIn("landing page", website.title)
+        self.assertTrue({"website design", "landing page", "one page website"}
+                        <= set(website.tags))
+        self.assertTrue(website.description.startswith("Need a simple, fast website or landing"))
+        for svc in (research, website):
+            self.assertEqual(len(svc.tags), len(set(svc.tags)))
+            self.assertIn("What I won't search for" if svc is research else "never make up",
+                          svc.description)
+
     def test_dishonest_listings_are_blocked(self) -> None:
         base = SERVICES["website"]
         for change, words in [

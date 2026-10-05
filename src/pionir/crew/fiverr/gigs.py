@@ -93,12 +93,13 @@ class Service:
 
 RESEARCH = Service(
     key="research",
-    title="I will find where to buy a hard to find item and send you a report",
+    title="I will find any hard to find product online and send you where to buy it",
     description=(
-        "Looking for something specific - a discontinued part, an exact model, a gift in one "
-        "particular colour? Tell me exactly what you need and I'll search the web for where you "
-        "can buy it, then send you a short report: each option with the seller, the price as "
-        "the listing shows it, the condition, availability and a direct link to the listing.\n\n"
+        "Can't find a product anywhere? A discontinued part, an exact model, a sold-out gift in "
+        "one particular colour? Tell me exactly what you need and I'll search the web for where "
+        "you can buy it, then send you a short price report: each option with the seller, the "
+        "price as the listing shows it, the condition, availability and a direct link to the "
+        "listing.\n\n"
         "What you get:\n"
         "- Up to 8 buying options per item, best first\n"
         "- Every listing opened before you get it: live, on the seller's own site, naming "
@@ -142,8 +143,8 @@ RESEARCH = Service(
          "listing and keeps only pages that are live, on the seller's own site, and show "
          "your item and the listed price."),
     ),
-    tags=("product research", "find products", "online shopping", "product sourcing",
-          "hard to find"),
+    tags=("product finder", "product research", "find a product", "online shopping",
+          "price comparison"),
     requirements=(
         "What exactly should I find? Brand, model or part number, size, colour, and anything "
         "else that matters to you.",
@@ -223,11 +224,11 @@ DATA = Service(
 
 WEBSITE = Service(
     key="website",
-    title="I will build a clean one page website for your small business",
+    title="I will design a clean one page website or landing page for your business",
     description=(
-        "Need a simple, fast website for your business? I'll build a one-page site with your "
-        "business name, what you do, your services and how to reach you, written only from the "
-        "details you give me.\n\n"
+        "Need a simple, fast website or landing page for your small business? I'll design a "
+        "one-page site with your business name, what you do, your services and how to reach you, "
+        "written only from the details you give me.\n\n"
         "What you get:\n"
         "- A responsive one-page site (index.html and styles.css) that works well on phones\n"
         "- Plain HTML and CSS: no scripts, no trackers, nothing loaded from other websites\n"
@@ -273,7 +274,8 @@ WEBSITE = Service(
          "These packages are text and design only, with no images, which keeps the page fast "
          "and simple."),
     ),
-    tags=("website", "landing page", "small business", "html css", "one page website"),
+    tags=("one page website", "landing page", "website design", "small business",
+          "responsive website"),
     requirements=(
         "Your business name and what you do, in one or two sentences.",
         "Your services or products, one per line.",
