@@ -65,6 +65,9 @@ HEADS = {
     "gig": "\U0001f9fe **FIVERR GIG DRAFT** — **you** create or edit the gig on Fiverr "
            "by pasting from this card and the attached listing. Pionir posts nothing to "
            "Fiverr.",
+    "idea": "\U0001f4a1 **NEW FIVERR GIG IDEA** — **you** decide, and if you want it you create "
+            "the gig on Fiverr yourself from this card and the attached listing. Pionir "
+            "posts nothing to Fiverr.",
     "order": "\U0001f195 **FIVERR ORDER**",
     "files_needed": "\U0001f4c2 **FIVERR ORDER: FILES NEEDED**",
     "problem": "⛔ **FIVERR DESK: NEEDS YOU** — nothing was prepared for the buyer.",
@@ -72,7 +75,7 @@ HEADS = {
     "note": "ℹ️ **FIVERR DESK**",
 }
 KINDS = tuple(HEADS)
-INBOX_KINDS = ("order", "gig")
+INBOX_KINDS = ("order", "gig", "idea")
 MAX_BODY = 12000
 MAX_FILES = 10
 MAX_FILE_BYTES = 8_000_000

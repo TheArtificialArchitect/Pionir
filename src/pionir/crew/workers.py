@@ -34,7 +34,7 @@ whole list, and a name not in it fails loudly at load time.
 - ``finder`` - REAL (finder.py). Researches each paid "Find it for me" order through Claude
   on the owner's Max (web tools only, the daily Claude cap), checks the answer fail-closed,
   and submits the report by fixed template as ``client.find_report`` for his approval.
-- ``fiverr_gigs``, ``fiverr_desk``, ``fiverr_earnings`` - REAL (fiverr/). The Fiverr division:
+- ``fiverr_gigs``, ``fiverr_ideas``, ``fiverr_desk``, ``fiverr_earnings`` - REAL (fiverr/). The Fiverr division:
   listings and order deliveries PREPARED for the owner, who does every Fiverr step himself.
 - ``product_shelf`` - REAL (products.py). Submits each product the owner stages in its own
   folder as ``product.gumroad_publish`` for his approval, and reads what the live ones sold
@@ -397,6 +397,13 @@ def fiverr_gigs(spec, **params):
     return GigDrafter(spec, **params)
 
 
+def fiverr_ideas(spec, **params):
+    """REAL. ``fiverr.ideas`` (fiverr/ideas.py): the next new-gig idea, chosen from measured
+    demand, handed to the owner on Discord one at a time to accept or skip."""
+    from .fiverr.ideas import GigIdeaProposer
+    return GigIdeaProposer(spec, **params)
+
+
 def fiverr_desk(spec, **params):
     """REAL. ``fiverr.desk`` (fiverr/desk.py): each Fiverr order, from Scrooge's events to a
     READY card with the files and a drafted reply the owner delivers on Fiverr himself."""
@@ -443,6 +450,7 @@ IMPLS = {
     "demand_ranker": demand_ranker,
     "api_builder": api_builder,
     "fiverr_gigs": fiverr_gigs,
+    "fiverr_ideas": fiverr_ideas,
     "fiverr_desk": fiverr_desk,
     "fiverr_earnings": fiverr_earnings,
     "daedalus_builds": daedalus_builds,
