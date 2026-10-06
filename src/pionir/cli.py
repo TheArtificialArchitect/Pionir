@@ -464,7 +464,10 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
 
         return serve(runtime, port=args.port, open_browser=not args.no_browser)
     if args.command == "doctor":
+        from . import ports
+
         report = _doctor(runtime)
+        report["ports"] = ports.summary(ports.audit())
         _print(report)
         unavailable = any(
             item["status"] == "unavailable"
@@ -472,6 +475,7 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
         )
         open_bridge = any("warning" in item for item in report["bridge_auth"].values())
         return int(unavailable or open_bridge
+                   or bool(report["ports"]["alerts"])
                    or report["routing_aim"]["status"] == "failing")
     if args.command == "capabilities":
         _print(_capabilities(runtime))

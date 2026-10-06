@@ -120,7 +120,7 @@ class LauncherShapeTests(unittest.TestCase):
         text = _launcher_text()
         block = text[text.index("if (-not $NoPeter) {"):text.index("# Bryo, the observer organism")]
         self.assertLess(block.index("$peterNow.Count"), block.index('Pane-Cmd "Peter :8790"'))
-        self.assertLess(block.index("Test-Port 8790"), block.index('Pane-Cmd "Peter :8790"'))
+        self.assertLess(block.index("Claim-Port 'peter' 8790"), block.index('Pane-Cmd "Peter :8790"'))
         self.assertLess(block.index("$relayMatch"), block.index('Pane-Cmd "Peter relay (VPS)"'))
 
 

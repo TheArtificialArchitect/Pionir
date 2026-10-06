@@ -631,6 +631,27 @@ class PionirApp:
         report["posting"] = self.posting_health()
         return report
 
+    _PORTS_TTL_S = 20.0
+
+    def ports_health(self) -> dict[str, Any]:
+        """Every registered port against what really holds it (ports.py), cached: the
+        audit is one PowerShell CIM call, too heavy to run on every dashboard poll."""
+        import time
+
+        from . import ports
+
+        now = time.monotonic()
+        cached = getattr(self, "_ports_cache", None)
+        if cached is not None and now - cached[0] < self._PORTS_TTL_S:
+            return cached[1]
+        try:
+            result = ports.summary(ports.audit())
+        except Exception as error:  # noqa: BLE001 - doctor reports, it does not fail
+            result = {"counts": {}, "ports": [],
+                      "alerts": [f"PORTS: the audit failed: {type(error).__name__}: {error}"]}
+        self._ports_cache = (now, result)
+        return result
+
     def posting_health(self) -> dict[str, Any]:
         """Is anything reaching the owner and going out? (posting_health.py): when each
         digest capability last parked and published, when the digest last reached Discord,
@@ -1554,7 +1575,7 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                 if route.path == "/api/state":
                     self._send(app.state())
                 elif route.path == "/api/doctor":
-                    self._send(app.doctor())
+                    self._send({**app.doctor(), "ports": app.ports_health()})
                 elif route.path == "/api/capabilities":
                     self._send({"capabilities": app.roster()})
                 elif route.path == "/api/audit":

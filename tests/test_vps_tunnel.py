@@ -356,8 +356,8 @@ class LauncherTests(unittest.TestCase):
                       '-File $tunnelScript" ""', text)
         block = text[text.index("if (-not $NoTunnel) {"):text.index("# Bryo, the observer organism")]
         pane = block.index('Pane-Cmd "VPS tunnel"')
-        for guard in ("$tunnelMatch", "Test-Port 18000", "Test-Port 18001", "Test-Port 18002",
-                      "Test-Path $tunnelKey"):
+        for guard in ("$tunnelMatch", "@(18000, 18001, 18002 |", "Get-PortState 'tunnel' $_",
+                      "$tunnelForeign.Count", "Test-Path $tunnelKey"):
             self.assertLess(block.index(guard), pane, guard)
         self.assertIn('$tunnelKey    = Join-Path $HOME ".pionir\\secrets\\vps-tunnel-key"', text)
 

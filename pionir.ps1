@@ -37,6 +37,33 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
+# The launcher's log: ~/.pionir/logs/launcher.log, one line per thing it printed, size-capped
+# (one rotation, launcher.log.1). Before this a failed launch left nothing to read. Write-Host
+# is shadowed so every line the launcher says is also kept, without touching each call.
+$logDir  = if ($env:PIONIR_LAUNCHER_LOG_DIR) { $env:PIONIR_LAUNCHER_LOG_DIR } else { Join-Path $HOME ".pionir\logs" }
+$logFile = Join-Path $logDir "launcher.log"
+$logCap  = 256KB
+$script:logWarned = $false
+function Write-Log([string]$text) {
+    if (-not $text.Trim()) { return }
+    try {
+        New-Item -ItemType Directory -Force $logDir | Out-Null
+        if ((Test-Path $logFile) -and ((Get-Item $logFile).Length -gt $logCap)) { Move-Item $logFile "$logFile.1" -Force }
+        Add-Content -Path $logFile -Value ("{0:o} [{1}] {2}" -f (Get-Date), $PID, $text.Trim()) -Encoding UTF8
+    } catch {
+        if (-not $script:logWarned) {
+            $script:logWarned = $true
+            Microsoft.PowerShell.Utility\Write-Host "  (the launcher log is not writable: $($_.Exception.Message))" -ForegroundColor DarkGray
+        }
+    }
+}
+function Write-Host {
+    param([Parameter(Position = 0)][object]$Object = "", [ConsoleColor]$ForegroundColor, [switch]$NoNewline)
+    Write-Log ([string]$Object)
+    Microsoft.PowerShell.Utility\Write-Host @PSBoundParameters
+}
+Write-Log ("launch: " + (($PSBoundParameters.GetEnumerator() | ForEach-Object { "-$($_.Key) $($_.Value)" }) -join " "))
+
 if ($Shortcut) {
     # A Desktop icon that runs this launcher. Shortcut only - nothing is added to
     # Startup, no task, no service (rule 3). Hidden so the only window that shows
@@ -134,14 +161,20 @@ function Test-Port([int]$p) {
     finally { $c.Dispose() }
 }
 
-function Stop-Port([int]$p, [string]$label) {
-    $c = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue
-    if ($c) {
-        $c | Select-Object -Expand OwningProcess -Unique | ForEach-Object {
-            Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
-        }
-        Write-Host "  stopped $label on $p."
+function Stop-Port([int]$p, [string]$label, [string]$id) {
+    # Only what the registry says is ours: a foreign program that happens to hold the port is
+    # named and left alone (this used to kill whatever listened there).
+    Read-Stack
+    $state = Get-PortState $id $p
+    if ($state.State -eq 'free') { return }
+    if ($state.State -eq 'foreign') {
+        Write-Host "  $label's port $p is held by $($state.Name) (pid $($state.OwnerPid)), which is not $label; left alone." -ForegroundColor Yellow
+        return
     }
+    @($script:listen | Where-Object { $_.Port -eq $p } | ForEach-Object { $_.OwnerPid } | Select-Object -Unique) | ForEach-Object {
+        Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "  stopped $label on $p."
 }
 
 function Stop-Bryo {
@@ -265,14 +298,135 @@ function Stop-Companion([string]$match, [string]$label) {
     }
 }
 
+# ---- Who holds a port, and who started the stack ---------------------------------------
+# One list of ports (src\pionir\ports.json) is read here, by pionir doctor and by Pionir
+# Desktop's tests. A listening port is not the same as the service (HEAD 3.20): a listener whose
+# command line does not match the registry is somebody else's program on our port. Processes
+# are read with CIM (psutil cannot read a PowerShell-detached command line, HEAD 3.22).
+$registryFile = Join-Path $srcDir "pionir\ports.json"
+$script:registry = $null
+$script:procs = @{}      # pid -> Win32_Process
+$script:listen = @()     # one row per listening TCP port: Port, OwnerPid
+function Get-PortSpec([string]$id) {
+    if (-not $script:registry) { $script:registry = Get-Content -Raw -Encoding UTF8 $registryFile | ConvertFrom-Json }
+    return ($script:registry.services | Where-Object { $_.id -eq $id } | Select-Object -First 1)
+}
+function Read-Stack {
+    $script:procs = @{}
+    foreach ($p in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) { $script:procs[[int]$p.ProcessId] = $p }
+    $script:listen = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | ForEach-Object {
+        [pscustomobject]@{ Port = [int]$_.LocalPort; OwnerPid = [int]$_.OwningProcess } })
+}
+function Get-Cmd($p) { return ([string]$p.ExecutablePath) + ' ' + ([string]$p.CommandLine) }
+function Test-Answers([int]$p, $spec) {
+    if ($spec.probe.kind -ne 'http') { return $true }
+    try {
+        $req = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$p$($spec.probe.path)")
+        $req.Proxy = $null; $req.Timeout = 2500; $req.ReadWriteTimeout = 2500
+        $resp = $req.GetResponse(); $resp.Close(); return $true
+    } catch [System.Net.WebException] {
+        # any status below 500 is an answer (a 401 from a signed endpoint is the service speaking)
+        if ($_.Exception.Response) { $code = [int]$_.Exception.Response.StatusCode; $_.Exception.Response.Close(); return ($code -lt 500) }
+        return $false
+    } catch { return $false }
+}
+function Get-PortState([string]$id, [int]$p) {
+    # free | ours-healthy | ours-unhealthy | foreign (Name = the program holding it)
+    $spec = Get-PortSpec $id
+    $holders = @($script:listen | Where-Object { $_.Port -eq $p })
+    if (-not $holders.Count) { return [pscustomobject]@{ State = 'free'; OwnerPid = 0; Name = '' } }
+    foreach ($h in $holders) {
+        $proc = $script:procs[[int]$h.OwnerPid]
+        if ($proc -and ((Get-Cmd $proc) -match $spec.match)) {
+            $state = if (Test-Answers $p $spec) { 'ours-healthy' } else { 'ours-unhealthy' }
+            return [pscustomobject]@{ State = $state; OwnerPid = $h.OwnerPid; Name = $proc.Name }
+        }
+    }
+    $who = $script:procs[[int]$holders[0].OwnerPid]
+    $name = if ($who -and $who.Name) { [string]$who.Name } else { 'an unidentified program' }
+    return [pscustomobject]@{ State = 'foreign'; OwnerPid = $holders[0].OwnerPid; Name = $name }
+}
+function Test-DesktopProc($p) {
+    # Pionir Desktop: the packaged app, or electron.exe run from its folder (not any shell in it)
+    return ($p -and ([string]$p.Name -match '^(Pionir Desktop|electron)\.exe$') -and ((Get-Cmd $p) -match 'pionir[ _-]?desktop'))
+}
+function Get-Owner([int]$procId) {
+    # Walk the parents: a Pionir pane shell -> 'pionir.ps1'; Desktop's electron -> 'desktop';
+    # neither (a hand-started process, or a parent that has since exited) -> 'hand'. A parent
+    # younger than its child is a recycled pid, not a parent.
+    $cur = $script:procs[$procId]
+    $seen = @{}
+    for ($i = 0; $i -lt 8 -and $cur -and -not $seen.ContainsKey([int]$cur.ProcessId); $i++) {
+        $seen[[int]$cur.ProcessId] = $true
+        if (Test-PionirPane $cur) { return 'pionir.ps1' }
+        if (Test-DesktopProc $cur) { return 'desktop' }
+        $parent = $script:procs[[int]$cur.ParentProcessId]
+        if ($parent -and $parent.CreationDate -and $cur.CreationDate -and ($parent.CreationDate -gt $cur.CreationDate)) { break }
+        $cur = $parent
+    }
+    return 'hand'
+}
+function Get-OwnerLabel([string]$owner) {
+    switch ($owner) { 'pionir.ps1' { 'this launcher (pionir.ps1)' } 'desktop' { 'Pionir Desktop' } default { 'started by hand' } }
+}
+function Get-StackOwner([int]$dashboardPort) {
+    # Who started the stack that is up now: 'desktop' if any core service is Desktop's, else
+    # 'pionir.ps1' if any is a pane's, else 'hand' / 'none'. Desktop wins: two launchers over
+    # one stack is the problem, and the one that must not be joined is the one with a manager.
+    [void](Get-PortSpec 'dashboard')   # loads the registry
+    $owners = @()
+    foreach ($svc in $script:registry.services) {
+        if (@($svc.launchers) -notcontains 'pionir.ps1' -or @($svc.launchers) -notcontains 'desktop') { continue }
+        foreach ($p in @($svc.ports)) {
+            $port = if ($svc.id -eq 'dashboard') { $dashboardPort } else { [int]$p }
+            $s = Get-PortState $svc.id $port
+            if ($s.State -like 'ours-*') { $owners += (Get-Owner ([int]$s.OwnerPid)) }
+        }
+    }
+    if ($owners -contains 'desktop') { return 'desktop' }
+    if ($owners -contains 'pionir.ps1') { return 'pionir.ps1' }
+    if ($owners.Count) { return 'hand' }
+    return 'none'
+}
+function Test-Running($spec) {
+    # Is a process matching this service alive, listening or not? (a slow starter is warming, not down)
+    foreach ($p in $script:procs.Values) {
+        if ([int]$p.ProcessId -ne $PID -and ((Get-Cmd $p) -match $spec.match)) { return $true }
+    }
+    return $false
+}
+function Claim-Port([string]$id, [int]$p, [string]$note = '') {
+    # The start decision for one service: 'free' (start it), 'up' (ours, leave it) or 'held'
+    # (a foreign program holds the port: never "already up", never started over).
+    $spec = Get-PortSpec $id
+    $s = Get-PortState $id $p
+    switch ($s.State) {
+        'free' { return 'free' }
+        'ours-healthy' {
+            Write-Host "  $($spec.label) already up on $p (pid $($s.OwnerPid), $(Get-OwnerLabel (Get-Owner ([int]$s.OwnerPid)))).$note" -ForegroundColor DarkCyan
+            return 'up'
+        }
+        'ours-unhealthy' {
+            Write-Host "  ! $($spec.label) is listening on $p (pid $($s.OwnerPid)) but $($spec.probe.path) does not answer; not started over it. Run pionir doctor." -ForegroundColor Yellow
+            return 'up'
+        }
+        default {
+            Write-Host "  !!! port $p is held by $($s.Name) (pid $($s.OwnerPid)), which is not $($spec.label). Not starting it, and not calling it up. Free the port or run pionir doctor." -ForegroundColor Red
+            $script:refused += "$($spec.label) :$p (held by $($s.Name))"
+            return 'held'
+        }
+    }
+}
+$script:refused = @()
+
 if ($Stop) {
     New-Item -ItemType Directory -Force (Split-Path $stopMarker) | Out-Null
     Set-Content -Path $stopMarker -Value (Get-Date -Format o) -Encoding UTF8
-    Stop-Port $Port "dashboard"
-    Stop-Port 8799 "Galatea"
-    Stop-Port 8771 "Daedalus"
-    Stop-Port 8770 "Melete"
-    Stop-Port 8782 "crew"
+    Stop-Port $Port "dashboard" "dashboard"
+    Stop-Port 8799 "Galatea" "galatea"
+    Stop-Port 8771 "Daedalus" "daedalus"
+    Stop-Port 8770 "Melete" "melete"
+    Stop-Port 8782 "crew" "crew"
     Stop-Companion $peterMatch "Peter"
     Stop-Companion $relayMatch "Peter's VPS relay"
     Stop-Companion $tunnelMatch "the VPS tunnel"
@@ -288,6 +442,16 @@ if (-not (Test-Port 11434)) {
     Write-Host "  ! Ollama is not answering on 127.0.0.1:11434 - start it, or routed turns will fail." -ForegroundColor Yellow
 }
 $env:PIONIR_GALATEA_URL = "http://127.0.0.1:8799"
+
+# Read the machine once: every listener and who owns it. Every start decision below comes from
+# this snapshot and the registry (a port held by a foreign program is never "already up").
+Read-Stack
+$stackOwner = Get-StackOwner $Port
+switch ($stackOwner) {
+    'desktop'    { Write-Host "  the stack that is up was started by Pionir Desktop; this launcher will not start a second copy beside it." -ForegroundColor DarkCyan }
+    'pionir.ps1' { Write-Host "  the stack that is up was started by this launcher (pionir.ps1); starting only what is missing." -ForegroundColor DarkCyan }
+    'hand'       { Write-Host "  part of the stack is up, started by hand; adopted as it is." -ForegroundColor DarkCyan }
+}
 
 # Bridge tokens. Daedalus (:8771, every repo under C:\src, policy "full") and Melete
 # (:8770) take a job from ANY local process unless started with a token: Daedalus reads
@@ -340,13 +504,14 @@ $pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://1
 
 $panes = @()   # ordered: dashboard, voice, then the doers
 $ports = @()   # the ports this launch is responsible for verifying
-if (-not (Test-Port $Port)) {
+if ((Claim-Port 'dashboard' $Port) -eq 'free') {
     $panes += ,(Pane-Cmd "Pionir :$Port" $root "python -m pionir server --port $Port$browserFlag" $pionirPrelude)
     $ports += $Port
-} else { Write-Host "  dashboard already up on $Port." -ForegroundColor DarkCyan }
+}
 
 if (-not $NoVoice) {
-    if (Test-Port 8799) { Write-Host "  Galatea already awake on 8799." -ForegroundColor DarkCyan }
+    $galateaState = Claim-Port 'galatea' 8799
+    if ($galateaState -ne 'free') { }
     elseif (Test-Path $galateaDir) {
         # --phone binds 0.0.0.0 so Ian can reach her from his phone over Tailscale;
         # her token gates every non-loopback request, so this fails closed.
@@ -357,7 +522,7 @@ if (-not $NoVoice) {
 
 if (-not $NoSpecialists) {
     if (-not $bridgeTokensOk) { }
-    elseif (Test-Port 8771) { Write-Host "  Daedalus already up on 8771 (pionir doctor says whether it wants a token)." -ForegroundColor DarkCyan }
+    elseif ((Claim-Port 'daedalus' 8771 ' pionir doctor says whether it wants a token.') -ne 'free') { }
     elseif (Test-Path $daedalusDir) {
         # Daedalus runs qwen3-coder:30b - a code-specialist MoE (~3B active),
         # a far stronger coder than a GPU 7B. It is NOT 0 VRAM: measured
@@ -378,7 +543,7 @@ if (-not $NoSpecialists) {
         $ports += 8771
     } else { Write-Host "  ! Daedalus not found at $daedalusDir; skipping." -ForegroundColor Yellow }
     if (-not $bridgeTokensOk) { }
-    elseif (Test-Port 8770) { Write-Host "  Melete already up on 8770 (it has a token only if this launcher started it)." -ForegroundColor DarkCyan }
+    elseif ((Claim-Port 'melete' 8770 ' It has a token only if this launcher started it.') -ne 'free') { }
     elseif (Test-Path $meleteDir) {
         $meleteEnv = "`$env:MELETE_TOKEN=(Get-Content -Raw (Join-Path `$HOME '.pionir\secrets\melete-token.txt')).Trim(); if (([string]`$env:MELETE_TOKEN).Length -lt 32) { Write-Host '  no usable MELETE_TOKEN (~/.pionir/secrets/melete-token.txt): not starting Melete without its token.' -ForegroundColor Red; [void](Read-Host); exit 1 }; "
         $panes += ,(Pane-Cmd "Melete :8770" $meleteDir "python -m melete.server" $meleteEnv)
@@ -393,8 +558,10 @@ if (-not $NoSpecialists) {
 # PIONIR_CREW_PIONIR_URL: the crew's hands task Pionir, so a -Port other than 8780
 # must reach them too (the same reason Atani gets ATANI_PIONIR_URL above).
 if (-not $NoCrew) {
-    if (Test-Port 8782) { Write-Host "  crew already up on 8782." -ForegroundColor DarkCyan }
-    else {
+    $crewState = Claim-Port 'crew' 8782
+    if ($crewState -eq 'free' -and (Test-Running (Get-PortSpec 'crew'))) {
+        Write-Host "  crew is starting (its port opens after the model warm-up); not started twice." -ForegroundColor DarkCyan
+    } elseif ($crewState -eq 'free') {
         $crewPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_CREW_PIONIR_URL='http://127.0.0.1:$Port'; `$env:PIONIR_CREW_API_PORT='8782'; "
         $panes += ,(Pane-Cmd "Crew :8782" $root "python -m pionir.crew" $crewPrelude)
         $ports += 8782
@@ -418,8 +585,7 @@ if (-not $NoPeter) {
     if ($peterNow.Count) {
         Write-Host "  Peter already running (pid $($peterNow[0].ProcessId)); adopted as he is, not started twice." -ForegroundColor DarkCyan
         Write-Host "    (started outside Pionir, his model calls skip the GPU gate until he is restarted from here.)" -ForegroundColor DarkGray
-    } elseif (Test-Port 8790) {
-        Write-Host "  ! port 8790 is held by another program; Peter not started." -ForegroundColor Yellow
+    } elseif ((Claim-Port 'peter' 8790) -ne 'free') {
     } elseif (Test-Path (Join-Path $peterDir "deploy\peter.ps1")) {
         $panes += ,(Pane-Cmd "Peter :8790" $peterDir "powershell -NoProfile -ExecutionPolicy Bypass -File $peterLive" $peterPrelude)
         $ports += 8790
@@ -439,10 +605,21 @@ if (-not $NoPeter) {
 # back to the public plain-HTTP ports (the feeds then say "tunnel down").
 if (-not $NoTunnel) {
     $tprocs = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue)
-    if (@($tprocs | Where-Object { [string]$_.CommandLine -match $tunnelMatch }).Count) {
+    $tunnelWrapper = @($tprocs | Where-Object { [string]$_.CommandLine -match $tunnelMatch }).Count
+    $tunnelHeld = @(18000, 18001, 18002 | ForEach-Object {
+        $s = Get-PortState 'tunnel' $_
+        if ($s.State -ne 'free') { [pscustomobject]@{ Port = $_; State = $s.State; Name = $s.Name; OwnerPid = $s.OwnerPid } } })
+    $tunnelForeign = @($tunnelHeld | Where-Object { $_.State -eq 'foreign' })
+    $tunnelNote = (@($tunnelHeld | ForEach-Object { ":$($_.Port) held by $($_.Name) (pid $($_.OwnerPid))" })) -join '; '
+    if ($tunnelForeign.Count) {
+        # Loud on purpose: this used to be one yellow line, and the money feeds just said 'tunnel down'.
+        $running = if ($tunnelWrapper) { " (a tunnel is running, so the other forwards still work)" } else { " The tunnel is NOT started." }
+        Write-Host "  !!! VPS TUNNEL: a program that is not the tunnel holds its loopback port - $tunnelNote.$running The money feeds say 'tunnel down' until it is freed (pionir doctor names it)." -ForegroundColor Red
+        $script:refused += "VPS tunnel ($tunnelNote)"
+    } elseif ($tunnelWrapper) {
         Write-Host "  VPS tunnel already running; not started twice." -ForegroundColor DarkCyan
-    } elseif ((Test-Port 18000) -or (Test-Port 18001) -or (Test-Port 18002)) {
-        Write-Host "  ! a port in 18000-18002 is held by another program; the VPS tunnel is not started (the money feeds say 'tunnel down')." -ForegroundColor Yellow
+    } elseif ($tunnelHeld.Count) {
+        Write-Host "  VPS tunnel already open ($tunnelNote); not started twice." -ForegroundColor DarkCyan
     } elseif (-not (Test-Path $tunnelKey)) {
         Write-Host "  VPS tunnel not set up yet (no key at $tunnelKey): run tools\vps-lockdown.ps1 to set it up." -ForegroundColor DarkCyan
     } elseif (Test-Path $tunnelScript) {
@@ -486,8 +663,22 @@ if (-not $NoBryo) {
     } else { Write-Host "  ! terrarium not found at $terrariumDir; no Bryo this run." -ForegroundColor Yellow }
 }
 
+function Write-Refused {
+    foreach ($r in $script:refused) { Write-Host "  !!! NOT STARTED: $r" -ForegroundColor Red }
+}
+if ($stackOwner -eq 'desktop' -and $panes.Count -gt 0) {
+    # Two launchers over one stack is the port mess: each treats the other's processes as
+    # foreign and they fight over the same ports. Desktop's stack is the one running.
+    Write-Host ""
+    Write-Host "  !!! NOT STARTING: Pionir Desktop already owns this stack, and a second launcher beside it would collide on its ports." -ForegroundColor Red
+    Write-Host "      Would have started: $($panes.Count) pane(s) for what is missing. Start those from Pionir Desktop instead," -ForegroundColor Red
+    Write-Host "      or close Desktop's stack first (Desktop's own Stop), then run pionir.ps1. Nothing was started or stopped." -ForegroundColor Red
+    Write-Refused
+    exit 3
+}
 if ($panes.Count -eq 0) {
     Write-Host "  everything is already up; nothing to start." -ForegroundColor DarkCyan
+    Write-Refused
     if (-not $NoBrowser -and (Test-Port $Port)) { Start-Process (Dashboard-Url $Port) }
     exit 0
 }
@@ -536,15 +727,30 @@ Write-Host "  verifying bridges are actually up..." -ForegroundColor DarkGray
 $waitSeconds = 30
 if ($ports -contains 8782) { $waitSeconds = 90 }
 $deadline = (Get-Date).AddSeconds($waitSeconds)
+function Get-IdForPort([int]$p) {
+    if ($p -eq $Port) { return 'dashboard' }
+    return (@($script:registry.services | Where-Object { @($_.ports) -contains $p }) | Select-Object -First 1).id
+}
 $pending = [System.Collections.ArrayList]@($ports)
 while ($pending.Count -gt 0 -and (Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 800
     @($pending) | ForEach-Object { if (Test-Port $_) { [void]$pending.Remove($_) } }
 }
+Read-Stack
 foreach ($p in $ports) {
-    if (Test-Port $p) { Write-Host ("  up   :{0}" -f $p) -ForegroundColor Green }
+    $id = Get-IdForPort $p
+    $spec = Get-PortSpec $id
+    $s = Get-PortState $id $p
+    if ($s.State -eq 'ours-healthy') { Write-Host ("  up   :{0}" -f $p) -ForegroundColor Green }
+    elseif ($s.State -eq 'ours-unhealthy') { Write-Host ("  LISTENING :{0} - but {1} does not answer yet" -f $p, $spec.probe.path) -ForegroundColor Yellow }
+    elseif ($s.State -eq 'foreign') { Write-Host ("  DOWN :{0} - held by {1} (pid {2}), which is not {3}" -f $p, $s.Name, $s.OwnerPid, $spec.label) -ForegroundColor Red }
+    elseif ($spec.slow_start -and (Test-Running $spec)) {
+        # alive, port not open yet: the crew warms and measures its model first (it can wait on the card)
+        Write-Host ("  WARMING :{0} - {1} is alive; this port opens after its model warm-up. Not down; pionir doctor shows when it is up." -f $p, $spec.label) -ForegroundColor Yellow
+    }
     else { Write-Host ("  DOWN :{0} - did not answer in time" -f $p) -ForegroundColor Red }
 }
+Write-Refused
 if ($bryoStarted) {
     # Bryo has no port; verify the organism process actually came up.
     $alive = $false

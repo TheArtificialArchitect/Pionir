@@ -214,9 +214,9 @@ class LauncherTests(unittest.TestCase):
         self.assertLess(made, self.text.index("$panes += "))
         self.assertLess(self.text.index("if ($Stop)"), made)     # -Stop makes nothing
         self.assertIn("$bridgeTokensOk = ($LASTEXITCODE -eq 0)", self.text)
-        for port in ("8771", "8770"):
+        for sid, port in (("daedalus", "8771"), ("melete", "8770")):
             self.assertRegex(self.text, r"if \(-not \$bridgeTokensOk\) \{ \}\s+elseif "
-                                        rf"\(Test-Port {port}\)")
+                                        rf"\(\(Claim-Port '{sid}' {port} [^)]*\) -ne 'free'\)")
 
     def test_a_bridge_already_up_without_its_token_is_shouted_about(self) -> None:
         block = self.text[self.text.index("$tokenOut = & python -m pionir bridge-tokens"):
