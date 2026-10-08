@@ -157,8 +157,9 @@ def layout(entry: dict) -> str:
                 f"cli.py with an argparse main() - pyproject.toml already maps the command "
                 f"`{entry['command']}` to {entry['package']}.cli:main), so `python -m "
                 f"{entry['package']}` works\n"
-                "- unittest tests in tests/test_*.py, run with PYTHONPATH=src and "
-                "`python -m unittest discover -s tests`\n"
+                "- unittest tests in tests/test_*.py that import the package by its own "
+                f"name (`from {entry['package']} import ...`, never `from src.`): they are "
+                "run isolated with only src/ on the path\n"
                 "- Python 3.11 or newer and the standard library ONLY: no third-party "
                 "package, nothing to pip install")
     return (f"- the code in src/ as ES modules, and bin/{entry['command']}.js as the "

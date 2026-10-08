@@ -73,6 +73,7 @@ from ..log import log
 from ..orders import _NOT_SET_UP
 from ..result import Err, Ok, Result
 from ..worker import ErrorKind, WorkContext, make_output, never_raises
+from .review import SUITE_RUNNER
 from ..workers import _Base
 from . import backlog as bl
 from . import package, review, sandbox
@@ -799,8 +800,10 @@ class BuildsWorker(_Base):
 
     def _verify(self, entry: dict) -> str:
         if entry["language"] == "python":
-            # Daedalus runs a string command through PowerShell on this machine
-            return "$env:PYTHONPATH='src'; python -m unittest discover -s tests"
+            # Daedalus runs a string command through PowerShell on this machine. It is the
+            # review's OWN suite code, isolated (-I -S, only src/ on the path): a softer command
+            # once passed `from src.pkg import` in the build and was rejected by the review.
+            return f'python -I -S -c "{SUITE_RUNNER}"'
         return "node --test"
 
     def _intent(self, p: dict, kind: str) -> str:
