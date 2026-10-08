@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
@@ -56,7 +57,13 @@ def _parser() -> argparse.ArgumentParser:
     server.add_argument(
         "--no-browser", action="store_true", help="do not open the dashboard in a browser"
     )
-    commands.add_parser("doctor", help="check state integrity and specialist reachability")
+    doctor = commands.add_parser("doctor", help="check state integrity and specialist reachability")
+    doctor.add_argument(
+        "--fix", action="store_true",
+        help="apply the safe, reversible fixes (stale git/pid locks, a stale stop marker, "
+             "missing folders, a dead pane of a running pionir.ps1 stack); everything that "
+             "needs admin, money, a secret or a decision is printed as a command instead",
+    )
     commands.add_parser(
         "bridge-tokens",
         help="make the Daedalus and Melete tokens in ~/.pionir/secrets if missing (owner-only)",
@@ -375,6 +382,21 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
     }
 
 
+def _doctor_fixes(runtime: PionirRuntime, rows: list, report: dict, *, apply: bool) -> dict:
+    """``doctor_fix``: with ``--fix`` the safe fixes are applied; without it, described."""
+    from . import build_sandbox, doctor_fix, ports
+
+    def sandbox_why() -> str | None:
+        root = (os.environ.get("PIONIR_DAEDALUS_SANDBOX", "").strip()
+                or build_sandbox.default_sandbox_root())
+        return build_sandbox.load_setup(root)[1]
+
+    root = report.get("state_root")
+    return doctor_fix.run(apply=apply, state_root=Path(root) if root else None, rows=rows,
+                          bridge_report=report.get("bridge_auth") or {},
+                          sandbox_why=sandbox_why, reaudit=ports.audit)
+
+
 def _memory_output(runtime: PionirRuntime) -> dict[str, Any]:
     """What memory has DONE lately, with its stall alarms (memory_health.py) - the
     counts above only say what is in the store, which looked healthy while nothing
@@ -467,7 +489,9 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
         from . import ports
 
         report = _doctor(runtime)
-        report["ports"] = ports.summary(ports.audit())
+        rows = ports.audit()
+        report["ports"] = ports.summary(rows)
+        report["fixes"] = _doctor_fixes(runtime, rows, report, apply=bool(getattr(args, "fix", False)))
         _print(report)
         unavailable = any(
             item["status"] == "unavailable"
@@ -476,6 +500,8 @@ def _execute(args: argparse.Namespace, runtime: PionirRuntime) -> int:
         open_bridge = any("warning" in item for item in report["bridge_auth"].values())
         return int(unavailable or open_bridge
                    or bool(report["ports"]["alerts"])
+                   or bool(report["fixes"]["applied"]
+                           and report["fixes"]["counts"].get("failed"))
                    or report["routing_aim"]["status"] == "failing")
     if args.command == "capabilities":
         _print(_capabilities(runtime))

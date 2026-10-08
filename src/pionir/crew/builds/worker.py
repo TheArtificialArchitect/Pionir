@@ -1,4 +1,4 @@
-"""``builds.daedalus``: Daedalus builds one small product a night; Claude reviews every one.
+"""``builds.daedalus``: Daedalus builds small products overnight; Claude reviews every one.
 
 The owner's product line is small paid developer tools ($9-19 on Gumroad). This worker turns
 the product backlog (backlog.py) into staged products, one at a time:
@@ -13,7 +13,10 @@ the product backlog (backlog.py) into staged products, one at a time:
    config first, and runs the job on a contained Daedalus of its own. Pionir takes its exclusive GPU lease for the job (Moss's model steps aside),
    so: at most ONE job at a time, never one that cannot finish before the window ends
    (``budget_minutes``, default 75, per slice; its ``not_after`` is the window's end at the latest, and
-   Pionir cancels it there), at most one NEW product per night. The job is submitted with
+   Pionir cancels it there). Jobs run BACK TO BACK until the window has no room left
+   (``new_per_night``, default 0 = no cap; 1 is the old one-a-night rule), with
+   ``rest_minutes`` (default 10) between two jobs in which the card is Moss's again; Daedalus
+   or the GPU being busy is waiting, never a failure. The job is submitted with
    ``follow=0`` and followed on later runs through ``ctx.task``, so the one hands thread is
    never held for most of an hour.
 2. **Settle** the job: Daedalus's gate passed and a commit landed in the sandbox -> BUILT.
@@ -24,7 +27,11 @@ the product backlog (backlog.py) into staged products, one at a time:
    no secret or owner data, the licence) - then Claude, through the crew's no-tools review
    path on the daily Claude cap. Only an approval with every check true is staged. A
    rejection gets ONE Daedalus repair with the review's reasons; a second rejection is
-   SHELVED with a Discord note. Claude's budget spent -> the build waits (never approved by
+   SHELVED with a Discord note. A product shelved because it ran out of time, committed
+   nothing, or failed its tests gets exactly ONE second life (second_life.py: a bigger
+   budget, a sharper prompt naming the empty commit, or the failing test output fed back);
+   every other shelf reason, and a spent second life, is terminal (``terminal_why``).
+   Claude's budget spent -> the build waits (never approved by
    default); Claude failing ``REVIEW_ATTEMPTS`` times -> SHELVED with a note.
 4. **Stage** an approved build (package.py) as ``<products_dir>/<slug>/`` in exactly the
    shelf's format. From there products.shelf submits it for the owner's approval like any
@@ -77,6 +84,7 @@ from .review import SUITE_RUNNER
 from ..workers import _Base
 from . import backlog as bl
 from . import package, review, sandbox
+from . import second_life as sl
 from .window import Window, can_start, not_after
 
 BUILD = "coding.daedalus_build"
@@ -159,12 +167,29 @@ class BuildsWorker(_Base):
 
     def __init__(self, spec, *, window: str = "01:00-07:00", budget_minutes: int = 75,
                  max_attempts: int = 2, slices: int = 2, ssh_dir: str | None = "~/.ssh", test_timeout_seconds: float = review.TEST_TIMEOUT,
-                 review_timeout_seconds: float = REVIEW_TIMEOUT) -> None:
+                 review_timeout_seconds: float = REVIEW_TIMEOUT, new_per_night: int = 0,
+                 rest_minutes: int = 10, second_lives: bool = True,
+                 second_life_budget_minutes: int = 150) -> None:
         super().__init__(spec)
         self.window = Window.parse(window)
         if not 10 <= int(budget_minutes) <= 180:
             raise ValueError("budget_minutes must be 10 to 180")
         self.budget = int(budget_minutes) * 60
+        # back to back (2026-10-07): a night used 75 of its 360 minutes. 0 = new products until
+        # the window closes; 1 is the old "one new product a night"
+        if not 0 <= int(new_per_night) <= 10:
+            raise ValueError("new_per_night must be 0 (until the window closes) to 10")
+        self.new_per_night = int(new_per_night)
+        # between two jobs the GPU goes back to Moss for this long (her model is put back
+        # when the lease ends) before the next product or second life takes it again
+        if not 0 <= int(rest_minutes) <= 60:
+            raise ValueError("rest_minutes must be 0 to 60")
+        self.rest = int(rest_minutes) * 60
+        self.second_lives = bool(second_lives)
+        if not int(budget_minutes) <= int(second_life_budget_minutes) <= 180:
+            raise ValueError("second_life_budget_minutes must be budget_minutes to 180 (the "
+                             "adapter's cap)")
+        self.second_life_budget = int(second_life_budget_minutes) * 60
         if not 1 <= int(max_attempts) <= 3:
             raise ValueError("max_attempts must be 1 to 3 (a build and its repairs)")
         self.max_attempts = int(max_attempts)
@@ -335,6 +360,7 @@ class BuildsWorker(_Base):
     def _settle(self, ctx: WorkContext, rec: dict, p: dict, out, events: list) -> None:
         """What one job's outcome means for its product."""
         rec["active"] = None
+        rec["rest_until"] = ctx.now + self.rest     # Moss has the card back for a while
         a = p["attempts"][-1]
         a["finished_at"] = ctx.now
         a["pionir_status"] = out.status
@@ -354,12 +380,14 @@ class BuildsWorker(_Base):
                        if output.get("stage_failed") else "Daedalus reported it did not work"))
             a.update(outcome="gate_failed", stage_failed=output.get("stage_failed"),
                      why=_clip(why, 300), job_id=output.get("job_id"))
+            p["last_test_output"] = str(why)[-sl.MAX_TEST_OUTPUT:]
             self._failed_attempt(ctx, rec, p, f"Daedalus's own gate did not pass: "
                                  f"{_clip(why, 300)}", events)
         elif out.status == "failed" and out.error_type == "AdapterTimeout":
             a.update(outcome="timed_out", why=_clip(out.error, 600))
             self._failed_attempt(ctx, rec, p, f"it did not finish in its "
-                                 f"{self.budget // 60}-minute budget and was stopped"
+                                 f"{int(a.get('budget_minutes') or self.budget // 60)}"
+                                 "-minute budget and was stopped"
                                  f"{_where_it_stopped(out.error)}", events)
         elif out.status == "failed" and (out.error_type in PASSING_TYPES or (
                 not out.error_type and _PASSING.search(out.error or ""))):
@@ -456,6 +484,7 @@ class BuildsWorker(_Base):
     def _lost(self, ctx, rec, p, events, why) -> None:
         a = p["attempts"][-1]
         rec["active"] = None
+        rec["rest_until"] = ctx.now + self.rest
         a["finished_at"] = ctx.now
         try:
             head = sandbox.head(p["repo"], **self._git())
@@ -477,8 +506,17 @@ class BuildsWorker(_Base):
         return sum(1 for a in p["attempts"]
                    if a.get("outcome") in COUNTED and int(a.get("slice") or 1) == here)
 
+    def _allowed(self, p: dict) -> int:
+        """Real attempts allowed at the slice in hand: a build and its repair, and one more
+        while the product is on its second life at this slice."""
+        life = p.get("second_life") or {}
+        here = int(p.get("slice") or 1)
+        extra = 1 if life.get("state") == "running" and int(life.get("slice") or 1) == here \
+            else 0
+        return self.max_attempts + extra
+
     def _failed_attempt(self, ctx, rec, p, why: str, events: list) -> None:
-        if self._counted(p) < self.max_attempts:
+        if self._counted(p) < self._allowed(p):
             reviewed = bool(p.get("reviewed_head"))      # a review already rejected a version
             p.update(state="repair", waiting=None, retry_after=0.0,
                      repair_from="review" if reviewed else "attempt",
@@ -492,8 +530,15 @@ class BuildsWorker(_Base):
 
     # ---- reviewing a build -----------------------------------------------------------------
     def _review_one(self, ctx: WorkContext, rec: dict, events: list) -> None:
-        p = next((p for p in rec["products"].values() if p.get("state") == "built"
-                  and float(p.get("review_after") or 0) <= ctx.now), None)
+        if rec.get("active"):
+            # our contained test run reaps EVERY process of the sandbox user first - the
+            # build Daedalus in flight included - so no review runs while a job is in flight
+            # (back-to-back builds made that likely); it runs as soon as the job settles
+            return
+        # the one waiting longest first (the record's keys are saved sorted, not in order)
+        p = min((p for p in rec["products"].values() if p.get("state") == "built"
+                 and float(p.get("review_after") or 0) <= ctx.now),
+                key=lambda q: float(q.get("created_at") or 0), default=None)
         if p is None:
             return
         entry = p["entry"]
@@ -527,6 +572,7 @@ class BuildsWorker(_Base):
                 "tests_passed": suite.passed}
         reasons = review.suite_problems(suite)
         if reasons:
+            p["last_test_output"] = str(suite.tail or "")[-sl.MAX_TEST_OUTPUT:]   # kept verbatim
             p["reviews"].append({**base, "by": "our checks", "approved": False,
                                  "reasons": [_clip(r, 300) for r in reasons[:12]]})
             self._rejected(ctx, rec, p, reasons, events, by="our checks")
@@ -597,7 +643,7 @@ class BuildsWorker(_Base):
         events.append(self._event(ctx, "build.rejected", {
             "slug": p["slug"], "by": by, "reasons": [_clip(r, 160) for r in reasons[:5]]}))
         self._night_log(ctx, f"{p['slug']}: REJECTED by {by} - {_clip(text, 160)}")
-        if self._counted(p) < self.max_attempts:
+        if self._counted(p) < self._allowed(p):
             p.update(state="repair", repair_reasons=[_clip(r, 400) for r in reasons[:12]],
                      waiting=None, retry_after=0.0, repair_from="review")
         else:
@@ -613,6 +659,8 @@ class BuildsWorker(_Base):
                          f"{type(exc).__name__}: {_clip(exc, 240)}", events)
             return
         p.update(state="staged", staged=staged, waiting=None, staged_at=ctx.now)
+        if (p.get("second_life") or {}).get("state") == "running":
+            p["second_life"].update(state="succeeded", ended_at=ctx.now)
         self._night_log(ctx, f"{p['slug']}: APPROVED by Claude and staged")
         events.append(self._event(ctx, "build.staged", {
             "slug": p["slug"], "name": p["entry"]["name"],
@@ -637,9 +685,12 @@ class BuildsWorker(_Base):
                  shelved_at=ctx.now)
         if rec.get("active") and rec["active"].get("slug") == p["slug"]:
             rec["active"] = None
-        self._night_log(ctx, f"{p['slug']}: SHELVED - {_clip(why, 160)}")
-        events.append(self._event(ctx, "build.shelved", {"slug": p["slug"],
-                                                         "why": _clip(why, 200)}))
+        revive = self._judge_shelf(ctx, p)
+        self._night_log(ctx, f"{p['slug']}: SHELVED - {_clip(why, 160)}"
+                             + (" (a second life follows)" if revive else " (terminal)"))
+        events.append(self._event(ctx, "build.shelved", {
+            "slug": p["slug"], "why": _clip(why, 200), "second_life": bool(revive),
+            "terminal_why": _clip(p.get("terminal_why") or "", 200) or None}))
         last = next((r for r in reversed(p.get("reviews") or [])), None)
         lines = [f"**{p['slug']}** - {p['entry']['name']}", "", f"Why: {why}"]
         if last and last.get("reasons"):
@@ -647,11 +698,45 @@ class BuildsWorker(_Base):
             lines += [f"- {_clip(r, 240)}" for r in last["reasons"][:8]]
         lines += ["", f"Attempts: {self._counted(p)}. The sandbox repo stays at "
                       f"`{p.get('repo') or '(none)'}` for a look.",
-                  "Nothing was staged or put on sale. The worker moves on to the next "
-                  "product in the backlog."]
-        self._card(ctx, rec, f"builds:shelved:{p['slug']}", "shelved",
-                   f"Shelved: {p['entry']['name']}"[:120], "\n".join(lines))
+                  "Nothing was staged or put on sale."]
+        if revive:
+            plan = sl.plan(p["second_life"]["kind"],
+                           budget_minutes=self.second_life_budget // 60)
+            lines.append(f"It gets ONE second life when the GPU is next free in a window: "
+                         f"{plan}. Whatever it builds goes through the same checks, Claude's review "
+                         "and your approval.")
+        else:
+            lines.append(f"This is final: {p.get('terminal_why')}. The worker moves on to "
+                         "the next product in the backlog.")
+        key = f"builds:shelved:{p['slug']}" + (
+            ":final" if (p.get("second_life") or {}).get("state") == "spent" else "")
+        self._card(ctx, rec, key, "shelved", f"Shelved: {p['entry']['name']}"[:120],
+                   "\n".join(lines))
         self._save(ctx, rec)
+
+    def _judge_shelf(self, ctx, p: dict) -> bool:
+        """A shelved product: does it get its one second life (``second_life`` pending), or
+        is it terminal (``terminal_why`` says why)? A product shelved before this rule existed
+        is judged the same way the first time the worker looks at it."""
+        life = p.get("second_life") or {}
+        if life.get("state") == "running":
+            life.update(state="spent", ended_at=ctx.now)
+            p["terminal_why"] = f"its second life ({life.get('kind')}) failed too: " \
+                                f"{_clip(p.get('shelved_why'), 300)}"
+            return False
+        if life or p.get("terminal_why"):
+            return life.get("state") == "pending"
+        if not self.second_lives:
+            p["terminal_why"] = "second lives are switched off (second_lives: false)"
+            return False
+        kind, label = sl.classify(p)
+        if kind is None:
+            p["terminal_why"] = f"no second life: {label} (only a timeout, an empty commit or " \
+                                "failing tests is retried)"
+            return False
+        p["second_life"] = {"state": "pending", "kind": kind, "label": label,
+                            "why": _clip(p.get("shelved_why"), 500), "at": ctx.now}
+        return True
 
     # ---- starting a job --------------------------------------------------------------------
     def _maybe_start(self, ctx: WorkContext, rec: dict, doc, events: list) -> None:
@@ -667,27 +752,80 @@ class BuildsWorker(_Base):
                  None)
         if p is not None and float(p.get("retry_after") or 0) > ctx.now:
             return
+        if p is not None and not can_start(night, ctx.now, self._budget_for(p)):
+            return                                          # its (bigger) budget no longer fits
         if p is None:
-            if any(q.get("state") in ("building", "built") for q in products.values()):
-                return                                      # still in flight or in review
-            if rec["nights"][night.key].get("started"):
-                return                                      # one new product a night
-            if doc is None:
-                return
-            entry = bl.choose(doc["products"], set(products), ctx.goal,
-                              demand.build_preference(ctx.state_dir, ctx.now))
-            if entry is None:
-                return
-            if not self._tools_ready(ctx, rec, night, entry, events):
-                return                                      # before a repo is even made
-            p = self._new_product(ctx, rec, entry, night, events)
+            if any(q.get("state") == "building" for q in products.values()):
+                return                                      # still in flight
+            if float(rec.get("rest_until") or 0) > ctx.now:
+                return                                      # the GPU is Moss's for a while
+            # back to back: a shelved product's one second life first, then a new product,
+            # for as long as the window has room (a built one waits for its review meanwhile:
+            # no review runs while a job is in flight, see _review_one)
+            p = self._second_life(ctx, rec, night, events)
             if p is None:
-                return
+                if self.new_per_night and sum(
+                        1 for q in products.values()
+                        if q.get("night") == night.key) >= self.new_per_night:
+                    return                                  # the owner capped new products
+                if doc is None:
+                    return
+                entry = bl.choose(doc["products"], set(products), ctx.goal,
+                                  demand.build_preference(ctx.state_dir, ctx.now))
+                if entry is None:
+                    return
+                if not self._tools_ready(ctx, rec, night, entry, events):
+                    return                                  # before a repo is even made
+                p = self._new_product(ctx, rec, entry, night, events)
+                if p is None:
+                    return
         elif not self._tools_ready(ctx, rec, night, p["entry"], events, p):
             return
         if self._landed_meanwhile(ctx, rec, p, events):
             return
         self._submit(ctx, rec, p, night, events)
+
+    def _budget_for(self, p: dict) -> int:
+        """A job's budget in seconds: the bigger one only for a timed-out product's second
+        life, at the slice that timed out."""
+        life = p.get("second_life") or {}
+        if life.get("state") == "running" and life.get("kind") == sl.TIMEOUT \
+                and int(life.get("slice") or 1) == int(p.get("slice") or 1):
+            return self.second_life_budget
+        return self.budget
+
+    def _second_life(self, ctx, rec: dict, night, events: list) -> dict | None:
+        """The oldest shelved product with a second life pending that fits in what is left of
+        the window: back to ``repair`` at its own slice, with the reason it was shelved."""
+        if not self.second_lives:
+            return None
+        shelved = sorted((q for q in rec["products"].values() if q.get("state") == "shelved"),
+                         key=lambda q: float(q.get("shelved_at") or q.get("created_at") or 0))
+        for p in shelved:
+            if not self._judge_shelf(ctx, p):
+                continue                                    # terminal; the record says why
+            life = p["second_life"]
+            budget = self.second_life_budget if life["kind"] == sl.TIMEOUT else self.budget
+            if not can_start(night, ctx.now, budget) or not p.get("repo") or not p.get("base"):
+                continue
+            if not self._tools_ready(ctx, rec, night, p["entry"], events, p):
+                return None
+            reviewed = bool(p.get("reviewed_head"))
+            life.update(state="running", started_at=ctx.now, night=night.key,
+                        slice=int(p.get("slice") or 1))
+            p.update(state="repair", waiting=None, retry_after=0.0,
+                     repair_from="review" if reviewed else "attempt",
+                     repair_reasons=[_clip(p.get("shelved_why"), 400)] + (
+                         list(p.get("repair_reasons") or [])[:11] if reviewed else []))
+            self._night_log(ctx, f"{p['slug']}: second life ({life['kind']}) - "
+                                 f"{sl.plan(life['kind'], budget_minutes=budget // 60)}")
+            events.append(self._event(ctx, "build.second_life", {
+                "slug": p["slug"], "kind": life["kind"], "why": _clip(life.get("why"), 200),
+                "budget_minutes": budget // 60}))
+            self._save(ctx, rec)
+            return p
+        self._save(ctx, rec)                                # judgements of old shelves kept
+        return None
 
     def _tools_ready(self, ctx, rec, night, entry: dict, events: list, p: dict | None = None) -> bool:
         """A Python build is gated on its tests (Daedalus's G2 runs pytest): with no pytest in
@@ -807,6 +945,16 @@ class BuildsWorker(_Base):
         return "node --test"
 
     def _intent(self, p: dict, kind: str) -> str:
+        life = p.get("second_life") or {}
+        here = int(p.get("slice") or 1)
+        if life.get("state") != "running" or int(life.get("slice") or 1) != here:
+            return self._intent_body(p, kind)
+        head = sl.preface(life.get("kind"), p, minutes=self._budget_for(p) // 60,
+                          verify=self._verify(p["entry"]))[:4000]
+        # the preface comes first and is never cut; the body shrinks to its short form
+        return head + "\n\n" + self._intent_body(p, kind, room=7800 - len(head))
+
+    def _intent_body(self, p: dict, kind: str, room: int = 7800) -> str:
         e = p["entry"]
         verify = self._verify(e)
         reasons_list = p.get("repair_reasons") or []
@@ -821,7 +969,7 @@ class BuildsWorker(_Base):
             features = "\n".join(f"- {f}" for f in e["features"])
             tests = "\n".join(f"- {t}" for t in e["acceptance"])
             slice_no, total = int(p.get("slice") or 1), int(p.get("slices") or 1)
-            lead = _slice_lead(slice_no, total, self.budget // 60)
+            lead = _slice_lead(slice_no, total, self._budget_for(p) // 60)
             if kind == "repair" and reasons_list:
                 lead += (" The previous attempt at this did not finish (" + reasons_list[0]
                          + "). Nothing from it was kept: work in small steps, write a test, "
@@ -836,24 +984,28 @@ class BuildsWorker(_Base):
                     f"Honest limits (the README says these): {e['limits']}\n\n"
                     f"Layout:\n{sandbox.layout(e)}\n\nRules:\n{sandbox.RULES}\n"
                     f"When you finish, all tests must pass with: {verify}")
-        if len(text) > 7800:
+        if len(text) > room:
             text = (f"Work in this repository ({p['repo']}) on {e['name']}. BRIEF.md is the full "
                     "specification: " + ("fix every problem listed below" if kind == "repair"
                                          else "build everything it asks for")
                     + f".\n\nRules:\n{sandbox.RULES}\nAll tests must pass with: {verify}\n\n"
-                    + "\n".join(f"- {r}" for r in reasons_list)[:3000])
-        return text[:7900]
+                    + "\n".join(f"- {r}" for r in reasons_list)[:max(0, min(3000, room - 2500))])
+        return text[:max(room, 1500) + 100]
 
     def _submit(self, ctx: WorkContext, rec: dict, p: dict, night, events: list) -> None:
         kind = "repair" if p.get("state") == "repair" else "build"
-        deadline = not_after(night, ctx.now, self.budget)
+        budget = self._budget_for(p)
+        deadline = not_after(night, ctx.now, budget)
         n = len(p["attempts"]) + 1
         build_id = f"{p['slug']}-{n}-{secrets.token_hex(4)}"
         payload = {"intent": self._intent(p, kind), "repo": p["repo"],
-                   "verify": self._verify(p["entry"]), "budget_seconds": self.budget,
+                   "verify": self._verify(p["entry"]), "budget_seconds": budget,
                    "not_after": deadline, "build_id": build_id}
         a = {"n": n, "kind": kind, "submitted_at": ctx.now, "not_after": deadline,
-             "night": night.key, "build_id": build_id, "slice": int(p.get("slice") or 1)}
+             "night": night.key, "build_id": build_id, "slice": int(p.get("slice") or 1),
+             "budget_minutes": budget // 60}
+        if (p.get("second_life") or {}).get("state") == "running":
+            a["second_life"] = p["second_life"]["kind"]
         p["attempts"].append(a)
         # one product a night: a repair of an earlier night's product counts as tonight's
         rec["nights"][night.key]["started"] = rec["nights"][night.key].get("started") \
@@ -875,7 +1027,8 @@ class BuildsWorker(_Base):
                                  f"{_hm(deadline)}")
             events.append(self._event(ctx, "build.started", {
                 "slug": p["slug"], "kind": kind, "attempt": n,
-                "budget_minutes": self.budget // 60, "not_after": _hm(deadline)}))
+                "budget_minutes": budget // 60, "not_after": _hm(deadline),
+                "second_life": a.get("second_life")}))
             self._save(ctx, rec)
             return
         if out.status == "failed" and (out.error_type == "CapabilityNotFound"
@@ -992,7 +1145,8 @@ class BuildsWorker(_Base):
             e = p["entry"]
             out += ["", f"**{p['slug']}** - {e['name']} (${e['price_cents'] / 100:.2f})"]
             for a in p.get("attempts") or []:
-                out.append(f"- {a.get('kind', 'build')} #{a['n']}: "
+                out.append(f"- {a.get('kind', 'build')} #{a['n']}"
+                           + (" (second life)" if a.get("second_life") else "") + ": "
                            f"{a.get('outcome') or 'running'}"
                            + (f" - {_clip(a.get('why'), 160)}" if a.get("why") else ""))
             last = (p.get("reviews") or [None])[-1]
@@ -1010,6 +1164,10 @@ class BuildsWorker(_Base):
                            "your approval; nothing is on sale until you approve it")
             elif state == "shelved":
                 out.append(f"- SHELVED: {_clip(p.get('shelved_why'), 240)}")
+                if (p.get("second_life") or {}).get("state") == "pending":
+                    out.append("  - it gets one second life in a coming window")
+                elif p.get("terminal_why"):
+                    out.append(f"  - final: {_clip(p.get('terminal_why'), 200)}")
             else:
                 out.append(f"- now: {state}" + (f" ({_clip(p.get('waiting'), 160)})"
                                                  if p.get("waiting") else ""))
@@ -1062,6 +1220,10 @@ class BuildsWorker(_Base):
                                                 if p.get("state") == "shelved"][-5:],
                                     "next_in_backlog": free[:5],
                                     "backlog_unusable": (doc or {}).get("malformed", [])[:3],
+                                    "second_lives": [
+                                        {"slug": p["slug"], "kind": p["second_life"].get("kind"),
+                                         "state": p["second_life"].get("state")}
+                                        for p in products if p.get("second_life")][-5:],
                                     "daedalus_down": bool(rec.get("daedalus_down_since")),
                                     "cards_unposted": len(rec["unposted"])},
                            figures=figures, entities=self.entities,

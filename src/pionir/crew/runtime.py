@@ -67,6 +67,12 @@ LEADER_FIRST_DELAY = 90.0
 # leaders' escalations - is daytime work the owner is around for.
 NIGHT_IMPLS = frozenset({"daedalus_builds", "api_builder"})
 FIRST_CHECKPOINT_SECONDS = 60
+# How stale "the crew was last alive at" may get. Both launchers stop the crew with a hard
+# kill (Desktop: taskkill /T /F; pionir.ps1: Stop-Process -Force), so no final checkpoint is
+# written, and every stop used to be recorded from the last checkpoint - up to
+# checkpoint_seconds (300) early. 43 recorded stops (2026-09-25..10-07) were each overstated
+# by up to 5 minutes. A heartbeat is one tiny meta write.
+HEARTBEAT_SECONDS = 30.0
 
 
 class Crew:
@@ -140,6 +146,7 @@ class Crew:
         self.checkpoints = 0
         self.steps = 0
         self._next_checkpoint = 0.0
+        self._next_heartbeat = 0.0
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="pionir-crew-loop", daemon=True)
         # Built here, served from start(): building a crew opens no socket.
@@ -207,10 +214,15 @@ class Crew:
             gap = max(0.0, now - float(saved_real))
             self.store.record_pause(float(saved_real), now, self.clock.t,
                                     "process was not running")
+            # this gap is recorded: an instance that dies before its first checkpoint must not
+            # record it AGAIN on the next start (rows #8/#9, #17/#18, #19/#20 and #32/#33 of
+            # the live pauses table shared one stopped_real and counted 18.6 minutes twice)
+            self.store.set("saved_real", now)
             self.paused_seconds_total = float(self.store.get("paused_total", 0.0)) + gap
             self.store.set("paused_total", self.paused_seconds_total)
             log.info("crew resumed after %.0f s not running", gap)
         self._next_checkpoint = now + FIRST_CHECKPOINT_SECONDS
+        self._next_heartbeat = now + HEARTBEAT_SECONDS
 
     def all_cadences(self) -> dict:
         return {**self.registry.cadences(),
@@ -314,8 +326,15 @@ class Crew:
                 with self._llock:
                     self._leaders_busy.discard(lead.leader_id)
         safe("vitals", self.vitals.check)
+        self._beat(now)
+
+    def _beat(self, now: float) -> None:
+        """The checkpoint when it is due, else a heartbeat when that is due."""
         if now >= self._next_checkpoint:
             safe("crew.checkpoint", self.checkpoint)
+        elif now >= self._next_heartbeat:
+            safe("crew.heartbeat", lambda: self.store.set("saved_real", now))
+            self._next_heartbeat = now + HEARTBEAT_SECONDS
 
     def _run(self) -> None:
         while not self._stop.is_set():

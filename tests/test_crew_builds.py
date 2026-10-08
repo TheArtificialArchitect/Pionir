@@ -732,13 +732,16 @@ class ReviewTests(_Case):
         self.assertEqual(note["kind"], "shelved")
         self.assertIn("still no --recursive flag", note["body"])
         self.assertFalse((self.shelf / "exif-strip").exists())
-        # no third job for it, and no new product the same night
+        # rejected by Claude twice: final, no second life and no third job for it
+        self.assertIn("no second life", p["terminal_why"])
+        self.assertIn("This is final", note["body"])
+        # back to back: the same night takes the next product, once the GPU has rested
         for minute in (30, 45):
             self.run_at(at(1, 3, minute))
-        self.assertEqual(len(self.pionir.builds()), 2)
-        # the next night takes the next product
-        self.run_at(at(2, 1, 30))
+        self.assertEqual(len(self.pionir.builds()), 3)
         self.assertTrue(self.pionir.builds()[2].payload["repo"].endswith("csv-to-ics"))
+        self.assertFalse(any(j.payload["repo"].endswith("exif-strip")
+                             for j in self.pionir.builds()[2:]))
 
     def test_a_repair_that_commits_nothing_new_is_a_failed_attempt(self) -> None:
         self.build_night(answers=[reject()])
@@ -747,6 +750,7 @@ class ReviewTests(_Case):
         self.assertEqual(self.product_state("exif-strip")["state"], "shelved")
 
     def test_claudes_budget_waits_and_is_never_an_approval(self) -> None:
+        self.worker.new_per_night = 1        # no second product meanwhile: the review alone
         self.build_night(answers=[])                         # the cap is spent
         p = self.product_state("exif-strip")
         self.assertEqual(p["state"], "built")
@@ -759,6 +763,7 @@ class ReviewTests(_Case):
 
     def test_claude_failing_or_answering_nonsense_is_retried_then_shelved(self) -> None:
         failed = Err(ClaudeRefusal("failed", "Claude did not answer: TimeoutExpired"))
+        self.worker.new_per_night = 1        # no second product meanwhile: the review alone
         self.build_night(answers=[failed])
         self.assertEqual(self.product_state("exif-strip")["review_failures"], 1)
         self.answers.append("I think it is fine.")        # not a verdict
@@ -803,7 +808,8 @@ class ReviewTests(_Case):
 
 
 class NightTests(_Case):
-    def test_one_product_a_night(self) -> None:
+    def test_new_per_night_one_is_the_old_one_product_a_night(self) -> None:
+        self.worker.new_per_night = 1
         self.build_night(answers=[approve()])
         self.assertEqual(self.product_state("exif-strip")["state"], "staged")
         for hour in (2, 3, 4, 5):
@@ -811,6 +817,15 @@ class NightTests(_Case):
         self.assertEqual(len(self.pionir.builds()), 1)
         self.run_at(at(2, 1, 30))
         self.assertEqual(len(self.pionir.builds()), 2)
+
+    def test_products_run_back_to_back_until_the_window_has_no_room(self) -> None:
+        self.assertEqual(self.worker.new_per_night, 0)       # the shipped default
+        self.build_night(answers=[approve()])                # staged at 01:50
+        self.run_at(at(1, 1, 55))                            # the GPU rests (Moss's turn)
+        self.assertEqual(len(self.pionir.builds()), 1)
+        self.run_at(at(1, 2, 0))
+        self.assertEqual(len(self.pionir.builds()), 2)
+        self.assertTrue(self.pionir.builds()[1].payload["repo"].endswith("csv-to-ics"))
 
     def test_the_nightly_report_says_what_was_built_and_where_it_is(self) -> None:
         self.build_night(answers=[approve()])
