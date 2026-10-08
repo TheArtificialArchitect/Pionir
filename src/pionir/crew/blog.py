@@ -15,12 +15,12 @@ One run:
    exactly one post. (A bare 24 hours after the last draft drifted a run later every day -
    23:04, 04:45, 10:26 - so some digests got none: the 10:26 draft came an hour after the
    09:00 digest.) With no digest known, it is every ``draft_every_seconds``.
-3. **A topic**: the evergreen seed, tied to a real product, that the division's goal as
-   Moss set it matches best - otherwise, or with no goal, for the blog the first seed about
-   the product with the highest measured demand (products.demand's ``demand.json``), and
-   failing that the next seed in the rotation.
-   The goal steers among the seeds; it is never a post's subject itself. A topic or slug
-   already used is never used again (the record).
+3. **A topic** (topics.py): one of the paid API guides we sell, at one of several angles,
+   that the division's goal as Moss set it matches best - otherwise the best by measured
+   demand (products.demand's ``demand.json``: the product's usage, the guide's views and
+   free-tool click-throughs, less what this worker already wrote on it), and failing that
+   the fallback order (the evergreen seeds, then the generated topics). The goal steers;
+   it is never a post's subject itself. A topic or slug already used is not used again.
 4. **Words from the shared brain only** (``ctx.words``: JSON schema, temperature 0,
    charged to this division). This module imports no model.
 5. **The worker repairs, then inserts the links itself.** ``repair`` mends two things the
@@ -31,10 +31,17 @@ One run:
    API, and the paid offer that fits the topic (a live Gumroad product, else /hire) - each
    carry the blog's UTM tags, and only THEN does ``contentcheck.check`` run - on the exact
    dict that would be submitted.
-6. **Blocked**: recorded with its reasons, loudly, and NOT submitted. One fresh draft is
-   allowed per run, with the reasons in the prompt; a topic blocked on an earlier day
-   starts its first draft with its last block's reasons (the model runs at temperature 0,
-   so without them it writes the same draft again). **Passed**: submitted as
+6. **Blocked**: first MENDED (postfix.py) - the literals the check quoted become
+   placeholders, then only the flagged sentences are rewritten by the shared brain - each
+   step checked again; still blocked, it is recorded with its reasons, loudly, and NOT
+   submitted. A run drafts afresh, with the reasons in the prompt, up to
+   ``drafts_per_run`` times, within ``local_drafts_per_day``; a day with budget left and no
+   post is drafted again on the next run. A topic blocked on an earlier day starts its first
+   draft with its last block's reasons (the model runs at temperature 0, so without them it
+   writes the same draft again). After ``claude_after_blocked`` blocked drafts in a day, a
+   worker with ``claude_drafts_per_day`` above 0 asks Claude for ONE draft (``claude -p`` on
+   the owner's Max, the API key removed, no tools), checked and approved like any other and
+   logged in ``claude_drafts``. **Passed**: submitted as
    ``Job("content.publish", {draft_id, slug, title, description, body_md, tags})``; Pionir
    parks it for the owner, and it is recorded as PENDING APPROVAL - never as published.
    The record keeps that exact payload with the post (``payload``): once published it is
@@ -53,7 +60,7 @@ import json
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import ClassVar
@@ -61,7 +68,7 @@ from urllib.parse import urlsplit
 
 from pionir import atomic
 
-from . import contentcheck
+from . import contentcheck, postfix, topics
 from .figures import Figure
 from .hands import Job, outcome_of
 from .log import log
@@ -73,6 +80,20 @@ CAPABILITY = "content.publish"
 SITE = "https://api.dokaz.net"
 MAX_SLUG = 50              # "YYYY-MM-DD-" + slug stays inside draft_id's 64
 MAX_TOPIC_BLOCKS = 3       # days a topic may be blocked before it is retired
+# A run keeps drafting (a fresh draft, with the last one's reasons) until one passes, up to
+# DRAFTS_PER_RUN; a day allows LOCAL_DRAFTS_PER_DAY in all. A day whose budget is not spent
+# and has no post yet is drafted again on the next run. The way back from a spent day is the
+# next UTC day.
+DRAFTS_PER_RUN = 3
+LOCAL_DRAFTS_PER_DAY = 6
+# After this many local drafts blocked in one UTC day, a worker whose claude_drafts_per_day
+# is above 0 may ask Claude (``claude -p`` on the owner's Max, the API key removed) for ONE
+# draft that day. It goes through the same check and the same approval.
+CLAUDE_AFTER_BLOCKED = 3
+# A pinned Sonnet-class id (escalation.DEFAULT_CLAUDE_MODEL, repeated here so this module
+# imports nothing that can reach a model; a test holds the two equal).
+CLAUDE_MODEL = "claude-sonnet-5"
+_MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,63}")
 DRAFT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -174,7 +195,14 @@ may write with a capital letter are: {names}. Every other word is lower case unl
 starts a sentence.
 - Write an acronym as the acronym (SVG, JSON, PDF) and never spell it out: write SVG, \
 never the words it stands for. Use only acronyms from the names above.
-- Title and headings in sentence case: only the first word capitalised.
+- Title and headings in sentence case: only the first word capitalised. A bold or italic \
+label at the start of a list item is in sentence case too ("**Error correction level**:"). \
+Every sentence, heading and list item still starts with a capital letter, as normal \
+English does.
+- Use American spelling (summarization, customize, color).
+- Name no browser, library, framework, app, tool, service or platform other than the names \
+above, and no competitor: describe what a thing does instead.
+- Write no word in all capitals except the acronyms above.
 - No numbers about the business: no counts of customers, users or sales, no revenue, no \
 prices, no money amounts. Never write "we made", "we earned", "we sold" or "our revenue".
 - No email addresses, phone numbers, IP addresses or street addresses, not even made-up \
@@ -187,7 +215,9 @@ invoice number"), never by an example value.
 handle, write a placeholder in curly braces, lower case with hyphens, such as \
 {{invoice-number}}, {{company-name}} or {{customer-email}}, instead of inventing one.
 - Code is optional. If you show any, show only a JSON request body in a fenced block, \
-with lower-case keys, placeholders as values, and no keys, tokens, headers or URLs.
+with lower-case keys, placeholders as values, and no keys, tokens, headers or URLs. Never \
+show a file format, markup or a command line (no vCard text, no HTML, no meta tags), and \
+never write an angle bracket, not even inside backticks.
 - title: 10 to 120 characters. description: one or two sentences, 60 to 280 characters. \
 body_md: 400 to 1200 words. slug: a few lower-case words joined by hyphens. tags: up to \
 five lower-case words, hyphens instead of spaces."""
@@ -206,16 +236,24 @@ HIRE = Offer(f"{SITE}/hire", "have us build it for you")
 # really on sale: the Gumroad listing (product.gumroad_list, 2026-10-04) has obol-pro,
 # metron, approval-gate, card-press and post-guard live. A topic none of them serves gets
 # HIRE. A product taken off sale must be taken out of here in the same change.
+OBOL = Offer("https://dokaz.gumroad.com/l/obol-pro",
+             "Obol on Gumroad: invoices and estimates with no subscription")
 OFFERS = {
-    "invoice-pdf-from-json": Offer("https://dokaz.gumroad.com/l/obol-pro",
-                                   "Obol on Gumroad: invoices and estimates with no "
-                                   "subscription"),
+    "invoice-pdf-from-json": OBOL,
+}
+# The same, by the API product a topic's guide sells (demand.GUIDES): every generated topic on
+# the invoice guide points at Obol too.
+OFFERS_BY_PRODUCT = {
+    "invoice": OBOL,
 }
 
 
 def offer_for(topic: Topic) -> Offer:
     """The paid offer a post on this topic points to: its product, or else /hire."""
-    return OFFERS.get(topic.key, HIRE)
+    if topic.key in OFFERS:
+        return OFFERS[topic.key]
+    from .demand import GUIDES
+    return OFFERS_BY_PRODUCT.get(GUIDES.get(topic.path, ""), HIRE)
 
 
 # ---- repairing the model's words before they are assembled ----------------------------
@@ -404,12 +442,35 @@ class DailyPoster(_Base):
     link_missing = "gave no URL for the post"
     record_what = "this worker's own event counts"
 
-    def __init__(self, spec, *, draft_every_seconds: int = 86400) -> None:
+    text_fields: tuple = ()          # the model's words a repair may change
+
+    def __init__(self, spec, *, draft_every_seconds: int = 86400,
+                 drafts_per_run: int = DRAFTS_PER_RUN,
+                 local_drafts_per_day: int = LOCAL_DRAFTS_PER_DAY,
+                 model_repairs: bool = True,
+                 claude_drafts_per_day: int = 0,
+                 claude_after_blocked: int = CLAUDE_AFTER_BLOCKED,
+                 claude_model: str = CLAUDE_MODEL,
+                 claude_timeout_seconds: int = 300) -> None:
         super().__init__(spec)
-        if isinstance(draft_every_seconds, bool) or not isinstance(draft_every_seconds, int) \
-                or draft_every_seconds <= 0:
-            raise ValueError("draft_every_seconds is a positive whole number of seconds")
+        for name, value, least in (("draft_every_seconds", draft_every_seconds, 1),
+                                   ("drafts_per_run", drafts_per_run, 1),
+                                   ("local_drafts_per_day", local_drafts_per_day, 1),
+                                   ("claude_drafts_per_day", claude_drafts_per_day, 0),
+                                   ("claude_after_blocked", claude_after_blocked, 1),
+                                   ("claude_timeout_seconds", claude_timeout_seconds, 1)):
+            if isinstance(value, bool) or not isinstance(value, int) or value < least:
+                raise ValueError(f"{name} is a whole number, at least {least}")
         self.draft_every_seconds = draft_every_seconds
+        self.drafts_per_run = drafts_per_run
+        self.local_drafts_per_day = local_drafts_per_day
+        self.model_repairs = bool(model_repairs)
+        self.claude_drafts_per_day = claude_drafts_per_day
+        self.claude_after_blocked = claude_after_blocked
+        if not isinstance(claude_model, str) or not _MODEL_ID.fullmatch(claude_model):
+            raise ValueError("claude_model is a plain model id, e.g. claude-sonnet-5")
+        self.claude_model = claude_model
+        self.claude_timeout_seconds = claude_timeout_seconds
 
     # ---- the record: what it drafted, what it used, what became of each post ----------
     def record_path(self, state_dir: Path) -> Path:
@@ -516,7 +577,7 @@ class DailyPoster(_Base):
         blocked = [b for b in rec.get("blocked") or [] if isinstance(b, dict)]
         last = rec.get("last_drafted_at")
         window = self.output_window_seconds()
-        topics_left = sum(1 for t in SEEDS if t.key not in (rec.get("used_topics") or []))
+        topics_left = topics.topics_left(rec)
         out.update({
             "last_run_at": rec.get("last_run_at"),
             "last_drafted_at": last,
@@ -539,8 +600,9 @@ class DailyPoster(_Base):
         start = since if since is not None else float(
             rec.get("first_run_at") or _first_seen(rec, now))
         if topics_left == 0 and not out["pending"]:
-            out["alert"] = ("has used every topic and will draft nothing more until a new "
-                            "seed topic is added")
+            out["alert"] = ("has used every topic and will draft nothing more until the "
+                            f"oldest may come back ({int(topics.REUSE_AFTER // 86400)} days "
+                            "after its use) or a guide is added (topics.py)")
         elif now - start > window:
             hours = round((now - start) / 3600)
             what = (f"its last post reached the owner {hours} h ago" if since is not None
@@ -617,32 +679,30 @@ class DailyPoster(_Base):
             "draft_id": post["draft_id"], "status": status, "why": _clip(why, 160)}))
 
     # ---- 2-6. one draft, checked, and submitted if it passed ------------------------------
-    def choose_topic(self, rec: dict, goal: str | None, demand=()) -> Topic | None:
-        """The free seed the goal's words match best; with no goal, or a goal that matches
-        no seed, the first free seed about the highest-demand product in ``demand`` (API
-        product ids, best first: ``demand_products``); else the next seed in the rotation.
-        The goal only steers among the seeds: it is an instruction to the division, never a
-        post's subject (Moss's "report only what the workers measured ... publish one good
-        post a day" once would have been one). The goal always wins over the demand."""
-        used = set(rec["used_topics"])
-        free = [t for t in SEEDS if t.key not in used]
-        if goal:
-            words = set(re.findall(r"[a-z0-9-]+", goal.lower()))
-            scored = sorted(((len(words & set(t.words)), i, t) for i, t in enumerate(free)),
-                            key=lambda x: (-x[0], x[1]))
-            if scored and scored[0][0] > 0:
-                return scored[0][2]
-        if demand:
-            from .demand import prefer_topic
-            topic = prefer_topic(free, demand)
-            if topic is not None:
-                return topic
-        return free[0] if free else None
+    def choose_topic(self, rec: dict, goal: str | None, demand: dict | None = None,
+                     now: float | None = None) -> Topic | None:
+        """The next topic (topics.py): the free topic the goal's words match best; else the
+        best by measured demand (``demand``: a fresh demand.json, ``topics.read``); else the
+        fallback order - the seeds, then the generated topics. The goal only steers: it is an
+        instruction to the division, never a post's subject (Moss's "report only what the
+        workers measured ... publish one good post a day" once would have been one)."""
+        return topics.choose(rec, goal, demand, now)
 
-    def demand_products(self, ctx: WorkContext) -> list:
-        """The API products measured demand ranks first (products.demand), for the topic
-        choice; none here - a worker that is steered by demand says so."""
-        return []
+    def demand_doc(self, ctx: WorkContext) -> dict | None:
+        """A fresh demand.json (products.demand), or None: the fallback order."""
+        from .demand import read_demand
+        return read_demand(ctx.state_dir, ctx.now)
+
+    def _today(self, rec: dict, now: float) -> dict:
+        """This UTC day's drafting ledger: local drafts, blocks, repairs, Claude drafts. A new
+        day starts a new one (the way back from a spent budget)."""
+        day = _day(now)
+        led = rec.get("today")
+        if not isinstance(led, dict) or led.get("day") != day:
+            led = {"day": day, "local": 0, "blocked": 0, "model_repairs": 0, "claude": 0,
+                   "submitted": 0, "blocked_topics": []}
+            rec["today"] = led
+        return led
 
     def _draft_and_submit(self, ctx: WorkContext, rec: dict, events: list) -> Result | None:
         if ctx.words is None:
@@ -651,38 +711,55 @@ class DailyPoster(_Base):
         if ctx.job is None:
             return self._err(ErrorKind.NOT_CONFIGURED, "no hands: a post reaches the owner "
                              "only through Pionir", retryable=False)
-        topic = self.choose_topic(rec, ctx.goal, self.demand_products(ctx))
+        topic = self.choose_topic(rec, ctx.goal, self.demand_doc(ctx), ctx.now)
         if topic is None:
-            log.warning("%s: every topic has been used; nothing to draft until a goal or a "
-                        "new seed topic is given", self.worker_id)
+            log.warning("%s: every topic has been used within the last %d days; nothing to "
+                        "draft until one may come back", self.worker_id,
+                        int(topics.REUSE_AFTER // 86400))
             return None
+        led = self._today(rec, ctx.now)
         # The model runs at temperature 0: a topic blocked on an earlier day, drafted again
         # with no reasons, comes back as the same draft and the same block. Its first draft
         # today already knows why its last one was thrown away.
         reasons: list = self._last_block_reasons(rec, topic)
         submitted = False
-        for attempt in (1, 2):      # one fresh draft per run, at most, after a block
+        wrote = 0
+        for attempt in range(1, self.drafts_per_run + 1):
+            if led["local"] >= self.local_drafts_per_day:
+                break
             got = ctx.words(self.purpose, self._system(),
                             self._prompt(topic, ctx.goal, reasons), self.schema)
             if isinstance(got, Err):
-                if attempt == 1:
+                if wrote == 0:
                     return got          # no words came: nothing was drafted, the day is not used
                 break
-            rec["last_drafted_at"] = ctx.now
+            wrote += 1
+            led["local"] += 1
             self._count(rec, "drafts_written")
-            draft = self.assemble(got.value, topic, rec, ctx.now)
-            reasons = self.check_draft(draft)
+            draft, reasons, first, mended = self._mend(ctx, rec, led, topic, got.value)
             if reasons:
-                self._blocked(ctx, rec, topic, draft, reasons, attempt, events)
+                led["blocked"] += 1
+                self._blocked(ctx, rec, topic, draft, reasons, attempt, events,
+                              first=first, mended=mended)
                 continue
-            self._submit(ctx, rec, topic, draft, events)
+            self._submit(ctx, rec, topic, draft, events, mended=mended)
             submitted = True
             break
+        if not submitted and self._claude_due(ctx, led):
+            submitted = self._claude_draft(ctx, rec, led, topic, reasons, events)
+        if submitted:
+            led["submitted"] += 1
+        # The day's drafting is settled - and the next draft waits for the next digest - once
+        # a post went out, or the day's local drafts are spent. Until then the next run drafts
+        # again (a blocked run is not a lost day).
+        if wrote and (submitted or led["local"] >= self.local_drafts_per_day):
+            rec["last_drafted_at"] = ctx.now
         # A topic is used up by a submitted post, not by a blocked day: with a strict check,
-        # burning a topic per block would exhaust the seeds having published nothing. A topic
+        # burning a topic per block would exhaust the topics having published nothing. A topic
         # blocked on MAX_TOPIC_BLOCKS days is retired, loudly - it is not going to work.
         blocks = rec.setdefault("topic_blocks", {})
-        if not submitted and reasons:
+        if not submitted and reasons and topic.key not in led["blocked_topics"]:
+            led["blocked_topics"].append(topic.key)
             blocks[topic.key] = int(blocks.get(topic.key, 0)) + 1
             if blocks[topic.key] >= MAX_TOPIC_BLOCKS:
                 log.warning("%s: topic %r blocked on %d days; retiring it", self.worker_id,
@@ -690,7 +767,107 @@ class DailyPoster(_Base):
         if (submitted or blocks.get(topic.key, 0) >= MAX_TOPIC_BLOCKS) \
                 and topic.key not in rec["used_topics"]:
             rec["used_topics"].append(topic.key)
+        if submitted or blocks.get(topic.key, 0) >= MAX_TOPIC_BLOCKS:
+            rec.setdefault("topic_used_at", {})[topic.key] = ctx.now
         return None
+
+    # ---- mending a blocked draft (postfix.py) ------------------------------------------------
+    def _mend(self, ctx: WorkContext, rec: dict, led: dict, topic: Topic, raw) -> tuple:
+        """``(draft, reasons, first reasons, what was mended)``: the draft assembled from the
+        model's words and checked; when it is blocked, the literals the check quoted are made
+        placeholders, then (``model_repairs``) only the flagged sentences are rewritten by
+        the shared brain - each step checked again on the exact payload. The check decides;
+        nothing here passes a draft it refused."""
+        raw = raw if isinstance(raw, dict) else {}
+        draft = self.assemble(raw, topic, rec, ctx.now)
+        reasons = self.check_draft(draft)
+        first, mended = list(reasons), []
+        if not reasons:
+            return draft, reasons, first, mended
+        fixed, done = postfix.placeholders_from_reasons(raw, self.text_fields, reasons)
+        if done:
+            raw, mended = fixed, mended + done
+            draft = self.assemble(raw, topic, rec, ctx.now)
+            reasons = self.check_draft(draft)
+        if reasons and self.model_repairs and ctx.words is not None:
+            units = postfix.flagged_units(raw, self.text_fields, reasons)
+            if units:
+                led["model_repairs"] += 1
+                self._count(rec, "model_repairs")
+                got = ctx.words(f"{self.purpose}_repair", self._system(),
+                                postfix.rewrite_prompt(units, reasons), postfix.REWRITE_SCHEMA)
+                if isinstance(got, Err):
+                    log.warning("%s: the sentence repair got no words: %s", self.worker_id,
+                                got.error)
+                else:
+                    fixed, done = postfix.apply_rewrites(raw, units, got.value)
+                    if done:
+                        raw, mended = fixed, mended + done
+                        draft = self.assemble(raw, topic, rec, ctx.now)
+                        reasons = self.check_draft(draft)
+        if mended and not reasons:
+            self._count(rec, "drafts_mended")
+        return draft, reasons, first, mended
+
+    # ---- the Claude fallback: one draft a day at most, its own budget ------------------------
+    def _claude_due(self, ctx: WorkContext, led: dict) -> bool:
+        """Claude may draft today: it is on (``claude_drafts_per_day`` above 0), this context
+        has Claude wired (``ctx.review``: the crew's; a test or a dry run has none), today's
+        local drafts were blocked at least ``claude_after_blocked`` times, and today's Claude
+        budget is not spent."""
+        return (self.claude_drafts_per_day > 0 and ctx.review is not None
+                and led["blocked"] >= self.claude_after_blocked
+                and led["claude"] < self.claude_drafts_per_day)
+
+    def _claude_prompt(self, topic: Topic, goal: str | None, reasons: list) -> str:
+        keys = ", ".join(self.schema.get("properties") or {})
+        return (self._system() + "\n\n" + self._prompt(topic, goal, reasons) + "\n\n"
+                f"Answer with ONE JSON object with exactly these keys: {keys}. No code "
+                "fence around it, no words before or after it.")
+
+    def _claude_draft(self, ctx: WorkContext, rec: dict, led: dict, topic: Topic,
+                      reasons: list, events: list) -> bool:
+        """One ``claude -p`` draft (Max, the API key removed, ``claude_model``, no tools:
+        claudedraft.py), through the same check, the same mending by rule and the same
+        approval as any other. Every attempt spends the day's budget and is logged in
+        ``claude_drafts``. The ONLY place a posting worker reaches a model other than the
+        shared brain, imported here and nowhere else."""
+        from . import claudedraft
+        led["claude"] += 1
+        self._count(rec, "claude_drafts")
+        entry = {"day": led["day"], "at": ctx.now, "topic": topic.key,
+                 "model": self.claude_model, "after_blocked": led["blocked"]}
+        rec["claude_drafts"] = (list(rec.get("claude_drafts") or []) + [entry])[-60:]
+        log.info("%s: %d local drafts blocked today; asking Claude (%s) for one draft of %r",
+                 self.worker_id, led["blocked"], entry["model"], topic.key)
+        got = claudedraft.ask(ctx.review, self.division,
+                              self._claude_prompt(topic, ctx.goal, reasons),
+                              float(self.claude_timeout_seconds), self.claude_model)
+        if isinstance(got, Err):
+            entry.update(outcome="failed", why=_clip(got.error, 200))
+            log.warning("%s: no Claude draft: %s", self.worker_id, entry["why"])
+            return False
+        raw = claudedraft.parse_json_object(got.value)
+        if raw is None:
+            entry.update(outcome="failed", why="Claude's answer was not a JSON object")
+            log.warning("%s: the Claude draft was not a JSON object", self.worker_id)
+            return False
+        self._count(rec, "drafts_written")
+        draft = self.assemble(raw, topic, rec, ctx.now)
+        found = self.check_draft(draft)
+        if found:
+            fixed, done = postfix.placeholders_from_reasons(raw, self.text_fields, found)
+            if done:
+                draft = self.assemble(fixed, topic, rec, ctx.now)
+                found = self.check_draft(draft)
+        if found:
+            led["blocked"] += 1
+            entry.update(outcome="blocked", why=_clip("; ".join(found), 300))
+            self._blocked(ctx, rec, topic, draft, found, 0, events, by="claude")
+            return False
+        entry.update(outcome="submitted", draft_id=draft["draft_id"])
+        self._submit(ctx, rec, topic, draft, events, by="claude")
+        return True
 
     @staticmethod
     def _last_block_reasons(rec: dict, topic: Topic) -> list:
@@ -734,11 +911,16 @@ class DailyPoster(_Base):
 
     # ---- blocked, or submitted -----------------------------------------------------------
     def _blocked(self, ctx: WorkContext, rec: dict, topic: Topic, draft: dict, reasons: list,
-                 attempt: int, events: list) -> None:
+                 attempt: int, events: list, *, first=None, mended=(), by: str = "") -> None:
         self._count(rec, "drafts_blocked")
-        rec["blocked"] = (rec["blocked"] + [{
-            "draft_id": draft["draft_id"], **self._describe(draft), "topic": topic.key,
-            "reasons": reasons, "attempt": attempt, "at": ctx.now}])[-100:]
+        entry = {"draft_id": draft["draft_id"], **self._describe(draft), "topic": topic.key,
+                 "reasons": reasons, "attempt": attempt, "at": ctx.now}
+        if mended:
+            entry["mended"] = list(mended)
+            entry["before_mending"] = list(first or [])
+        if by:
+            entry["drafted_by"] = by
+        rec["blocked"] = (rec["blocked"] + [entry])[-100:]
         log.warning("%s: draft %s BLOCKED by the content check and NOT submitted (attempt %d): "
                     "%s", self.worker_id, draft["draft_id"], attempt, "; ".join(reasons))
         events.append(self._event(ctx, "post.blocked", {
@@ -746,16 +928,25 @@ class DailyPoster(_Base):
             "reasons": [_clip(r, 90) for r in reasons[:3]]}))
 
     def _submit(self, ctx: WorkContext, rec: dict, topic: Topic, draft: dict,
-                events: list) -> None:
+                events: list, *, mended=(), by: str = "") -> None:
         post = {"draft_id": draft["draft_id"], **self._describe(draft), "topic": topic.key}
-        self._submit_post(ctx, rec, post, draft, events)
+        if mended:
+            post["mended"] = list(mended)
+        if by:
+            post["drafted_by"] = by
+        self._submit_post(ctx, rec, post, draft, events, by=by)
 
     def _submit_post(self, ctx: WorkContext, rec: dict, post: dict, draft: dict,
-                     events: list) -> None:
+                     events: list, *, by: str = "") -> None:
         """Send one checked draft to Pionir and record what it said. ``post`` is the
-        record's entry for it, already describing the draft."""
+        record's entry for it, already describing the draft. A draft Claude wrote says so
+        in the words the owner approves (``by``)."""
         self._before_submit(ctx, rec, draft, post)
-        out = ctx.job(self._job(draft))
+        job = self._job(draft)
+        if by:
+            job = replace(job, what=f"{job.what} (drafted by {by.capitalize()} after the "
+                                    "local model's drafts were blocked)")
+        out = ctx.job(job)
         self._after_submit(ctx, rec, draft)
         post.update(submitted_at=ctx.now, status=out.status, task_id=out.task_id,
                     approval_id=out.approval_id)
@@ -810,8 +1001,7 @@ class DailyPoster(_Base):
         return make_output(self, kind="post.tally", valid_at=ctx.now, observed_at=ctx.now,
                            payload={"pending_approval": pending[-3:],
                                     "next_draft_in_hours": round(wait / 3600, 1),
-                                    "topics_left": sum(1 for t in SEEDS
-                                                       if t.key not in rec["used_topics"])},
+                                    "topics_left": topics.topics_left(rec)},
                            figures=figures, entities=self.entities,
                            provenance={"source": "real", "provider": self.provider,
                                        "record": self.record_what})
@@ -839,14 +1029,10 @@ class BlogWorker(DailyPoster):
     purpose = "blog_draft"
     schema = DRAFT_SCHEMA
     record_what = "the blog worker's own event counts"
+    text_fields = ("title", "description", "body_md")
 
     def _blank(self) -> dict:
         return {**super()._blank(), "used_slugs": []}
-
-    def demand_products(self, ctx: WorkContext) -> list:
-        """The blog is steered by demand: a fresh ranking's products, best first."""
-        from .demand import product_preference
-        return product_preference(ctx.state_dir, ctx.now)
 
     def _system(self) -> str:
         return SYSTEM.format(names=self._names())
@@ -884,6 +1070,11 @@ class BlogWorker(DailyPoster):
                 v, done = repair(key, v)
                 repaired += done
             words[key] = v
+        if isinstance(words["body_md"], str):
+            # code blocks, HTML tags as text, Title Case labels (postfix.py, step 1)
+            others = [v for k, v in words.items() if k != "body_md" and isinstance(v, str)]
+            words["body_md"] = postfix.mend_body("body_md", words["body_md"], repaired,
+                                                 names=_names_as_written(), others=others)
         title = words["title"]
         base = slugify(raw.get("slug") or title or topic.key) or slugify(topic.key)
         slug, n, used = base, 2, set(rec["used_slugs"])
@@ -953,6 +1144,11 @@ class BlogWorker(DailyPoster):
 
     def _after_submit(self, ctx: WorkContext, rec: dict, draft: dict) -> None:
         rec["used_slugs"].append(draft["slug"])
+
+
+def _names_as_written() -> tuple:
+    """The allowlisted names, longest first, as the prompt offers them."""
+    return tuple(sorted(set(_allowlist_display()), key=lambda n: (-len(n), n)))
 
 
 def _allowlist_display() -> list:

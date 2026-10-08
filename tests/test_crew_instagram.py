@@ -200,24 +200,24 @@ class SubmitTests(_Case):
 
 class CheckTests(_Case):
     def test_a_failing_draft_is_never_submitted_and_is_recorded_with_its_reasons(self) -> None:
-        result = self.run_at(T0, FakeBrain(bad(), bad()))
+        result = self.run_at(T0, FakeBrain(bad(), bad(), bad()))
         self.assertEqual(self.hands.jobs, [])
         blocked = [o for o in result.value if o.kind == "post.blocked"]
-        self.assertEqual(len(blocked), 2)
+        self.assertEqual(len(blocked), 3)
         self.assertTrue(any("Jane Doe" in r for r in blocked[0].payload["reasons"]))
         self.assertTrue(all(o.derived for o in blocked))   # model words back no figure
         rec = self.record()
-        self.assertEqual(len(rec["blocked"]), 2)
+        self.assertEqual(len(rec["blocked"]), 3)
         self.assertTrue(any("Jane Doe" in r for r in rec["blocked"][0]["reasons"]))
         self.assertEqual(rec["posts"], [])
         t = self.tally(result)
         self.assertEqual((t["drafts written"], t["drafts blocked"],
-                          t["posts submitted for approval"]), (2, 2, 0))
+                          t["posts submitted for approval"]), (3, 3, 0))
 
-    def test_one_redraft_per_run_with_the_reasons_in_the_prompt(self) -> None:
-        brain = FakeBrain(bad(), bad(), good())
+    def test_redrafts_per_run_with_the_reasons_in_the_prompt(self) -> None:
+        brain = FakeBrain(bad(), bad(), bad(), good())
         self.run_at(T0, brain)
-        self.assertEqual(len(brain.calls), 2)                # never a third in one run
+        self.assertEqual(len(brain.calls), 3)                # drafts_per_run, never a fourth
         self.assertNotIn("Jane Doe", brain.calls[0]["user"])
         self.assertIn("Jane Doe", brain.calls[1]["user"])
         self.assertEqual(brain.calls[0]["schema"], DRAFT_SCHEMA)
@@ -230,26 +230,26 @@ class CheckTests(_Case):
         self.assertEqual(self.kinds(result).count("post.blocked"), 1)
 
     def test_text_that_does_not_fit_the_card_is_a_block_not_a_crash(self) -> None:
-        result = self.run_at(T0, FakeBrain(too_wide(), too_wide()))
+        result = self.run_at(T0, FakeBrain(too_wide(), too_wide(), too_wide()))
         self.assertIsInstance(result, Ok)
         self.assertEqual(self.hands.jobs, [])
         reasons = self.record()["blocked"][0]["reasons"]
         self.assertTrue(any(r.startswith("card:") and "too wide" in r for r in reasons),
                         reasons)
-        self.assertEqual(self.tally(result)["drafts blocked"], 2)
+        self.assertEqual(self.tally(result)["drafts blocked"], 3)
 
     def test_a_caption_that_does_not_point_to_the_bio_is_blocked(self) -> None:
         d = good()
         d["caption"] = d["caption"].replace(" The full guide is at the link in bio.", "")
-        self.run_at(T0, FakeBrain(d, d))
+        self.run_at(T0, FakeBrain(d, d, d))
         self.assertEqual(self.hands.jobs, [])
         self.assertTrue(any("link in bio" in r for r in self.record()["blocked"][0]["reasons"]))
 
     def test_a_brain_answer_that_is_not_a_post_is_blocked(self) -> None:
-        result = self.run_at(T0, FakeBrain({"headline": 7}, "nonsense"))
+        result = self.run_at(T0, FakeBrain({"headline": 7}, "nonsense", "nonsense"))
         self.assertIsInstance(result, Ok)
         self.assertEqual(self.hands.jobs, [])
-        self.assertEqual(self.tally(result)["drafts blocked"], 2)
+        self.assertEqual(self.tally(result)["drafts blocked"], 3)
 
 
 class CardFileTests(_Case):
@@ -335,16 +335,16 @@ class TopicTests(_Case):
         self.assertEqual(self.record()["used_topics"], [SEEDS[0].key, SEEDS[1].key])
 
     def test_a_blocked_day_does_not_use_up_the_topic(self) -> None:
-        brain = FakeBrain(bad(), bad(), good())
+        brain = FakeBrain(bad(), bad(), bad(), good())
         self.run_at(T0, brain)
         self.assertEqual(self.record()["used_topics"], [])
         self.run_at(T0 + DAY, brain)
         self.assertIn(SEEDS[0].subject, brain.calls[0]["user"])
-        self.assertIn(SEEDS[0].subject, brain.calls[2]["user"])      # retried, then passed
+        self.assertIn(SEEDS[0].subject, brain.calls[3]["user"])      # retried, then passed
         self.assertEqual(self.record()["used_topics"], [SEEDS[0].key])
 
     def test_a_topic_blocked_on_three_days_is_retired(self) -> None:
-        brain = FakeBrain(*[bad()] * (2 * MAX_TOPIC_BLOCKS))
+        brain = FakeBrain(*[bad()] * (3 * MAX_TOPIC_BLOCKS))
         for day in range(MAX_TOPIC_BLOCKS):
             if day:
                 self.assertEqual(self.record()["used_topics"], [], day)
@@ -448,7 +448,7 @@ class CrewTests(unittest.TestCase):
         self.assertIn("posting.instagram", system)
         self.assertIn("post.blocked", user)
         self.assertIn("posting.instagram", user)
-        self.assertIn("2 drafts blocked", user)
+        self.assertIn("3 drafts blocked", user)
 
 
 if __name__ == "__main__":

@@ -65,8 +65,10 @@
       "workers": [
         {"name": "blog", "impl": "blog_writer", "uses": ["content.publish"], "kind": "post", "cadence_seconds": 21600,
          "provider": "none", "entities": ["Blog"],
-         "note": "one checked blog draft a day for api.dokaz.net, each submitted for the owner's approval",
-         "params": {"draft_every_seconds": 86400}},
+         "note": "one checked blog draft a day for api.dokaz.net, each submitted for the owner's approval; topics from what we sell by measured demand; a blocked draft is mended and redrafted within a daily budget; after 3 blocked drafts in a day, at most one claude -p draft (Max, sonnet-class), checked and approved like any other",
+         "params": {"draft_every_seconds": 86400, "drafts_per_run": 3,
+                    "local_drafts_per_day": 6, "claude_drafts_per_day": 1,
+                    "claude_after_blocked": 3, "claude_model": "claude-sonnet-5"}},
         {"name": "instagram", "impl": "instagram_writer", "uses": ["social.instagram_post"], "kind": "post", "cadence_seconds": 21600,
          "provider": "none", "entities": ["Instagram"],
          "note": "one checked Instagram card post a day, each submitted for the owner's approval",
