@@ -106,13 +106,18 @@ class TokenFileTests(unittest.TestCase):
             self.assertEqual(len(aces), 1, aces)
             self.assertNotIn("(I)", aces[0])
             self.assertTrue(aces[0].endswith(":(F)"), aces)
-            owner = subprocess.run(
+            # Windows PowerShell 5.1 started from pwsh 7 (CI's default shell) inherits pwsh's
+            # PSModulePath and cannot load Microsoft.PowerShell.Security, so Get-Acl fails
+            # before reading anything: give 5.1 its own module path.
+            env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+            got = subprocess.run(
                 ["powershell", "-NoProfile", "-Command",
                  f"(Get-Acl -LiteralPath '{self.dir / name}').Access | "
                  "ForEach-Object { $_.IdentityReference.Translate("
                  "[System.Security.Principal.SecurityIdentifier]).Value }"],
-                capture_output=True, text=True, check=True).stdout.split()
-            self.assertEqual(owner, [sid])
+                capture_output=True, text=True, env=env)
+            self.assertEqual(got.returncode, 0, got.stderr)
+            self.assertEqual(got.stdout.split(), [sid])
 
     @unittest.skipIf(os.name == "nt", "POSIX modes")
     def test_the_file_is_owner_only_on_posix(self) -> None:
