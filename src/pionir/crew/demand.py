@@ -22,9 +22,12 @@ with no measured input at all has no score and ranks after every scored one; a s
 any input unknown is marked partial (a lower bound). Signals Scrooge does not record at all
 are listed in ``UNAVAILABLE``, never given a number:
 
-- per-tool click-throughs: the tools tag their links ``utm_content=<slug>``, but Scrooge
-  stores a visit's campaign as ``source/medium/campaign`` only (traffic.ts ``campaignOf``), so
-  only the free tools' TOTAL is measured (campaign ``dokazindustries/referral/free-tools``);
+- per-tool click-throughs, UNTIL Scrooge reports them: the tools tag their links
+  ``utm_content=<slug>``; a Scrooge that keeps it (its ``traffic_content`` table) lists
+  ``traffic.top_contents`` (``[{campaign, content, n}]``), and each tool then has a measured
+  ``tool_clicks`` input. A dash without that list (an older Scrooge, or its migration not yet
+  applied: ``null``) measures only the free tools' TOTAL (campaign
+  ``dokazindustries/referral/free-tools``), and per-tool click-throughs stay UNKNOWN;
 - 429s: a rejected call is counted in ``usage.calls`` (``meter`` runs before the quota check)
   but nothing records that it was rejected; free and paid callers are not split either; and
   usage is metered per product (``/v1/<product>``), not per endpoint. What IS measured is how
@@ -32,9 +35,10 @@ are listed in ``UNAVAILABLE``, never given a number:
   ``FREE_PER_DAY`` calls (the anonymous daily cap) is a SATURATED day;
 - search referrals per post: referrers are counted site-wide, never per page.
 
-**What it writes.** ``<state_dir>/demand.json`` - the ranking with every input, for the two
-hooks that read it (``build_preference`` for the Builds backlog pick, ``product_preference``
-for the blog's topic choice; each ignores a file older than ``STALE_AFTER``) - and its own
+**What it writes.** ``<state_dir>/demand.json`` - the ranking with every input, and
+``guides`` (each paid API guide's own page views and free-tool click-throughs), for the hooks
+that read it (``build_preference`` for the Builds backlog pick; ``read_demand`` for the posting
+workers' topic choice, topics.py; each ignores a file older than ``STALE_AFTER``) - and its own
 record ``<state_dir>/products.demand.json`` (the cards it posted). It never writes a backlog:
 the owner edits those.
 
@@ -98,7 +102,9 @@ INPUTS = {
     "guide_views": ("API guide page views", "last30", 1, 1),
     "post_views": ("blog post page views", "last30", 1, 1),
     "post_clicks": ("blog post clicks to product pages", "last30", 5, 1),
+    "tool_clicks": ("free tool click-throughs to the API guide", "last30", 5, 1),
 }
+CONTENTS_CAP = 50                  # Scrooge's LIMIT on traffic.top_contents (traffic.ts)
 UNAVAILABLE = {
     "tool_click_through_per_tool": (
         "UNKNOWN: the free tools tag their links utm_content=<slug>, but Scrooge keeps only "
@@ -224,6 +230,13 @@ def read_ranking(state_dir, now: float) -> list | None:
     """The ranked candidates of a fresh ``demand.json``; None when there is none, it is older
     than ``STALE_AFTER``, or it cannot be read (said in the log - the reader then falls back
     to its own order, never to a guess)."""
+    doc = read_demand(state_dir, now)
+    return None if doc is None else [c for c in doc["ranking"] if isinstance(c, dict)]
+
+
+def read_demand(state_dir, now: float) -> dict | None:
+    """A fresh ``demand.json`` whole (its ``ranking`` checked to be a list); None as for
+    ``read_ranking``."""
     if state_dir is None:
         return None
     path = Path(state_dir) / DEMAND_FILE
@@ -241,7 +254,7 @@ def read_ranking(state_dir, now: float) -> list | None:
         return None
     if now - float(doc["computed_at"]) > STALE_AFTER:
         return None
-    return [c for c in doc["ranking"] if isinstance(c, dict)]
+    return doc
 
 
 def _wanted(ranking) -> list:
@@ -327,8 +340,8 @@ class DemandWorker(DashReader):
                "traffic_since": signals.since, "inputs": {k: {"measures": v[0], "window": v[1],
                                                               "weight": v[2], "per": v[3]}
                                                           for k, v in INPUTS.items()},
-               "unavailable": UNAVAILABLE, "site": signals.site(), "notes": notes,
-               "ranking": ranking}
+               "unavailable": signals.unavailable(), "site": signals.site(),
+               "notes": notes, "ranking": ranking, "guides": signals.guides()}
         save_record(Path(ctx.state_dir) / DEMAND_FILE, out)
         events = self._card(ctx, rec, ranking, counterparts)
         rec["cards"] = rec["cards"][-KEEP_CARDS:]
@@ -345,10 +358,13 @@ class DemandWorker(DashReader):
                                         "guide_views": s.guide_views(pid=pid)}))
         for slug, (name, guide) in TOOLS.items():
             pid = GUIDES[guide]
-            out.append(self._candidate("tool", slug, name, pid,
-                                       {**s.api_inputs(pid),
-                                        "guide_views": s.guide_views(paths=(guide,))},
-                                       unavailable=["tool_click_through_per_tool"]))
+            inputs = {**s.api_inputs(pid), "guide_views": s.guide_views(paths=(guide,))}
+            if s.contents is not None:          # Scrooge keeps utm_content: measured
+                out.append(self._candidate("tool", slug, name, pid,
+                                           {**inputs, "tool_clicks": s.tool_clicks(slug)}))
+            else:
+                out.append(self._candidate("tool", slug, name, pid, inputs,
+                                           unavailable=["tool_click_through_per_tool"]))
         out += self._topics(ctx, s, notes)
         counterparts = set()
         out += self._builds(ctx, s, notes, counterparts)
@@ -374,6 +390,7 @@ class DemandWorker(DashReader):
         return c
 
     def _topics(self, ctx, s: Signals, notes: list) -> list:
+        from .topics import topic_by_key
         posts: dict = {}
         try:
             for p in published_posts(read_record(ctx.state_dir, self.blog_worker)):
@@ -383,7 +400,10 @@ class DemandWorker(DashReader):
             log.warning("%s: the blog record is unreadable: %s", self.worker_id, exc)
             notes.append("the blog record is unreadable: its posts' figures are unknown")
         out = []
-        for t in SEEDS:
+        # every seed, and every generated topic (topics.py) a published post is about
+        seeds = {t.key for t in SEEDS}
+        extra = [topic_by_key(k) for k in posts if k not in seeds]
+        for t in list(SEEDS) + [t for t in extra if t is not None]:
             pid = topic_product(t)
             inputs = {"guide_views": s.guide_views(paths=(t.path,))}
             for p in posts.get(t.key, []):
@@ -508,8 +528,9 @@ class DemandWorker(DashReader):
             body = (f"demand seen: the API guide behind the free {c['name']} tool had {least}"
                     f"{v['value']} page views in the last 30 days, and no paid download covers "
                     f"it (nothing on the shelf or in the Builds backlog) - suggest a "
-                    f"downloadable {c['name']} for Gumroad. Per-tool click-throughs are "
-                    f"UNKNOWN (Scrooge does not keep utm_content).")
+                    f"downloadable {c['name']} for Gumroad."
+                    + (" Per-tool click-throughs are UNKNOWN (Scrooge does not report "
+                       "utm_content yet)." if "tool_clicks" not in c["inputs"] else ""))
             figs = [Figure(v["value"], "count", INPUTS["guide_views"][0], c["id"], "last30")]
             out.append((f"no-paid-{c['ref']}", title, body, figs))
         return out
@@ -583,7 +604,7 @@ class DemandWorker(DashReader):
                                     "candidates": len(ranking),
                                     "scored": len(ranking) - len(unscored),
                                     "unknown": unscored[:12],
-                                    "unavailable": sorted(UNAVAILABLE),
+                                    "unavailable": sorted(s.unavailable()),
                                     "notes": notes[:5], "file": DEMAND_FILE},
                            figures=figures, entities=self.entities,
                            provenance={**self._provenance(resp), "record": self.record_what})
@@ -596,6 +617,24 @@ def _add(a: dict | None, b: dict) -> dict:
     if a.get("value") is None or b.get("value") is None:
         return _inp(None, why=a.get("why") or b.get("why") or "not measured")
     return _inp(a["value"] + b["value"], at_least=bool(a.get("at_least") or b.get("at_least")))
+
+
+def _contents(traffic: dict) -> list | None:
+    """``traffic.top_contents`` checked: ``[(campaign, content, n)]``; None when the dash does
+    not report it (absent, or ``null`` until Scrooge's traffic_content migration is applied)."""
+    rows = traffic.get("top_contents")
+    if rows is None:
+        return None
+    if not isinstance(rows, list):
+        raise _Malformed("traffic.top_contents is not a list")
+    out = []
+    for i, row in enumerate(rows[:500]):
+        where = f"traffic.top_contents[{i}]"
+        if not isinstance(row, dict) or not isinstance(row.get("campaign"), str) \
+                or not isinstance(row.get("content"), str):
+            raise _Malformed(f"{where} is {row!r}")
+        out.append((row["campaign"], row["content"], _count(row, "n", where)))
+    return out
 
 
 class Signals:
@@ -611,6 +650,9 @@ class Signals:
         self.camps_capped = False
         self.referrers: list | None = None
         self.sales: list | None = None
+        # [(campaign, content, n)] from traffic.top_contents; None: Scrooge does not report it
+        self.contents: list | None = None
+        self.contents_capped = False
 
     @classmethod
     def read(cls, doc: dict) -> Signals:
@@ -642,7 +684,44 @@ class Signals:
             s.referrers = _rows(t, "top_referrers", "ref_host", required=False)
             s.sales = _rows(t, "sales_by_campaign", "campaign", required=False,
                             counts=("sales", "net"))
+            s.contents = _contents(t)
+            s.contents_capped = s.contents is not None and len(s.contents) >= CONTENTS_CAP
         return s
+
+    def unavailable(self) -> dict:
+        """``UNAVAILABLE``, less what this dash does measure."""
+        if self.contents is None:
+            return dict(UNAVAILABLE)
+        return {k: v for k, v in UNAVAILABLE.items() if k != "tool_click_through_per_tool"}
+
+    def tool_clicks(self, slug: str) -> dict:
+        """Click-throughs from one free tool (campaign ``FREE_TOOLS_CAMPAIGN``, utm_content =
+        its slug), last 30 days. Unknown when Scrooge does not report utm_content, or when the
+        tool is missing from a capped list."""
+        if self.contents is None:
+            return _inp(None, why="the dash reports no utm_content (traffic.top_contents)")
+        want = "/".join(FREE_TOOLS_CAMPAIGN)
+        rows = [n for camp, content, n in self.contents if camp == want and content == slug]
+        if not rows and self.contents_capped:
+            return _inp(None, why=f"not in the top {CONTENTS_CAP} contents (the list is capped)")
+        return _inp(sum(rows))
+
+    def guides(self) -> dict:
+        """Each paid API guide's own measured figures, for the posting workers' topics:
+        ``{path: {"product", "views", "tool_clicks"}}`` (``tool_clicks``: from the free tools
+        that link to it; unknown as ``tool_clicks`` is, or when no tool links to it)."""
+        out = {}
+        for path, pid in GUIDES.items():
+            slugs = [slug for slug, (_n, guide) in TOOLS.items() if guide == path]
+            if not slugs:
+                clicks = _inp(None, why="no free tool links to this guide")
+            else:
+                clicks = self.tool_clicks(slugs[0])
+                for slug in slugs[1:]:
+                    clicks = _add(clicks, self.tool_clicks(slug))
+            out[path] = {"product": pid, "views": self.guide_views(paths=(path,)),
+                         "tool_clicks": clicks}
+        return out
 
     def products(self) -> set:
         return {p for _d, p, _c, _e, _n in self.usage or []}

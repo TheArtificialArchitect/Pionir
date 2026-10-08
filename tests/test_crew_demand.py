@@ -373,9 +373,15 @@ class HookTests(_Case):
                                  goal=goal, state_dir=state or self.state))
             return brain.calls[0]["user"]
 
-        # no seed is about Convert; the first about QR codes is SEEDS[3], not SEEDS[0]
-        self.assertEqual(SEEDS[3].key, "qr-codes-from-an-api")
-        self.assertTrue(draft().startswith(f"Topic: {SEEDS[3].subject}."))
+        # no seed is about Convert, but generated topics are (topics.py): the
+        # highest-demand product's guide with the most views of its own, as demand.json says
+        from pionir.crew import topics
+        doc = json.loads((self.state / demand.DEMAND_FILE).read_text(encoding="utf-8"))
+        convert = [p for p, g in doc["guides"].items() if g["product"] == "convert"]
+        best = max(convert, key=lambda p: doc["guides"][p]["views"]["value"] or 0)
+        first = topics.make_topic(topics.GUIDE_BY_PATH[best], topics.ANGLES[0])
+        said = draft()
+        self.assertTrue(said.startswith(f"Topic: {first.subject}."), said)
         other = self.root / "other"
         other.mkdir()
         (other / demand.DEMAND_FILE).write_text(
@@ -392,6 +398,50 @@ class HookTests(_Case):
         self.assertEqual(demand.prefer_topic(free, ["convert", "qr"]).key,
                          "qr-codes-from-an-api")
         self.assertIsNone(demand.prefer_topic(free, ["convert"]))
+
+
+class ToolClickTests(_Case):
+    """Scrooge's utm-content branch reports ``traffic.top_contents``: per-tool
+    click-throughs become measured; without it (absent, or null before the migration) they
+    stay UNKNOWN, never zero."""
+
+    CONTENTS = (
+        {"campaign": "dokazindustries/referral/free-tools", "content": "json-to-excel", "n": 7},
+        {"campaign": "dokazindustries/referral/free-tools", "content": "qr-code-generator",
+         "n": 2},
+        {"campaign": "instagram/bio/", "content": "json-to-excel", "n": 50},   # not a tool's
+    )
+
+    def test_measured_tool_clicks_feed_the_tools_and_the_guides(self) -> None:
+        self.ok(doc=with_traffic(top_contents=list(self.CONTENTS)))
+        by_id, doc = self.ranking()
+        excel = by_id["tool:json-to-excel"]
+        self.assertEqual(excel["inputs"]["tool_clicks"], {"value": 7})
+        self.assertNotIn("unavailable", excel)
+        self.assertEqual(by_id["tool:csv-to-json"]["inputs"]["tool_clicks"], {"value": 0})
+        self.assertNotIn("tool_click_through_per_tool", doc["unavailable"])
+        self.assertEqual(doc["guides"]["/docs/json-to-excel-api"]["tool_clicks"], {"value": 7})
+        self.assertEqual(doc["guides"]["/docs/json-to-excel-api"]["views"], {"value": 44})
+        # the topics read it: five per click on top of the product's score and the views
+        from pionir.crew import topics
+        scores = topics.guide_scores(demand.read_demand(self.state, T0 + 60))
+        self.assertEqual(scores["/docs/json-to-excel-api"] - scores["/docs/json-to-csv-api"],
+                         44 + 5 * 7)
+
+    def test_without_top_contents_per_tool_clicks_stay_unknown(self) -> None:
+        for doc in (DASH, with_traffic(top_contents=None)):
+            self.ok(doc=doc)
+            by_id, out = self.ranking()
+            self.assertNotIn("tool_clicks", by_id["tool:json-to-excel"]["inputs"])
+            self.assertEqual(by_id["tool:json-to-excel"]["unavailable"],
+                             ["tool_click_through_per_tool"])
+            self.assertIn("tool_click_through_per_tool", out["unavailable"])
+            self.assertIsNone(out["guides"]["/docs/json-to-excel-api"]["tool_clicks"]["value"])
+
+    def test_a_malformed_top_contents_is_malformed_not_guessed(self) -> None:
+        result = self.run_at(doc=with_traffic(top_contents=[{"campaign": 3}]))
+        self.assertIsInstance(result, Err)
+        self.assertEqual(result.error.kind, ErrorKind.MALFORMED)
 
 
 class WiringTests(unittest.TestCase):

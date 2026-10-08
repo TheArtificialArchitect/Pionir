@@ -13,11 +13,12 @@ One run:
    done-without-a-permalink is not; anything else is still waiting. Nothing is ever
    assumed published.
 2. **At most one draft per day** (``draft_every_seconds``).
-3. **A topic**: the blog seed that the division's goal as Moss set it matches best -
-   otherwise, or with no goal, the next blog seed (``blog.SEEDS``) this worker has not
-   used. The goal steers among the seeds; it is never a post's subject itself. Its own
-   record: a topic the blog used is fine here too. A blocked day does not use a topic up
-   (``MAX_TOPIC_BLOCKS``).
+3. **A topic** from the same source as the blog's (topics.py): the free topic the
+   division's goal as Moss set it matches best - otherwise the best by measured demand
+   (products.demand), otherwise the fallback order (the seeds, then the generated topics).
+   The goal steers; it is never a post's subject itself. Its own ledger (``used_topics``):
+   a topic the blog used is fine here too, and the generated topics mean it does not run
+   dry. A blocked day does not use a topic up (``MAX_TOPIC_BLOCKS``).
 4. **Words from the shared brain only** (``ctx.words``: JSON schema, temperature 0,
    charged to this division). This module imports no model.
 5. **The worker assembles the payload** - ``{draft_id, headline, points, caption, hashtags,
@@ -147,6 +148,7 @@ class InstagramWorker(DailyPoster):
     link_field = "permalink"
     link_missing = "gave no instagram.com permalink for the post"
     record_what = "the Instagram worker's own event counts"
+    text_fields = ("headline", "points", "caption")
 
     # ---- the card kept beside the record ---------------------------------------------------
     def cards_dir(self, state_dir: Path) -> Path:

@@ -1,7 +1,8 @@
 {
   "_how": "The ONLY capitalised names a public post may use (contentcheck.py). Anything else written with a capital letter mid-sentence - a person, a place, a company, a customer - blocks the post and is named in the reason. This is an ALLOWLIST on purpose: a denylist once published a friend's name, a city and a workplace, each a category nobody had thought to deny. Keep it modest and explicit; adding a name is a decision. The owner's internal systems (Pionir, Moss, Scrooge, ...) must never be added: they are refused at load time.",
   "brand": ["Dokaz", "Dokaz Industries", "Kleos", "Techne", "Obol", "Metron"],
-  "products": ["Invoice PDF", "Email Verify", "QR Code API", "Site Intel", "Text AI"],
+  "products": ["Invoice PDF", "Email Verify", "QR Code API", "Site Intel", "Text AI",
+    "Barcode API", "Calendar API", "Convert API", "Image API", "Markdown to PDF"],
   "technology": [
     "Python", "JavaScript", "TypeScript", "PowerShell", "Node", "JSON", "PDF", "QR", "API",
     "HTTP", "HTTPS", "REST", "SQL", "CSV", "URL", "SVG", "PNG", "DNS", "MX", "SMTP", "HTML",
@@ -10,7 +11,9 @@
     "Linux", "Excel", "Google", "Chrome", "GitHub",
     "IP", "WHOIS", "SPF", "DKIM", "DMARC", "TLS", "SSL", "IMAP", "MIME", "XML", "YAML", "UI", "UX",
     "CLI", "SDK", "OCR", "ISO", "B2B", "B2C", "ROI", "CAPTCHA", "MFA", "2FA", "OTP", "Deliverability",
-    "Exchanger"
+    "Exchanger",
+    "EAN", "EAN-13", "UPC", "UPC-A", "EXIF", "GPS", "ICS", "XLSX", "JPEG", "CMS", "TV", "XMP",
+    "IPTC", "iCalendar", "A4"
   ],
   "code": ["True", "False", "None", "YOUR_API_KEY", "Content-Type", "GET", "POST"],
   "currencies": ["USD", "EUR", "GBP", "CAD", "AUD"],

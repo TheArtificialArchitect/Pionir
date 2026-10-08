@@ -67,11 +67,21 @@ def bad():
 class FakeBrain:
     """``ctx.words``: answers each call with the next scripted draft (or Err)."""
 
-    def __init__(self, *answers) -> None:
+    def __init__(self, *answers, rewrites=None) -> None:
         self.answers = list(answers)
         self.calls: list = []
+        # the sentence repairs (purpose "<draft purpose>_repair", postfix.py): kept apart
+        # from the drafts, answered by ``rewrites`` (a callable of the user prompt, or a
+        # fixed answer) - by default with no rewrite, so a scripted draft stays as it was
+        self.repairs: list = []
+        self.rewrites = rewrites
 
     def __call__(self, purpose, system, user, schema):
+        if purpose.endswith("_repair"):
+            self.repairs.append({"purpose": purpose, "user": user, "schema": schema})
+            ans = self.rewrites(user) if callable(self.rewrites) else self.rewrites
+            ans = {"rewrites": []} if ans is None else ans
+            return ans if isinstance(ans, (Ok, Err)) else Ok(ans)
         self.calls.append({"purpose": purpose, "system": system, "user": user,
                            "schema": schema})
         ans = self.answers.pop(0) if self.answers else good()
@@ -227,27 +237,78 @@ class SubmitTests(_Case):
 
 class CheckTests(_Case):
     def test_a_failing_draft_is_never_submitted_and_is_recorded_with_its_reasons(self) -> None:
-        brain = FakeBrain(bad(), bad())
+        brain = FakeBrain(bad(), bad(), bad())
         result = self.run_at(T0, brain)
         self.assertEqual(self.hands.jobs, [])
         blocked = [o for o in result.value if o.kind == "post.blocked"]
-        self.assertEqual(len(blocked), 2)
+        self.assertEqual(len(blocked), 3)
         self.assertTrue(any("Jane Doe" in r for r in blocked[0].payload["reasons"]))
         self.assertTrue(all(o.derived for o in blocked))   # model words back no figure
         rec = self.record()
-        self.assertEqual(len(rec["blocked"]), 2)
+        self.assertEqual(len(rec["blocked"]), 3)
         self.assertTrue(any("Jane Doe" in r for r in rec["blocked"][0]["reasons"]))
         self.assertEqual(rec["posts"], [])
         t = self.tally(result)
         self.assertEqual((t["drafts written"], t["drafts blocked"],
-                          t["posts submitted for approval"]), (2, 2, 0))
+                          t["posts submitted for approval"]), (3, 3, 0))
+        # the flagged sentence was sent for repair after each draft, and nothing else
+        self.assertEqual(len(brain.repairs), 3)
+        self.assertIn("A friend, Jane Doe, swears by it.", brain.repairs[0]["user"])
+        self.assertNotIn("Why addresses go bad", brain.repairs[0]["user"])
 
-    def test_one_redraft_per_run_with_the_reasons_in_the_prompt(self) -> None:
-        brain = FakeBrain(bad(), bad(), good())
+    def test_redrafts_per_run_with_the_reasons_in_the_prompt(self) -> None:
+        brain = FakeBrain(bad(), bad(), bad(), good())
         self.run_at(T0, brain)
-        self.assertEqual(len(brain.calls), 2)                # never a third in one run
+        self.assertEqual(len(brain.calls), 3)                # drafts_per_run, never a fourth
         self.assertNotIn("Jane Doe", brain.calls[0]["user"])
         self.assertIn("Jane Doe", brain.calls[1]["user"])
+        self.assertIn("Jane Doe", brain.calls[2]["user"])
+        self.assertEqual(self.hands.jobs, [])
+
+    def test_a_blocked_run_with_budget_left_drafts_again_on_the_next_run(self) -> None:
+        brain = FakeBrain(bad(), bad(), bad(), good())
+        self.run_at(T0, brain)
+        self.assertEqual(self.hands.jobs, [])
+        self.assertIsNone(self.record()["last_drafted_at"])      # the day is not settled
+        self.run_at(T0 + 6 * 3600, brain)
+        self.assertEqual(len(brain.calls), 4)
+        self.assertEqual(len(self.hands.jobs), 1)
+        self.run_at(T0 + 12 * 3600, brain)                    # settled: nothing more today
+        self.assertEqual(len(brain.calls), 4)
+
+    def test_the_days_local_budget_is_a_hard_cap(self) -> None:
+        brain = FakeBrain(*[bad()] * 20)
+        for hours in (0, 6, 12, 18):
+            self.run_at(T0 + hours * 3600, brain)
+        self.assertEqual(len(brain.calls), self.worker.local_drafts_per_day)
+        self.assertEqual(self.hands.jobs, [])
+        rec = self.record()
+        self.assertEqual(rec["today"]["local"], self.worker.local_drafts_per_day)
+        self.assertEqual(rec["topic_blocks"][SEEDS[0].key], 1)    # one blocked DAY
+
+    def test_a_model_repair_of_the_flagged_sentence_is_checked_and_submitted(self) -> None:
+        def fix(user):
+            n = int(user.split("\n")[-1].split(".", 1)[0])
+            return {"rewrites": [{"id": n, "text": "A friend swears by it."}]}
+        brain = FakeBrain(bad(), rewrites=fix)
+        self.run_at(T0, brain)
+        self.assertEqual(len(brain.calls), 1)                 # mended, not redrafted
+        (job,) = self.hands.jobs
+        self.assertNotIn("Jane Doe", job.payload["body_md"])
+        self.assertIn("A friend swears by it.", job.payload["body_md"])
+        self.assertEqual(contentcheck.check(job.payload), [])
+        (post,) = self.record()["posts"]
+        self.assertTrue(any("rewrote a sentence" in m for m in post["mended"]))
+
+    def test_a_repair_that_keeps_the_name_is_still_blocked(self) -> None:
+        def stubborn(user):
+            n = int(user.split("\n")[-1].split(".", 1)[0])
+            return {"rewrites": [{"id": n, "text": "My friend Jane Doe loves it."}]}
+        brain = FakeBrain(bad(), bad(), bad(), rewrites=stubborn)
+        self.run_at(T0, brain)
+        self.assertEqual(self.hands.jobs, [])                 # the check decides, always
+        self.assertTrue(all(any("Jane Doe" in r for r in b["reasons"])
+                            for b in self.record()["blocked"]))
 
     def test_a_blocked_draft_then_a_clean_redraft_is_submitted(self) -> None:
         result = self.run_at(T0, FakeBrain(bad(), good()))
@@ -290,17 +351,17 @@ class TopicAndSlugTests(_Case):
     def test_a_blocked_day_does_not_use_up_the_topic(self) -> None:
         # the first real run blocked a topic and moved on: 14 seeds would be gone in a
         # fortnight with nothing published
-        brain = FakeBrain(bad(), bad(), good())
+        brain = FakeBrain(bad(), bad(), bad(), good())
         self.run_at(T0, brain)
         self.assertEqual(self.record()["used_topics"], [])
         self.run_at(T0 + DAY, brain)
         self.assertIn(SEEDS[0].subject, brain.calls[0]["user"])
-        self.assertIn(SEEDS[0].subject, brain.calls[2]["user"])      # retried, then passed
+        self.assertIn(SEEDS[0].subject, brain.calls[3]["user"])      # retried, then passed
         self.assertEqual(self.record()["used_topics"], [SEEDS[0].key])
 
     def test_a_topic_blocked_on_three_days_is_retired(self) -> None:
         from pionir.crew.blog import MAX_TOPIC_BLOCKS
-        brain = FakeBrain(*[bad()] * (2 * MAX_TOPIC_BLOCKS))
+        brain = FakeBrain(*[bad()] * (3 * MAX_TOPIC_BLOCKS))
         for day in range(MAX_TOPIC_BLOCKS):
             if day:
                 self.assertEqual(self.record()["used_topics"], [], day)
@@ -316,12 +377,12 @@ class TopicAndSlugTests(_Case):
     def test_a_topic_blocked_yesterday_starts_today_knowing_why(self) -> None:
         # temperature 0: without yesterday's reasons the first draft is yesterday's draft,
         # blocked again, and the topic burns its MAX_TOPIC_BLOCKS days
-        brain = FakeBrain(bad(), bad(), good())
+        brain = FakeBrain(bad(), bad(), bad(), good())
         self.run_at(T0, brain)
         self.assertNotIn("thrown away", brain.calls[0]["user"])     # a fresh topic: none
         self.run_at(T0 + DAY, brain)
-        self.assertEqual(len(brain.calls), 3)
-        today = brain.calls[2]["user"]
+        self.assertEqual(len(brain.calls), 4)
+        today = brain.calls[3]["user"]
         self.assertIn(f"Topic: {SEEDS[0].subject}.", today)
         self.assertIn("thrown away", today)
         self.assertIn("'Jane Doe'", today)
@@ -404,10 +465,13 @@ class RepairTests(unittest.TestCase):
             'Point the code at www.example.com or shop.example.\n\n```json\n'
             '{"data": "https://www.example.com/menu?table=4", "format": "svg"}\n```'), QR)
         self.assertNotIn("example", d["body_md"].replace("examples", ""))
-        self.assertIn('{"data": "your-site", "format": "svg"}', d["body_md"])
+        # the JSON block's example values are placeholders now (postfix.scrub_code_blocks)
+        self.assertIn('"data": "{data}"', d["body_md"])
         self.assertIn("Point the code at your-site or your-site.", d["body_md"])
         self.assertEqual(self.worker.check_draft(d), [])
-        self.assertEqual(len(d["repaired"]), 3)
+        self.assertEqual(len(d["repaired"]), 4)
+        self.assertIn("body_md: example values in a JSON block made placeholders",
+                      d["repaired"])
 
     def test_a_reserved_email_address_is_left_alone(self) -> None:
         # user@example.com is an address the check already allows; "user@your-site" would
@@ -445,10 +509,13 @@ class RepairTests(unittest.TestCase):
         d = self.assemble(body_plus("#### Ask Jane Doe"))
         self.assertTrue(any("Jane Doe" in r for r in self.worker.check_draft(d)))
 
-    def test_a_hash_line_inside_a_code_fence_is_not_touched(self) -> None:
+    def test_a_hash_line_inside_a_code_fence_is_not_made_a_heading(self) -> None:
+        # a fence that is not JSON is removed whole (postfix.py); its lines never become
+        # headings on the way out
         d = self.assemble(body_plus("```\n#### not a heading\n```"))
-        self.assertIn("#### not a heading", d["body_md"])
-        self.assertNotIn("repaired", d)
+        self.assertNotIn("not a heading", d["body_md"])
+        self.assertEqual(d["repaired"],
+                         ["body_md: removed a code block that is not JSON ('#### not a heading')"])
 
     def test_repaired_text_still_fails_on_every_other_reason(self) -> None:
         d = self.assemble(body_plus("Ask [Jane Doe](https://example.com/jane) at "
@@ -465,7 +532,7 @@ class RepairTests(unittest.TestCase):
         state = Path(tmp.name)
         hands = FakeHands()
         raw = body_plus("Ask [Jane Doe](https://example.com/jane).")
-        ctx = WorkContext(now=T0, http=None, secrets_dir=state, words=FakeBrain(raw, raw),
+        ctx = WorkContext(now=T0, http=None, secrets_dir=state, words=FakeBrain(raw, raw, raw),
                           job=hands.job, approval=hands.approval, state_dir=state)
         self.worker.run(ctx)
         rec = json.loads(self.worker.record_path(state).read_text(encoding="utf-8"))
@@ -546,11 +613,16 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(w.check_draft(d), [])
         pionir_check(d)
         # the form the prompt does NOT ask for: an angle bracket reads as raw HTML to both
+        # checks, and the worker's assembly takes the brackets off (postfix.unbracket_tags)
         d = w.assemble(body_plus("The field holds <invoice-number> until then."), INVOICE,
                        {"used_slugs": []}, T0)
-        self.assertTrue(any("raw HTML" in r for r in w.check_draft(d)))
+        self.assertIn("The field holds invoice-number until then.", d["body_md"])
+        self.assertEqual(w.check_draft(d), [])
+        raw = dict(d, body_md=d["body_md"].replace("holds invoice-number", "holds <invoice-number>"))
+        raw.pop("repaired", None)
+        self.assertTrue(any("raw HTML" in r for r in w.check_draft(raw)))
         with self.assertRaises(ValueError):
-            pionir_check(d)
+            pionir_check(raw)
 
     def test_the_system_prompt_offers_those_placeholders_and_the_new_rules(self) -> None:
         system = default_registry().require("posting.blog")._system()
@@ -676,7 +748,7 @@ class CrewTests(unittest.TestCase):
         self.assertIn("PENDING APPROVAL has NOT been published", system)
         self.assertIn("post.blocked", user)
         self.assertIn("Jane Doe", user)
-        self.assertIn("2 drafts blocked", user)
+        self.assertIn("3 drafts blocked", user)
 
     def test_the_hands_say_unreachable_when_pionir_cannot_list_approvals(self) -> None:
         self.crew.hands.client = object()

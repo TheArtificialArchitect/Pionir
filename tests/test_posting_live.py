@@ -154,7 +154,7 @@ class DraftTimingAgreementTests(_Poster):
 class PulseTests(_Poster):
     def test_a_blog_whose_every_draft_is_blocked_raises_no_output_though_its_runs_succeed(
             self) -> None:
-        brain = FakeBrain(*[bad()] * 20)
+        brain = FakeBrain(*[bad()] * 60)
         t = START
         while t < START + 3 * DAY:
             result = self.run_at(t, brain)
@@ -194,8 +194,13 @@ class PulseTests(_Poster):
         self.assertIsNotNone(self.worker.pulse(self.state, START + 2.5 * DAY, DIGEST)["alert"])
 
     def test_a_poster_with_no_topic_left_says_so(self) -> None:
+        from pionir.crew import topics
         rec = self.worker.load(self.state)
         rec["used_topics"] = [t.key for t in SEEDS]
+        self.worker.save(self.state, rec)
+        # the seeds are only the fallback now: generated topics are left
+        self.assertGreater(self.worker.pulse(self.state, START, DIGEST)["topics_left"], 100)
+        rec["used_topics"] = [t.key for t in topics.all_topics()]
         self.worker.save(self.state, rec)
         self.assertIn("every topic", self.worker.pulse(self.state, START, DIGEST)["alert"])
 
