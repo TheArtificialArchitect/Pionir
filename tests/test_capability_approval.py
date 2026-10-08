@@ -102,6 +102,14 @@ EXPECTED = {
     "proteus.start_service": ("card", None),
     "proteus.deploy": ("card", None),
     "quotes.card": ("auto", None),
+    # ---- Etsy streams: every listing and publish costs Etsy's listing fee - its own card
+    "etsy.create_draft_listing": ("card", None),
+    "etsy.activate_listing": ("card", None),
+    "etsy.search_active": ("auto", None),
+    "etsy.receipts": ("auto", None),
+    "printify.catalog": ("auto", None),
+    "printify.create_product": ("card", None),
+    "printify.publish": ("card", None),
 }
 
 NEW_FIELDS = ("requires_approval", "spends_money", "batchable", "batch_condition",

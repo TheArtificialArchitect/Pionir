@@ -17,26 +17,29 @@ class DefaultCatalogueTests(unittest.TestCase):
         reg = default_registry()
         self.assertEqual(reg.division_ids(),
                          ("treasury", "watch", "posting", "contracts", "products", "fiverr",
-                          "builds"))
+                          "builds", "etsy"))
         self.assertEqual(reg.ids(), ("builds.daedalus", "contracts.delivery",
-                                     "contracts.feedback", "contracts.finder", "contracts.orders", "fiverr.desk",
+                                     "contracts.feedback", "contracts.finder", "contracts.orders",
+                                     "etsy.digital", "etsy.pod", "etsy.scout", "fiverr.desk",
                                      "fiverr.gigs", "fiverr.ideas", "posting.blog",
                                      "posting.devto",
                                      "posting.instagram", "posting.newsletter",
                                      "posting.results",
                                      "products.api_builder", "products.demand",
                                      "products.shelf",
-                                     "treasury.bolts", "treasury.fiverr", "treasury.ledger",
+                                     "treasury.bolts", "treasury.etsy", "treasury.fiverr",
+                                     "treasury.ledger",
                                      "watch.health"))
         live = sorted(w.worker_id for w in reg.all() if w.live)
         self.assertEqual(live, ["builds.daedalus",
                                 "contracts.delivery", "contracts.feedback", "contracts.finder", "contracts.orders",
+                                "etsy.digital", "etsy.pod", "etsy.scout",
                                 "fiverr.desk", "fiverr.gigs", "fiverr.ideas", "posting.blog",
                                 "posting.devto",
                                 "posting.instagram", "posting.newsletter",
                                 "posting.results", "products.api_builder",
                                 "products.demand", "products.shelf",
-                                "treasury.bolts", "treasury.fiverr",
+                                "treasury.bolts", "treasury.etsy", "treasury.fiverr",
                                 "treasury.ledger", "watch.health"])
 
     def test_adding_a_worker_is_adding_an_entry(self) -> None:

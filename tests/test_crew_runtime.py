@@ -122,7 +122,9 @@ class ForegroundRunTests(unittest.TestCase):
             self.assertIn("treasury.ledger", text)
             self.assertIn("LIVE but NOT CONFIGURED", text)        # no token file in the temp dir
             self.assertIn("posting.blog", text)
-            self.assertIn("20 live, 0 placeholder(s)", text)
+            self.assertIn("24 live, 0 placeholder(s)", text)
+            # the Etsy workers idle until the shop is set up, naming the exact next step
+            self.assertIn(r"etsy.scout               LIVE but no Etsy credentials", text)
             self.assertIn("stopped cleanly", lines[-1])
             self.assertTrue(crew.stopping)
             self.assertGreater(crew.steps, 0)

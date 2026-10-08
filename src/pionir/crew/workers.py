@@ -431,6 +431,34 @@ def bolts_collector(spec, **params):
     return BoltsWorker(spec, **params)
 
 
+# ---- Etsy streams (crew/etsy/) ----------------------------------------------------------------
+def etsy_scout(spec, **params):
+    """REAL. ``etsy.scout`` (etsy/scout.py): measures Etsy demand for keywords derived from
+    Etsy's own tags and the crew's demand ranking (seeds only as fallback), via Pionir."""
+    from .etsy.scout import EtsyScout
+    return EtsyScout(spec, **params)
+
+
+def etsy_digital(spec, **params):
+    """REAL. ``etsy.digital`` (etsy/maker.py): a spreadsheet + printable listing, drafted from
+    measured demand and submitted as ``etsy.create_draft_listing`` for the owner's approval."""
+    from .etsy.maker import DigitalMaker
+    return DigitalMaker(spec, **params)
+
+
+def etsy_pod(spec, **params):
+    """REAL. ``etsy.pod`` (etsy/pod.py): a typographic print-on-demand product through
+    Printify, created and published only on the owner's two approvals."""
+    from .etsy.pod import PodMaker
+    return PodMaker(spec, **params)
+
+
+def etsy_sales(spec, **params):
+    """REAL. ``treasury.etsy`` (etsy/sales.py): the Etsy-reported gross, read-only."""
+    from .etsy.sales import EtsySales
+    return EtsySales(spec, **params)
+
+
 # The whole list of worker implementations. A catalogue ``impl`` not named here is an
 # error at load time, never a worker that silently does not exist.
 IMPLS = {
@@ -455,4 +483,9 @@ IMPLS = {
     "fiverr_earnings": fiverr_earnings,
     "daedalus_builds": daedalus_builds,
     "bolts_collector": bolts_collector,
+    # ---- Etsy streams ----
+    "etsy_scout": etsy_scout,
+    "etsy_digital": etsy_digital,
+    "etsy_pod": etsy_pod,
+    "etsy_sales": etsy_sales,
 }
