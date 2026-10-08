@@ -122,7 +122,7 @@ class ForegroundRunTests(unittest.TestCase):
             self.assertIn("treasury.ledger", text)
             self.assertIn("LIVE but NOT CONFIGURED", text)        # no token file in the temp dir
             self.assertIn("posting.blog", text)
-            self.assertIn("20 live, 0 placeholder(s)", text)
+            self.assertIn("25 live, 0 placeholder(s)", text)
             self.assertIn("stopped cleanly", lines[-1])
             self.assertTrue(crew.stopping)
             self.assertGreater(crew.steps, 0)
@@ -133,7 +133,12 @@ class ForegroundRunTests(unittest.TestCase):
             # Strict on purpose - no surprise network calls. The ledger is never called (no
             # token). Health got no answer here, so it asked the control site before daring to
             # call the site down; that second call is the one it is supposed to make.
-            self.assertEqual(urls, {"https://api.dokaz.net/health", CONTROL_URL})
+            # The Marketplaces scouts read the stores' PUBLIC catalogues (stage 2: after every
+            # other worker) - expected, and only those hosts.
+            public = {u for u in urls if u.startswith((
+                "https://api.apify.com/v2/store?", "https://chromewebstore.google.com/",
+                "https://apps.shopify.com/"))}
+            self.assertEqual(urls - public, {"https://api.dokaz.net/health", CONTROL_URL})
 
     def test_a_restart_records_the_gap_it_was_not_running(self) -> None:
         with temp_dir() as root:

@@ -1071,6 +1071,30 @@ def apibuild_lines(row: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+# ---- Marketplaces (crew/marketplaces): a store publish says what goes public, first ----------
+MARKET_APIFY = "apify.publish"
+MARKET_CHROME = "chrome.publish_update"
+
+
+def marketplace_lines(row: Mapping[str, Any]) -> list[str]:
+    """The first lines of an Apify Store or Chrome Web Store publish card."""
+    payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
+    if row.get("capability") == MARKET_APIFY:
+        pricing = payload.get("pricing") if isinstance(payload.get("pricing"), Mapping) else {}
+        price = pricing.get("price_usd")
+        each = f"${float(price):.4f}" if isinstance(price, (int, float)) else "?"
+        return [f"\U0001f310 **PUBLISHES PUBLICLY ON THE APIFY STORE** - "
+                f"{_escape(str(payload.get('title')))}, charging users **{each} per successful "
+                f"result** ({_escape(str(pricing.get('event_title')))}) - the Actor is built "
+                "on Apify first and made public only if the build succeeds."]
+    if row.get("capability") == MARKET_CHROME:
+        return [f"\U0001f310 **UPLOADS TO THE CHROME WEB STORE AND SUBMITS IT FOR REVIEW** - "
+                f"{_escape(str(payload.get('name')))} {_escape(str(payload.get('version')))} "
+                f"(item `{_fence_safe(str(payload.get('item_id')))}`); it goes live only when "
+                "Google's review passes."]
+    return []
+
+
 def render_request(row: Mapping[str, Any], owner: str | None, *,
                    delivery: Mapping[str, Any] | None = None,
                    product: Mapping[str, Any] | None = None,
@@ -1116,6 +1140,7 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
             lines.append(listing)
     if row.get("capability") == APIBUILD_VERIFY:
         lines += apibuild_lines(row)
+    lines += marketplace_lines(row)
     if delivers:
         lines.append(client_deliver_line(payload.get("to")))
         if payload.get("hold_for_balance") is True:
@@ -1223,6 +1248,11 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
         lines += _instagram_lines(payload)
         if isinstance(payload.get("caption"), str):
             shown = {**payload, "caption": "(the full caption above)"}
+    if row.get("capability") == MARKET_APIFY and isinstance(payload.get("readme_md"), str):
+        lines += ["**The Store page, in full (README.md):**", _FENCE + "md",
+                  _fence_safe(payload["readme_md"]), _FENCE]
+        shown = {**shown, "readme_md": f"(the full README above, "
+                                       f"{len(payload['readme_md']):,} characters)"}
     lines += ["**Full payload:**", _FENCE + "json",
               _fence_safe(json.dumps(shown, indent=2, ensure_ascii=False, default=str)),
               _FENCE]

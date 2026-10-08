@@ -97,6 +97,11 @@ EXPECTED = {
     "proteus.start_service": ("card", None),
     "proteus.deploy": ("card", None),
     "quotes.card": ("auto", None),
+    # Marketplaces: a store publish is its own card on every call; the reads just run
+    "apify.publish": ("card", None),
+    "apify.stats": ("auto", None),
+    "chrome.publish_update": ("card", None),
+    "chrome.status": ("auto", None),
 }
 
 NEW_FIELDS = ("requires_approval", "spends_money", "batchable", "batch_condition",

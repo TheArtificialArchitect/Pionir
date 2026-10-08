@@ -431,6 +431,30 @@ def bolts_collector(spec, **params):
     return BoltsWorker(spec, **params)
 
 
+# ---- Marketplaces (crew/marketplaces): Apify Store, Chrome Web Store, Shopify App Store ----
+def marketplace_scout(spec, **params):
+    """REAL. ``marketplaces.scout_<market>`` (marketplaces/scout.py): gaps in one store from its
+    public catalogue, scored and de-duplicated, specified through the shared brain, and the
+    best spec handed to the Builds backlog (or, for Shopify, to the packager)."""
+    from .marketplaces.scout import ScoutWorker
+    return ScoutWorker(spec, **params)
+
+
+def marketplace_packager(spec, **params):
+    """REAL. ``marketplaces.packager`` (marketplaces/packager.py): each approved store build as a
+    listing draft, submitted as ``apify.publish`` / ``chrome.publish_update`` - parked for the
+    owner's approval on every call."""
+    from .marketplaces.packager import PackagerWorker
+    return PackagerWorker(spec, **params)
+
+
+def marketplace_watcher(spec, **params):
+    """REAL. ``marketplaces.watcher`` (marketplaces/watcher.py): the published products' runs,
+    users and ratings, read only, and the division's report."""
+    from .marketplaces.watcher import WatcherWorker
+    return WatcherWorker(spec, **params)
+
+
 # The whole list of worker implementations. A catalogue ``impl`` not named here is an
 # error at load time, never a worker that silently does not exist.
 IMPLS = {
@@ -455,4 +479,8 @@ IMPLS = {
     "fiverr_earnings": fiverr_earnings,
     "daedalus_builds": daedalus_builds,
     "bolts_collector": bolts_collector,
+    # ---- Marketplaces ----
+    "marketplace_scout": marketplace_scout,
+    "marketplace_packager": marketplace_packager,
+    "marketplace_watcher": marketplace_watcher,
 }
