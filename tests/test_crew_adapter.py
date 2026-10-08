@@ -156,10 +156,13 @@ class ManifestTests(unittest.TestCase):
     def test_risk_levels_routability_and_no_model(self) -> None:
         caps = {c.name: c for c in CrewAdapter().manifest.capabilities}
         self.assertEqual(set(caps), {"crew.digest", "crew.divisions", "crew.compute",
-                                     "crew.set_goal", "crew.allocate"})
+                                     "crew.set_goal", "crew.allocate", "crew.run_worker",
+                                     "crew.pause_worker", "crew.resume_worker",
+                                     "crew.set_cadence"})
         for name in ("crew.digest", "crew.divisions", "crew.compute"):
             self.assertIs(caps[name].risk, RiskLevel.READ_ONLY, name)
-        for name in ("crew.set_goal", "crew.allocate"):
+        for name in ("crew.set_goal", "crew.allocate", "crew.run_worker", "crew.pause_worker",
+                     "crew.resume_worker", "crew.set_cadence"):
             self.assertIs(caps[name].risk, RiskLevel.REVERSIBLE_WRITE, name)
         for cap in caps.values():
             self.assertFalse(cap.routable, cap.name)

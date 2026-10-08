@@ -61,6 +61,11 @@ EXPECTED = {
     "crew.compute": ("auto", None),
     "crew.set_goal": ("auto", None),
     "crew.allocate": ("auto", None),
+    # the worker controls: compute only, reversible, self-expiring (crew/control.py)
+    "crew.run_worker": ("auto", None),
+    "crew.pause_worker": ("auto", None),
+    "crew.resume_worker": ("auto", None),
+    "crew.set_cadence": ("auto", None),
     "coding.daedalus_solve": ("card", None),
     "coding.daedalus_build": ("card", None),
     "coding.daedalus_build_cancel": ("auto", None),

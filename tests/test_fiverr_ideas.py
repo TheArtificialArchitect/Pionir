@@ -1,10 +1,12 @@
-"""The Fiverr gig-idea proposer: ideas come only from measured demand, one at a time, never twice
-after a no, and nothing is priced or posted to Fiverr by it.
+"""The Fiverr gig-idea proposer: ideas come only from measured demand, a few at a time, none
+waiting for ever, never twice after a no, and nothing is priced or posted to Fiverr by it.
 
 Each test fails if the rule it names is reverted: an idea proposed with no measured demand (or from
-a stale or unreadable ranking), two ideas open at once, a skipped idea proposed again, an idea
-card that claims the demand is Fiverr search volume or leaves out the delivery gap, a price set
-without the owner, a reply read twice, or an idea listing that overclaims what the tool does.
+a stale or unreadable ranking), more than MAX_OPEN ideas open at once or two new ones in one run,
+an unanswered idea holding its slot for ever (one idea in 15 runs) or reminded more than once, a
+skipped idea proposed again, an idea card that claims the demand is Fiverr search volume or leaves
+out the delivery gap, a price set without the owner, a reply read twice, or an idea listing that
+overclaims what the tool does.
 """
 from __future__ import annotations
 
@@ -12,6 +14,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from test_fiverr_desk import FakePionir
 
@@ -124,10 +127,12 @@ class ProposerTests(unittest.TestCase):
         self.assertIn("NOT SET", body)                      # no price until he sets one
         self.assertTrue((self.root / "fiverr" / "gigs" / "emailclean" / "gig.md").is_file())
 
-    def test_only_one_idea_is_open_at_a_time_and_it_is_not_reposted(self) -> None:
+    def test_one_new_idea_per_run_and_an_open_one_is_not_reposted(self) -> None:
         self.go()
-        self.go(T0 + 30_000)
         self.assertEqual(self.pionir.posted("idea:"), ["idea:emailclean:v1"])
+        self.go(T0 + 30_000)                # a second slot is free: the next measured idea
+        self.go(T0 + 60_000)
+        self.assertEqual(self.pionir.posted("idea:"), ["idea:emailclean:v1", "idea:codes:v1"])
 
     def test_skip_drops_the_idea_for_good_and_the_next_one_comes(self) -> None:
         self.go()
@@ -140,6 +145,48 @@ class ProposerTests(unittest.TestCase):
         self.go(T0 + 400)
         self.go(T0 + 500)
         self.assertEqual(self.pionir.posted("idea:"), ["idea:emailclean:v1", "idea:codes:v1"])
+
+    def test_never_more_than_max_open_ideas_wait_at_once(self) -> None:
+        with mock.patch.object(ideas, "MAX_OPEN", 1):
+            self.go()
+            self.go(T0 + 30_000)
+        self.assertEqual(self.pionir.posted("idea:"), ["idea:emailclean:v1"])
+
+    def test_an_unanswered_idea_is_reminded_once_then_expires_freeing_its_slot(self) -> None:
+        """Reverted: one unanswered card holds the only slot for ever."""
+        day = 86400
+        with mock.patch.object(ideas, "MAX_OPEN", 1):
+            self.go()
+            self.go(T0 + day)                                    # waiting: nothing new
+            self.assertEqual(self.pionir.posted("idea-remind:"), [])
+            self.go(T0 + ideas.REMIND_AFTER_SECONDS + 60)        # the one reminder
+            self.go(T0 + ideas.REMIND_AFTER_SECONDS + 3600)      # ... and not again
+            self.assertEqual(self.pionir.posted("idea-remind:"), ["idea-remind:emailclean:v1"])
+            note = self.pionir.cards["idea-remind:emailclean:v1"][0]
+            self.assertEqual(note["kind"], "note")
+            self.assertIn("only reminder", note["body"])
+            self.assertEqual(self.pionir.posted("idea:"), ["idea:emailclean:v1"])
+            self.rank([row("email", 104), row("barcode", 84)], computed_at=T0 + 2 * day)
+            self.go(T0 + ideas.EXPIRE_AFTER_SECONDS + 60)        # expired: the slot is free
+        self.assertEqual(self.pionir.posted("idea:"), ["idea:emailclean:v1", "idea:codes:v1"])
+        rec = self.worker.load(self.state)
+        self.assertEqual(rec["ideas"]["emailclean"]["status"], "expired")
+        self.assertEqual(rec["ideas"]["codes"]["status"], "proposed")
+        # no message says it expired, and it is not proposed again by itself
+        self.assertEqual(len(self.pionir.posted("idea-remind:")), 1)
+        self.go(T0 + 10 * day)
+        self.assertEqual(len(self.pionir.posted("idea:emailclean")), 1)
+
+    def test_a_late_reply_on_an_expired_idea_still_counts(self) -> None:
+        self.go()
+        self.go(T0 + ideas.EXPIRE_AFTER_SECONDS + 60)
+        self.assertEqual(self.worker.load(self.state)["ideas"]["emailclean"]["status"],
+                         "expired")
+        self.reply("2010", "emailclean", "redraft")
+        self.go(T0 + ideas.EXPIRE_AFTER_SECONDS + 120)
+        self.assertIn("idea:emailclean:v2", self.pionir.cards)
+        self.assertEqual(self.worker.load(self.state)["ideas"]["emailclean"]["status"],
+                         "proposed")
 
     def test_a_stale_or_missing_ranking_proposes_nothing(self) -> None:
         self.rank([row("email", 104)], computed_at=T0 - 10 * 86400)

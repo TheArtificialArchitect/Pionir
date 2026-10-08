@@ -37,6 +37,7 @@ from functools import partial
 from .api import CrewApi
 from .brain import Brain, Post, http_post_json
 from .clock import WallClock
+from .control import DispatchControl
 from .direction import Allocation, Direction
 from .escalation import (
     DEFAULT_CLAUDE_MODEL,
@@ -98,8 +99,12 @@ class Crew:
                                              token_file=cfg.pionir_token_file), now=monotonic)
         self.http = http if http is not None else UrllibHttp()
         self.gate = ProviderGate(registry.providers)
+        # parking, retries and the run-now / pause / cadence controls (control.py)
+        self.control = DispatchControl(self.store, registry, secrets_dir=cfg.secrets_dir,
+                                       clock=now, jitter=jitter)
         self.dispatcher = Dispatcher(registry, self.store, context=self.context_for,
-                                     gate=self.gate, max_workers=cfg.pool_size, clock=now)
+                                     gate=self.gate, max_workers=cfg.pool_size, clock=now,
+                                     control=self.control)
         self.escalator = Escalator(self.store, self.allocation,
                                    runner=claude_runner if cfg.claude_daily_cap > 0 else None,
                                    daily_cap=cfg.claude_daily_cap,
@@ -108,6 +113,7 @@ class Crew:
                                                  cfg.claude_daily_cap),
                                    night_model=getattr(cfg, "claude_model",
                                                        DEFAULT_CLAUDE_MODEL),
+                                   leader_cap=getattr(cfg, "claude_leader_cap", None),
                                    timeout=cfg.escalation_timeout_seconds, clock=now,
                                    research_runner=(research_runner
                                                     if cfg.claude_daily_cap > 0 else None),
@@ -116,7 +122,8 @@ class Crew:
                                    review_runner=(review_runner
                                                   if cfg.claude_daily_cap > 0 else None))
         self.leaders = {d: Leader(d, registry, self.store, ask=self.brain.ask,
-                                  escalator=self.escalator, model=cfg.model, clock=now)
+                                  escalator=self.escalator, model=cfg.model, clock=now,
+                                  rerun=self.leader_rerun)
                         for d in registry.division_ids()}
         self._leader_pool = ThreadPoolExecutor(max_workers=cfg.leader_pool_size,
                                                thread_name_prefix="pionir-crew-leader")
@@ -126,6 +133,7 @@ class Crew:
                              outputs=self.output_alerts)
         self.direction.outputs = self.output_alerts
         self.direction.facts = self.output_facts
+        self.direction.dispatch = self.dispatch_status
         self.started_at = now()
         self.born_real = 0.0
         self.paused_seconds_total = 0.0
@@ -136,7 +144,7 @@ class Crew:
         self._thread = threading.Thread(target=self._run, name="pionir-crew-loop", daemon=True)
         # Built here, served from start(): building a crew opens no socket.
         self.api = (CrewApi(self.direction, health=self.api_health, port=cfg.api_port,
-                            token_file=cfg.pionir_token_file)
+                            token_file=cfg.pionir_token_file, controls=self)
                     if cfg.api_port is not None else None)
         self._restore()
 
@@ -324,6 +332,48 @@ class Crew:
         results = {d: lead.run() for d, lead in self.leaders.items()}
         return {"workers": report, "leaders": results}
 
+    # ---- the controls Moss (crew API) and the leaders hold -------------------------
+    def run_now(self, worker_id: str, *, by: str) -> dict:
+        """Run a worker at the next tick (control.DispatchControl.request_run)."""
+        in_flight = worker_id in self.dispatcher.in_flight()
+        return self.control.request_run(worker_id, by=by, in_flight=in_flight)
+
+    def pause_worker(self, worker_id: str, *, by: str, hours=None, reason=None) -> dict:
+        return self.control.pause(worker_id, by=by, hours=hours, reason=reason)
+
+    def resume_worker(self, worker_id: str, *, by: str) -> dict:
+        return self.control.resume(worker_id, by=by)
+
+    def set_cadence(self, worker_id: str, multiplier, *, by: str, hours=None) -> dict:
+        return self.control.set_cadence(worker_id, multiplier, by=by, hours=hours)
+
+    def leader_rerun(self, division: str, worker_id: str) -> dict:
+        """A leader's distilled decision asked for a fresh run of one of ITS workers:
+        ``{"worker", "queued": True}`` or ``{"worker", "queued": False, "why"}``. Bounded
+        per day per division (control.LEADER_RUNS_PER_DAY); never raises."""
+        try:
+            in_flight = worker_id in self.dispatcher.in_flight()
+            got = self.control.request_run(worker_id, by=f"leader.{division}",
+                                           division=division, in_flight=in_flight)
+            return {"worker": worker_id, "queued": True,
+                    **({"note": got["note"]} if got.get("note") else {})}
+        except ValueError as exc:
+            return {"worker": worker_id, "queued": False, "why": str(exc)}
+        except Exception as exc:  # noqa: BLE001 - a report must still be written
+            lesion("crew.leader_rerun", exc)
+            return {"worker": worker_id, "queued": False, "why": type(exc).__name__}
+
+    def dispatch_status(self) -> dict:
+        """{worker id: its dispatch state} for /api/divisions (DispatchControl.status)."""
+        now = self._now()
+        last = self.store.last_attempts()
+        health = {h.worker_id: h for h in self.store.health(self.registry.cadences(), now)}
+        running = set(self.dispatcher.in_flight())
+        return {w.worker_id: self.control.status(w, now, health=health.get(w.worker_id),
+                                                 prev=last.get(w.worker_id),
+                                                 in_flight=w.worker_id in running)
+                for w in self.registry.all()}
+
     # ---- for a viewer ----------------------------------------------------------
     def pulses(self) -> list:
         """Every worker that keeps an output counter (the daily posters), as it stands:
@@ -404,6 +454,7 @@ class Crew:
                "stopping": self.stopping, "uptime_s": round(now - self.started_at),
                "divisions": list(self.registry.division_ids())}
         if not self.stopping:
+            doc["dispatch"] = self.control.summary(now)
             doc["posting"] = self.pulses()
             doc["alerts"] = [a for a in self.vitals.report() if a["check"] != "not_wired"]
         return doc
@@ -419,6 +470,7 @@ class Crew:
             "leaders": [h.to_dict() for h in self.store.health(
                 {lead.leader_id: lead.cadence_seconds for lead in self.leaders.values()}, now)],
             "in_flight": self.dispatcher.in_flight(),
+            "dispatch": self.control.summary(now),
             "vitals": self.vitals.to_dict(),
             "brain": self.brain.snapshot(),
             "hands": self.hands.snapshot(),

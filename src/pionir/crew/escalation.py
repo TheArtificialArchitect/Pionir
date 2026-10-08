@@ -36,6 +36,13 @@ worker then validates every byte (crew/fiverr/site.py) - nothing Claude wrote is
 **Reviews** (``Escalator.review``) run through ``claude_review_runner`` with NO tools at all.
 Both spend the same cap and share as research.
 
+**The leaders' share** (``leader_cap``, default ``default_leader_cap``: 40% of the daily
+cap, 4 of 10): a leader's escalation (``Escalator.escalate``) also counts against a pool of
+its own, so the leaders' reports can never take the slots the workers need for real work -
+research, website builds, reviews. Measured before it existed: treasury and contracts
+escalated 4-6 times a day between them about the same unchanged facts, starving the finder
+and the build reviews. (A leader also asks only when its input changed: leader.py.)
+
 **Overnight work** (the Builds division and the API builder: ``night=True``) is held tighter:
 a separate per-night cap (``night_cap``, default 3; a night is noon to noon, local time),
 INSIDE the daily cap, and an explicit cheaper model (``night_model``, default
@@ -72,6 +79,14 @@ Runner = Callable[[str, float], str]
 DEFAULT_CLAUDE_MODEL = "claude-sonnet-5"
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:\[\]-]{0,63}")
 DEFAULT_NIGHT_CAP = 3
+# The leaders' share of the daily Claude cap; the rest is reserved for workers' real work.
+LEADER_SHARE = 0.4
+LEADERS_POOL = "leaders"
+
+
+def default_leader_cap(daily_cap: int) -> int:
+    """How many of the day's Claude calls the leaders may take between them."""
+    return int(max(0, daily_cap) * LEADER_SHARE)
 
 
 def clean_model(model) -> str | None:
@@ -367,7 +382,8 @@ class Escalator:
                  timeout: float = 300.0, clock: Callable[[], float] = time.time,
                  research_runner: Runner | None = None, site_runner: Runner | None = None,
                  review_runner: Runner | None = None, night_cap: int = DEFAULT_NIGHT_CAP,
-                 night_model: str | None = DEFAULT_CLAUDE_MODEL) -> None:
+                 night_model: str | None = DEFAULT_CLAUDE_MODEL,
+                 leader_cap: int | None = None) -> None:
         if daily_cap < 0:
             raise ValueError("the daily Claude cap cannot be negative")
         if night_cap < 0:
@@ -381,6 +397,10 @@ class Escalator:
         self.researched = 0
         self.built = 0
         self.daily_cap = int(daily_cap)
+        self.leader_cap = (default_leader_cap(self.daily_cap) if leader_cap is None
+                           else min(int(leader_cap), self.daily_cap))
+        if self.leader_cap < 0:
+            raise ValueError("the leaders' Claude cap cannot be negative")
         self.night_cap = int(night_cap)
         self.night_model = clean_model(night_model)
         self.timeout = timeout
@@ -403,7 +423,8 @@ class Escalator:
             share = self.allocation.cap("claude_escalations", division)
             ok, reason, esc_id = self.store.reserve_escalation(
                 day=day, division=division, t=now, global_cap=self.daily_cap,
-                division_cap=min(share, self.daily_cap))
+                division_cap=min(share, self.daily_cap), pool=LEADERS_POOL,
+                pool_cap=self.leader_cap)
         except Exception as exc:  # noqa: BLE001 - a refusal, in words
             return Err(f"could not reserve an escalation: {type(exc).__name__}: {exc}")
         if not ok:
@@ -507,6 +528,8 @@ class Escalator:
     def snapshot(self) -> dict:
         day = local_day(self._clock())
         return {"enabled": self.enabled, "daily_cap": self.daily_cap,
+                "leader_cap": self.leader_cap,
+                "leaders_used_today": self.store.pool_escalations(day, LEADERS_POOL),
                 "night_cap": self.night_cap, "night_model": self.night_model,
                 "used_tonight": self.store.night_escalations(night_key(self._clock())),
                 "used_today": self.store.escalations_on(day), "answered": self.answered,

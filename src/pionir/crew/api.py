@@ -11,6 +11,14 @@ action. The API is the Direction API (direction.py) over HTTP, nothing more:
     GET  /api/compute                      Direction.compute
     POST /api/goal     {division, goal, priority?, by?}     Direction.set_goal
     POST /api/allocate {resource, shares, by?}              Direction.allocate
+    POST /api/worker/run     {worker, by?}                         run it at the next tick
+    POST /api/worker/pause   {worker, hours?, reason?, by?}        pause it (expires)
+    POST /api/worker/resume  {worker, by?}                         end a pause
+    POST /api/worker/cadence {worker, multiplier, hours?, by?}     scale its cadence (expires)
+
+The four worker controls (control.py) are compute only and reversible: a pause and a
+cadence multiplier always expire (at most 7 days; a multiplier is 0.25 to 4), a run-now is
+one run. None of them approves or spends anything.
 
 Every answer is a JSON object with ``ok``. Bad input is a 400 carrying the ValueError's
 text, never a 500; a 500 is only ever a real fault, recorded as a lesion. There is no
@@ -47,6 +55,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 from ..auth import compat_from_environment, parse_bearer, read_token
+from .control import parse_hours, parse_multiplier, parse_reason
 from .direction import DIGEST_CHARS, MAX_GOAL_CHARS, _check_resource
 from .log import lesion, log
 
@@ -65,7 +74,10 @@ DEFAULT_BY = "crew-api"
 _LOCAL_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 GET_ROUTES = ("/api/health", "/api/digest", "/api/divisions", "/api/compute")
-POST_ROUTES = ("/api/goal", "/api/allocate")
+WORKER_ROUTES = ("/api/worker/run", "/api/worker/pause", "/api/worker/resume",
+                 "/api/worker/cadence")
+POST_ROUTES = ("/api/goal", "/api/allocate", *WORKER_ROUTES)
+MAX_WORKER_CHARS = 80
 
 Reply = tuple[int, dict]
 
@@ -136,6 +148,34 @@ def parse_allocation(body: Mapping) -> dict:
     return {"resource": resource.strip(), "shares": dict(shares), "by": parse_by(body.get("by"))}
 
 
+def parse_worker(body: Mapping) -> str:
+    """The worker a control names. Whether it exists is the crew's to say (its registry)."""
+    worker = body.get("worker")
+    if not isinstance(worker, str) or not worker.strip():
+        raise ValueError("worker names one of the crew's workers (division.name)")
+    worker = worker.strip()
+    if len(worker) > MAX_WORKER_CHARS or not worker.isprintable():
+        raise ValueError(f"worker is a worker id of at most {MAX_WORKER_CHARS} characters")
+    return worker
+
+
+def parse_worker_control(path: str, body: Mapping) -> dict:
+    """A worker control's body -> its arguments, by route (``/api/worker/<what>``)."""
+    args = {"worker": parse_worker(body), "by": parse_by(body.get("by"))}
+    what = path.rsplit("/", 1)[-1]
+    if what == "pause":
+        args["hours"] = parse_hours(body.get("hours"))
+        args["reason"] = parse_reason(body.get("reason"))
+    elif what == "cadence":
+        if "multiplier" not in body:
+            raise ValueError("multiplier is required (1 ends a change)")
+        args["multiplier"] = parse_multiplier(body.get("multiplier"))
+        args["hours"] = parse_hours(body.get("hours"))
+    elif what not in ("run", "resume"):
+        raise ValueError(f"no such worker control: {what}")
+    return args
+
+
 def is_loopback(host: str) -> bool:
     try:
         address = ipaddress.ip_address((host or "").split("%", 1)[0])
@@ -162,10 +202,14 @@ class CrewApi:
 
     def __init__(self, direction, *, health: Callable[[], dict],
                  port: int = DEFAULT_PORT, host: str = BIND_HOST,
-                 token_file: Path | None = None, compat: bool | None = None) -> None:
+                 token_file: Path | None = None, compat: bool | None = None,
+                 controls=None) -> None:
         if not is_loopback(host):
             raise ValueError("the crew API binds loopback only")
         self.direction = direction
+        # the worker controls (runtime.Crew: run_now, pause_worker, resume_worker,
+        # set_cadence); None: those routes answer 503
+        self.controls = controls
         # The token a write must carry, read per request (Pionir may re-make it).
         self.token_file = token_file
         self.compat = compat_from_environment() if compat is None else compat
@@ -282,6 +326,8 @@ class CrewApi:
     def _post(self, path: str, body: dict) -> Reply:
         if self._health().get("stopping"):
             return 503, _err("the crew is stopping; nothing was changed")
+        if path in WORKER_ROUTES:
+            return self._control(path, body)
         if path == "/api/goal":
             args = parse_goal(body)
             row = self.direction.set_goal(args["division"], args["goal"],
@@ -291,6 +337,31 @@ class CrewApi:
         allocation = self.direction.allocate(args["resource"], args["shares"], by=args["by"])
         return 200, {"ok": True, "resource": args["resource"], "by": args["by"],
                      "allocation": allocation}
+
+
+    def _control(self, path: str, body: dict) -> Reply:
+        if self.controls is None:
+            return 503, _err("this crew has no worker controls; nothing was changed")
+        args = parse_worker_control(path, body)
+        worker, by = args.pop("worker"), args["by"]
+        what = path.rsplit("/", 1)[-1]
+        try:
+            if what == "run":
+                got = self.controls.run_now(worker, **args)
+            elif what == "pause":
+                got = self.controls.pause_worker(worker, **args)
+            elif what == "resume":
+                got = self.controls.resume_worker(worker, **args)
+            else:
+                got = self.controls.set_cadence(worker, args.pop("multiplier"), **args)
+        except KeyError as exc:                    # an unknown worker is a 400, in words
+            raise ValueError(str(exc).strip("'\"")) from exc
+        out = {"ok": True, "worker": got["worker"], "by": by, "control": got["control"]}
+        if what == "run":
+            out["queued"] = True
+        if got.get("note"):
+            out["note"] = got["note"]
+        return 200, out
 
 
 def _err(message: str) -> dict:

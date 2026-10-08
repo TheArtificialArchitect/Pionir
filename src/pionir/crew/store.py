@@ -107,6 +107,13 @@ CREATE TABLE IF NOT EXISTS night_escalations (
     esc_id INTEGER PRIMARY KEY, night TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_night_esc ON night_escalations(night);
+-- Which of those attempts came from a POOL with its own cap inside the daily one (today only
+-- "leaders": the leaders' reports, so their questions cannot starve the workers' builds and
+-- reviews). A separate table, so an existing database needs no migration.
+CREATE TABLE IF NOT EXISTS escalation_pools (
+    esc_id INTEGER PRIMARY KEY, day TEXT NOT NULL, pool TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_esc_pool ON escalation_pools(day, pool);
 """
 
 CALL_CAP = 20000
@@ -503,7 +510,8 @@ class CrewStore:
     # ---- Claude escalations -------------------------------------------------
     def reserve_escalation(self, *, day: str, division: str, t: float, global_cap: int,
                            division_cap: int, night: str | None = None,
-                           night_cap: int = 0) -> tuple:
+                           night_cap: int = 0, pool: str | None = None,
+                           pool_cap: int = 0) -> tuple:
         """Check the caps (the daily one, the division's share and, for overnight work - a
         ``night`` key - the night's) and take a slot in ONE writer transaction, so two
         leaders can never both take the last one. -> (ok, reason, id)."""
@@ -523,8 +531,18 @@ class CrewStore:
                 if spent >= night_cap:
                     return False, (f"the night's Claude cap of {night_cap} is used up "
                                    f"({spent} tonight)"), None
+            if pool is not None:
+                taken = c.execute("SELECT COUNT(*) FROM escalation_pools WHERE day=? AND "
+                                  "pool=?", (day, pool)).fetchone()[0]
+                if taken >= pool_cap:
+                    return False, (f"the {pool}' share of the daily Claude cap is {pool_cap} "
+                                   f"a day and {taken} are used; the rest is kept for the "
+                                   "workers' builds and reviews"), None
             cur = c.execute("INSERT INTO escalations (t, day, division, status) "
                             "VALUES (?,?,?,'running')", (t, day, division))
+            if pool is not None:
+                c.execute("INSERT INTO escalation_pools (esc_id, day, pool) VALUES (?,?,?)",
+                          (cur.lastrowid, day, pool))
             if night is not None:
                 c.execute("INSERT INTO night_escalations (esc_id, night) VALUES (?,?)",
                           (cur.lastrowid, night))
@@ -534,6 +552,10 @@ class CrewStore:
     def finish_escalation(self, esc_id: int, ok: bool, note: str = "") -> None:
         self._write(lambda c: c.execute("UPDATE escalations SET status=?, note=? WHERE id=?",
                                         ("ok" if ok else "failed", note[:500], esc_id)))
+
+    def pool_escalations(self, day: str, pool: str) -> int:
+        return self._read("SELECT COUNT(*) FROM escalation_pools WHERE day=? AND pool=?",
+                          (day, pool))[0][0]
 
     def night_escalations(self, night: str) -> int:
         return self._read("SELECT COUNT(*) FROM night_escalations WHERE night=?",
