@@ -339,4 +339,13 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         from .adapters.printify import PrintifyAdapter, printify_settings
 
         runtime.register(PrintifyAdapter(printify_settings(configured)))
+    # ---- Marketplaces (crew/marketplaces): the Apify Store and the Chrome Web Store ----
+    # apify.publish and chrome.publish_update park for the owner's approval on EVERY call;
+    # apify.stats and chrome.status only read. The token and credential files are read when a
+    # task runs (tools\setup-apify.ps1, tools\setup-chrome-webstore.ps1): no network at boot.
+    from .adapters.apify import ApifyAdapter, apify_settings
+    from .adapters.chrome_webstore import ChromeWebStoreAdapter, chrome_settings
+
+    runtime.register(ApifyAdapter(apify_settings(configured)))
+    runtime.register(ChromeWebStoreAdapter(chrome_settings(configured)))
     return runtime

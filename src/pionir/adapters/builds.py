@@ -52,6 +52,11 @@ HEADS = {
     "problem": "⚠️ **BUILDS — NEEDS YOU**",
     "demand": "\U0001f4a1 **DEMAND SEEN** — a suggestion only: nothing was added to any "
               "backlog, built or put on sale.",
+    # ---- Marketplaces (crew/marketplaces) ----
+    "market": "\U0001f6d2 **MARKETPLACES** — nothing here was published: every publish waits "
+              "for your ✅ on its own approval card.",
+    "market_reviews": "⭐ **MARKETPLACES — RATINGS MOVED** — read-only news: nothing was "
+                      "read from or posted to the store.",
 }
 KINDS = tuple(HEADS)
 INBOX_KINDS = ("night", "backlog")

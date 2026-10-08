@@ -457,6 +457,28 @@ def etsy_sales(spec, **params):
     """REAL. ``treasury.etsy`` (etsy/sales.py): the Etsy-reported gross, read-only."""
     from .etsy.sales import EtsySales
     return EtsySales(spec, **params)
+# ---- Marketplaces (crew/marketplaces): Apify Store, Chrome Web Store, Shopify App Store ----
+def marketplace_scout(spec, **params):
+    """REAL. ``marketplaces.scout_<market>`` (marketplaces/scout.py): gaps in one store from its
+    public catalogue, scored and de-duplicated, specified through the shared brain, and the
+    best spec handed to the Builds backlog (or, for Shopify, to the packager)."""
+    from .marketplaces.scout import ScoutWorker
+    return ScoutWorker(spec, **params)
+
+
+def marketplace_packager(spec, **params):
+    """REAL. ``marketplaces.packager`` (marketplaces/packager.py): each approved store build as a
+    listing draft, submitted as ``apify.publish`` / ``chrome.publish_update`` - parked for the
+    owner's approval on every call."""
+    from .marketplaces.packager import PackagerWorker
+    return PackagerWorker(spec, **params)
+
+
+def marketplace_watcher(spec, **params):
+    """REAL. ``marketplaces.watcher`` (marketplaces/watcher.py): the published products' runs,
+    users and ratings, read only, and the division's report."""
+    from .marketplaces.watcher import WatcherWorker
+    return WatcherWorker(spec, **params)
 
 
 # The whole list of worker implementations. A catalogue ``impl`` not named here is an
@@ -488,4 +510,8 @@ IMPLS = {
     "etsy_digital": etsy_digital,
     "etsy_pod": etsy_pod,
     "etsy_sales": etsy_sales,
+    # ---- Marketplaces ----
+    "marketplace_scout": marketplace_scout,
+    "marketplace_packager": marketplace_packager,
+    "marketplace_watcher": marketplace_watcher,
 }

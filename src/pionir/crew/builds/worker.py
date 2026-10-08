@@ -652,8 +652,16 @@ class BuildsWorker(_Base):
 
     def _stage(self, ctx, rec, p, files: dict, guard, events: list) -> None:
         """ONLY for a build Claude approved (``_review_one``)."""
+        # Marketplaces hook: a store product (an Apify Actor's core, a Chrome extension) is
+        # staged for the Marketplaces packager, never on the Gumroad shelf; the packager tells
+        # the owner, and its publish waits for his approval like everything else.
+        marketplace = bl.product_type(p["entry"]) != bl.GUMROAD
         try:
-            staged = package.stage(p["entry"], files, ctx.products_dir, guard.secrets)
+            if marketplace:
+                from ..marketplaces.staging import stage_build
+                staged = stage_build(p["entry"], files, ctx.builds_dir, guard.secrets)
+            else:
+                staged = package.stage(p["entry"], files, ctx.products_dir, guard.secrets)
         except Exception as exc:  # noqa: BLE001 - shelved with the reason, never re-reviewed
             self._shelve(ctx, rec, p, f"approved, but it could not be staged: "
                          f"{type(exc).__name__}: {_clip(exc, 240)}", events)
@@ -668,6 +676,9 @@ class BuildsWorker(_Base):
             figures=[Figure(p["entry"]["price_cents"], "usd_cents", "listing price",
                             stream=p["slug"], window="now")]))
         entry = p["entry"]
+        if marketplace:
+            self._save(ctx, rec)
+            return
         self._card(ctx, rec, f"builds:staged:{p['slug']}", "staged",
                    f"{entry['name']}"[:120],
                    f"**{p['slug']}** - ${entry['price_cents'] / 100:.2f}\n"
@@ -1160,7 +1171,9 @@ class BuildsWorker(_Base):
                 out += [f"  - {_clip(r, 200)}" for r in (last.get("reasons") or [])[:5]]
             state = p.get("state")
             if state == "staged":
-                out.append(f"- STAGED at `{p['staged']['folder']}` - the shelf submits it for "
+                who = ("the Marketplaces packager drafts its listing"
+                       if bl.product_type(e) != bl.GUMROAD else "the shelf submits it")
+                out.append(f"- STAGED at `{p['staged']['folder']}` - {who} for "
                            "your approval; nothing is on sale until you approve it")
             elif state == "shelved":
                 out.append(f"- SHELVED: {_clip(p.get('shelved_why'), 240)}")

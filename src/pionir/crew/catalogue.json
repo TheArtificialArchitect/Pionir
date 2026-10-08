@@ -3,7 +3,8 @@
   "providers": {
     "dokaz": 2.0,
     "claude": 1.0,
-    "none": 0.0
+    "none": 0.0,
+    "marketplaces": 3.0
   },
   "known_names": ["Moss", "Pionir", "Claude", "Ian", "Scrooge", "Dokaz"],
   "divisions": [
@@ -237,6 +238,41 @@
          "provider": "none", "entities": ["Etsy", "Printify"],
          "note": "a typographic print-on-demand product through Printify, priced cost-plus, at most 1 a day, created and published only on the owner's approvals",
          "params": {"daily_cap": 1, "min_margin_cents": 400}}
+      ]
+    },
+    {
+      "id": "marketplaces",
+      "title": "Marketplaces",
+      "leader_cadence_seconds": 21600,
+      "entities": ["Apify", "Chrome Web Store", "Shopify", "Daedalus", "Discord"],
+      "brief_quota": {"market.published": 5, "market.submitted": 5, "market.submitted_for_approval": 4,
+                      "market.denied": 3, "market.failed": 3, "market.draft_blocked": 4, "market.drafted": 4,
+                      "market.spec_queued": 3, "market.spec_written": 3, "market.spec_waiting": 2,
+                      "market.spec_blocked": 2, "market.gap": 4, "market.stats": 6, "market.report": 2,
+                      "market.ratings_moved": 3, "market.scout": 3, "market.packager": 2,
+                      "market.read_failed": 2},
+      "leader_notes": "The Marketplaces division sells small software where buyers already look: the Apify Store (pay-per-event Actors), the Chrome Web Store (freemium extensions) and the Shopify App Store (a submission pack only, for now). Three scouts read each store's PUBLIC catalogue (robots.txt obeyed, no account, no personal data) and score gaps: a market.gap row is a niche with measured demand (its figure says what was measured - Apify: users of the niche's Actors in 30 days; Chrome: users; Shopify: review count, the store's only public demand figure) and few or poorly rated competitors; niches touching people's personal data are EXCLUDED and never specified. market.spec_written is a spec whose words came from the shared brain (derived: never a source of figures); market.spec_blocked failed the checks; market.spec_queued means it was added to the Builds backlog for Daedalus overnight (NOT built yet); market.spec_waiting says why it was not (one marketplace product waits in the backlog at a time; Chrome waits until the night builds can test JavaScript). marketplaces.packager turns a build Claude approved into a listing draft (market.drafted) or blocks it with reasons (market.draft_blocked), and submits a publish that Pionir PARKS for the owner (market.submitted_for_approval: NOT live). Only a market.published row means an Actor is live on the Apify Store; market.submitted means a Chrome version went to Google's review and is NOT live yet. market.denied / market.failed say why one did not go out. marketplaces.watcher reports market.stats per published item (users, runs, ratings as the store reports them) and market.report; earnings are UNKNOWN (neither store reports them by API) - never say zero. When a worker reports NOT CONFIGURED, the owner has not yet run tools\\setup-apify.ps1 or tools\\setup-chrome-webstore.ps1: say which. Never call anything live, published or earning unless a row says so.",
+      "workers": [
+        {"name": "scout_apify", "stage": 2, "impl": "marketplace_scout", "uses": [], "kind": "market",
+         "cadence_seconds": 21600, "provider": "marketplaces", "entities": ["Apify"],
+         "note": "Apify Store gaps from its public API, specified and handed to the Builds backlog",
+         "params": {"market": "apify", "pages": 2}},
+        {"name": "scout_chrome", "stage": 2, "impl": "marketplace_scout", "uses": [], "kind": "market",
+         "cadence_seconds": 21600, "provider": "marketplaces", "entities": ["Chrome Web Store"],
+         "note": "Chrome Web Store gaps from its public pages (robots.txt obeyed), specified; built once JavaScript builds exist",
+         "params": {"market": "chrome", "pages": 3, "details": 8}},
+        {"name": "scout_shopify", "stage": 2, "impl": "marketplace_scout", "uses": [], "kind": "market",
+         "cadence_seconds": 43200, "provider": "marketplaces", "entities": ["Shopify"],
+         "note": "Shopify App Store gaps from its public pages, specified as a submission pack",
+         "params": {"market": "shopify", "pages": 3}},
+        {"name": "packager", "stage": 2, "impl": "marketplace_packager",
+         "uses": ["apify.publish", "builds.card", "chrome.publish_update"], "kind": "market",
+         "cadence_seconds": 1800, "provider": "none", "entities": ["Apify", "Chrome Web Store", "Shopify"],
+         "note": "approved store builds as listing drafts, each publish parked for the owner's approval"},
+        {"name": "watcher", "stage": 2, "impl": "marketplace_watcher",
+         "uses": ["apify.stats", "builds.card", "chrome.status"], "kind": "market",
+         "cadence_seconds": 21600, "provider": "marketplaces", "entities": ["Apify", "Chrome Web Store"],
+         "note": "the published products' runs, users and ratings, read only, and the division report"}
       ]
     }
   ]

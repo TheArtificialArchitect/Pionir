@@ -17,11 +17,14 @@ class DefaultCatalogueTests(unittest.TestCase):
         reg = default_registry()
         self.assertEqual(reg.division_ids(),
                          ("treasury", "watch", "posting", "contracts", "products", "fiverr",
-                          "builds", "etsy"))
+                          "builds", "etsy", "marketplaces"))
         self.assertEqual(reg.ids(), ("builds.daedalus", "contracts.delivery",
                                      "contracts.feedback", "contracts.finder", "contracts.orders",
                                      "etsy.digital", "etsy.pod", "etsy.scout", "fiverr.desk",
-                                     "fiverr.gigs", "fiverr.ideas", "posting.blog",
+                                     "fiverr.gigs", "fiverr.ideas", "marketplaces.packager",
+                                     "marketplaces.scout_apify", "marketplaces.scout_chrome",
+                                     "marketplaces.scout_shopify", "marketplaces.watcher",
+                                     "posting.blog",
                                      "posting.devto",
                                      "posting.instagram", "posting.newsletter",
                                      "posting.results",
@@ -34,7 +37,10 @@ class DefaultCatalogueTests(unittest.TestCase):
         self.assertEqual(live, ["builds.daedalus",
                                 "contracts.delivery", "contracts.feedback", "contracts.finder", "contracts.orders",
                                 "etsy.digital", "etsy.pod", "etsy.scout",
-                                "fiverr.desk", "fiverr.gigs", "fiverr.ideas", "posting.blog",
+                                "fiverr.desk", "fiverr.gigs", "fiverr.ideas",
+                                "marketplaces.packager", "marketplaces.scout_apify",
+                                "marketplaces.scout_chrome", "marketplaces.scout_shopify",
+                                "marketplaces.watcher", "posting.blog",
                                 "posting.devto",
                                 "posting.instagram", "posting.newsletter",
                                 "posting.results", "products.api_builder",

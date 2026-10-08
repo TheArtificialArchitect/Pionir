@@ -42,6 +42,18 @@ FIELDS = ("slug", "name", "price_cents", "summary", "tags", "language", "package
 # Slugs the product shelf already holds (the owner's hand-made products): never reused.
 RESERVED = frozenset({"approval-gate", "card-press", "post-guard"})
 
+# ---- Marketplaces (crew/marketplaces): an entry may name the store it is built for --------
+# Absent means a Gumroad tool, as every entry before it. A marketplace product is priced on
+# its store (price_cents 0) and staged for the Marketplaces packager, not the product shelf
+# (worker.py ``_stage``). A Shopify app is never built here.
+GUMROAD = "gumroad_tool"
+OPTIONAL_FIELDS = ("product_type",)
+PRODUCT_TYPES = (GUMROAD, "apify_actor", "chrome_extension")
+
+
+def product_type(entry) -> str:
+    return (entry.get("product_type") if isinstance(entry, dict) else None) or GUMROAD
+
 WHAT_YOU_GET = {
     "python": ("Source code, tests and a README. Python 3.11 or newer, standard library only; "
                "it runs offline and sends nothing anywhere. Single-developer commercial "
@@ -290,7 +302,7 @@ def entry_problems(entry) -> list:
         return ["the entry is not an object"]
     reasons: list = []
     missing = [k for k in FIELDS if k not in entry]
-    extra = sorted(set(entry) - set(FIELDS))
+    extra = sorted(set(entry) - set(FIELDS) - set(OPTIONAL_FIELDS))
     if missing:
         reasons.append(f"missing: {', '.join(missing)}")
     if extra:
@@ -303,7 +315,13 @@ def entry_problems(entry) -> list:
     _line(entry, "name", 5, 80, reasons)
     _line(entry, "summary", 20, 200, reasons)
     price = entry.get("price_cents")
-    if isinstance(price, bool) or not isinstance(price, int) \
+    marketplace = product_type(entry) != GUMROAD
+    if product_type(entry) not in PRODUCT_TYPES:
+        reasons.append(f"product_type must be one of {', '.join(PRODUCT_TYPES)}")
+    elif marketplace:
+        if price != 0 or isinstance(price, bool):
+            reasons.append("a marketplace product's price_cents is 0: it is priced on its store")
+    elif isinstance(price, bool) or not isinstance(price, int) \
             or not MIN_PRICE <= price <= MAX_PRICE:
         reasons.append(f"price_cents must be whole cents from {MIN_PRICE} to {MAX_PRICE} "
                        "($9-19)")
@@ -327,7 +345,7 @@ def entry_problems(entry) -> list:
     if not isinstance(limits, str) or not 10 <= len(limits) <= 600 or "<" in limits \
             or ">" in limits:
         reasons.append("limits must be 10 to 600 characters, with no < or >")
-    if not reasons:
+    if not reasons and not marketplace:
         try:
             check_product(listing_payload(entry, zip_sha="0" * 64, cover_sha="0" * 64))
         except ValueError as exc:
