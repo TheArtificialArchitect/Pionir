@@ -5,7 +5,7 @@
   "technology": [
     "Python", "JavaScript", "TypeScript", "PowerShell", "Node", "JSON", "PDF", "QR", "API",
     "HTTP", "HTTPS", "REST", "SQL", "CSV", "URL", "SVG", "PNG", "DNS", "MX", "SMTP", "HTML",
-    "CSS", "SEO", "UTF-8", "ASCII", "Unicode", "ID", "AI", "LLM", "SaaS", "Wi-Fi", "vCard",
+    "CSS", "SEO", "UTF-8", "ASCII", "Unicode", "ID", "AI", "LLM", "SaaS", "Wi-Fi", "SSID", "WPA", "WPA2", "WPA3", "WEP", "IoT", "RFC", "vCard",
     "CRM", "FAQ", "OK", "Markdown", "Cloudflare", "Stripe", "Gumroad", "Windows", "macOS",
     "Linux", "Excel", "Google", "Chrome", "GitHub",
     "IP", "WHOIS", "SPF", "DKIM", "DMARC", "TLS", "SSL", "IMAP", "MIME", "XML", "YAML", "UI", "UX",

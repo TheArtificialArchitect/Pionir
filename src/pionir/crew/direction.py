@@ -259,6 +259,14 @@ class Direction:
                 e["no_output"] = {w: _clip_text(why, 240) for w, why in sorted(mine.items())}
                 if e.get("attention") in (None, "none"):
                     e["attention"] = "watch"
+            if e.get("attention") == "act" and e.get("status") == "report" \
+                    and not _act_grounded(e["workers"], r):
+                # "act" means Moss must decide something. A leader that names no decision
+                # while every worker is healthy is echoing words (a stale goal saying "get X
+                # working again" made one say "stalled" for days), not a measured fact
+                e["attention"] = "watch"
+                e["attention_note"] = ("the leader said act, but named no decision and every "
+                                       "worker is healthy, so it is shown as watch")
             entries.append(e)
         rank = {a: i for i, a in enumerate(ATTENTION)}
         entries.sort(key=lambda e: (rank.get(e.get("attention"), 1), e["priority"]))
@@ -281,6 +289,18 @@ def _fig_text(d: dict) -> str:
 def _clip_text(s: str, n: int) -> str:
     s = " ".join(str(s).split())
     return s if len(s) <= n else s[:n - 3] + "..."
+
+
+_HEALTH_PROBLEMS = ("no_output", "never_succeeded", "not_wired", "not_configured", "stale",
+                    "silent")
+
+
+def _act_grounded(line: dict, report) -> bool:
+    """A leader's "act" stands on a decision it put to Moss (an escalation) or on a worker
+    its own counters say is unwell - never on the report's words alone."""
+    if report and (report.get("escalation") or report.get("blocking")):
+        return True
+    return any(line.get(k) for k in _HEALTH_PROBLEMS)
 
 
 def _health_line(health: list, no_output: dict | None = None) -> dict:

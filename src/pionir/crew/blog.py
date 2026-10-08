@@ -219,11 +219,11 @@ def offer_for(topic: Topic) -> Offer:
 
 
 # ---- repairing the model's words before they are assembled ----------------------------
-# Two things the model writes against its instructions that a fixed rule can mend without
+# Three things the model writes against its instructions that a fixed rule can mend without
 # loosening the check: a Markdown link (its anchor text stays and is checked like any other
-# words; only the target goes), and an address on a host RFC 2606 / 6761 reserves for
+# words; only the target goes), an address on a host RFC 2606 / 6761 reserves for
 # documentation (example.com/.org/.net and their subdomains, the .example TLD), which can
-# never be anyone's site. Every other URL, domain or address is left exactly as written,
+# never be anyone's site, and a heading deeper than ### (made ###, its words untouched). Every other URL, domain or address is left exactly as written,
 # so it still blocks. The full check then runs on the assembled post.
 _MD_LINK = re.compile(r"(?<!!)\[([^\[\]\n]+)\]\(\s*<?[^)\s>]*>?(?:\s+\"[^\"\n]*\")?\s*\)")
 _RESERVED_HOST = (r"(?:(?:[a-z0-9-]+\.)*example\.(?:com|org|net)|(?:[a-z0-9-]+\.)+example)"
@@ -255,7 +255,28 @@ def repair(field: str, text: str) -> tuple:
     text = _MD_LINK.sub(unlink, text)
     text = _RESERVED_URL.sub(reserved, text)
     text = _RESERVED_BARE.sub(reserved, text)
+    text = _demote_deep_headings(field, text, done)
     return text, done
+
+
+_DEEP_HEADING = re.compile(r"^(\s{0,3})#{4,6}(?=\s)")
+_FENCE = re.compile(r"^\s{0,3}(?:```|~~~)")
+
+
+def _demote_deep_headings(field: str, text: str, done: list) -> str:
+    """A #### (or deeper) heading becomes ###: the site shows #### as literal text, and the
+    words are unchanged, so every other rule still sees exactly what was written. Lines
+    inside a code fence are not headings and are left alone."""
+    out, fenced, n = [], False, 0
+    for line in text.split("\n"):
+        if _FENCE.match(line):
+            fenced = not fenced
+        elif not fenced and _DEEP_HEADING.match(line):
+            line, n = _DEEP_HEADING.sub(r"\1###", line, count=1), n + 1
+        out.append(line)
+    if n:
+        done.append(f"{field}: {n} heading(s) deeper than ### made ###")
+    return "\n".join(out)
 
 
 # A reason about a link names the hosts a post may link to; echoed back, it reads as an

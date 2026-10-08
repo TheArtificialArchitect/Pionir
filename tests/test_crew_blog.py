@@ -435,6 +435,21 @@ class RepairTests(unittest.TestCase):
         self.assertEqual(d["body_md"].count("utm_source=blog"), footer.count("utm_source=blog"))
         self.assertEqual(self.worker.check_draft(d), [])
 
+    def test_a_heading_deeper_than_three_is_made_three_and_its_words_still_checked(self) -> None:
+        # live 2026-10-06 and 10-07: the Wi-Fi post's second draft was blocked only for a ####
+        d = self.assemble(body_plus("#### Scan the code\n\nPoint the camera at it."))
+        self.assertIn("\n### Scan the code\n", d["body_md"])
+        self.assertNotIn("####", d["body_md"])
+        self.assertEqual(self.worker.check_draft(d), [])
+        self.assertIn("body_md: 1 heading(s) deeper than ### made ###", d["repaired"])
+        d = self.assemble(body_plus("#### Ask Jane Doe"))
+        self.assertTrue(any("Jane Doe" in r for r in self.worker.check_draft(d)))
+
+    def test_a_hash_line_inside_a_code_fence_is_not_touched(self) -> None:
+        d = self.assemble(body_plus("```\n#### not a heading\n```"))
+        self.assertIn("#### not a heading", d["body_md"])
+        self.assertNotIn("repaired", d)
+
     def test_repaired_text_still_fails_on_every_other_reason(self) -> None:
         d = self.assemble(body_plus("Ask [Jane Doe](https://example.com/jane) at "
                                     "jane@realmail.com about invoice INV-2024-001."))

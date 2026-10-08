@@ -146,6 +146,29 @@ class DigestTests(_Case):
         self.assertLessEqual(len(json.dumps(small["divisions"])), 1200)
         self.assertTrue(small["truncated"])
 
+    def test_act_stands_only_on_a_decision_or_an_unwell_worker(self) -> None:
+        # live: Contracts said "order desk stalled" / act for days (a stale "get
+        # contracts.orders working again" goal) while every worker was healthy and the only
+        # order was declined; the map showed it orange the whole time
+        crew = self.crew()
+        now = time.time()
+        for w, d in (("alpha.a1", "alpha"), ("beta.b1", "beta")):
+            crew.store.record_attempt(worker_id=w, division=d, started_at=now - 5,
+                                      finished_at=now - 1, error=None, written=1)
+        crew.store.add_report(division="alpha", written_at=now, status="report", stamp=now,
+                              headline="order desk stalled", summary="s", attention="act")
+        crew.store.add_report(division="beta", written_at=now, status="report", stamp=now,
+                              headline="a decision", summary="s", attention="act",
+                              escalation={"question": "raise the price?"})
+        crew.store.add_report(division="gamma", written_at=now, status="report", stamp=now,
+                              headline="never ran", summary="s", attention="act")
+        got = {e["division"]: e for e in crew.direction.digest(max_chars=100_000)["divisions"]}
+        self.assertEqual(got["alpha"]["attention"], "watch")
+        self.assertIn("named no decision", got["alpha"]["attention_note"])
+        self.assertEqual(got["beta"]["attention"], "act")         # a decision put to Moss
+        self.assertEqual(got["gamma"]["attention"], "act")        # its worker never succeeded
+        self.assertNotIn("attention_note", got["gamma"])
+
     def test_a_silent_division_is_shown_not_omitted(self) -> None:
         crew = self.crew()
         entries = crew.direction.digest()["divisions"]

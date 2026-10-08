@@ -67,6 +67,15 @@ class CleanDraftTests(unittest.TestCase):
         self.assertEqual(cc.check(with_body(
             "It works the same with Stripe, Gumroad or Cloudflare, on Windows and Linux.")), [])
 
+    def test_the_wifi_vocabulary_passes_and_a_name_beside_it_still_blocks(self) -> None:
+        # live 2026-10-05..07: a post about Wi-Fi QR codes cannot avoid these; every draft
+        # of it was blocked on SSID, WPA, WPA2, WEP and retired the topic unpublished
+        body = ("The code holds the SSID and the password, and says whether the network uses "
+                "WPA2, WPA3, WPA or the old WEP. It suits IoT devices; RFC rules apply.")
+        self.assertEqual(cc.check(with_body(body)), [])
+        reasons = cc.check(with_body(body + " Ask Marcus Hale about it."))
+        self.assertTrue(any("Marcus" in r for r in reasons), reasons)
+
     def test_an_api_endpoint_in_code_needs_no_utm(self) -> None:
         # TRAFFIC.md never counts /v1/*: an endpoint is not a page a visitor lands on
         self.assertEqual(cc.check(with_body(
