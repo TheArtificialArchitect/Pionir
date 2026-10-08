@@ -380,7 +380,7 @@ class Crew:
                     "last_at": at, "kind": _kind_word(kind),
                     "last_attempt_at": h.last_attempt_at if h else None,
                     "last_success_at": h.last_success_at if h else None,
-                    "alert": _alert_words(alert) if alert else None}
+                    "alert": _alert_words(alert) if alert else _setup_words(h)}
             if "submitted" in pulse or "published" in pulse:
                 fact["posting"] = {k: pulse.get(k) for k in POSTING_FACTS
                                    if isinstance(pulse.get(k), (int, float))
@@ -438,6 +438,14 @@ _KIND_OK = re.compile(r"^[A-Za-z0-9_.:-]{1,60}$")
 def _kind_word(kind) -> str | None:
     """An output's kind is a code like ``post.tally``; anything else is not shown."""
     return kind if isinstance(kind, str) and _KIND_OK.fullmatch(kind) else None
+
+
+def _setup_words(h) -> str | None:
+    """Why a worker that cannot run is not running, for a viewer: its own NOT_CONFIGURED or
+    NOT_WIRED sentence. Without it the panel showed a worker that never ran and no reason."""
+    if h is None or not h.last_error or not (h.not_configured or h.not_wired):
+        return None
+    return _alert_words(f"{'not set up' if h.not_configured else 'not wired'}: {h.last_error}")
 
 
 def _alert_words(alert) -> str:

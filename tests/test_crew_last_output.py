@@ -133,6 +133,27 @@ class LastOutputTests(_Case):
         self.assertEqual(fact["last_attempt_at"], NOW - 5)
         self.assertIsNone(fact["last_success_at"])
 
+    def test_a_worker_that_is_not_set_up_says_why_on_the_panel(self) -> None:
+        # 2026-10-07: products.api_builder sat at 'never' with alert null for days while its
+        # own NOT_CONFIGURED sentence (node not set up) named the fix; the panel must show it
+        why = "NOT SET UP: node is not set up: run tools\setup-build-sandbox.ps1 as administrator"
+        self.attempt("fiverr.gigs", at=NOW - 5,
+                     error=WorkerError("fiverr.gigs", ErrorKind.NOT_CONFIGURED, why))
+        fact = self.facts()["fiverr.gigs"]
+        self.assertEqual(fact["state"], "never")
+        self.assertIn("not set up: NOT SET UP: node is not set up", fact["alert"])
+        self.attempt("fiverr.gigs", at=NOW - 4,
+                     error=WorkerError("fiverr.gigs", ErrorKind.NOT_WIRED, "no fiverr.card hand"))
+        self.assertEqual(self.facts()["fiverr.gigs"]["alert"], "not wired: no fiverr.card hand")
+
+    def test_any_other_error_still_never_reaches_the_panel(self) -> None:
+        for kind in ErrorKind:
+            if kind in (ErrorKind.NOT_CONFIGURED, ErrorKind.NOT_WIRED):
+                continue
+            self.attempt("fiverr.gigs", at=NOW - 5, error=WorkerError("fiverr.gigs", kind, SECRET))
+            self.assertIsNone(self.facts()["fiverr.gigs"]["alert"], kind)
+            self.assertNotIn("Jane", json.dumps(self.crew.direction.divisions()))
+
     def test_an_unreadable_records_path_and_parser_words_never_reach_the_panel(self) -> None:
         path = record_path(self.state, "posting.blog")
         path.parent.mkdir(parents=True, exist_ok=True)

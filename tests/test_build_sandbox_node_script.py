@@ -106,7 +106,14 @@ class NodeSetupScriptTests(unittest.TestCase):
         grant = _section(self.node, "Run-Icacls @($NodeTools, \"/inheritance:r\"",
                          'Did "${NodeTools}')
         self.assertIn("*${UserSid}:(OI)(CI)RX", grant)
-        self.assertIn('"/deny", "*${UserSid}:(OI)(CI)(W,D,DC,WDAC,WO)"', grant)
+        # 2026-10-07: icacls's W is FILE_GENERIC_WRITE, which carries SYNCHRONIZE and
+        # READ_CONTROL; denied, they beat the RX allow and node got EPERM opening tsc.js, so
+        # the probe left node out of the record and every TypeScript build was refused. The
+        # deny names the write rights one by one, never W/R/GW/GR, after removing old denies.
+        deny = '"/deny", "*${UserSid}:(OI)(CI)(WD,AD,WEA,WA,D,DC,WDAC,WO)"'
+        self.assertIn(deny, grant)
+        self.assertNotIn("(W,", grant)
+        self.assertLess(grant.index('"/remove:d", "*${UserSid}"'), grant.index(deny))
         self.assertNotIn("*${UserSid}:(OI)(CI)F", grant)
         self.assertNotIn("*${UserSid}:(OI)(CI)M", grant)
 

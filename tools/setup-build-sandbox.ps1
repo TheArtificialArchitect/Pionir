@@ -381,7 +381,10 @@ if (-not $NodeEnabled) {
     # read-only to pionir-builds: it may read and run the tools, never change them
     Run-Icacls @($NodeTools, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F",
         "*S-1-5-32-544:(OI)(CI)F", "*${OwnerSid}:(OI)(CI)RX", "*${UserSid}:(OI)(CI)RX")
-    Run-Icacls @($NodeTools, "/deny", "*${UserSid}:(OI)(CI)(W,D,DC,WDAC,WO)")
+    # the write rights one by one: icacls W is FILE_GENERIC_WRITE, whose SYNCHRONIZE and
+    # READ_CONTROL, denied, beat the RX grant and make every file unopenable (EPERM) for node
+    Run-Icacls @($NodeTools, "/remove:d", "*${UserSid}")
+    Run-Icacls @($NodeTools, "/deny", "*${UserSid}:(OI)(CI)(WD,AD,WEA,WA,D,DC,WDAC,WO)")
     Did "${NodeTools}: $User may read and run it, and is denied every write"
 }
 
