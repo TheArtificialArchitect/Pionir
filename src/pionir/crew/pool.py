@@ -21,6 +21,12 @@ success, ``Err``, an exception that escaped ``never_raises``, a malformed ``Ok``
 A worker cannot stop the pool: ``run`` is contractually incapable of raising, and is
 still called inside a guard, because "contractually" describes the decorated workers and
 not a future one that forgets the decorator.
+
+**Beyond the cadence** (control.py): with a ``DispatchControl`` the dispatcher also parks a
+worker that is not configured (probing it on a backoff, and re-checking its readiness on
+the pool until it turns ok), retries a retryable failure early, and honours the run-now,
+pause and cadence-multiplier controls Moss and the leaders hold. Without one it is exactly
+the cadence rule above.
 """
 from __future__ import annotations
 
@@ -113,7 +119,8 @@ class DispatchReport:
 
 class Dispatcher:
     def __init__(self, registry, store, *, context: Callable, gate: ProviderGate,
-                 max_workers: int = 4, clock: Callable[[], float] = time.time) -> None:
+                 max_workers: int = 4, clock: Callable[[], float] = time.time,
+                 control=None) -> None:
         if max_workers <= 0:
             raise ValueError("max_workers must be positive")
         self.registry = registry
@@ -126,6 +133,8 @@ class Dispatcher:
         self._lock = threading.Lock()
         self._in_flight: set = set()
         self._quiet: dict = {}                  # worker_id -> (message, logged at)
+        self._checking: set = set()             # parked workers whose readiness is being read
+        self.control = control                  # control.DispatchControl, or None
         self.max_workers = max_workers
 
     def due(self, now: float | None = None, only: Sequence[str] | None = None) -> tuple:
@@ -139,7 +148,11 @@ class Dispatcher:
         due, skipped = [], 0
         for w in self.registry.all():
             prev = last.get(w.worker_id)
-            if prev is not None and now - prev < w.cadence_seconds * jitter(w.worker_id):
+            if self.control is not None:
+                ok = self.control.is_due(w, prev, now)
+            else:
+                ok = prev is None or now - prev >= w.cadence_seconds * jitter(w.worker_id)
+            if not ok:
                 skipped += 1
                 continue
             due.append(w)
@@ -154,6 +167,8 @@ class Dispatcher:
         outcomes; without it, it counts what was submitted."""
         workers, skipped = self.due(now, only)
         report = DispatchReport(skipped=skipped)
+        if only is None:
+            self._rechecks(self._clock() if now is None else now)
         futures: list = []
         for w in workers:
             with self._lock:
@@ -180,11 +195,43 @@ class Dispatcher:
                     report.errors.append(error)
         return report
 
+    def _rechecks(self, now: float) -> None:
+        """Hand every parked worker whose readiness is due another look to the pool: a
+        readiness read may be slow (the API builder's runs icacls and PowerShell), and the
+        loop thread must never wait on one."""
+        if self.control is None:
+            return
+        for wid in self.control.rechecks_due(now):
+            worker = self.registry.resolve(wid)
+            if worker is None:
+                continue
+            with self._lock:
+                if wid in self._checking or wid in self._in_flight:
+                    continue
+                self._checking.add(wid)
+            try:
+                self._pool.submit(self._recheck, worker)
+            except RuntimeError:                 # the pool is shutting down
+                with self._lock:
+                    self._checking.discard(wid)
+                return
+
+    def _recheck(self, worker) -> None:
+        try:
+            self.control.recheck(worker)
+        except Exception as exc:  # noqa: BLE001 - a broken re-check must be loud, not fatal
+            lesion("pool.recheck", exc)
+        finally:
+            with self._lock:
+                self._checking.discard(worker.worker_id)
+
     def run_one(self, worker) -> tuple:
         """Run one worker and record the attempt, whatever happens. -> (error, written)."""
         error: WorkerError | None = None
         outputs: list = []
         started = self._clock()
+        if self.control is not None:
+            self.control.started(worker.worker_id)
         try:
             self.gate.wait_turn(worker.provider)
             started = self._clock()
@@ -217,6 +264,11 @@ class Dispatcher:
         except Exception as exc:  # noqa: BLE001 - a store failure must be loud, not fatal
             lesion("pool.record_attempt", exc)
         finally:
+            if self.control is not None:
+                try:
+                    self.control.after_run(worker, error, self._clock())
+                except Exception as exc:  # noqa: BLE001 - loud, never fatal to the pool
+                    lesion("pool.control", exc)
             with self._lock:
                 self._in_flight.discard(worker.worker_id)
         if self._worth_logging(worker.worker_id, error):

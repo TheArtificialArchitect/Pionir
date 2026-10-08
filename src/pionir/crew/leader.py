@@ -29,7 +29,17 @@ messages, builds a bounded brief (brief.py), and then:
   up like any failing worker.
 - **Escalates** a hard judgment to Claude, when the local model asks to and the caps
   allow (escalation.py). Claude's answer is advice, attached to the report, and it
-  passes the same grounding check or is withheld.
+  passes the same grounding check or is withheld. Only when its input has MATERIALLY
+  changed since the division's last escalation (``salient_state``: the workers' health
+  verdicts, the newest value of each recorded figure, the goal - never an age or a
+  timestamp): the contracts leader asked 115 times in 7 days about the same zero orders,
+  and with treasury spent 4-6 of the day's 10 Claude calls on reports, starving the builds
+  and the finder. An unchanged input gets the last answer back, marked ``unchanged_since``,
+  and Claude is not asked.
+- **Asks for a fresh run** of its own workers when its distilled report says so
+  (``rerun``: the model may name up to two of the division's live workers). Bounded per
+  division per day by the crew's dispatch control (control.LEADER_RUNS_PER_DAY); what was
+  asked and what came of it is kept in the report's provenance.
 
 A leader never raises and its every run is recorded in the runs table beside its
 workers', so a leader that never manages a report is reported like any dead worker.
@@ -74,13 +84,18 @@ REPORT_SCHEMA = {
                     "items": {"type": "string", "maxLength": 160}},
         "escalate": {"type": "boolean"},
         "question": {"type": "string", "maxLength": 400},
+        "rerun": {"type": "array", "maxItems": 0, "items": {"type": "string"}},
     },
     "required": ["headline", "summary", "attention", "figures", "routine", "escalate"],
 }
 
 
-def report_schema(numbers) -> dict:
-    """REPORT_SCHEMA with ``figures`` held to this brief's figure numbers."""
+MAX_RERUN = 2
+
+
+def report_schema(numbers, rerun=()) -> dict:
+    """REPORT_SCHEMA with ``figures`` held to this brief's figure numbers, and ``rerun`` to
+    the division's own live workers (none: it cannot name any)."""
     numbers = sorted(set(numbers))
     schema = json.loads(json.dumps(REPORT_SCHEMA))
     figs = schema["properties"]["figures"]
@@ -88,6 +103,10 @@ def report_schema(numbers) -> dict:
         figs["items"]["enum"] = numbers
     else:
         figs["maxItems"] = 0
+    workers = sorted(set(rerun))
+    if workers:
+        schema["properties"]["rerun"] = {"type": "array", "maxItems": MAX_RERUN,
+                                         "items": {"type": "string", "enum": workers}}
     return schema
 
 
@@ -118,6 +137,9 @@ REPAIR = """Your report could not be sent to Moss, for these reasons:
 Write the report again as ONE JSON object in the same shape, fixing every reason. Use \
 only what the brief records; leave out anything you cannot back with it."""
 
+RERUN_RULE = """- "rerun": ids of YOUR workers to run again right now, ONLY when one failed or is \
+stale and a fresh reading would change what Moss must decide; otherwise leave it empty."""
+
 FIGURES_ONLY = "figures_only"           # provenance["composed"] of a fallback report
 MAX_FALLBACK_SUMMARY = 2400
 
@@ -141,6 +163,25 @@ class Report:
     question: str = ""
     escalation: dict | None = None
     provenance: dict = field(default_factory=dict)
+    rerun: tuple = ()
+
+
+def salient_state(brief) -> str:
+    """A digest of what a leader's judgment rests on, and nothing that moves on its own:
+    each worker's health verdict (not its ages or failure counts), the newest value of each
+    recorded real-source figure, and the division's goal. Equal digests mean nothing
+    material changed - so Claude would be asked the same question about the same facts."""
+    health = sorted((h.worker_id, str(h.last_outcome or ""), str(h.last_error_kind or ""),
+                     bool(h.is_stale), bool(h.has_never_succeeded), h.silent_streak >= 3)
+                    for h in brief.health)
+    newest: dict = {}
+    for _n, o, f in figure_table(brief):                 # newest first within a kind
+        newest.setdefault((o.worker_id, o.kind, f.measures, f.stream, f.window),
+                          (f.value, f.unit))
+    goal = brief.goal or {}
+    doc = {"health": health, "figures": sorted([list(k), list(v)] for k, v in newest.items()),
+           "goal": [goal.get("goal"), goal.get("priority")]}
+    return hashlib.sha256(json.dumps(doc, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def parse_json_object(text: str) -> dict | None:
@@ -217,10 +258,16 @@ def examine(raw, division: str, numbered: dict | None = None) -> tuple:
     if not isinstance(escalate, bool):
         reasons.append('"escalate" must be true or false')
     question = _text(raw, "question", MAX_QUESTION, reasons, required=False)
+    rerun = raw.get("rerun", [])
+    if not isinstance(rerun, list) or len(rerun) > MAX_RERUN or not all(
+            isinstance(r, str) and 0 < len(r) <= 80 for r in rerun):
+        reasons.append(f'"rerun" must be at most {MAX_RERUN} of your worker ids')
+        rerun = []
     if reasons:
         return None, reasons
     return Report(division, headline, summary, attention, tuple(figures),
-                  tuple(r.strip() for r in routine if r.strip()), escalate, question), []
+                  tuple(r.strip() for r in routine if r.strip()), escalate, question,
+                  rerun=tuple(dict.fromkeys(r.strip() for r in rerun))), []
 
 
 def validate(raw, division: str, numbered: dict | None = None) -> Report | None:
@@ -281,7 +328,8 @@ Ask = Callable[..., tuple]
 class Leader:
     def __init__(self, division: str, registry, store, *, ask: Ask, escalator=None,
                  goals: Callable[[], dict] | None = None, model: str = "",
-                 clock: Callable[[], float] = time.time) -> None:
+                 clock: Callable[[], float] = time.time,
+                 rerun: Callable[[str, str], dict] | None = None) -> None:
         self.division = division
         self.leader_id = f"leader.{division}"
         self.spec = registry.division(division)
@@ -293,6 +341,16 @@ class Leader:
         self.model = model
         self._clock = clock
         self.cadence_seconds = self.spec.leader_cadence_seconds
+        # (division, worker id) -> {"worker", "queued", "why"?}: runtime.Crew.leader_rerun.
+        # None: the leader cannot ask for a run, and its schema lets it name no worker.
+        self.rerun = rerun
+
+    def rerunnable(self) -> list:
+        """The workers this leader may ask to run again: its division's live ones."""
+        if self.rerun is None:
+            return []
+        return [w.worker_id for w in self.registry.workers_in(self.division)
+                if getattr(w, "live", True)]
 
     # ---- the decision to say nothing ------------------------------------------
     def consider(self, brief) -> Abstention | None:
@@ -353,13 +411,16 @@ class Leader:
             return Ok(abstain), 1
         user = render(brief)
         system = SYSTEM.format(title=brief.title)
+        rerunnable = self.rerunnable()
+        if rerunnable:
+            system += "\n" + RERUN_RULE
         if self.spec.leader_notes:
             system += f"\n\nFor this division:\n{self.spec.leader_notes}"
         digest = hashlib.sha256(f"{self.model}\x1f{system}\x1f{user}".encode()).hexdigest()[:16]
         provenance = {"model": self.model, "prompt_digest": digest, "temperature": 0,
                       "inputs": len(brief.outputs), "new_inputs": len(brief.new_outputs)}
         numbered = {n: f for n, _o, f in figure_table(brief)}
-        schema = report_schema(numbered)
+        schema = report_schema(numbered, rerunnable)
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         failures: list = []             # (kind, reasons) per attempt that failed
         for attempt in (1, 2):
@@ -381,6 +442,8 @@ class Leader:
                 if failures:
                     provenance["repaired"] = failures[0][0]
                 escalation = self._escalate(brief, report, user) if report.escalate else None
+                if report.rerun:
+                    provenance["rerun"] = self._ask_rerun(report.rerun, rerunnable)
                 self.store.add_report(
                     division=self.division, written_at=now, status="report",
                     stamp=brief.stamp, headline=report.headline, summary=report.summary,
@@ -448,16 +511,46 @@ class Leader:
                     ErrorKind.NO_WORDS)
         return Err(WorkerError(self.leader_id, last, reason))
 
+    def _ask_rerun(self, names: tuple, allowed: list) -> list:
+        """Queue a fresh run of each named worker this leader may ask for; -> what came of
+        each, for the report's provenance."""
+        out = []
+        for wid in names[:MAX_RERUN]:
+            if wid not in allowed:
+                out.append({"worker": wid, "queued": False,
+                            "why": "not a live worker of this division"})
+                continue
+            try:
+                out.append(dict(self.rerun(self.division, wid)))
+            except Exception as exc:  # noqa: BLE001 - the report is still written
+                log.warning("%s: could not ask for a run of %s: %s", self.leader_id, wid, exc)
+                out.append({"worker": wid, "queued": False, "why": type(exc).__name__})
+        return out
+
     def _escalate(self, brief, report: Report, rendered: str) -> dict:
         question = report.question or report.headline
         if self.escalator is None:
             return {"question": question, "answer": None, "refused": "no escalator"}
+        state = salient_state(brief)
+        key = f"escalated:{self.division}"
+        last = self.store.get(key)
+        if isinstance(last, dict) and last.get("state") == state:
+            # the same facts were put to Claude already: its answer stands, no call spent
+            return {"question": question, "answer": last.get("answer"),
+                    "unchanged_since": last.get("t"),
+                    "skipped": "nothing material changed since the last escalation, so "
+                               "Claude was not asked again"}
         context = f"{rendered}\n\nLEADER'S READ: {report.summary}"
         got = self.escalator.escalate(self.division, question, context)
         if isinstance(got, Err):
             return {"question": question, "answer": None, "refused": str(got.error)}
         problems = check_report([got.value], (), brief.recorded_figures(), brief.known_names(),
                                 brief.vocabulary(), brief.recorded_values())
+        answer = None if problems else got.value
+        try:
+            self.store.set(key, {"state": state, "t": self._clock(), "answer": answer})
+        except Exception as exc:  # noqa: BLE001 - the answer still goes up; say so
+            log.warning("%s: could not remember its escalation: %s", self.leader_id, exc)
         if problems:
             return {"question": question, "answer": None,
                     "withheld": "Claude's answer " + "; ".join(problems)[:400]}

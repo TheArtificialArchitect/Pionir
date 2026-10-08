@@ -13,10 +13,17 @@ first. The card says what was measured and says plainly that it is NOT Fiverr se
 which nothing here can see. An idea whose product has no measured demand is not proposed; an
 unreadable or stale ranking proposes nothing (unknown is never "go").
 
-**One at a time.** An idea waits on the owner's reply before another is proposed, and an idea he
-skipped is never proposed again. His replies on the card: ``skip`` (drop it), ``redraft`` (a
-fresh card), ``price <basic> <standard> <premium>`` (sets the prices, new card), ``listed``
-(he put it on Fiverr - recorded, and the card explains the delivery gap below).
+**A few at a time, and none waits for ever.** At most ``MAX_OPEN`` ideas are open (proposed,
+unanswered) at once, and at most one NEW idea is proposed per run. One card per idea; if he has
+not answered after ``REMIND_AFTER_SECONDS`` it gets ONE short reminder note, and after
+``EXPIRE_AFTER_SECONDS`` it is marked ``expired`` - no message, it simply stops holding a slot,
+so the next measured idea may be proposed. (Before this, one unanswered card held the queue: one
+idea in 15 runs.) An expired idea is not proposed again by itself; his late reply on its card
+still counts - ``redraft`` or a price re-opens it with a fresh card, ``listed``/``skip`` are
+recorded. An idea he skipped is never proposed again. His replies on the card: ``skip`` (drop
+it), ``redraft`` (a fresh card), ``price <basic> <standard> <premium>`` (sets the prices, new
+card), ``listed`` (he put it on Fiverr - recorded, and the card explains the delivery gap
+below).
 
 **No delivery path yet, and the card says so.** The desk (desk.py) routes an order only to a
 gig in ``gigs.SERVICES``; an order for an idea's gig stops on a NEEDS YOU card for him to
@@ -213,6 +220,11 @@ IDEAS = {i.service.key: i for i in (
 EXTRA_APIS = {"codes": ("barcode",)}
 
 PRODUCT_INPUTS = ("api_calls", "api_caller_days", "guide_views")
+# How many ideas may wait on the owner at once, and how long one waits before it is reminded
+# about (once) and then expires, freeing its slot.
+MAX_OPEN = 3
+REMIND_AFTER_SECONDS = 2 * 86400
+EXPIRE_AFTER_SECONDS = 3 * 86400
 _BLANK = {"status": "new", "owner_prices": None, "version": 0, "cards": [], "redraft": True}
 
 
@@ -334,8 +346,9 @@ class GigIdeaProposer(_Base):
                 m = measured(ranking, IDEAS[key]) or state.get("measured")
                 if m:
                     self._card(ctx, IDEAS[key], m, state, guard, events)
+        self._age(ctx, rec, events)
         awaiting = [k for k, s in rec["ideas"].items() if s.get("status") == "proposed"]
-        if not awaiting:
+        if len(awaiting) < MAX_OPEN:
             chosen = pick(ranking, rec["ideas"])
             if chosen is not None:
                 idea, m = chosen
@@ -350,7 +363,7 @@ class GigIdeaProposer(_Base):
         for s in rec["ideas"].values():
             counts[s.get("status", "new")] = counts.get(s.get("status", "new"), 0) + 1
         figs = [Figure(counts.get(st, 0), "count", f"Fiverr gig ideas {st}", window="now")
-                for st in ("proposed", "listed", "skipped")]
+                for st in ("proposed", "listed", "skipped", "expired")]
         tally = make_output(
             self, kind="fiverr.idea_tally", valid_at=ctx.now, observed_at=ctx.now,
             payload={"ideas": sorted(IDEAS), "ranking_read": ranking is not None},
@@ -387,16 +400,57 @@ class GigIdeaProposer(_Base):
                                           {"idea": key, "decision": "listed"}))
             elif text in ("redraft", "redraft please", "redo"):
                 state["redraft"] = True
+                self._reopen(state)
             else:
                 try:
                     state["owner_prices"] = parse_owner_prices(text)
                     state["redraft"] = True
+                    self._reopen(state)
                 except ValueError as exc:
                     post_card(ctx, {"key": f"idea-note:{key}:{rid}", "kind": "note",
                                     "ref": key, "title": f"Gig idea {key}: reply not read",
                                     "body": f"Your reply wasn't `skip`, `listed`, `redraft` "
                                             f"or a price: {exc}. Nothing changed."},
                               f"tell the owner his reply to the {key} idea was not read")
+
+    @staticmethod
+    def _reopen(state: dict) -> None:
+        """His reply on an expired idea's card wants it back: it is open again."""
+        if state.get("status") == "expired":
+            state.update(status="proposed", expired_at=None)
+
+    def _age(self, ctx: WorkContext, rec: dict, events: list) -> None:
+        """Remind about an unanswered idea once, then let it expire: an open idea never holds
+        a slot for ever, and he is never nagged more than once about it."""
+        for key, state in rec["ideas"].items():
+            if state.get("status") != "proposed" or key not in IDEAS:
+                continue
+            since = state.get("proposed_at")
+            if not isinstance(since, (int, float)) or isinstance(since, bool):
+                continue
+            waited = ctx.now - since
+            version = int(state.get("version") or 0)
+            if waited >= EXPIRE_AFTER_SECONDS:
+                state.update(status="expired", expired_at=ctx.now)
+                log.info("%s: the %s idea expired unanswered after %.0f days; its slot is free",
+                         self.worker_id, key, waited / 86400)
+                events.append(self._event(ctx, "fiverr.idea_decided",
+                                          {"idea": key, "decision": "expired"}))
+            elif waited >= REMIND_AFTER_SECONDS and state.get("reminded") != version:
+                posted, why = post_card(ctx, {
+                    "key": f"idea-remind:{key}:v{version}", "kind": "note", "ref": key,
+                    "title": f"Gig idea {key}: still waiting on you",
+                    "body": f"The {key} gig idea card has had no reply for "
+                            f"{waited / 86400:.0f} days. Reply on it with `skip`, `listed`, "
+                            "`redraft` or a price. If there is no reply it expires in "
+                            f"{(EXPIRE_AFTER_SECONDS - waited) / 86400:.0f} day(s) and makes "
+                            "room for the next idea. This is the only reminder."},
+                    f"remind the owner about the {key} gig idea")
+                if posted:
+                    state["reminded"] = version
+                else:
+                    log.warning("%s: the reminder about the %s idea was not posted: %s",
+                                self.worker_id, key, why)
 
     def _card(self, ctx: WorkContext, idea: Idea, m: dict, state: dict, guard,
               events: list) -> bool:

@@ -13,6 +13,11 @@ Capabilities, all invoked by name (``routable=False``) and none holding a model:
 - ``crew.set_goal``, ``crew.allocate`` - REVERSIBLE_WRITE. The owner lets Moss set goals
   and move COMPUTE between divisions freely; these are not money, and the crew has no
   money lever (``allocate`` takes ``model_calls`` or ``claude_escalations`` only).
+- ``crew.run_worker``, ``crew.pause_worker``, ``crew.resume_worker``,
+  ``crew.set_cadence`` - REVERSIBLE_WRITE, the same class: when one worker runs (now; not
+  until a pause ends or expires; its cadence x0.25 to x4 for at most 7 days). Compute only:
+  a worker's real-world actions still go through Pionir's gates, and nothing here latches -
+  a pause and a cadence change always expire (crew/control.py).
 
 The payload is checked with the crew API's own validators before anything is sent, so a
 malformed request is refused by Pionir with the crew's words. The crew's answer is
@@ -43,7 +48,12 @@ from pionir.contracts import (
     Task,
     TaskResult,
 )
-from pionir.crew.api import parse_allocation, parse_goal, parse_max_chars
+from pionir.crew.api import (
+    parse_allocation,
+    parse_goal,
+    parse_max_chars,
+    parse_worker_control,
+)
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
 
 NOT_RUNNING = "the crew is not running"
@@ -61,6 +71,20 @@ WRITES = {
     "crew.set_goal": "Set a crew division's goal and priority (1 most, 5 least)",
     "crew.allocate": "Allocate crew compute (model_calls or claude_escalations) between "
                      "divisions as fractions",
+    # ---- worker controls (crew/control.py): compute only, reversible, self-expiring ----
+    "crew.run_worker": "Run one crew worker at the next tick ({worker}), once",
+    "crew.pause_worker": "Pause one crew worker ({worker, hours?<=168, reason?}); it "
+                         "resumes by itself when the hours end",
+    "crew.resume_worker": "End a crew worker's pause ({worker})",
+    "crew.set_cadence": "Scale one crew worker's cadence ({worker, multiplier 0.25-4, "
+                        "hours?<=168}); 1 ends it, and it ends by itself",
+}
+# capability -> the crew API route it calls
+WORKER_CONTROLS = {
+    "crew.run_worker": "/api/worker/run",
+    "crew.pause_worker": "/api/worker/pause",
+    "crew.resume_worker": "/api/worker/resume",
+    "crew.set_cadence": "/api/worker/cadence",
 }
 
 
@@ -133,6 +157,12 @@ class CrewAdapter:
             if task.capability == "crew.allocate":
                 args = parse_allocation({**payload, "by": by})
                 return "POST", "/api/allocate", args
+            if task.capability in WORKER_CONTROLS:
+                route = WORKER_CONTROLS[task.capability]
+                parse_worker_control(route, {**payload, "by": by})     # refuse it here
+                body = {k: payload[k] for k in ("worker", "hours", "reason", "multiplier")
+                        if k in payload and payload[k] is not None}
+                return "POST", route, {**body, "by": by}
         except ValueError as error:
             raise AdapterProtocolError(f"{task.capability}: {error}") from error
         raise AdapterProtocolError(f"the crew has no capability {task.capability!r}")
@@ -180,5 +210,7 @@ class CrewAdapter:
             evidence.append(f"crew:goal:{output.get('division')}")
         if output.get("ok") is True and task.capability == "crew.allocate":
             evidence.append(f"crew:allocate:{output.get('resource')}")
+        if output.get("ok") is True and task.capability in WORKER_CONTROLS:
+            evidence.append(f"crew:worker:{output.get('worker')}")
         return TaskResult(task_id=task.task_id, agent_id=self.manifest.agent_id,
                           output=output, evidence=tuple(evidence))

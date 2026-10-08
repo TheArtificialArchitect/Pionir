@@ -77,6 +77,10 @@ class CrewSettings:
     # PIONIR_CREW_CLAUDE_NIGHT_CAP / PIONIR_CREW_CLAUDE_MODEL override.
     claude_night_cap: int = DEFAULT_NIGHT_CAP
     claude_model: str = DEFAULT_CLAUDE_MODEL
+    # How many of the daily cap the LEADERS' escalations may take between them; the rest is
+    # kept for workers' real work (research, builds, reviews). None: 40% of the daily cap
+    # (escalation.default_leader_cap). PIONIR_CREW_CLAUDE_LEADER_CAP overrides.
+    claude_leader_cap: int | None = None
     escalation_timeout_seconds: float = 300.0
     # The loopback HTTP API Moss reaches the crew through (api.py), via Pionir's
     # ``crew.*`` capabilities. Bound to 127.0.0.1 only. 0 takes a free port (tests);
@@ -149,6 +153,8 @@ class CrewSettings:
             raise ValueError("claude_daily_cap cannot be negative")
         if self.claude_night_cap < 0:
             raise ValueError("claude_night_cap cannot be negative")
+        if self.claude_leader_cap is not None and self.claude_leader_cap < 0:
+            raise ValueError("claude_leader_cap cannot be negative")
         clean_model(self.claude_model)
         if self.api_port is not None and (isinstance(self.api_port, bool)
                                           or not 0 <= self.api_port <= 65535):
@@ -209,6 +215,7 @@ class CrewSettings:
             ("PIONIR_CREW_POOL_SIZE", "pool_size", int),
             ("PIONIR_CREW_CLAUDE_DAILY_CAP", "claude_daily_cap", int),
             ("PIONIR_CREW_CLAUDE_NIGHT_CAP", "claude_night_cap", int),
+            ("PIONIR_CREW_CLAUDE_LEADER_CAP", "claude_leader_cap", int),
             ("PIONIR_CREW_CLAUDE_MODEL", "claude_model", str),
             ("PIONIR_CREW_SECRETS_DIR", "secrets_dir", Path),
             ("PIONIR_CREW_CATALOGUE", "catalogue_path", Path),

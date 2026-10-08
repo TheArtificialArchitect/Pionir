@@ -127,6 +127,9 @@ class DivisionsTests(_Case):
         # each worker also carries its last output; none of these has run, so it is "never"
         outputs = [w.pop("output") for w in alpha["workers"]]
         self.assertEqual([o["state"] for o in outputs], ["never", "never"])
+        # and its dispatch state (control.py): never run, nothing held, so "scheduled"
+        dispatch = [w.pop("dispatch") for w in alpha["workers"]]
+        self.assertEqual([d["state"] for d in dispatch], ["scheduled", "scheduled"])
         self.assertEqual(alpha["workers"], [
             {"id": "alpha.a1", "live": True, "uses": ["x.read", "x.post"]},
             {"id": "alpha.a2", "live": True, "uses": []}])
@@ -163,6 +166,15 @@ class DigestTests(_Case):
         crew.store.add_report(division="gamma", written_at=now, status="report", stamp=now,
                               headline="never ran", summary="s", attention="act")
         got = {e["division"]: e for e in crew.direction.digest(max_chars=100_000)["divisions"]}
+        # the same decision again on unchanged facts (leader.py reused its escalation): that
+        # was already put to Moss, so it grounds no fresh "act"
+        crew.store.add_report(division="beta", written_at=now + 1, status="report", stamp=now,
+                              headline="a decision", summary="s", attention="act",
+                              escalation={"question": "raise the price?", "answer": None,
+                                          "unchanged_since": now - 3600})
+        repeated = {e["division"]: e
+                    for e in crew.direction.digest(max_chars=100_000)["divisions"]}
+        self.assertEqual(repeated["beta"]["attention"], "watch")
         self.assertEqual(got["alpha"]["attention"], "watch")
         self.assertIn("named no decision", got["alpha"]["attention_note"])
         self.assertEqual(got["beta"]["attention"], "act")         # a decision put to Moss

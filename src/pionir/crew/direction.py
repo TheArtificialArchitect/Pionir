@@ -106,6 +106,10 @@ class Direction:
         # -> {worker id: what it last produced and when} (runtime.Crew.output_facts): counts,
         # timestamps and kinds only, never a payload. Shown per worker in ``divisions``.
         self.facts: Callable[[], dict] | None = None
+        # -> {worker id: its dispatch state} (runtime.Crew.dispatch_status, control.py):
+        # parked, paused, retrying or scheduled, its consecutive failures, and every control
+        # on it. Shown per worker in ``divisions``.
+        self.dispatch: Callable[[], dict] | None = None
 
     def _output_facts(self) -> dict | None:
         if self.facts is None:
@@ -114,6 +118,15 @@ class Direction:
             return dict(self.facts() or {})
         except Exception as exc:  # noqa: BLE001 - a read must still answer; say it could not
             log.warning("direction: the workers' output facts could not be read: %s", exc)
+            return None
+
+    def _dispatch(self) -> dict | None:
+        if self.dispatch is None:
+            return None
+        try:
+            return dict(self.dispatch() or {})
+        except Exception as exc:  # noqa: BLE001 - a read must still answer; say it could not
+            log.warning("direction: the workers' dispatch state could not be read: %s", exc)
             return None
 
     def _no_output(self) -> dict:
@@ -182,11 +195,12 @@ class Direction:
         goals = self.store.directions()
         quiet = self._no_output()
         facts = self._output_facts()
+        dispatch = self._dispatch()
         out = []
         for d in self.registry.divisions():
             workers = self.registry.workers_in(d.division_id)
             health = self.store.health(self.registry.cadences(d.division_id), now)
-            out.append({
+            entry = {
                 "division": d.division_id, "title": d.title,
                 "goal": (goals.get(d.division_id) or {}).get("goal"),
                 "priority": (goals.get(d.division_id) or {}).get("priority"),
@@ -197,10 +211,19 @@ class Direction:
                 "workers": [{"id": w.worker_id, "live": bool(w.live),
                              "uses": list(self.registry.uses(w.worker_id)),
                              **({"output": facts[w.worker_id]}
-                                if facts is not None and w.worker_id in facts else {})}
+                                if facts is not None and w.worker_id in facts else {}),
+                             **({"dispatch": dispatch[w.worker_id]}
+                                if dispatch is not None and w.worker_id in dispatch else {})}
                             for w in workers],
                 "health": _health_line(health, quiet),
-            })
+            }
+            if dispatch is not None:
+                # which of its workers are held off their cadence, and why is per worker
+                states = {w.worker_id: (dispatch.get(w.worker_id) or {}).get("state")
+                          for w in workers}
+                entry["dispatch"] = {s: sorted(w for w, st in states.items() if st == s)
+                                     for s in ("parked", "paused", "retrying")}
+            out.append(entry)
         return out
 
     def digest(self, *, max_chars: int = DIGEST_CHARS) -> dict:
@@ -297,8 +320,13 @@ _HEALTH_PROBLEMS = ("no_output", "never_succeeded", "not_wired", "not_configured
 
 def _act_grounded(line: dict, report) -> bool:
     """A leader's "act" stands on a decision it put to Moss (an escalation) or on a worker
-    its own counters say is unwell - never on the report's words alone."""
-    if report and (report.get("escalation") or report.get("blocking")):
+    its own counters say is unwell - never on the report's words alone. An escalation the
+    leader did NOT put up anew (``unchanged_since``: the same facts were already put to
+    Claude and to Moss, leader.py) is no new decision: it does not ground another "act"."""
+    esc = (report or {}).get("escalation") or None
+    if esc and esc.get("unchanged_since") is not None:
+        esc = None
+    if report and (esc or report.get("blocking")):
         return True
     return any(line.get(k) for k in _HEALTH_PROBLEMS)
 

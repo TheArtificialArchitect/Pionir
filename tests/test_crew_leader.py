@@ -178,8 +178,9 @@ class ReportTests(_Case):
         self.assertIsInstance(result.value, Report)
         _url, body = post.calls[0]
         self.assertEqual(body["options"]["temperature"], 0)
-        # the report schema, with figures held to the brief's own numbered figures (F1)
-        self.assertEqual(body["format"], report_schema([1]))
+        # the report schema, with figures held to the brief's own numbered figures (F1) and
+        # the workers it may ask to rerun to its own division's live ones
+        self.assertEqual(body["format"], report_schema([1], ["alpha.ledger"]))
         self.assertEqual(body["format"]["required"], REPORT_SCHEMA["required"])
         self.assertEqual(body["format"]["properties"]["figures"]["items"]["enum"], [1])
         row = crew.store.reports(division="alpha")[0]
@@ -423,7 +424,7 @@ class HealthClaimTests(_Case):
 class EscalationTests(_Case):
     def test_the_daily_cap_holds_across_all_leaders(self) -> None:
         claude = FakeClaude()
-        crew = self.crew(claude=claude, claude_daily_cap=2)
+        crew = self.crew(claude=claude, claude_daily_cap=2, claude_leader_cap=2)
         got = [crew.escalator.escalate(d, "hard?", "facts") for d in ("alpha", "watch", "posting")]
         self.assertEqual([type(g).__name__ for g in got], ["Ok", "Ok", "Err"])
         self.assertIn("daily Claude cap of 2", got[2].error)
@@ -437,7 +438,7 @@ class EscalationTests(_Case):
 
     def test_a_division_cannot_exceed_its_share(self) -> None:
         claude = FakeClaude()
-        crew = self.crew(claude=claude, claude_daily_cap=4)
+        crew = self.crew(claude=claude, claude_daily_cap=4, claude_leader_cap=4)
         crew.direction.allocate("claude_escalations", {"alpha": 0.25})
         self.assertIsInstance(crew.escalator.escalate("alpha", "q", "c"), Ok)
         second = crew.escalator.escalate("alpha", "q", "c")
@@ -448,7 +449,7 @@ class EscalationTests(_Case):
 
     def test_a_leader_attaches_claudes_answer_or_why_not(self) -> None:
         claude = FakeClaude(answer="Keep the price; nothing recorded argues otherwise.")
-        crew = self.crew(claude=claude, claude_daily_cap=1)
+        crew = self.crew(claude=claude, claude_daily_cap=1, claude_leader_cap=1)
         crew.dispatcher.dispatch(only=["alpha.ledger"], wait=True)
         ask = FakeAsk(reply(escalate=True, question="Should we change the price?"))
         report = self.leader(crew, "alpha", ask).run().value
@@ -457,7 +458,7 @@ class EscalationTests(_Case):
 
     def test_claudes_invented_figure_is_withheld(self) -> None:
         crew = self.crew(claude=FakeClaude(answer="Aim for $5,000 next month."),
-                         claude_daily_cap=1)
+                         claude_daily_cap=1, claude_leader_cap=1)
         crew.dispatcher.dispatch(only=["alpha.ledger"], wait=True)
         report = self.leader(crew, "alpha", FakeAsk(reply(escalate=True, question="q?"))).run()
         self.assertIsNone(report.value.escalation["answer"])
