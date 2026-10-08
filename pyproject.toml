@@ -13,6 +13,7 @@ authors = [{ name = "Ian Lee" }]
 dependencies = [
   "pillow>=10.1",  # social/card.py draws the Instagram card (variable-font axes need 10.1+)
   "tzdata; sys_platform == 'win32'",  # worklog.py: zoneinfo has no zone database on Windows
+  "openpyxl>=3.1",  # crew/etsy/sheets.py: the Etsy digital listings' .xlsx workbooks
 ]
 
 [project.optional-dependencies]

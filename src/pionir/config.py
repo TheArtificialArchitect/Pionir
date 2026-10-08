@@ -352,6 +352,20 @@ class PionirSettings:
     # leaves it unregistered; PIONIR_PROTEUS_SSH_KEY points at another key.
     proteus_host: str | None = "174.138.35.184"
     proteus_ssh_key: Path | None = None
+    # ---- Etsy streams (crew division ``etsy``) ----------------------------------------------
+    # Etsy's Open API v3 and Printify's API for the etsy.* and printify.* capabilities. Every
+    # listing, product and publish parks for the owner's yes on every call (the Etsy listing
+    # fee makes the listing ones spends_money). Credentials are read when a call runs:
+    # etsy_credentials_file (None: ~/.pionir/secrets/etsy.json, tools/setup-etsy.ps1) and
+    # printify_credentials_file (None: ~/.pionir/secrets/printify.json,
+    # tools/setup-printify.ps1). Files are staged under etsy_dir (None: ~/.pionir/etsy; the
+    # crew reads the same PIONIR_ETSY_DIR). PIONIR_ETSY_URL / PIONIR_PRINTIFY_URL set to
+    # "off" leave them unregistered.
+    etsy_url: str | None = "https://api.etsy.com/v3"
+    printify_url: str | None = "https://api.printify.com/v1"
+    etsy_dir: Path | None = None
+    etsy_credentials_file: Path | None = None
+    printify_credentials_file: Path | None = None
 
     def __post_init__(self) -> None:
         if self.gpu_lock_wait_seconds < 0:
@@ -375,6 +389,24 @@ class PionirSettings:
                 raise ValueError(f"{label} status command cannot be empty")
         # Reuse the scheduler's complete budget validation.
         _ = self.resource_budget
+
+    # ---- Etsy streams --------------------------------------------------------------------
+    @property
+    def etsy_path(self) -> Path:
+        if self.etsy_dir is not None:
+            return self.etsy_dir
+        try:
+            return Path.home() / ".pionir" / "etsy"
+        except RuntimeError:
+            return self.state_root / "etsy"
+
+    @property
+    def etsy_credentials_path(self) -> Path:
+        return self.etsy_credentials_file or self.secrets_path / "etsy.json"
+
+    @property
+    def printify_credentials_path(self) -> Path:
+        return self.printify_credentials_file or self.secrets_path / "printify.json"
 
     @property
     def audit_path(self) -> Path:
@@ -761,4 +793,12 @@ class PionirSettings:
                 else None
             ),
             work_tz=(os.environ.get("PIONIR_WORK_TZ") or "").strip() or None,
+            # ---- Etsy streams ----
+            etsy_url=_optional_url("PIONIR_ETSY_URL", _declared("etsy_url")),
+            printify_url=_optional_url("PIONIR_PRINTIFY_URL", _declared("printify_url")),
+            etsy_dir=(
+                Path(os.environ["PIONIR_ETSY_DIR"]).expanduser()
+                if (os.environ.get("PIONIR_ETSY_DIR") or "").strip()
+                else None
+            ),
         )

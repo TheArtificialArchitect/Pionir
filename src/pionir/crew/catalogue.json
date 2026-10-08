@@ -31,9 +31,13 @@
          "params": {"desk_worker": "fiverr.desk"}},
         {"name": "bolts", "impl": "bolts_collector", "kind": "bolts", "cadence_seconds": 900,
          "provider": "none", "entities": ["Bolts"],
-         "note": "pays Bolts (a play currency, never money) once for each outcome already on record; reads only, no model"}
+         "note": "pays Bolts (a play currency, never money) once for each outcome already on record; reads only, no model"},
+        {"name": "etsy", "impl": "etsy_sales", "uses": ["etsy.receipts"], "kind": "etsy_sales", "cadence_seconds": 3600,
+         "provider": "none", "entities": ["Etsy"],
+         "note": "the Etsy-reported gross of the Etsy shop's paid receipts (amounts and listing ids only, read through Pionir); not our revenue records",
+         "params": {"window_days": 90}}
       ],
-      "leader_notes": "treasury.ledger is Scrooge's ledger: our revenue. treasury.fiverr is different: fiverr.earnings holds the Fiverr-reported gross - the prices Fiverr's order emails state, before Fiverr's fee - for orders not cancelled and for completed orders. Always call it Fiverr-reported gross, report it separately, and never add it to our revenue or call it revenue: Fiverr keeps its fee and pays out on its own schedule, and Scrooge's ledger never sees it. Orders whose price was not a plain US dollar amount are counted, never valued. When treasury.fiverr has not run or cannot read the desk's record, Fiverr earnings are UNKNOWN, never zero. treasury.bolts is a play-currency tally: Bolts are never revenue and never money, so never add them to any figure above or call them earnings; report them as Bolts only. When a source it reads is UNKNOWN, say UNKNOWN, never zero."
+      "leader_notes": "treasury.ledger is Scrooge's ledger: our revenue. treasury.fiverr is different: fiverr.earnings holds the Fiverr-reported gross - the prices Fiverr's order emails state, before Fiverr's fee - for orders not cancelled and for completed orders. Always call it Fiverr-reported gross, report it separately, and never add it to our revenue or call it revenue: Fiverr keeps its fee and pays out on its own schedule, and Scrooge's ledger never sees it. Orders whose price was not a plain US dollar amount are counted, never valued. When treasury.fiverr has not run or cannot read the desk's record, Fiverr earnings are UNKNOWN, never zero. treasury.bolts is a play-currency tally: Bolts are never revenue and never money, so never add them to any figure above or call them earnings; report them as Bolts only. When a source it reads is UNKNOWN, say UNKNOWN, never zero. treasury.etsy is the Etsy-reported gross of the Etsy shop's paid receipts, before Etsy's fees: like the Fiverr figure, report it separately, never add it to our revenue or call it revenue (Etsy keeps its fees and holds 75% of a new shop's earnings for 90 days); when treasury.etsy reports NOT CONFIGURED or cannot read the receipts, Etsy sales are UNKNOWN, never zero."
     },
     {
       "id": "watch",
@@ -206,6 +210,31 @@
          "provider": "claude", "entities": ["Daedalus", "Claude"],
          "note": "one small developer tool a night, built by Daedalus in a fresh sandbox repo inside the overnight GPU window, reviewed by Claude on the daily cap, and staged for the product shelf (still the owner's approval before any sale)",
          "params": {"window": "01:00-07:00", "budget_minutes": 75, "max_attempts": 2, "slices": 2, "ssh_dir": "~/.ssh"}}
+      ]
+    },
+    {
+      "_note": "Etsy streams: digital downloads and print on demand on ONE Etsy shop (crew/etsy/).",
+      "id": "etsy",
+      "title": "Etsy",
+      "leader_cadence_seconds": 21600,
+      "entities": ["Etsy", "Printify"],
+      "leader_notes": "Two income streams on one Etsy shop. etsy.scout measures demand on Etsy's public search (etsy.demand: keywords ranked by average favourites of the top results per log10 of the competing listings; a keyword with no score is UNKNOWN, never zero). etsy.digital makes a spreadsheet (.xlsx with working formulas) plus a printable PDF for the best keyword it can make and submits it as an Etsy draft for the owner's approval; once that draft exists it asks a second approval to make it live. etsy.pod makes a typographic print-on-demand product in Printify (one approval, nothing public) and then asks a second approval to publish it to the Etsy shop. Every listing costs Etsy's $0.20 listing fee and is approved by the owner on its own card first. A row PENDING APPROVAL has NOT been listed or published: say it waits for the owner. Only etsy.listed and etsy.pod_published rows are live listings. etsy.not_listed says why something did not go out (denied, failed, refused by Pionir's checks); etsy.blocked is a draft our own checks stopped (no brand, no name, the AI disclosure word for word, exactly 13 tags). When a worker reports NOT CONFIGURED, the owner has not yet opened the Etsy shop or run tools\\setup-etsy.ps1 / tools\\setup-printify.ps1: say exactly which, from its message. The daily caps are deliberate (one shop: a suspension would end both streams): never suggest raising them. Sales are reported by treasury.etsy, not here.",
+      "brief_quota": {"etsy.demand": 1, "etsy.tally": 1, "etsy.pod_tally": 1,
+                      "etsy.pending_approval": 4, "etsy.listed": 4, "etsy.pod_published": 4,
+                      "etsy.not_listed": 4, "etsy.blocked": 3},
+      "workers": [
+        {"name": "scout", "impl": "etsy_scout", "uses": ["etsy.search_active"], "kind": "etsy_demand", "cadence_seconds": 86400,
+         "provider": "none", "entities": ["Etsy"],
+         "note": "measures Etsy demand for keywords from Etsy's own tags and the crew's demand ranking (seeds only until something is measured), through Pionir's read-only search",
+         "params": {"max_probes": 8}},
+        {"name": "digital", "impl": "etsy_digital", "uses": ["etsy.create_draft_listing", "etsy.activate_listing"], "kind": "etsy_listing", "cadence_seconds": 3600, "stage": 1,
+         "provider": "none", "entities": ["Etsy"],
+         "note": "a spreadsheet with formulas + printable PDF for the best measured keyword, at most 2 a day, each a draft and then a live listing only on the owner's approvals",
+         "params": {"daily_cap": 2}},
+        {"name": "pod", "impl": "etsy_pod", "uses": ["printify.catalog", "printify.create_product", "printify.publish"], "kind": "etsy_pod", "cadence_seconds": 3600, "stage": 1,
+         "provider": "none", "entities": ["Etsy", "Printify"],
+         "note": "a typographic print-on-demand product through Printify, priced cost-plus, at most 1 a day, created and published only on the owner's approvals",
+         "params": {"daily_cap": 1, "min_margin_cents": 400}}
       ]
     }
   ]

@@ -327,4 +327,16 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
     if configured.specialists_file is not None:
         for adapter in load_stdio_adapters(configured.specialists_file):
             runtime.register(adapter)
+    # ---- Etsy streams (crew division ``etsy``) ---------------------------------------------
+    # No boot-time call: credentials are read when a call runs. Every listing, product and
+    # publish parks for the owner's yes on every call; the Etsy listing fee makes
+    # etsy.create_draft_listing, etsy.activate_listing and printify.publish spends_money.
+    if configured.etsy_url is not None:
+        from .adapters.etsy import EtsyAdapter, etsy_settings
+
+        runtime.register(EtsyAdapter(etsy_settings(configured)))
+    if configured.printify_url is not None:
+        from .adapters.printify import PrintifyAdapter, printify_settings
+
+        runtime.register(PrintifyAdapter(printify_settings(configured)))
     return runtime

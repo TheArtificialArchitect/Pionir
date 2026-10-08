@@ -112,6 +112,9 @@ from .adapters.products import PUBLISH as PRODUCT_PUBLISH
 from .adapters.products import price_text
 from .adapters.testimonials import HIRE_PAGE
 from .adapters.testimonials import PUBLISH_TESTIMONIAL as CLIENT_TESTIMONIAL
+# Etsy streams: their cards' lines and previews live with their adapters
+from .adapters import etsy as etsy_cards
+from .adapters import printify as printify_cards
 from .batching import DigestSettings, answer_request, local_now, read_request
 from .fiverr import FiverrReplies
 from .fiverr import store_for as fiverr_store_for
@@ -972,6 +975,20 @@ def _product_lines(payload: Mapping[str, Any],
     return lines
 
 
+# Etsy streams: the capabilities whose card shows (and attaches) staged files from disk
+SHOP_PREVIEWED = frozenset({etsy_cards.CREATE, printify_cards.CREATE})
+
+
+def shop_cover(preview: Mapping[str, Any] | None) -> Attachment | None:
+    """The first photo of an Etsy draft, or a Printify design, to attach to its card."""
+    if not preview or preview.get("ok") is not True:
+        return None
+    data = preview.get("cover_bytes")
+    if not isinstance(data, bytes) or not data.startswith(b"\x89PNG"):
+        return None
+    return (str(preview.get("cover_name") or "photo.png"), "image/png", data)
+
+
 def product_cover(preview: Mapping[str, Any] | None) -> Attachment | None:
     """The cover to attach to a product card, as (file name, content type, bytes)."""
     if not preview or preview.get("ok") is not True:
@@ -1075,7 +1092,8 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
                    delivery: Mapping[str, Any] | None = None,
                    product: Mapping[str, Any] | None = None,
                    quote_reply: Mapping[str, Any] | None = None,
-                   digest: bool = False) -> str:
+                   digest: bool = False,
+                   shop: Mapping[str, Any] | None = None) -> str:
     """The whole text of an approval message, before it is split to fit Discord.
     Nothing that says what the action does is ever cut; long text is split
     across messages instead. ``delivery`` is a client.deliver's zip as inspected on
@@ -1116,6 +1134,9 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
             lines.append(listing)
     if row.get("capability") == APIBUILD_VERIFY:
         lines += apibuild_lines(row)
+    # Etsy streams: an Etsy listing or a Printify product - what is listed, at what price,
+    # with which files and photos as inspected on disk (``shop``), and the AI disclosure
+    lines += etsy_cards.card_lines(row, shop) + printify_cards.card_lines(row, shop)
     if delivers:
         lines.append(client_deliver_line(payload.get("to")))
         if payload.get("hold_for_balance") is True:
@@ -1223,6 +1244,10 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
         lines += _instagram_lines(payload)
         if isinstance(payload.get("caption"), str):
             shown = {**payload, "caption": "(the full caption above)"}
+    lines += etsy_cards.card_body(row) + printify_cards.card_body(row)
+    if row.get("capability") in SHOP_PREVIEWED and isinstance(payload.get("description"), str):
+        shown = {**shown, "description": f"(the full description above, "
+                                         f"{len(payload['description']):,} characters)"}
     lines += ["**Full payload:**", _FENCE + "json",
               _fence_safe(json.dumps(shown, indent=2, ensure_ascii=False, default=str)),
               _FENCE]
@@ -1510,6 +1535,8 @@ class DiscordGate:
         inspect_delivery: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
         inspect_product: Callable[[Mapping[str, Any]], Mapping[str, Any]] | None = None,
         quotes: QuoteReplies | None = None,
+        inspect_shop: Mapping[str, Callable[[Mapping[str, Any]], Mapping[str, Any]]]
+        | None = None,
         fiverr: FiverrReplies | None = None,
         builds: FiverrReplies | None = None,
         digest: DigestSettings | None = None,
@@ -1539,6 +1566,9 @@ class DiscordGate:
         # ProductAdapter.product_preview: a product card lists the zip's files and carries
         # the cover as they are on disk when it is posted.
         self._inspect_product = inspect_product
+        # Etsy streams: capability -> its adapter's preview (EtsyAdapter.listing_preview,
+        # PrintifyAdapter.design_preview): the staged files as they are on disk now
+        self._inspect_shop = dict(inspect_shop or {})
         self._previews: dict[str, tuple[float, Mapping[str, Any] | None]] = {}
         self._opener = opener
         self._stop = threading.Event()
@@ -1571,6 +1601,15 @@ class DiscordGate:
         product_preview = getattr(products, "product_preview", None)
         if callable(product_preview):
             kwargs.setdefault("inspect_product", product_preview)
+        shop_previews = {}
+        for agent, cap, method in (("etsy", etsy_cards.CREATE, "listing_preview"),
+                                   ("printify", printify_cards.CREATE, "design_preview")):
+            found = getattr(adapters.get(agent) if isinstance(adapters, Mapping) else None,
+                            method, None)
+            if callable(found):
+                shop_previews[cap] = found
+        if shop_previews:
+            kwargs.setdefault("inspect_shop", shop_previews)
         order = getattr(client, "order", None)
         if callable(order) and "quotes" not in kwargs:
             # Replies are read only for cards in this record: with no quote card posted, the
@@ -1604,7 +1643,8 @@ class DiscordGate:
         turns the card into a DO NOT APPROVE on a later poll without re-scanning it every
         tick)."""
         inspect = {CLIENT_DELIVER: self._inspect_delivery,
-                   PRODUCT_PUBLISH: self._inspect_product}.get(str(row.get("capability")))
+                   PRODUCT_PUBLISH: self._inspect_product,
+                   **self._inspect_shop}.get(str(row.get("capability")))
         if inspect is None:
             return None
         key = str(row.get("id"))
@@ -1635,6 +1675,8 @@ class DiscordGate:
             return render_request(row, self.settings.owner, quote_reply=reply, digest=digest)
         if row.get("capability") == PRODUCT_PUBLISH:
             return render_request(row, self.settings.owner, product=preview, digest=digest)
+        if row.get("capability") in SHOP_PREVIEWED:
+            return render_request(row, self.settings.owner, shop=preview, digest=digest)
         return render_request(row, self.settings.owner, delivery=preview, digest=digest)
 
     def __repr__(self) -> str:
@@ -1869,6 +1911,8 @@ class DiscordGate:
             attachment = (CARD_FILENAME, "image/jpeg", image) if image is not None else None
         elif row.get("capability") == PRODUCT_PUBLISH:
             attachment = product_cover(preview)
+        elif row.get("capability") in SHOP_PREVIEWED:
+            attachment = shop_cover(preview)
         attach_failed: str | None = None
         if attachment is None:
             sent = self._call("POST", f"/channels/{channel}/messages", message)
@@ -1898,7 +1942,8 @@ class DiscordGate:
             # is never approved (and is posted again)
             "complete": False,
         }
-        if row.get("capability") in (INSTAGRAM_POST, PRODUCT_PUBLISH) \
+        if (row.get("capability") in (INSTAGRAM_POST, PRODUCT_PUBLISH)
+                or row.get("capability") in SHOP_PREVIEWED) \
                 and (attachment is None or attach_failed is not None):
             # The owner has not seen its image: a digest item like this is never approved
             # blind (from the card or its preview); the next digest posts it again.
