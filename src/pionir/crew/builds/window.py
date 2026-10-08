@@ -3,7 +3,7 @@
 Daedalus's 30B coder takes the whole card and evicts the model Moss and the leaders speak
 with, so builds run only at night: by default 01:00-07:00 local time (configurable; a window
 may cross midnight, e.g. 23:00-05:00). A window is named by the local date it STARTS on - the
-"night" - and at most one product is started per night.
+"night" - and jobs run back to back in it while there is room (worker.py).
 
 A job may start only when it can finish inside the window: ``now + budget <= end``. Its
 ``not_after`` (the wall-clock time Pionir's adapter cancels it at, whatever else) is

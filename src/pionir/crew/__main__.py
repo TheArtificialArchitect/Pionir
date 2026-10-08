@@ -53,9 +53,11 @@ def run(crew, *, stop: threading.Event | None = None, out: Callable[[str], None]
     if monitor:
         crew.monitor = Monitor(crew.cfg, crew.store)
         crew.monitor.start()
-    crew.start()
-    out("crew: started")
     try:
+        # inside the try: a start that fails (the API's port taken) still stops cleanly,
+        # with its final checkpoint, instead of leaving the gap to be guessed next time
+        crew.start()
+        out("crew: started")
         while not stop.wait(0.5):
             pass
     except KeyboardInterrupt:

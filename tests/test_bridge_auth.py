@@ -197,10 +197,11 @@ class LauncherTests(unittest.TestCase):
                          {"DAEDALUS_TOKEN": "daedalus-token.txt"})
         self.assertEqual(_token_env(_assignment(self.text, "meleteEnv")),
                          {"MELETE_TOKEN": "melete-token.txt"})
+        # each in its pane's restart loop (scripts/pane-loop.ps1), told its port
         self.assertIn('Pane-Cmd "Daedalus :8771" $daedalusDir "python -m daedalus.server" '
-                      '$daedalusEnv)', self.text)
+                      '$daedalusEnv 8771)', self.text)
         self.assertIn('Pane-Cmd "Melete :8770" $meleteDir "python -m melete.server" '
-                      '$meleteEnv)', self.text)
+                      '$meleteEnv 8770)', self.text)
 
     def test_pionir_is_handed_both_tokens(self) -> None:
         self.assertEqual(_token_env(_assignment(self.text, "pionirPrelude")),

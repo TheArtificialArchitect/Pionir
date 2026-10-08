@@ -219,12 +219,18 @@ function Enc([string]$command) {
 # keeps a pane whose process ended with an error code - every restart left a whole
 # window of dead panes behind (seven of them by one evening).
 $stopMarker = Join-Path $env:LOCALAPPDATA "Pionir\stopping"
-function Pane-Cmd([string]$title, [string]$dir, [string]$run, [string]$prelude) {
+# A bridge that dies on its own is restarted IN its pane (scripts\pane-loop.ps1): with backoff
+# (5 s doubling to 60 s), never after an exit 0 / Ctrl+C / -Stop, never over a port something
+# else now answers on, and it gives up loudly after 5 crashes in 10 minutes. Before this a
+# crash waited for Ian to notice the pane (2026-10-07 outage review). The loop lives inside
+# the pane he launched: closing the window still brings everything down (rule 3).
+$paneLoop = Join-Path $root "scripts\pane-loop.ps1"
+function Pane-Cmd([string]$title, [string]$dir, [string]$run, [string]$prelude, [int]$port = 0, [string]$noRestart = "") {
     # PIONIR_PANE marks the shell as one of ours, so Close-EmptyPanes can find it.
-    $body = "`$env:PIONIR_PANE='1'; `$host.UI.RawUI.WindowTitle='$title'; Set-Location '$dir'; $prelude$run; " +
-            "`$code = `$LASTEXITCODE; if (Test-Path '$stopMarker') { exit 0 }; " +
-            "Write-Host ''; Write-Host ('  $title stopped on its own (exit ' + `$code + '). Read the error above; press Enter to close this pane.') -ForegroundColor Yellow; " +
-            "[void](Read-Host); exit 0"
+    $q = { param($s) $s.Replace("'", "''") }
+    $codes = if ($noRestart) { " -NoRestartCodes $noRestart" } else { "" }
+    $body = "`$env:PIONIR_PANE='1'; `$host.UI.RawUI.WindowTitle='$title'; Set-Location '$dir'; $prelude" +
+            "& '$(& $q $paneLoop)' -Title '$(& $q $title)' -Command '$(& $q $run)' -Port $port -StopMarker '$(& $q $stopMarker)'$codes; exit `$LASTEXITCODE"
     return @("powershell", "-ExecutionPolicy", "Bypass", "-EncodedCommand", (Enc $body))
 }
 
@@ -505,7 +511,7 @@ $pionirPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_GALATEA_URL='http://1
 $panes = @()   # ordered: dashboard, voice, then the doers
 $ports = @()   # the ports this launch is responsible for verifying
 if ((Claim-Port 'dashboard' $Port) -eq 'free') {
-    $panes += ,(Pane-Cmd "Pionir :$Port" $root "python -m pionir server --port $Port$browserFlag" $pionirPrelude)
+    $panes += ,(Pane-Cmd "Pionir :$Port" $root "python -m pionir server --port $Port$browserFlag" $pionirPrelude $Port)
     $ports += $Port
 }
 
@@ -515,7 +521,7 @@ if (-not $NoVoice) {
     elseif (Test-Path $galateaDir) {
         # --phone binds 0.0.0.0 so Ian can reach her from his phone over Tailscale;
         # her token gates every non-loopback request, so this fails closed.
-        $panes += ,(Pane-Cmd "Galatea :8799" $galateaDir "python -m galatea wake --port 8799 --no-browser --phone" "")
+        $panes += ,(Pane-Cmd "Galatea :8799" $galateaDir "python -m galatea wake --port 8799 --no-browser --phone" "" 8799)
         $ports += 8799
     } else { Write-Host "  ! Galatea not found at $galateaDir; skipping the voice." -ForegroundColor Yellow }
 }
@@ -539,14 +545,14 @@ if (-not $NoSpecialists) {
         #                    does not (think=true is a 400), so it is inert until the
         #                    model changes. /health brain.thinking_active is the truth.
         $daedalusEnv = "`$env:DAEDALUS_MODEL='qwen3-coder:30b'; `$env:DAEDALUS_NUM_CTX='32768'; `$env:DAEDALUS_MAX_STEPS='32'; `$env:DAEDALUS_REPAIRS='4'; `$env:DAEDALUS_TEMPERATURE='0.35'; `$env:DAEDALUS_THINK='1'; `$env:DAEDALUS_TOKEN=(Get-Content -Raw (Join-Path `$HOME '.pionir\secrets\daedalus-token.txt')).Trim(); if (([string]`$env:DAEDALUS_TOKEN).Length -lt 32) { Write-Host '  no usable DAEDALUS_TOKEN (~/.pionir/secrets/daedalus-token.txt): not starting Daedalus without its token.' -ForegroundColor Red; [void](Read-Host); exit 1 }; "
-        $panes += ,(Pane-Cmd "Daedalus :8771" $daedalusDir "python -m daedalus.server" $daedalusEnv)
+        $panes += ,(Pane-Cmd "Daedalus :8771" $daedalusDir "python -m daedalus.server" $daedalusEnv 8771)
         $ports += 8771
     } else { Write-Host "  ! Daedalus not found at $daedalusDir; skipping." -ForegroundColor Yellow }
     if (-not $bridgeTokensOk) { }
     elseif ((Claim-Port 'melete' 8770 ' It has a token only if this launcher started it.') -ne 'free') { }
     elseif (Test-Path $meleteDir) {
         $meleteEnv = "`$env:MELETE_TOKEN=(Get-Content -Raw (Join-Path `$HOME '.pionir\secrets\melete-token.txt')).Trim(); if (([string]`$env:MELETE_TOKEN).Length -lt 32) { Write-Host '  no usable MELETE_TOKEN (~/.pionir/secrets/melete-token.txt): not starting Melete without its token.' -ForegroundColor Red; [void](Read-Host); exit 1 }; "
-        $panes += ,(Pane-Cmd "Melete :8770" $meleteDir "python -m melete.server" $meleteEnv)
+        $panes += ,(Pane-Cmd "Melete :8770" $meleteDir "python -m melete.server" $meleteEnv 8770)
         $ports += 8770
     } else { Write-Host "  ! Melete not found at $meleteDir; skipping." -ForegroundColor Yellow }
 }
@@ -563,7 +569,7 @@ if (-not $NoCrew) {
         Write-Host "  crew is starting (its port opens after the model warm-up); not started twice." -ForegroundColor DarkCyan
     } elseif ($crewState -eq 'free') {
         $crewPrelude = "`$env:PYTHONPATH='$srcDir'; `$env:PIONIR_CREW_PIONIR_URL='http://127.0.0.1:$Port'; `$env:PIONIR_CREW_API_PORT='8782'; "
-        $panes += ,(Pane-Cmd "Crew :8782" $root "python -m pionir.crew" $crewPrelude)
+        $panes += ,(Pane-Cmd "Crew :8782" $root "python -m pionir.crew" $crewPrelude 8782)
         $ports += 8782
     }
 }
@@ -587,7 +593,7 @@ if (-not $NoPeter) {
         Write-Host "    (started outside Pionir, his model calls skip the GPU gate until he is restarted from here.)" -ForegroundColor DarkGray
     } elseif ((Claim-Port 'peter' 8790) -ne 'free') {
     } elseif (Test-Path (Join-Path $peterDir "deploy\peter.ps1")) {
-        $panes += ,(Pane-Cmd "Peter :8790" $peterDir "powershell -NoProfile -ExecutionPolicy Bypass -File $peterLive" $peterPrelude)
+        $panes += ,(Pane-Cmd "Peter :8790" $peterDir "powershell -NoProfile -ExecutionPolicy Bypass -File $peterLive" $peterPrelude 8790)
         $ports += 8790
         $peterStarted = $true
     } else { Write-Host "  ! Peter not found at $peterDir; skipping the feed." -ForegroundColor Yellow }
@@ -623,7 +629,7 @@ if (-not $NoTunnel) {
     } elseif (-not (Test-Path $tunnelKey)) {
         Write-Host "  VPS tunnel not set up yet (no key at $tunnelKey): run tools\vps-lockdown.ps1 to set it up." -ForegroundColor DarkCyan
     } elseif (Test-Path $tunnelScript) {
-        $panes += ,(Pane-Cmd "VPS tunnel" $root "powershell -NoProfile -ExecutionPolicy Bypass -File $tunnelScript" "")
+        $panes += ,(Pane-Cmd "VPS tunnel" $root "powershell -NoProfile -ExecutionPolicy Bypass -File $tunnelScript" "" 0 "2")
         $ports += 18000
     } else { Write-Host "  ! the tunnel script was not found at $tunnelScript." -ForegroundColor Yellow }
 }
