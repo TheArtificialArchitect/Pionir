@@ -161,6 +161,9 @@ try {
         }
         $bytes = [Text.Encoding]::UTF8.GetBytes($html)
         $context.Response.ContentType = "text/html; charset=utf-8"
+        # Without a length the response goes out chunked and the listener closes right after, so
+        # the browser often showed a blank page instead of this message.
+        $context.Response.ContentLength64 = $bytes.Length
         $context.Response.OutputStream.Write($bytes, 0, $bytes.Length)
         $context.Response.Close()
     }
