@@ -33,7 +33,7 @@ from pionir.crew.builds import backlog as bl
 from pionir.crew.hands import JobOutcome
 from pionir.crew.marketplaces import paths, providers
 from pionir.crew.marketplaces.staging import stage_build
-from pionir.crew.registry import default_registry
+from pionir.crew.registry import build_registry, default_registry, load_catalogue
 from pionir.crew.result import Err, Ok
 from pionir.crew.worker import ErrorKind, WorkContext, WorkerError
 
@@ -87,6 +87,26 @@ class Pionir:
         return [j for j in self.jobs if j.capability == capability]
 
 
+# The owner dropped the Chrome Web Store and put the Shopify App Store on hold (2026-10-08): their
+# scouts are out of catalogue.json, but the code stays tested so either can come back.
+DORMANT = ("marketplaces.scout_chrome", "marketplaces.scout_shopify")
+
+
+def dormant_registry():
+    cat = load_catalogue()
+    div = next(d for d in cat["divisions"] if d["id"] == "marketplaces")
+    div["workers"] = list(div["workers"]) + [
+        {"name": "scout_chrome", "stage": 2, "impl": "marketplace_scout", "uses": [],
+         "kind": "market", "cadence_seconds": 21600, "provider": "marketplaces",
+         "entities": ["Chrome Web Store"], "note": "dormant",
+         "params": {"market": "chrome", "pages": 3, "details": 8}},
+        {"name": "scout_shopify", "stage": 2, "impl": "marketplace_scout", "uses": [],
+         "kind": "market", "cadence_seconds": 43200, "provider": "marketplaces",
+         "entities": ["Shopify"], "note": "dormant", "params": {"market": "shopify", "pages": 3}}]
+    return build_registry(cat)
+
+
+
 class _Case(unittest.TestCase):
     def setUp(self) -> None:
         isolate(self)
@@ -118,7 +138,8 @@ class _Case(unittest.TestCase):
         return WorkContext(**base)
 
     def step(self, worker_id, **over):
-        worker = default_registry().require(worker_id)
+        reg = dormant_registry() if worker_id in DORMANT else default_registry()
+        worker = reg.require(worker_id)
         worker.sleep = lambda s: None
         return worker.run(self.ctx(**over))
 
@@ -390,10 +411,13 @@ class ReadinessTests(unittest.TestCase):
             self.assertIsNone(reg.require("marketplaces.scout_apify").readiness(secrets))
             why = reg.require("marketplaces.packager").readiness(secrets)
             self.assertIn("apify-token.txt", why)
-            self.assertIn("chrome-webstore.json", why)
+            # Chrome is dropped: its credentials are not asked for, so Apify alone is ready
+            self.assertNotIn("chrome-webstore.json", why)
             (secrets / "apify-token.txt").write_text("t")
-            (secrets / "chrome-webstore.json").write_text("{}")
+            self.assertIsNone(reg.require("marketplaces.packager").readiness(secrets))
             self.assertIsNone(reg.require("marketplaces.watcher").readiness(secrets))
+            self.assertNotIn("marketplaces.scout_chrome", reg.ids())
+            self.assertNotIn("marketplaces.scout_shopify", reg.ids())
 
 
 if __name__ == "__main__":

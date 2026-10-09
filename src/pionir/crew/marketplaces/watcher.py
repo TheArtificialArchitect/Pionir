@@ -92,7 +92,7 @@ class WatcherWorker(_Base):
             log.warning("%s: could not write %s: %s", self.worker_id, paths.PERFORMANCE, exc)
         save_record(record_path(ctx.state_dir, self.worker_id), rec)
         missing = missing_credentials(ctx.secrets_dir)
-        if not actors and not chrome and len(missing) == 2:
+        if not actors and not chrome and missing:
             return self._err(ErrorKind.NOT_CONFIGURED, "nothing published to watch, and no "
                              "store credential yet: " + "; ".join(missing), retryable=False)
         return Ok((*events, self._report(ctx, drafts, perf, notes, missing)))

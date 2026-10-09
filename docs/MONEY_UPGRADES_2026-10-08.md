@@ -107,20 +107,11 @@ set PayPal payout ($20 minimum).
 cd C:\src\Pionir; powershell -ExecutionPolicy Bypass -File .\tools\setup-apify.ps1
 ```
 
-### 6. Chrome Web Store
-Pay the $5 developer fee, note the Publisher ID. Google Cloud: enable *Chrome Web Store API*,
-create an OAuth **Desktop app** client.
-```powershell
-cd C:\src\Pionir; powershell -ExecutionPolicy Bypass -File .\tools\setup-chrome-webstore.ps1
-```
-Per extension (the Discord card names the pack): create the item by hand once, then
-```powershell
-cd C:\src\Pionir; powershell -ExecutionPolicy Bypass -File .\tools\setup-chrome-webstore.ps1 -Slug <slug> -ItemId <id>
-```
-Note: Chrome specs wait until night builds can test JavaScript inside the sandbox — see "Not
-done" below.
+### 6. ~~Chrome Web Store~~ — dropped by Ian 2026-10-08 (too much effort for almost no income)
+Scout removed from the crew; code kept dormant. Replacement researched (only Dreamstime
+qualifies: ~$5-25/mo, $100 payout floor) - Ian chose to leave the slot empty for now.
 
-### 7. Shopify — nothing until you want to submit a pack ($19 partner registration).
+### 7. ~~Shopify~~ — on hold (scout off).
 
 ---
 

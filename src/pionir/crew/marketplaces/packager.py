@@ -47,14 +47,20 @@ MAX_SUBMITS_PER_RUN = 1
 SETTLED = ("published", "submitted", "denied", "failed", "unknown", "gave_up")
 
 
+# The owner dropped the Chrome Web Store on 2026-10-08 (too much effort for almost no income).
+# Its credentials are no longer required, or every Apify-only setup would read NOT CONFIGURED
+# for ever. Set True to bring Chrome back (and re-add its scout to catalogue.json).
+CHROME_ACTIVE = False
+
+
 def missing_credentials(secrets_dir) -> list:
-    """Which store credential files are not there yet, with the script that writes each."""
+    """Which ACTIVE store credential files are not there yet, with the script that writes each."""
     out = []
     if secrets_dir is None:
         return ["no secrets folder is configured"]
     if not (secrets_dir / APIFY_TOKEN).is_file():
         out.append(rf"no Apify token at {secrets_dir / APIFY_TOKEN} (run tools\setup-apify.ps1)")
-    if not (secrets_dir / CHROME_CREDENTIALS).is_file():
+    if CHROME_ACTIVE and not (secrets_dir / CHROME_CREDENTIALS).is_file():
         out.append(rf"no Chrome Web Store credentials at {secrets_dir / CHROME_CREDENTIALS} "
                    r"(run tools\setup-chrome-webstore.ps1)")
     return out
