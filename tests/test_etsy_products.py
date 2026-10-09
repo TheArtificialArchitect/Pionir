@@ -286,5 +286,14 @@ class PictureTests(unittest.TestCase):
         self.assertEqual(img.getpixel((0, 0))[3], 0)
 
 
+
+class SlugTests(unittest.TestCase):
+    def test_a_keyword_that_starts_with_the_kind_is_not_doubled(self) -> None:
+        from pionir.crew.etsy.common import slug_for
+        self.assertTrue(slug_for("budget", "budget tracker spreadsheet", 1.0)
+                        .startswith("budget-tracker-spreadsheet-"))
+        self.assertTrue(slug_for("pod", "cat lover mug", 1.0).startswith("pod-cat-lover-mug-"))
+
+
 if __name__ == "__main__":
     unittest.main()

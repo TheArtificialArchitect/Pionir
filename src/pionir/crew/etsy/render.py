@@ -185,7 +185,7 @@ def preview_images(xlsx: bytes, pages: list, kind_name: str, headline: str,
     roles, widths, body = _table_parts(kind_name, grid)
     img, draw = _canvas(headline, "Spreadsheet (.xlsx) with formulas + printable PDF")
     shown = body if len(body) <= 13 else body[:12] + [body[-1]]
-    draw.text((80, 340), "The Example sheet, as it computes:", font=_font(40, SEMIBOLD),
+    draw.text((80, 340), "The Example tab, with its formulas filled in:", font=_font(40, SEMIBOLD),
               fill=INK)
     height = min(1050, 80 * len(shown))
     draw_table(draw, (80, 410, PREVIEW_SIZE[0] - 80, 410 + height), shown, header=0,

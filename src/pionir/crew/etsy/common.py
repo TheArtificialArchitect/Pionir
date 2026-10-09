@@ -40,7 +40,9 @@ def utc_day(ts: float) -> str:
 def slug_for(prefix: str, keyword: str, now: float) -> str:
     words = re.sub(r"[^a-z0-9]+", "-", keyword.lower()).strip("-")[:36].strip("-")
     tail = hashlib.sha256(f"{keyword}|{now}".encode()).hexdigest()[:6]
-    return f"{prefix}-{words}-{tail}"[:60].strip("-")
+    if words == prefix or words.startswith(prefix + "-"):
+        prefix = ""   # "budget" + "budget tracker" was staged as budget-budget-tracker-...
+    return "-".join(p for p in (prefix, words, tail) if p)[:60].strip("-")
 
 
 def sha256(data: bytes) -> str:
