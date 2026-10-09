@@ -62,13 +62,19 @@ Then close and reopen Pionir Desktop (or `cd C:\src\Pionir; .\pionir.ps1 -Stop; 
 ### 2. Adobe Stock (10 min, once)
 1. Adobe Stock contributor account (contributor.stock.adobe.com), if you don't have one.
 2. Cloudflare API token with **Workers AI Read + Edit** (dash.cloudflare.com/profile/api-tokens).
-3. Contributor portal → Upload → FTP/SFTP → generate password. (A brand-new account may need a few web uploads approved before SFTP turns on.)
+3. ~~SFTP password~~ — Adobe has phased SFTP out for new contributors; press Enter at the SFTP
+   prompts. The pipeline runs in **web mode** (changed 2026-10-08, Scrooge b28cad3).
 ```powershell
 cd C:\src\Scrooge; powershell -ExecutionPolicy Bypass -File .\tools\setup-stock-secrets.ps1
 ```
-**Per batch, forever:** contributor portal → Uploaded Files → select all → tick
-*Created using generative AI tools* → Submit. Adobe can't take that flag over SFTP, so your
-Submit is both the declaration and your approval.
+**Per batch (weekly is fine; batches keep 14 days):**
+```powershell
+cd C:\src\Scrooge; powershell -ExecutionPolicy Bypass -File .\tools\stock-batch.ps1
+```
+It puts every new image in one folder under `Pictures\Adobe Stock` with one merged
+`batch.csv`, and opens the folder and the portal. Then: Upload → drag in the JPEGs; Uploaded
+Files → Upload CSV → `batch.csv`; select all → tick *Created using generative AI tools* →
+Submit. Your Submit is both Adobe's AI declaration and your approval.
 
 ### 3. Scrooge per-tool click tracking (`utm-content` branch)
 ```powershell
