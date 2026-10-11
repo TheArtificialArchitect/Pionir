@@ -55,6 +55,8 @@ from pionir.errors import AdapterProtocolError, AdapterUnavailable
 _log = logging.getLogger(__name__)
 
 CATALOG = "printify.catalog"
+BLUEPRINTS_MAX_BYTES = 32_000_000
+BLUEPRINTS_TTL_SECONDS = 24 * 3600
 CREATE = "printify.create_product"
 PUBLISH = "printify.publish"
 
@@ -393,7 +395,7 @@ class PrintifyAdapter:
         return doc
 
     def _call(self, method: str, path: str, token: str, *, body: Any = None, step: str,
-              upload: bool = False) -> Any:
+              upload: bool = False, max_bytes: int = shop.MAX_RESPONSE_BYTES) -> Any:
         data = json.dumps(body).encode("utf-8") if body is not None else None
         headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
         if data is not None:
@@ -401,7 +403,7 @@ class PrintifyAdapter:
         timeout = self.settings.upload_timeout_seconds if upload else \
             self.settings.timeout_seconds
         status, doc = shop.http(self._open, method, f"{self._api}{path}", data, headers,
-                                timeout, AGENT)
+                                timeout, AGENT, max_bytes=max_bytes)
         if 200 <= status < 300:
             return doc
         said = ""
@@ -451,10 +453,33 @@ class PrintifyAdapter:
         rows = doc.get("variants") if isinstance(doc, Mapping) else doc
         return [v for v in (rows or []) if isinstance(v, Mapping)]
 
-    def _catalog(self, item: Mapping[str, Any], token: str) -> dict[str, Any]:
-        doc = self._call("GET", "/catalog/blueprints.json", token, step="read the blueprints")
+    def _blueprints(self, token: str) -> list:
+        """Every blueprint's id and title. The full list is ~5 MB (2,777 blueprints, Oct 2026),
+        so it is read with a larger cap and kept for a day beside the ledger."""
+        cache = self.settings.ledger_file.parent / "printify-blueprints.json"
+        try:
+            kept = json.loads(cache.read_text("utf-8"))
+            if self._clock() - float(kept["at"]) < BLUEPRINTS_TTL_SECONDS                     and isinstance(kept.get("blueprints"), list) and kept["blueprints"]:
+                return kept["blueprints"]
+        except (OSError, ValueError, KeyError, TypeError):
+            pass   # no cache, or an unreadable one: read Printify
+        doc = self._call("GET", "/catalog/blueprints.json", token, step="read the blueprints",
+                         max_bytes=BLUEPRINTS_MAX_BYTES)
         if not isinstance(doc, list):
-            raise shop.unavailable("Printify's blueprints answer is not a list")
+            raise shop.unavailable("Printify's blueprints answer is not a list (empty, not "
+                                   f"JSON, or over {BLUEPRINTS_MAX_BYTES:,} bytes)")
+        slim = [{"id": b["id"], "title": b["title"]} for b in doc
+                if isinstance(b, Mapping) and isinstance(b.get("id"), int)
+                and isinstance(b.get("title"), str)]
+        try:
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps({"at": self._clock(), "blueprints": slim}), "utf-8")
+        except OSError as exc:
+            _log.warning("printify: could not keep the blueprint list: %s", exc)
+        return slim
+
+    def _catalog(self, item: Mapping[str, Any], token: str) -> dict[str, Any]:
+        doc = self._blueprints(token)
         noun = item["product"]
         pattern = re.compile(r"(?<![a-z])" + re.escape(noun) + r"s?(?![a-z])", re.IGNORECASE)
         found = sorted((b for b in doc if isinstance(b, Mapping)

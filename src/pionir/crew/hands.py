@@ -126,7 +126,17 @@ def _error_of(doc: dict) -> str:
     err = doc.get("error")
     if isinstance(err, dict):
         return str(err.get("message") or err.get("type") or "error")
-    return str(err or doc.get("reason") or "")
+    if err or doc.get("reason"):
+        return str(err or doc.get("reason"))
+    # an adapter that answered ok:false says why inside its own output; without this the
+    # worker only ever saw "Pionir reported it did not work" (Printify's catalog, Oct 2026)
+    result = doc.get("result")
+    if isinstance(result, dict):
+        for key in ("error", "refused", "unavailable", "reason"):
+            value = result.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:500]
+    return ""
 
 
 def outcome_of(capability: str, doc) -> JobOutcome:

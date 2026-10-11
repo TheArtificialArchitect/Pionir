@@ -183,6 +183,7 @@ class FakePrintify:
         self.uploads: list[dict] = []
         self.published: list[str] = []
         self.next = 1
+        self.blueprint_filler = 0   # extra blueprints, to make the answer as big as the real one
 
     def steps(self) -> list[str]:
         return [c["step"] for c in self.calls]
@@ -204,9 +205,12 @@ class FakePrintify:
         m = call["method"]
         if path == "/catalog/blueprints.json":
             call["step"] = "blueprints"
+            filler = [{"id": 1000 + i, "title": f"Filler Product {i}", "brand": "Filler",
+                       "model": "F", "description": "x" * 1700, "images": []}
+                      for i in range(self.blueprint_filler)]
             return Response(200, [{"id": 9, "title": "Unisex Jersey Short Sleeve Tee"},
                                   {"id": 5, "title": "Ceramic Mug 11oz"},
-                                  {"id": 6, "title": "Ceramic Mug Gift Box Edition"}])
+                                  {"id": 6, "title": "Ceramic Mug Gift Box Edition"}] + filler)
         if path.endswith("/print_providers.json"):
             call["step"] = "providers"
             return Response(200, [{"id": 1, "title": "Provider One"}])

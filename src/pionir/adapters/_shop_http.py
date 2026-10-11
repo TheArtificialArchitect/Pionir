@@ -64,17 +64,20 @@ def check_url(url: str, what: str) -> None:
 
 
 def http(opener: Opener, method: str, url: str, data: bytes | None,
-         headers: Mapping[str, str], timeout: float, agent: str) -> tuple[int, Any]:
-    """(HTTP status, parsed JSON or None). Status 0 means nothing answered."""
+         headers: Mapping[str, str], timeout: float, agent: str,
+         max_bytes: int = MAX_RESPONSE_BYTES) -> tuple[int, Any]:
+    """(HTTP status, parsed JSON or None). Status 0 means nothing answered. ``max_bytes`` caps
+    the answer read; a bigger answer is None AND logged (Printify's whole catalog outgrew the
+    4 MB default in 2026 and read as "not a list" with no clue why)."""
     request = urllib.request.Request(url, data=data, method=method,
                                      headers={"User-Agent": agent, **headers})
     try:
         # timeout by keyword: OpenerDirector.open(url, data=None, timeout=...) takes a
         # positional second argument as the POST body.
         with opener(request, timeout=timeout) as response:
-            return int(getattr(response, "status", 200)), read_json(response)
+            return int(getattr(response, "status", 200)), read_json(response, max_bytes, url)
     except urllib.error.HTTPError as error:
-        return error.code, read_json(error)
+        return error.code, read_json(error, max_bytes, url)
     except (urllib.error.URLError, TimeoutError, OSError) as error:
         # the exception text is not carried: it could echo the request
         _log.warning("%s: %s %s did not answer (%s)", agent, method,
@@ -82,12 +85,16 @@ def http(opener: Opener, method: str, url: str, data: bytes | None,
         return 0, None
 
 
-def read_json(response: Any) -> Any:
+def read_json(response: Any, max_bytes: int = MAX_RESPONSE_BYTES, url: str = "") -> Any:
     try:
-        raw = response.read(MAX_RESPONSE_BYTES + 1)
+        raw = response.read(max_bytes + 1)
     except (OSError, ValueError):
         return None
-    if not raw or len(raw) > MAX_RESPONSE_BYTES:
+    if not raw:
+        return None
+    if len(raw) > max_bytes:
+        _log.warning("an answer from %s is over %d bytes and was not read",
+                     urllib.parse.urlsplit(url).path or "a store", max_bytes)
         return None
     try:
         return json.loads(raw.decode("utf-8"))

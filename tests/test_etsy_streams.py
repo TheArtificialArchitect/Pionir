@@ -652,5 +652,30 @@ class EndToEndTests(_Case):
         self.assertIn("etsy.pod_published", [o.kind for o in got.value])
 
 
+class PrintifyCatalogSizeTests(_Case):
+    def catalog(self) -> dict:
+        from pionir.contracts import Task
+        return self.printify_adapter.execute(Task("printify.catalog", {"product": "mug"})).output
+
+    def test_a_catalog_bigger_than_the_default_cap_is_read_and_kept_for_a_day(self) -> None:
+        # Printify's real blueprint list passed 4 MB in Oct 2026 and read as "not a list"
+        self.printify.blueprint_filler = 2600
+        out = self.catalog()
+        self.assertTrue(out["ok"], out)
+        self.assertEqual([b["blueprint_id"] for b in out["blueprints"]], [5, 6])
+        before = self.printify.steps().count("blueprints")
+        self.assertTrue(self.catalog()["ok"])
+        self.assertEqual(self.printify.steps().count("blueprints"), before)  # from the cache
+
+
+class HandsErrorTests(unittest.TestCase):
+    def test_an_adapters_own_reason_reaches_the_worker(self) -> None:
+        from pionir.crew.hands import outcome_of
+        got = outcome_of("printify.catalog", {"ok": False, "status": "error", "result": {
+            "ok": False, "unavailable": "Printify's blueprints answer is not a list"}})
+        self.assertEqual(got.status, "failed")
+        self.assertIn("not a list", got.error)
+
+
 if __name__ == "__main__":
     unittest.main()
