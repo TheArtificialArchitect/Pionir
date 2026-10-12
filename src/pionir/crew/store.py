@@ -435,6 +435,27 @@ class CrewStore:
             return self._read("SELECT COUNT(*) FROM outputs")[0][0]
         return self._read("SELECT COUNT(*) FROM outputs WHERE division=?", (division,))[0][0]
 
+    def refusal_outputs(self, since: float, suffixes: Sequence[str], limit: int = 5000) -> list:
+        """Every output since ``since`` whose kind ends in ``.<suffix>`` (``etsy.blocked``,
+        ``build.rejected``...), newest first - however many tallies were written meanwhile.
+        A read for the self-improvement worker; never written."""
+        if not suffixes:
+            return []
+        where = " OR ".join("kind LIKE ?" for _ in suffixes)
+        rows = self._read(f"SELECT {_OUT_COLS} FROM outputs WHERE observed_at > ? AND ({where}) "
+                          "ORDER BY observed_at DESC LIMIT ?",
+                          (since, *[f"%.{s}" for s in suffixes], limit))
+        return [_output_row(r) for r in rows]
+
+    def failed_runs(self, since: float, limit: int = 2000) -> list:
+        """Every failed attempt of any worker since ``since``, newest first: what the
+        self-improvement worker clusters into repeated failures. A read; never written."""
+        rows = self._read("SELECT worker_id, finished_at, error_kind, error_message FROM runs "
+                          "WHERE outcome='err' AND finished_at > ? ORDER BY run_id DESC "
+                          "LIMIT ?", (since, limit))
+        keys = ("worker_id", "finished_at", "error_kind", "error_message")
+        return [dict(zip(keys, r)) for r in rows]
+
     def runs(self, worker_id: str, limit: int = 20) -> list:
         rows = self._read("SELECT started_at, finished_at, outcome, error_kind, error_message, "
                           "yielded, written FROM runs WHERE worker_id=? ORDER BY run_id DESC "

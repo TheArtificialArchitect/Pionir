@@ -65,7 +65,7 @@ LEADER_FIRST_DELAY = 90.0
 # The workers that run unattended overnight: their Claude calls take the per-night cap and the
 # cheaper model (escalation.Escalator). Everything else - the Fiverr desk's client work, the
 # leaders' escalations - is daytime work the owner is around for.
-NIGHT_IMPLS = frozenset({"daedalus_builds", "api_builder"})
+NIGHT_IMPLS = frozenset({"daedalus_builds", "api_builder", "self_improver"})
 FIRST_CHECKPOINT_SECONDS = 60
 # How stale "the crew was last alive at" may get. Both launchers stop the crew with a hard
 # kill (Desktop: taskkill /T /F; pionir.ps1: Stop-Process -Force), so no final checkpoint is
@@ -179,7 +179,13 @@ class Crew:
                            scrooge_repo=getattr(self.cfg, "scrooge_repo", None),
                            economy_dir=getattr(self.cfg, "economy_dir", None),
                            approvals_path=getattr(self.cfg, "approvals_path", None),
-                           outputs=self.store.read_outputs)
+                           outputs=self.store.read_outputs,
+                           failed_runs=self.store.failed_runs,
+                           refusals=self.store.refusal_outputs,
+                           pionir_repo=getattr(self.cfg, "pionir_repo", None),
+                           improve_dir=getattr(self.cfg, "improve_dir", None),
+                           cortex_path=getattr(self.cfg, "cortex_path", None),
+                           crew_log=self.cfg.state_dir / "crew.log")
 
     def _words(self, worker, purpose: str, system: str, user: str, schema: dict) -> Result:
         """The ONLY way a worker reaches a model: the shared brain, JSON-schema output,

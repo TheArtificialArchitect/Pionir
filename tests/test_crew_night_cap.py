@@ -255,14 +255,15 @@ class ConfigTests(unittest.TestCase):
 class WiringTests(unittest.TestCase):
     def test_only_the_overnight_workers_are_night_workers(self) -> None:
         from pionir.crew.runtime import NIGHT_IMPLS
-        self.assertEqual(NIGHT_IMPLS, {"daedalus_builds", "api_builder"})
+        # the self-improvement pass runs after the build window, unattended: the same caps
+        self.assertEqual(NIGHT_IMPLS, {"daedalus_builds", "api_builder", "self_improver"})
 
     def test_the_real_workers_carry_their_impl_so_the_night_flag_reaches_them(self) -> None:
         from pionir.crew.registry import default_registry
         from pionir.crew.runtime import NIGHT_IMPLS
         night = {w.worker_id for w in default_registry().all()
                  if getattr(w, "impl", None) in NIGHT_IMPLS}
-        self.assertEqual(night, {"products.api_builder", "builds.daedalus"})
+        self.assertEqual(night, {"products.api_builder", "builds.daedalus", "builds.improve"})
 
 
 if __name__ == "__main__":

@@ -42,6 +42,9 @@ whole list, and a name not in it fails loudly at load time.
 - ``daedalus_builds`` - REAL (builds/). One small developer tool a night, built by Daedalus in
   a fresh sandbox repo inside the overnight GPU window, reviewed by Claude (and by our own
   checks), and staged for products.shelf - which still submits it for the owner's approval.
+- ``self_improver`` - REAL (improve/). ``builds.improve``: Pionir's self-improvement, one pass a
+  night after the build window - Daedalus writes a fix for a failure that keeps recurring,
+  Claude reviews it, and only the owner's yes on ``improve.apply`` applies it.
 - ``demand_ranker`` - REAL (demand.py). Scores what to build and sell next from measured demand
   only (the dash's API usage and traffic; UNKNOWN never zero), writes ``demand.json`` for the
   Builds backlog pick and the blog's topic choice, and posts at most one suggestion card a day.
@@ -418,6 +421,15 @@ def daedalus_builds(spec, **params):
     return BuildsWorker(spec, **params)
 
 
+def self_improver(spec, **params):
+    """REAL. ``builds.improve`` (improve/worker.py): one pass a night after the build window -
+    a failure that keeps recurring in Pionir's own records, fixed by Daedalus in the sandbox
+    with a regression test, verified there, reviewed once by Claude, and proposed to the owner
+    as ``improve.apply``. It never applies anything itself."""
+    from .improve.worker import SelfImprover
+    return SelfImprover(spec, **params)
+
+
 def fiverr_earnings(spec, **params):
     """REAL. ``treasury.fiverr``: the Fiverr-reported gross, read from the desk's record."""
     from .fiverr.desk import FiverrEarnings
@@ -504,6 +516,7 @@ IMPLS = {
     "fiverr_desk": fiverr_desk,
     "fiverr_earnings": fiverr_earnings,
     "daedalus_builds": daedalus_builds,
+    "self_improver": self_improver,
     "bolts_collector": bolts_collector,
     # ---- Etsy streams ----
     "etsy_scout": etsy_scout,

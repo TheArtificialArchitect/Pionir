@@ -1,0 +1,179 @@
+"""Applying an approved self-improvement to the owner's repo, and undoing one.
+
+Run ONLY on Ian's yes (``improve.apply``, parked on every call) and by Ian himself
+(``python -m pionir improve undo <id>``). Never a push, a restart, a force or a reset of his
+work:
+
+- **apply**: the repo must be on ``main`` with no change to a tracked file, and the candidate's
+  base commit must be HEAD or an ancestor of it. The patch is checked against the INDEX
+  (``git apply --check --cached``: the repo's line endings are left to git), applied there,
+  committed as ONE commit whose message names the candidate, and the changed files are then
+  written out from that commit. Main moved so that it no longer applies cleanly -> **stale**
+  ("will re-propose"), nothing touched. The candidate's targeted tests then run in the repo; red
+  -> the commit is reverted at once (FUSION_PLAN Phase 3: restore the incumbent on failure).
+- **undo**: ``git revert`` of exactly the commit that applied it, only on a clean ``main`` that
+  still contains it.
+
+``git`` and the test run are injected, so tests never touch a real repo of Ian's.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import tempfile
+from collections.abc import Callable
+from pathlib import Path
+
+from . import runner
+from .guard import changed_paths
+
+GIT_TIMEOUT = 120
+TEST_TIMEOUT = 900.0
+BRANCH = "main"
+
+# (args, cwd) -> (returncode, stdout+stderr)
+Git = Callable[[list, Path], tuple]
+# (argv, cwd, timeout) -> (returncode, output, timed_out)
+Run = Callable[[list, Path, float], tuple]
+
+
+def _env() -> dict:
+    return {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0",
+            "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+
+
+def real_git(args: list, cwd: Path) -> tuple:
+    try:
+        done = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=GIT_TIMEOUT,
+                              stdin=subprocess.DEVNULL, check=False, env=_env())
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 127, f"git could not run: {type(exc).__name__}: {exc}"
+    return done.returncode, ((done.stdout or "") + (done.stderr or "")).strip()
+
+
+def real_run(argv: list, cwd: Path, timeout: float) -> tuple:
+    try:
+        done = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout,
+                              stdin=subprocess.DEVNULL, check=False, env=_env())
+    except subprocess.TimeoutExpired:
+        return None, "", True
+    except OSError as exc:
+        return 127, f"{type(exc).__name__}: {exc}", False
+    return done.returncode, ((done.stdout or "") + (done.stderr or ""))[-4000:], False
+
+
+def _clip(text, n: int = 300) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= n else text[:n - 3] + "..."
+
+
+def repo_state(repo: Path, git: Git) -> str | None:
+    """Why the repo cannot take a change now (not a repo, not on main, a tracked file
+    changed), or None."""
+    if not (Path(repo) / ".git").exists():
+        return f"{repo} is not a git repository"
+    rc, branch = git(["symbolic-ref", "--quiet", "--short", "HEAD"], repo)
+    if rc != 0 or branch.strip() != BRANCH:
+        return f"{repo} is not on {BRANCH} (it is on {branch.strip() or 'a detached HEAD'})"
+    rc, dirty = git(["status", "--porcelain", "--untracked-files=no"], repo)
+    if rc != 0:
+        return f"git status failed in {repo}: {_clip(dirty, 160)}"
+    if dirty.strip():
+        return (f"{repo} has uncommitted changes to tracked files "
+                f"({_clip(dirty.splitlines()[0], 80)}); nothing is applied over them")
+    return None
+
+
+def apply_patch(repo, patch_file, cid: str, base: str, *, title: str, tests: list,
+                approval: str = "", git: Git = real_git, run: Run = real_run,
+                python: str = sys.executable, test_timeout: float = TEST_TIMEOUT) -> dict:
+    """``{"applied": True, "commit", "tests", ...}``, ``{"applied": False, "stale": True,
+    "why"}`` or ``{"applied": False, "error"}``. See the module docstring."""
+    repo, patch_file = Path(repo), Path(patch_file)
+    why = repo_state(repo, git)
+    if why:
+        return {"applied": False, "stale": True, "why": why + "; will re-propose"}
+    rc, _ = git(["cat-file", "-e", f"{base}^{{commit}}"], repo)
+    if rc != 0:
+        return {"applied": False, "stale": True,
+                "why": f"its base commit {base[:10]} is not in {repo}; will re-propose"}
+    rc, _ = git(["merge-base", "--is-ancestor", base, "HEAD"], repo)
+    if rc != 0:
+        return {"applied": False, "stale": True,
+                "why": f"main no longer contains its base {base[:10]} (history moved); "
+                       "will re-propose"}
+    rc, out = git(["apply", "--check", "--cached", str(patch_file)], repo)
+    if rc != 0:
+        return {"applied": False, "stale": True,
+                "why": f"main moved and the patch no longer applies cleanly "
+                       f"({_clip(out, 200)}); stale, will re-propose"}
+    rc, out = git(["apply", "--cached", str(patch_file)], repo)
+    if rc != 0:
+        git(["reset", "-q"], repo)
+        return {"applied": False, "error": f"git apply failed: {_clip(out, 200)}"}
+    message = (f"Self-improvement {cid}: {_clip(title, 100)}\n\n"
+               f"Candidate {cid}, proposed by the crew's builds.improve worker (Daedalus "
+               f"wrote it, Claude reviewed it) and approved by Ian"
+               + (f" (Pionir task {approval})" if approval else "") + ".\n"
+               f"Undo: python -m pionir improve undo {cid}\n")
+    rc, out = git(["commit", "-q", "-m", message], repo)
+    if rc != 0:
+        git(["reset", "-q"], repo)              # the index back to HEAD; the work tree was never touched
+        return {"applied": False, "error": f"git commit failed: {_clip(out, 200)}"}
+    rc, commit = git(["rev-parse", "HEAD"], repo)
+    commit = commit.strip()
+    paths = changed_paths(patch_file.read_text(encoding="utf-8", errors="replace"))
+    if paths:
+        git(["checkout", "HEAD", "--", *paths], repo)
+    result = {"applied": True, "commit": commit, "paths": paths}
+    tested = run_tests(repo, tests, run=run, python=python, timeout=test_timeout)
+    result["tests"] = tested.to_dict()
+    if not tested.ok:
+        rc, out = git(["revert", "--no-edit", commit], repo)
+        if rc == 0:
+            _rc, rev = git(["rev-parse", "HEAD"], repo)
+            result.update(reverted=True, revert_commit=rev.strip(),
+                          why="its targeted tests did not pass on main, so it was reverted "
+                              "at once")
+        else:
+            result.update(reverted=False,
+                          why=f"its targeted tests did not pass on main AND the automatic "
+                              f"revert failed ({_clip(out, 160)}): run python -m pionir "
+                              f"improve undo {cid}")
+    return result
+
+
+def run_tests(repo: Path, tests: list, *, run: Run = real_run, python: str = sys.executable,
+              timeout: float = TEST_TIMEOUT) -> runner.SuiteResult:
+    """The candidate's targeted test modules, in the repo, as the owner (after his yes)."""
+    modules = [m for m in (runner.module_name(t) for t in tests) if m]
+    if not modules:
+        return runner.SuiteResult(False, tail="no targeted test module to run")
+    with tempfile.TemporaryDirectory(prefix="pionir-improve-") as tmp:
+        out = Path(tmp) / "result.json"
+        code, tail, timed_out = run(runner.argv(python, out, modules), Path(repo), timeout)
+        return runner.read_result(out, returncode=code, timed_out=timed_out,
+                                  tail=str(tail or ""))
+
+
+def undo(repo, commit: str, cid: str, *, git: Git = real_git) -> dict:
+    """``git revert`` of the commit that applied ``cid``: ``{"undone": True,
+    "revert_commit"}`` or ``{"undone": False, "why"}``."""
+    repo = Path(repo)
+    why = repo_state(repo, git)
+    if why:
+        return {"undone": False, "why": why}
+    rc, _ = git(["merge-base", "--is-ancestor", commit, "HEAD"], repo)
+    if rc != 0:
+        return {"undone": False, "why": f"main does not contain {commit[:10]} (was it already "
+                                        "undone, or is this another branch?)"}
+    rc, out = git(["revert", "--no-edit", commit], repo)
+    if rc != 0:
+        git(["revert", "--abort"], repo)
+        return {"undone": False, "why": f"git revert failed ({_clip(out, 200)}); nothing was "
+                                        "changed"}
+    _rc, rev = git(["rev-parse", "HEAD"], repo)
+    return {"undone": True, "revert_commit": rev.strip(), "commit": commit, "id": cid}

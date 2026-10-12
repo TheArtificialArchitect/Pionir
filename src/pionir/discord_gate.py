@@ -1088,6 +1088,52 @@ def apibuild_lines(row: Mapping[str, Any]) -> list[str]:
     return lines
 
 
+IMPROVE_APPLY = "improve.apply"
+
+
+def improve_lines(row: Mapping[str, Any]) -> list[str]:
+    """A self-improvement as parked: why it was proposed (the evidence), what it changes (the
+    diff), what Claude said, how it was verified, and how to undo it. Approving commits it to
+    main of the Pionir repo; nothing is pushed or restarted."""
+    context = row.get("context")
+    lines = ["\U0001f6e0️ **CHANGES PIONIR'S OWN CODE** - one commit on main of the Pionir "
+             "repo if you approve (written by Daedalus, reviewed by Claude). Nothing is pushed "
+             "or restarted."]
+    if not isinstance(context, Mapping):
+        return lines
+    lines.append(f"**Candidate:** `{_fence_safe(str(context.get('id')))}` - "
+                 f"{_escape(str(context.get('title') or ''))}")
+    ev = context.get("evidence") if isinstance(context.get("evidence"), Mapping) else {}
+    if ev:
+        lines.append(f"**Evidence:** {_escape(str(ev.get('worker')))} - seen "
+                     f"{_escape(str(ev.get('count')))} times ({_escape(str(ev.get('first_seen')))}"
+                     f" to {_escape(str(ev.get('last_seen')))}): "
+                     f"{_escape(str(ev.get('reason') or ''))}")
+        samples = ev.get("samples")
+        if isinstance(samples, list) and samples:
+            lines += ["**Sample lines:**", _FENCE,
+                      _fence_safe("\n".join(str(x) for x in samples[:3])), _FENCE]
+    if isinstance(context.get("hypothesis"), str) and context["hypothesis"]:
+        lines.append(f"**Hypothesis:** {_escape(context['hypothesis'])}")
+    verdict = context.get("verdict") if isinstance(context.get("verdict"), Mapping) else {}
+    if verdict:
+        word = "APPROVED" if verdict.get("approved") else "NOT approved"
+        lines.append(f"**Claude's review:** {word} - {_escape(str(verdict.get('summary') or ''))}")
+    if isinstance(context.get("verification"), str) and context["verification"]:
+        lines.append(f"**Verified in the sandbox:** {_escape(context['verification'])}")
+    stat = context.get("diff_stat")
+    if isinstance(stat, str) and stat:
+        lines += ["**Diff stat:**", _FENCE, _fence_safe(stat), _FENCE]
+    diff = context.get("diff")
+    if isinstance(diff, str) and diff:
+        lines += ["**The diff:**", _FENCE, _fence_safe(diff), _FENCE]
+    if isinstance(context.get("diff_file"), str):
+        lines.append(f"**Full diff:** `{_fence_safe(context['diff_file'])}`")
+    if isinstance(context.get("undo"), str):
+        lines.append(f"**Undo after applying:** `{_fence_safe(context['undo'])}`")
+    return lines
+
+
 # ---- Marketplaces (crew/marketplaces): a store publish says what goes public, first ----------
 MARKET_APIFY = "apify.publish"
 MARKET_CHROME = "chrome.publish_update"
@@ -1158,6 +1204,8 @@ def render_request(row: Mapping[str, Any], owner: str | None, *,
             lines.append(listing)
     if row.get("capability") == APIBUILD_VERIFY:
         lines += apibuild_lines(row)
+    if row.get("capability") == IMPROVE_APPLY:
+        lines += improve_lines(row)
     # Etsy streams: an Etsy listing or a Printify product - what is listed, at what price,
     # with which files and photos as inspected on disk (``shop``), and the AI disclosure
     lines += etsy_cards.card_lines(row, shop) + printify_cards.card_lines(row, shop)

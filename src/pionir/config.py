@@ -319,6 +319,12 @@ class PionirSettings:
     # The Bolts ledger's folder (economy/): None means ~/.pionir/economy. The crew reads the
     # same variable, PIONIR_ECONOMY_DIR.
     economy_dir: Path | None = None
+    # Self-improvement (crew/improve, adapters/improve.py): the Pionir repository an approved
+    # change is committed to (None means C:/src/Pionir) and the folder each candidate's patch,
+    # card and outcome live in (None means ~/.pionir/improve). PIONIR_REPO_DIR and
+    # PIONIR_IMPROVE_DIR override; the crew reads the same variables.
+    pionir_repo: Path | None = None
+    improve_dir: Path | None = None
     specialists_file: Path | None = None
     shared_gpu_lock_file: Path | None = None
     # The local embedding model for hybrid recall. Default on: it is ~0.32 GB and
@@ -535,6 +541,20 @@ class PionirSettings:
         except RuntimeError:
             return self.state_root / "apibuilds"
         return home / ".pionir" / "apibuilds"
+
+    @property
+    def pionir_repo_path(self) -> Path:
+        return self.pionir_repo if self.pionir_repo is not None else Path("C:/src/Pionir")
+
+    @property
+    def improve_path(self) -> Path:
+        if self.improve_dir is not None:
+            return self.improve_dir
+        try:
+            home = Path.home()
+        except RuntimeError:
+            return self.state_root / "improve"
+        return home / ".pionir" / "improve"
 
     @property
     def economy_path(self) -> Path:
@@ -761,6 +781,16 @@ class PionirSettings:
             economy_dir=(
                 Path(os.environ["PIONIR_ECONOMY_DIR"]).expanduser()
                 if (os.environ.get("PIONIR_ECONOMY_DIR") or "").strip()
+                else None
+            ),
+            pionir_repo=(
+                Path(os.environ["PIONIR_REPO_DIR"]).expanduser()
+                if (os.environ.get("PIONIR_REPO_DIR") or "").strip()
+                else None
+            ),
+            improve_dir=(
+                Path(os.environ["PIONIR_IMPROVE_DIR"]).expanduser()
+                if (os.environ.get("PIONIR_IMPROVE_DIR") or "").strip()
                 else None
             ),
             embed_model=_embed_model_from_env(),
