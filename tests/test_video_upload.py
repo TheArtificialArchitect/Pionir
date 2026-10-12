@@ -703,10 +703,10 @@ class AdapterTests(UploadCase):
             f.unlink()
         self.assertEqual(self.adapter(FakeTransport()).status()["uploader"], "secrets not set up")
 
-    def test_shipped_niches_are_all_disabled_for_upload(self) -> None:
+    def test_only_the_owners_pick_is_enabled_for_upload(self) -> None:
         from pionir.video.niche import load_niches
         for niche in load_niches():
-            self.assertFalse(niche.live, niche.id)
+            self.assertEqual(niche.live, niche.id == "forgotten-engineering", niche.id)
 
 
 if __name__ == "__main__":

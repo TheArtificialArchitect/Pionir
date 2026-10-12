@@ -369,7 +369,7 @@ class ApprovalGateTests(unittest.TestCase):
                                              secrets_dir=self.root / "no-secrets"))
         status = adapter.status()
         self.assertEqual(status["staged"], 1)
-        self.assertEqual(status["live"], [])
+        self.assertEqual(status["live"], ["forgotten-engineering"])
         self.assertEqual(status["uploader"], "secrets not set up")
 
     def test_status_says_unavailable_when_the_niche_file_is_bad(self) -> None:

@@ -18,11 +18,12 @@ def refused(**overrides) -> str:
 
 
 class ShippedConfigTests(unittest.TestCase):
-    def test_the_shipped_niches_load_and_none_is_live_until_a_channel_exists(self) -> None:
+    def test_the_shipped_niches_load_and_only_the_owners_pick_is_live(self) -> None:
         niches = load_niches(DEFAULT_PATH)
         self.assertEqual({n.id for n in niches},
                          {"seattle-local-history", "forgotten-engineering", "local-ai-12gb"})
-        self.assertEqual(live_niches(niches), [])
+        # Ian picked forgotten engineering on 2026-10-12, once his channel existed
+        self.assertEqual([n.id for n in live_niches(niches)], ["forgotten-engineering"])
         self.assertTrue(all(not n.example and n.voice == "af_nicole" for n in niches))
         # one video a week per channel, three channels, so three a week in all
         self.assertTrue(all(n.cadence_days == 7 for n in niches))

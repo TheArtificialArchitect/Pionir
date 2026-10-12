@@ -29,6 +29,10 @@ without any of it. The uploader stays disabled until steps 1-6 are done **and** 
    **7 days**, and the uploader would stop working weekly. (An app that is only used by you does
    not need Google's verification for this; the sign-in screen will warn "unverified app" and you
    click Advanced > continue.)
+5. If the browser instead says **"Access blocked: ... has not completed the Google verification
+   process"**, the app is still in Testing and the account you signed in with is not on its test
+   user list. Fix either way: Google Auth Platform > **Audience** > **Publish app** (preferred), or
+   add that exact account under **Test users** there.
 
 ## 4. Desktop OAuth client, and the secrets file
 
