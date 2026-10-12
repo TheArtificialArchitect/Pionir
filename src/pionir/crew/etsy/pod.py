@@ -50,6 +50,7 @@ from .common import (
     slug_for,
     write_staged,
 )
+from .maker import fit_title
 
 PURPOSE = "etsy print-on-demand listing"
 INTRO = (60, 500)
@@ -342,7 +343,7 @@ class PodMaker(_Base):
         intro = " ".join(str(words.get("intro") or "").split())
         if not INTRO[0] <= len(intro) <= INTRO[1]:
             reasons.append(f"intro: {INTRO[0]}-{INTRO[1]} characters")
-        title = " ".join(str(words.get("title") or "").split())
+        title = fit_title(" ".join(str(words.get("title") or "").split()))
         tags: list = []
         for t in [*(words.get("tags") if isinstance(words.get("tags"), list) else []),
                   keyword, *GENERIC_TAGS]:
