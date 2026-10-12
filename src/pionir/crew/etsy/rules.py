@@ -84,6 +84,8 @@ ACRONYMS = frozenset({"PDF", "PDFs", "XLSX", "AI", "DIY", "PNG", "US", "A4", "A5
 CALENDAR = frozenset({"Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
                       "Sunday", "January", "February", "March", "April", "May", "June",
                       "July", "August", "September", "October", "November", "December"})
+# Hunspell also holds these as first names; in a budget planner they are the bills paid.
+PLANNER_WORDS = frozenset({"Bill", "Bills"})
 
 # Printable ASCII minus < > { } [ ] ` $ ^ \ ~ @ # (nothing tag- or markup-shaped, no
 # handles or hashtags), plus typographic quotes, dashes and the ellipsis. The | stays: Etsy
@@ -170,7 +172,7 @@ def name_problem(text: str) -> str | None:
             if not _known_lower(tok):
                 return f"uses a word the dictionary does not know ({tok[:30]!r}); fail closed"
             continue
-        if tok in CALENDAR or len(tok) == 1:
+        if tok in CALENDAR or tok in PLANNER_WORDS or len(tok) == 1:
             continue
         kind = word_kind(tok)
         if kind == ORDINARY:

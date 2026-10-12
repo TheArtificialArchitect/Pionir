@@ -18,7 +18,7 @@ from openpyxl import load_workbook
 from pionir.adapters import etsy as etsy_adapter
 from pionir.crew.etsy import render, rules, sheets
 from pionir.crew.etsy.formulas import Evaluator, FormulaError, references
-from pionir.crew.etsy.maker import describe, normalise_tags
+from pionir.crew.etsy.maker import DigitalMaker, describe, fit_title, kinds_off, normalise_tags
 
 TAGS = ["budget tracker", "budget spreadsheet", "wedding budget", "wedding planner",
         "budget planner", "expense tracker", "printable planner", "spending tracker",
@@ -293,6 +293,48 @@ class SlugTests(unittest.TestCase):
         self.assertTrue(slug_for("budget", "budget tracker spreadsheet", 1.0)
                         .startswith("budget-tracker-spreadsheet-"))
         self.assertTrue(slug_for("pod", "cat lover mug", 1.0).startswith("pod-cat-lover-mug-"))
+
+
+class OneProductOnceTests(unittest.TestCase):
+    """2026-10-12: the maker kept remaking the budget workbook under new keywords ("budget
+    planner", "bill tracker", "expense tracker"), and 26 drafts were thrown away by false
+    alarms ('Medical' as a spending category, 'Bill' as a name, a 250-character title)."""
+
+    def test_a_kind_waiting_or_live_or_just_denied_is_off(self) -> None:
+        day = 86400.0
+        items = [{"kind": "budget", "status": "activate_pending"},
+                 {"kind": "habit", "status": "active"},
+                 {"kind": "debt", "status": "denied", "settled_at": 100 * day},
+                 {"kind": "savings", "status": "failed", "settled_at": 100 * day}]
+        off = kinds_off(items, 101 * day)
+        self.assertEqual(set(off), {"budget", "habit", "debt"})   # a failure holds nothing
+        self.assertNotIn("debt", kinds_off(items, 200 * day))     # a no rests, not forever
+
+    def test_a_long_title_keeps_its_leading_phrases(self) -> None:
+        long = "Monthly Budget Planner Spreadsheet | " + " | ".join(
+            f"Expense Tracker Template {i}" for i in range(10))
+        fitted = fit_title(long)
+        self.assertLessEqual(len(fitted), rules.TITLE_MAX)
+        self.assertTrue(long.startswith(fitted) and fitted.startswith("Monthly Budget"))
+        self.assertEqual(fit_title(TITLE), TITLE)
+        self.assertEqual(fit_title("x" * 200), "x" * 200)        # no cut: the rule refuses it
+
+    def test_bill_is_a_bill_not_a_person(self) -> None:
+        self.assertIsNone(rules.name_problem("Monthly Bill Tracker | Bills Checklist"))
+        self.assertIsNotNone(rules.name_problem("A budget for Kimberly"))
+
+    def test_a_bad_row_label_is_left_out_not_the_draft(self) -> None:
+        kind = sheets.KINDS["budget"]
+        words = {"headline": "Monthly Budget Tracker", "intro": INTRO, "tags": TAGS,
+                 "title": TITLE, "labels": ["Housing", "Food", "Transport", "Medical",
+                                            "Utilities", "Savings"]}
+        draft, reasons = DigitalMaker._assemble(None, words, kind, "budget tracker")
+        self.assertEqual(reasons, [])
+        self.assertNotIn("Medical", draft["labels"])
+        self.assertNotIn("Medical", draft["description"])
+        words["labels"] = ["Medical", "Food"]                     # too few left: refused
+        _draft, reasons = DigitalMaker._assemble(None, words, kind, "budget tracker")
+        self.assertTrue(reasons)
 
 
 if __name__ == "__main__":

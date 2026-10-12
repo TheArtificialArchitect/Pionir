@@ -12,7 +12,11 @@ One run:
    cleanly until Ian runs ``tools\\setup-etsy.ps1``).
 3. **What to make**: the best-ranked keyword in the scout's fresh ranking that a workbook
    kind can make (``sheets.kind_for``), that names an Etsy category, and that this worker
-   never made before (its record is the dedupe ledger: keyword and slug, for ever).
+   never made before (its record is the dedupe ledger: keyword and slug, for ever). Keywords
+   are many and kinds are few - "budget planner", "bill tracker" and "expense tracker" are
+   the same budget workbook under another title - so a kind with a listing waiting on the
+   owner or live is not made again, and a kind the owner said no to rests ``DENIED_REST_DAYS``
+   (``kinds_off``). When every kind is off it says so and makes nothing.
 4. **Words**: the shared brain fills a JSON schema (a short headline, the title, a short
    intro, 13 tags, the row labels). Tags are normalised and topped up from fixed, generic
    ones; then every word is checked (``rules``) - a draft that fails gets ONE redraft with the
@@ -55,6 +59,10 @@ PURPOSE = "etsy digital listing"
 HEADLINE = (8, 40)
 INTRO = (60, 600)
 BLOCK_DAYS = 14
+DENIED_REST_DAYS = 30
+# An item in one of these states holds its kind: the same workbook is not offered twice.
+HOLDS_KIND = ("unreachable", "draft_pending", "draft_created", "activate_unreachable",
+              "activate_pending", "active")
 GENERIC_TAGS = ("printable", "digital download", "spreadsheet template", "printable planner",
                 "instant download", "planner printable", "tracker template",
                 "monthly planner", "organizer", "fillable tracker", "spreadsheet",
@@ -82,6 +90,31 @@ def normalise_tags(raw, kind: sheets.Kind, keyword: str) -> list[str]:
             break
         add(t)
     return out[:rules.TAGS_EXACTLY]
+
+
+def kinds_off(items: list, now: float) -> dict[str, str]:
+    """Kind -> why no new listing of it is made now (waiting on the owner, live, or a no)."""
+    off: dict[str, str] = {}
+    for item in items:
+        kind, status = item.get("kind"), item.get("status")
+        if not isinstance(kind, str):
+            continue
+        if status in HOLDS_KIND:
+            off.setdefault(kind, "live" if status == "active" else "waiting on the owner")
+        elif status == "denied"                 and now - float(item.get("settled_at") or 0) < DENIED_REST_DAYS * 86400:
+            off.setdefault(kind, "the owner said no to one recently")
+    return off
+
+
+def fit_title(title: str) -> str:
+    """A title over ``rules.TITLE_MAX`` cut back to its leading ' | ' phrases that fit (only
+    words are dropped, none added); a title with no such cut is returned as it was."""
+    if len(title) <= rules.TITLE_MAX:
+        return title
+    parts = title.split(" | ")
+    while len(parts) > 1 and len(" | ".join(parts)) > rules.TITLE_MAX:
+        parts.pop()
+    return " | ".join(parts)
 
 
 def describe(intro: str, kind: sheets.Kind, labels: list[str]) -> str:
@@ -241,10 +274,13 @@ class DigitalMaker(_Base):
         ranking = read_scout(ctx.state_dir, ctx.now)
         if ranking is None:
             return "no fresh demand ranking from etsy.scout yet"
+        off = kinds_off(rec["items"], ctx.now)
         pick = None
         for row in ranking:
             kw = row.get("keyword")
             if row.get("track") != "digital" or not isinstance(kw, str) or kw in rec["made"]:
+                continue
+            if row.get("kind") in off:
                 continue
             if ctx.now < float(rec["blocked"].get(kw) or 0):
                 continue
@@ -253,6 +289,9 @@ class DigitalMaker(_Base):
             pick = row
             break
         if pick is None:
+            if off and set(sheets.KINDS) <= set(off):
+                return "every workbook it can make is listed or waiting: " + ", ".join(
+                    f"{k} ({why})" for k, why in sorted(off.items()))
             return "nothing in the demand ranking that a workbook can make, not made before"
         kind = sheets.KINDS[pick["kind"]]
         draft, reasons = None, []
@@ -351,11 +390,17 @@ class DigitalMaker(_Base):
                   if isinstance(x, str)]
         labels = list(dict.fromkeys(labels))
         lo, hi = kind.labels
+        # a row label is the buyer's to rename: one that fails a check is left out, not the draft
+        kept = [lab for i, lab in enumerate(labels)
+                if not rules.label_problems(f"labels[{i}]", lab)]
+        if len(kept) < len(labels) and len(kept) >= lo:
+            labels = kept
+        else:
+            for i, lab in enumerate(labels):
+                reasons += rules.label_problems(f"labels[{i}]", lab)
         if not lo <= len(labels) <= hi:
             reasons.append(f"labels: {lo}-{hi} distinct names")
-        for i, lab in enumerate(labels):
-            reasons += rules.label_problems(f"labels[{i}]", lab)
-        title = " ".join(str(words.get("title") or "").split())
+        title = fit_title(" ".join(str(words.get("title") or "").split()))
         tags = normalise_tags(words.get("tags"), kind, keyword)
         description = describe(intro, kind, labels)
         reasons += rules.listing_problems(title, description, tags, kind="digital")
