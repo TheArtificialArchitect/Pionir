@@ -76,15 +76,17 @@ $listener = New-Object Net.HttpListener
 $listener.Prefixes.Add($redirect)
 $listener.Start()
 try {
+  # Each pair in parentheses: in PowerShell ',' binds tighter than '+', so without them the
+  # pairs fuse into one space-separated string and Google answers 400 (2026-10-12).
   $query = @(
-    'client_id=' + [Uri]::EscapeDataString($client.client_id),
-    'redirect_uri=' + [Uri]::EscapeDataString($redirect),
+    ('client_id=' + [Uri]::EscapeDataString($client.client_id)),
+    ('redirect_uri=' + [Uri]::EscapeDataString($redirect)),
     'response_type=code',
-    'scope=' + [Uri]::EscapeDataString($Scope),
+    ('scope=' + [Uri]::EscapeDataString($Scope)),
     'access_type=offline',
     'prompt=consent',
-    'state=' + $state,
-    'code_challenge=' + $challenge,
+    ('state=' + $state),
+    ('code_challenge=' + $challenge),
     'code_challenge_method=S256'
   ) -join '&'
   $url = "https://accounts.google.com/o/oauth2/v2/auth?$query"
