@@ -73,7 +73,7 @@ class _Case(unittest.TestCase):
         self.patch = self.make_patch({"src/pionir/crew/etsy/maker.py": FIXED, REG: REGRESSION})
         self.ran: list = []
         self.tests_pass = True
-        self.adapter = ImproveAdapter(ImproveSettings(self.repo, self.improve), run=self.fake_run)
+        self.adapter = ImproveAdapter(ImproveSettings(self.repo, self.improve))
         self.digest = self.card()
 
     def tearDown(self) -> None:
@@ -193,16 +193,27 @@ class ApplyTests(_Case):
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
         self.assertEqual((self.repo / "src/pionir/crew/etsy/maker.py").read_text(
             encoding="utf-8").replace("\r\n", "\n"), FIXED)
-        self.assertEqual(self.ran, [["test_regression_imp_20261012_ab12"]])
         self.assertEqual(self.outcome()["commit"], self.head())
 
-    def test_the_real_runner_runs_the_targeted_test_in_the_repo(self) -> None:
-        self.adapter = ImproveAdapter(ImproveSettings(self.repo, self.improve))
-        result = self.adapter.execute(self.task())
-        self.assertTrue(result.output["applied"], result.output)
-        self.assertTrue(result.output["tests"]["ok"], result.output["tests"])
-        self.assertEqual(result.output["tests"]["ran"], 1)
-        self.assertFalse(result.output.get("reverted"))
+    def test_nothing_of_the_patch_is_run_as_ian(self) -> None:
+        # its tests ran contained before he was asked: a run here, as him, could leave side
+        # effects that no revert takes back
+        from pionir.selfimprove import apply as applier
+        calls = []
+        real = applier.subprocess.run
+
+        def spy(argv, *a, **kw):
+            calls.append(list(argv))
+            return real(argv, *a, **kw)
+        applier.subprocess.run = spy
+        try:
+            result = self.adapter.execute(self.task())
+        finally:
+            applier.subprocess.run = real
+        self.assertTrue(result.output["applied"])
+        self.assertEqual(result.output["tests"], [REG])
+        self.assertTrue(calls)
+        self.assertTrue(all(c[0] == "git" for c in calls), calls)
 
     def test_main_moved_but_still_applies(self) -> None:
         commit(self.repo, {"README.md": "Pionir, moved on\n"})
@@ -247,7 +258,7 @@ class ApplyTests(_Case):
         other = self.make_patch({"src/pionir/crew/etsy/maker.py": FIXED.replace(
             "None", "'other'"), REG: REGRESSION})
         done = applier.apply_patch(self.repo, other.encode("utf-8"), CID, self.base,
-                                   title="t", tests=[REG], run=self.fake_run)
+                                   title="t", tests=[REG])
         self.assertTrue(done["applied"], done)
         self.assertIn("'other'", git(self.repo, "show", "HEAD:src/pionir/crew/etsy/maker.py"))
 
@@ -261,7 +272,7 @@ class ApplyTests(_Case):
                                                       "        x = 1\n        self.assertEqual(1, 1)\n"})
         from pionir.selfimprove import apply as applier
         done = applier.apply_patch(self.repo, weak.encode("utf-8"), CID, self.base, title="t",
-                                   tests=[], run=self.fake_run)
+                                   tests=[])
         self.assertFalse(done["applied"])
         self.assertIn("real assert", done["error"])
         self.assertEqual(self.head(), self.base)
@@ -280,16 +291,6 @@ class ApplyTests(_Case):
         result = self.adapter.execute(self.task())
         self.assertFalse(result.output["applied"])
         self.assertIn("not on main", result.output["why"])
-
-    def test_red_targeted_tests_are_reverted_at_once(self) -> None:
-        self.tests_pass = False
-        result = self.adapter.execute(self.task())
-        self.assertTrue(result.output["applied"])
-        self.assertTrue(result.output["reverted"])
-        self.assertEqual(git(self.repo, "rev-list", "--count", f"{self.base}..HEAD"), "2")
-        self.assertEqual((self.repo / "src/pionir/crew/etsy/maker.py").read_text(
-            encoding="utf-8").replace("\r\n", "\n"), RULES)
-        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
 
 
 class CliTests(_Case):

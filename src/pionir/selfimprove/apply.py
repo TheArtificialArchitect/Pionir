@@ -11,24 +11,23 @@ work:
   against the INDEX (``git apply --check --cached``: the repo's line endings are left to git),
   applied there, the guard runs AGAIN on the trees in his index (asserts per test, imports, the
   catalogue), and only then is it committed as ONE commit whose message names the candidate and
-  are the changed files written out from that commit. Main moved so that it no longer applies cleanly -> **stale**
-  ("will re-propose"), nothing touched. The candidate's targeted tests then run in the repo; red
-  -> the commit is reverted at once (FUSION_PLAN Phase 3: restore the incumbent on failure).
+  are the changed files written out from that commit. Main moved so that it no longer applies
+  cleanly -> **stale** ("will re-propose"), nothing touched. Nothing of the patch is RUN here as
+  Ian: its tests ran contained in the sandbox on exactly these bytes before he was asked, and a
+  run as him could leave side effects no revert takes back. Undo is his one command away.
 - **undo**: ``git revert`` of exactly the commit that applied it, only on a clean ``main`` that
   still contains it.
 
-``git`` and the test run are injected, so tests never touch a real repo of Ian's.
+``git`` is injected, so tests never touch a real repo of Ian's.
 """
 from __future__ import annotations
 
 import os
 import subprocess
-import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
-from . import runner
 from .guard import parse_patch, patch_problems, tree_problems
 
 GIT_TIMEOUT = 120
@@ -91,15 +90,15 @@ def repo_state(repo: Path, git: Git) -> str | None:
 
 
 def apply_patch(repo, patch: bytes, cid: str, base: str, *, title: str, tests: list,
-                approval: str = "", known=frozenset(), git: Git = real_git, run: Run = real_run,
-                python: str = sys.executable, test_timeout: float = TEST_TIMEOUT) -> dict:
-    """``{"applied": True, "commit", "tests", ...}``, ``{"applied": False, "stale": True,
+                approval: str = "", known=frozenset(), protected: dict | None = None,
+                files: dict | None = None, git: Git = real_git) -> dict:
+    """``{"applied": True, "commit", ...}``, ``{"applied": False, "stale": True,
     "why"}`` or ``{"applied": False, "error"}``. ``patch`` is the exact bytes Ian approved (the
     caller read and hashed them once); they are written to a private temporary file and only
     that file is applied. See the module docstring."""
     repo = Path(repo)
     text = patch.decode("utf-8", "replace")
-    problems = patch_problems(text, known_imports=known)
+    problems = patch_problems(text, known_imports=known, protected=protected)
     if problems:
         return {"applied": False, "error": "the protected list refuses it: "
                                            + "; ".join(problems[:4])}
@@ -150,7 +149,8 @@ def apply_patch(repo, patch: bytes, cid: str, base: str, *, title: str, tests: l
         rc, out = git(["show", f":{path}"], repo)
         if rc == 0:
             after[path] = out.encode("utf-8")
-    problems = tree_problems(paths, before, after, known=known)
+    problems = tree_problems(paths, before, after, known=known, protected=protected,
+                             files=files if files is not None else {**before, **after})
     if problems:
         git(["reset", "-q"], repo)               # the index back to HEAD; nothing else touched
         return {"applied": False, "error": "the protected list refuses it: "
@@ -168,35 +168,10 @@ def apply_patch(repo, patch: bytes, cid: str, base: str, *, title: str, tests: l
     commit = commit.strip()
     if paths:
         git(["checkout", "HEAD", "--", *paths], repo)
-    result = {"applied": True, "commit": commit, "paths": paths}
-    tested = run_tests(repo, tests, run=run, python=python, timeout=test_timeout)
-    result["tests"] = tested.to_dict()
-    if not tested.ok:
-        rc, out = git(["revert", "--no-edit", commit], repo)
-        if rc == 0:
-            _rc, rev = git(["rev-parse", "HEAD"], repo)
-            result.update(reverted=True, revert_commit=rev.strip(),
-                          why="its targeted tests did not pass on main, so it was reverted "
-                              "at once")
-        else:
-            result.update(reverted=False,
-                          why=f"its targeted tests did not pass on main AND the automatic "
-                              f"revert failed ({_clip(out, 160)}): run python -m pionir "
-                              f"improve undo {cid}")
-    return result
-
-
-def run_tests(repo: Path, tests: list, *, run: Run = real_run, python: str = sys.executable,
-              timeout: float = TEST_TIMEOUT) -> runner.SuiteResult:
-    """The candidate's targeted test modules, in the repo, as the owner (after his yes)."""
-    modules = [m for m in (runner.module_name(t) for t in tests) if m]
-    if not modules:
-        return runner.SuiteResult(False, tail="no targeted test module to run")
-    with tempfile.TemporaryDirectory(prefix="pionir-improve-") as tmp:
-        out = Path(tmp) / "result.json"
-        code, tail, timed_out = run(runner.argv(python, out, modules), Path(repo), timeout)
-        return runner.read_result(out, returncode=code, timed_out=timed_out,
-                                  tail=str(tail or ""))
+    # Nothing of the patch is RUN here, as Ian: its tests ran contained in the sandbox, on
+    # exactly these bytes, before he was asked (a run here could leave side effects that no
+    # revert takes back). The tests it carries are named for the record.
+    return {"applied": True, "commit": commit, "paths": paths, "tests": list(tests)}
 
 
 def undo(repo, commit: str, cid: str, *, git: Git = real_git) -> dict:

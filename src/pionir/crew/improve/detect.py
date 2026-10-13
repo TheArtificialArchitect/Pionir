@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from pionir.selfimprove.guard import protected_why
+from pionir.selfimprove.guard import allowed_why_not, protected_closure, protected_why
 
 SELF = "builds.improve"
 SELF_CAPABILITY = "improve.apply"
@@ -354,17 +354,20 @@ def locate(repo, c: Cluster, *, limit: int = 4) -> dict:
     if root is None or not root.is_dir():
         return {"targets": [], "protected": [], "needs_human": None}
     frags = _fragments(c.example)
-    scored, guarded = [], []
+    texts = {}
     for path in sorted(root.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
-        rel = path.relative_to(Path(repo)).as_posix()
         try:
-            text = path.read_text(encoding="utf-8", errors="replace")
+            texts[path.relative_to(Path(repo)).as_posix()] = path.read_text(
+                encoding="utf-8", errors="replace")
         except OSError:
             continue
+    extra = protected_closure(texts)        # what protected code imports is protected too
+    scored, guarded = [], []
+    for rel, text in texts.items():
         words = sum(3 for f in frags if f in text)
-        if protected_why(rel):
+        if protected_why(rel, extra) or allowed_why_not(rel):
             if words:
                 guarded.append(rel)
             continue
@@ -377,7 +380,7 @@ def locate(repo, c: Cluster, *, limit: int = 4) -> dict:
     needs = None
     if guarded and not worded:
         needs = (f"needs a human: it touches a protected rule ({', '.join(guarded[:3])} - "
-                 f"{protected_why(guarded[0])})")
+                 f"{protected_why(guarded[0], extra) or allowed_why_not(guarded[0])})")
     if c.source in ("outputs", "runs", "vitals") and "." in c.worker:
         found.append("src/pionir/crew/catalogue.json")
     return {"targets": found, "protected": guarded[:4], "needs_human": needs}

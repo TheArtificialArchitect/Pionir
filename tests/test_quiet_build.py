@@ -69,7 +69,18 @@ class Transport:
             raise self.error
         if path.startswith("/api/state"):
             return {"now": NOW.isoformat(), "typing": self.typing, "situation": self.situation}
-        return {"messages": list(self.messages)}
+        after = int(path.split("after=", 1)[1]) if "after=" in path else 0
+        # like Galatea: ascending, at most PAGE rows after ``after``
+        return {"messages": [m for m in self.messages if m["id"] > after][:self.PAGE]}
+
+    PAGE = 2
+
+    @staticmethod
+    def history(minutes_ago: list) -> list:
+        """Rows with ids 1.. whose times are ``minutes_ago`` (oldest first)."""
+        return [{"id": i + 1, "role": "ian" if i % 2 == 0 else "her", "text": "x",
+                 "ts": (NOW - timedelta(minutes=m)).isoformat()}
+                for i, m in enumerate(minutes_ago)]
 
 
 class Moss:
@@ -113,11 +124,39 @@ class MossProbeTests(unittest.TestCase):
         self.assertIn("typing", self.probe(last_turn_minutes_ago=90, typing=True))
         self.assertIn("mid-conversation", self.probe(situation="night · you're mid-conversation"))
 
-    def test_not_running_is_idle_and_unreadable_is_not(self) -> None:
+    def test_unreadable_is_not_idle(self) -> None:
+        self.assertIn("could not be read", self.probe(error=AdapterUnavailable("401")))
+
+    def test_her_last_turn_is_the_newest_row_not_the_first_page(self) -> None:
+        transport = Transport()
+        transport.messages = Transport.history([900, 800, 700, 600, 2])   # 3 pages
+        self.assertIn("2 minute(s) ago", moss_busy_probe(Moss(transport))())
+
+    def test_ids_going_backwards_are_not_idle_until_read_again(self) -> None:
+        transport = Transport()
+        transport.messages = Transport.history([900, 800, 700, 600, 500])
+        probe = moss_busy_probe(Moss(transport))
+        self.assertIsNone(probe())                                # quiet for hours
+        transport.messages = Transport.history([1])              # her store was replaced
+        self.assertIn("went backwards", probe())
+        self.assertIn("1 minute(s) ago", probe())                # read again from the start
+
+    def test_not_running_only_when_refused_twice_a_minute_apart(self) -> None:
         refused = AdapterUnavailable("down")
         refused.__cause__ = urllib.error.URLError(ConnectionRefusedError())
-        self.assertIsNone(self.probe(error=refused))
-        self.assertIn("could not be read", self.probe(error=AdapterUnavailable("401")))
+        clock = [1000.0]
+        transport = Transport(error=refused)
+        probe = moss_busy_probe(Moss(transport), clock=lambda: clock[0])
+        self.assertIn("not answering", probe())                  # a restart blip?
+        clock[0] += 30
+        self.assertIn("not answering", probe())
+        clock[0] += 31
+        self.assertIsNone(probe())                               # down for over a minute
+        transport.error = None                                    # she answers again...
+        transport.messages = Transport.history([3])
+        self.assertIn("3 minute(s) ago", probe())
+        transport.error = refused                                 # ...so a new refusal starts over
+        self.assertIn("not answering", probe())
 
     def test_unwired_is_never_idle(self) -> None:
         settle = DaedalusAdapter().settle_for(Task(BUILD_QUIET, {}))

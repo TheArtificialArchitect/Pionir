@@ -218,13 +218,223 @@ def _match(path: str, pattern: str) -> bool:
     return pat.endswith("/**") and p.startswith(pat[:-2])
 
 
-def protected_why(path: str) -> str | None:
-    """Why ``path`` (repo-relative, posix) is protected, or None."""
+def protected_why(path: str, extra: dict | None = None) -> str | None:
+    """Why ``path`` (repo-relative, posix) is protected, or None. ``extra``: the protected
+    import closure (``protected_closure``) - a module a protected module imports."""
     p = path.replace("\\", "/").lstrip("/")
     for pattern, why in PROTECTED:
         if _match(p, pattern):
             return why
+    if extra:
+        return extra.get(p)
     return None
+
+
+# ---- the protected import closure ---------------------------------------------------------------
+def module_name_of(path: str) -> str | None:
+    """``src/pionir/a/b.py`` -> ``pionir.a.b`` (a package's ``__init__.py`` -> the package)."""
+    if not (path.startswith("src/") and path.endswith(".py")):
+        return None
+    parts = path[len("src/"):-3].split("/")
+    if parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts) or None
+
+
+def _path_for(module: str, files) -> str | None:
+    base = "src/" + module.replace(".", "/")
+    for candidate in (base + ".py", base + "/__init__.py"):
+        if candidate in files:
+            return candidate
+    return None
+
+
+def _imported_modules(path: str, source: str) -> set:
+    """Every pionir module ``path`` imports - at the top or inside a function - and the
+    packages on the way."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    name = module_name_of(path) or ""
+    package = name if path.endswith("__init__.py") else name.rsplit(".", 1)[0]
+    found: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            found |= {a.name for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                up = package.split(".")
+                mod = ".".join(up[:len(up) - node.level + 1] + ([node.module] if node.module
+                                                                 else []))
+            else:
+                mod = node.module or ""
+            found.add(mod)
+            found |= {f"{mod}.{a.name}" for a in node.names}
+    out = set()
+    for mod in found:
+        if mod == "pionir" or mod.startswith("pionir."):
+            parts = mod.split(".")
+            out |= {".".join(parts[:i]) for i in range(1, len(parts) + 1)}
+    return out
+
+
+def protected_closure(files: dict) -> dict:
+    """{path: why} for every Pionir module a PROTECTED module imports, transitively: changing
+    one of those changes what the protected code runs, so it is protected too. ``files``: the
+    repo's tree (path -> bytes or text)."""
+    start = [p for p in files if p.endswith(".py") and p.startswith("src/") and protected_why(p)]
+    seen = set(start)
+    todo = [(p, p) for p in start]
+    out: dict = {}
+    while todo:
+        path, root = todo.pop()
+        for mod in _imported_modules(path, _text(files[path])):
+            dep = _path_for(mod, files)
+            if dep is None or dep in seen:
+                continue
+            seen.add(dep)
+            out[dep] = f"imported by protected code ({root})"
+            todo.append((dep, root))
+    return out
+
+
+# ---- changing a protected module from somewhere else -----------------------------------------
+_PATCH_FORMS = frozenset({"object", "dict", "multiple"})
+
+
+def _is_patcher(node) -> bool:
+    """``patch(...)``, ``mock.patch(...)``, ``patch.object/dict/multiple(...)`` and any
+    ``monkeypatch.<x>(...)`` - not an ordinary ``dict()`` or ``object()``."""
+    fn = node.func
+    if isinstance(fn, ast.Name):
+        return fn.id.startswith("patch")
+    if isinstance(fn, ast.Attribute):
+        owner = fn.value
+        owner_name = owner.attr if isinstance(owner, ast.Attribute) else owner.id if isinstance(
+            owner, ast.Name) else ""
+        return fn.attr.startswith("patch") or owner_name == "monkeypatch" or (
+            fn.attr in _PATCH_FORMS and owner_name.startswith("patch"))
+    return False
+
+
+def _call_name(node) -> str:
+    fn = node.func
+    return fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else ""
+
+
+def _root(node):
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
+def _mutations(source: str, *, test: bool, is_protected) -> dict | None:
+    """Counts of every way the file could change ANOTHER module: an attribute assigned,
+    deleted or augmented on an imported name (or an alias of one), setattr/delattr, a write
+    to a namespace (``__dict__``, ``vars()``, ``globals()``, ``sys.modules``), a reload, and
+    patching - which a test may do only through ``unittest.mock`` and never on a protected
+    module. None when it does not parse."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    imported, origin = set(), {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                imported.add((a.asname or a.name).split(".")[0])
+                origin[a.asname or a.name.split(".")[0]] = \
+                    a.name if a.asname else a.name.split(".")[0]
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                imported.add(a.asname or a.name)
+                origin[a.asname or a.name] = f"{node.module or ''}.{a.name}"
+    for _ in range(3):                  # aliases: m = auth; m.X = ...
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and isinstance(node.value, (ast.Name, ast.Attribute)) \
+                    and _root(node.value) in imported:
+                imported |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    counts: dict = {}
+
+    def bump(kind: str) -> None:
+        counts[kind] = counts.get(kind, 0) + 1
+
+    def target(t) -> None:
+        if isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                target(e)
+            return
+        if isinstance(t, ast.Attribute) and _root(t) in imported:
+            bump("assigns or deletes an attribute of an imported module")
+        if isinstance(t, ast.Subscript):
+            inner = t.value
+            if (isinstance(inner, ast.Attribute) and inner.attr in ("__dict__", "modules")) or \
+                    (isinstance(inner, ast.Call) and _call_name(inner) in ("vars", "globals")):
+                bump("writes a module's namespace")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                target(t)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            target(node.target)
+        elif isinstance(node, ast.Delete):
+            for t in node.targets:
+                target(t)
+        elif isinstance(node, ast.Attribute) and node.attr == "__dict__" and not test:
+            bump("reaches into a namespace (__dict__)")
+        elif isinstance(node, ast.Call):
+            name = _call_name(node)
+            first = node.args[0] if node.args else None
+            if name in ("setattr", "delattr"):
+                if not test or (first is not None and _root(first) in imported):
+                    bump("calls setattr/delattr on another object")
+            elif name == "reload":
+                bump("reloads a module")
+            elif name in ("vars", "globals") and not test:
+                bump("reads a namespace to change it (vars/globals)")
+            elif _is_patcher(node):
+                if not test:
+                    bump("patches another module")
+                elif isinstance(first, ast.Constant) and isinstance(first.value, str) and \
+                        first.value.startswith("pionir"):
+                    if is_protected(first.value.split(":")[0]):
+                        bump("patches a protected module")
+                elif first is not None and _root(first) in origin and \
+                        is_protected(origin[_root(first)]):
+                    bump("patches a protected module")
+            elif name == "start" and isinstance(node.func, ast.Attribute) and \
+                    isinstance(node.func.value, ast.Call) and \
+                    _call_name(node.func.value).startswith("patch"):
+                bump("starts a patcher outside a with/decorator scope")
+    return counts
+
+
+def indirect_problems(path: str, old, new, *, protected=None, files=()) -> list:
+    """What a changed Python file would do to OTHER modules (``_mutations``), counted against
+    the file before the change - any new way is refused."""
+    test = path.startswith("tests/")
+    extra = protected or {}
+
+    def is_protected(dotted: str) -> bool:
+        """Whether the module that owns ``dotted`` (a module, or an attribute of one) is
+        protected: the longest prefix that is a module of the tree is the one checked."""
+        mod = dotted
+        while mod and "." in mod:
+            dep = _path_for(mod, files)
+            if dep is not None:
+                return bool(protected_why(dep, extra))
+            mod = mod.rpartition(".")[0]
+        return False
+
+    after = _mutations(_text(new), test=test, is_protected=is_protected)
+    if after is None:
+        return []
+    before = _mutations(_text(old), test=test, is_protected=is_protected) if old else {}
+    before = before or {}
+    return [f"{path} {kind}: a change here never reaches into another module"
+            for kind, n in sorted(after.items()) if n > before.get(kind, 0)]
 
 
 def allowed_why_not(path: str, status: str = "modified") -> str | None:
@@ -327,10 +537,12 @@ def _count(regex, lines) -> int:
     return sum(len(regex.findall(t)) for t in lines)
 
 
-def patch_problems(text: str, *, local_modules=frozenset(), known_imports=frozenset()) -> list:
+def patch_problems(text: str, *, local_modules=frozenset(), known_imports=frozenset(),
+                   protected: dict | None = None) -> list:
     """Every reason the diff alone refuses the patch (empty: none). ``local_modules`` are the
     tests folder's helper modules; ``known_imports`` every top-level name Pionir imports
-    somewhere already (neither is a new dependency)."""
+    somewhere already (neither is a new dependency); ``protected`` the protected import
+    closure of the tree the patch applies to (``protected_closure``)."""
     if not isinstance(text, str) or not text.strip():
         return ["the patch is empty: it changes nothing"]
     if len(text) > MAX_CHARS:
@@ -348,7 +560,7 @@ def patch_problems(text: str, *, local_modules=frozenset(), known_imports=frozen
     if total > MAX_LINES:
         reasons.append(f"it changes {total} lines; at most {MAX_LINES} fit one review")
     for f in files:
-        why = protected_why(f.path) if f.path else None
+        why = protected_why(f.path, protected) if f.path else None
         if why:
             reasons.append(f"{f.path} is protected ({why}): no agent changes it")
             continue
@@ -511,19 +723,30 @@ def _text(data) -> str:
     return data.decode("utf-8", "replace") if isinstance(data, bytes) else str(data)
 
 
-def tree_problems(changed: list, base: dict, head: dict, *, known=frozenset()) -> list:
-    """What the two trees (repo-relative path -> bytes) show about the changed paths: a test
-    with fewer real asserts, a removed test, a new skip marker, a file that no longer parses,
-    an import of anything Pionir does not import already, a new dynamic import, and the
-    catalogue's wiring changed. ``known``: top-level names Pionir imports already (default:
-    computed from ``base``)."""
+def tree_problems(changed: list, base: dict, head: dict, *, known=frozenset(),
+                  protected: dict | None = None, files: dict | None = None) -> list:
+    """What the two trees (repo-relative path -> bytes) show about the changed paths: a file
+    in the protected import closure, a change that reaches into another module
+    (``indirect_problems``), a test with fewer real asserts, a removed test, a new skip marker,
+    a file that no longer parses, an import of anything Pionir does not import already, a new
+    dynamic import, and the catalogue's wiring changed. ``known``: top-level names Pionir
+    imports already; ``protected`` / ``files``: the protected closure and the whole tree
+    (default: computed from ``base``, which must then be the whole tree)."""
     reasons: list = []
+    files = files if files is not None else base
+    extra = protected if protected is not None else protected_closure(files)
     known = set(known or known_imports(base)) | set(sys.stdlib_module_names) | OWN | DECLARED
     known |= {p.split("/")[-1][:-3] for p in base if p.startswith("tests/") and p.endswith(".py")}
     for path in changed:
         old, new = base.get(path), head.get(path)
+        why = protected_why(path, extra)
+        if why:
+            reasons.append(f"{path} is protected ({why}): no agent changes it")
+            continue
         if new is None:
             continue
+        if path.endswith(".py"):
+            reasons += indirect_problems(path, old, new, protected=extra, files=files)
         if path == CATALOGUE:
             before = _catalogue_wiring(_text(old or b"{}"))
             after = _catalogue_wiring(_text(new))

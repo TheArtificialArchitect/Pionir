@@ -15,7 +15,7 @@ The guard (selfimprove/guard.py) runs again here, before parking and before appl
 more on the trees in Ian's own index: the worker's word that it passed is not taken.
 
 On the yes: selfimprove/apply.py - one commit on a clean ``main`` that still contains the base,
-its targeted tests re-run (red -> reverted at once), or "stale, will re-propose". Never a push,
+nothing of it run as Ian (its tests ran contained before he was asked), or "stale, will re-propose". Never a push,
 never a restart. The outcome is written to ``<id>/outcome.json`` for the worker and for
 ``python -m pionir improve status``.
 """
@@ -62,8 +62,8 @@ def local_modules(repo: Path) -> frozenset:
         return frozenset()
 
 
-def repo_imports(repo: Path) -> frozenset:
-    """Every top-level name Pionir's own modules import (read from the owner's repo)."""
+def repo_files(repo: Path) -> dict:
+    """Pionir's own modules, read from the owner's repo (path -> bytes)."""
     files = {}
     root = Path(repo) / "src" / "pionir"
     try:
@@ -71,8 +71,13 @@ def repo_imports(repo: Path) -> frozenset:
             if "__pycache__" not in path.parts:
                 files[path.relative_to(repo).as_posix()] = path.read_bytes()
     except OSError:
-        return frozenset()
-    return guard.known_imports(files) | local_modules(repo)
+        return {}
+    return files
+
+
+def repo_imports(repo: Path) -> frozenset:
+    """Every top-level name Pionir's own modules import (read from the owner's repo)."""
+    return guard.known_imports(repo_files(repo)) | local_modules(repo)
 
 
 class ImproveAdapter:
@@ -136,12 +141,15 @@ class ImproveAdapter:
         if len(card["base"]) < 40:
             raise AdapterProtocolError(f"{APPLY} refused by Pionir - {cid}'s card names no "
                                        "base commit")
-        known = repo_imports(self.settings.pionir_repo)
-        problems = guard.patch_problems(data.decode("utf-8", "replace"), known_imports=known)
+        files = repo_files(self.settings.pionir_repo)
+        known = guard.known_imports(files) | local_modules(self.settings.pionir_repo)
+        closure = guard.protected_closure(files)
+        problems = guard.patch_problems(data.decode("utf-8", "replace"), known_imports=known,
+                                        protected=closure)
         if problems:
             raise AdapterProtocolError(f"{APPLY} refused by Pionir - the protected list "
                                        f"refuses it: {'; '.join(problems[:4])}")
-        return cid, data, card, known
+        return cid, data, card, (known, closure, files)
 
     def validate(self, task: Task) -> None:
         self._checked(task)
@@ -164,16 +172,17 @@ class ImproveAdapter:
                 "repo": str(self.settings.pionir_repo),
                 "undo": f"python -m pionir improve undo {cid}",
                 "runs": "one commit on main of the Pionir repo (if main is clean and still "
-                        "contains its base), then its targeted tests; red is reverted at once. "
+                        "contains its base), nothing of it is run as you (its tests ran contained in the sandbox). "
                         "Nothing is pushed or restarted."}
 
     # ---- the call ---------------------------------------------------------------------------
     def execute(self, task: Task) -> TaskResult:
-        cid, data, card, known = self._checked(task)
+        cid, data, card, (known, closure, files) = self._checked(task)
         done = applier.apply_patch(
             self.settings.pionir_repo, data, cid, card["base"],
             title=str(card.get("title") or cid), tests=[str(t) for t in card.get("tests") or []],
-            approval=str(task.task_id), known=known, git=self._git, run=self._run)
+            approval=str(task.task_id), known=known, protected=closure, files=files,
+            git=self._git)
         outcome = {**done, "id": cid, "at": self._clock(), "digest": task.payload["digest"]}
         store.write_json(store.folder(self.settings.improve_dir, cid) / store.OUTCOME, outcome)
         ok = done.get("applied") is True or done.get("stale") is True

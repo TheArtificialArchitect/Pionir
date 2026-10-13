@@ -358,6 +358,112 @@ class ShapeTests(_Case):
         self.assertEqual(f.added[0], "        y = 1\u2028-        self.assertEqual(x, 2)")
 
 
+class IndirectTests(_Case):
+    """A protected module changed from somewhere else: the reviewer's 3-line exploit and its
+    variants, from an allowlisted module and from a test."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.repo.change({"src/pionir/approvals.py": "def requires_owner(*a):\n    return True\n",
+                          "src/pionir/auth.py": "GRANTABLE_PERMISSIONS = frozenset()\n"})
+        self.base = self.repo.tree()
+
+    def refused(self, path: str, text: str) -> list:
+        self.repo.change({path: text})
+        problems = guard.tree_problems([path], self.base, self.repo.tree())
+        self.repo.change({path: self.base.get(path, b"").decode() or "x = 1\n"})
+        return problems
+
+    def test_the_reviewers_exploit_is_refused(self) -> None:
+        problems = self.refused(RULE, (
+            "from pionir import approvals, auth\n"
+            "setattr(auth, 'GRANTABLE_PERMISSIONS', frozenset({'x'}))\n"
+            "approvals.requires_owner = lambda *a, **k: False\n"))
+        self.assertTrue(any("setattr" in p for p in problems), problems)
+        self.assertTrue(any("attribute of an imported module" in p for p in problems), problems)
+
+    def test_every_other_way_into_another_module_is_refused(self) -> None:
+        for text in ("from pionir import auth\nm = auth\nm.GRANTABLE_PERMISSIONS = 1\n",
+                     "import pionir.auth\npionir.auth.GRANTABLE_PERMISSIONS = 1\n",
+                     "from pionir import auth\ndel auth.GRANTABLE_PERMISSIONS\n",
+                     "from pionir import auth\nauth.GRANTABLE_PERMISSIONS |= {1}\n",
+                     "import sys\nsys.modules['pionir.auth'] = object()\n",
+                     "from pionir import auth\nvars(auth)['GRANTABLE_PERMISSIONS'] = 1\n",
+                     "from pionir import auth\nauth.__dict__['X'] = 1\n",
+                     "import importlib\nfrom pionir import auth\nimportlib.reload(auth)\n",
+                     "from unittest import mock\nmock.patch('pionir.auth.X', 1).start()\n"):
+            with self.subTest(text=text):
+                self.assertTrue(self.refused(RULE, text), text)
+
+    def test_a_test_may_not_patch_a_protected_module(self) -> None:
+        test = "tests/test_rules.py"
+        for line in ("        with mock.patch('pionir.approvals.requires_owner', lambda: 0):\n"
+                     "            pass\n",
+                     "        with mock.patch.object(approvals, 'requires_owner', lambda: 0):\n"
+                     "            pass\n",
+                     "        mock.patch('pionir.crew.etsy.maker.check').start()\n",
+                     "        setattr(approvals, 'requires_owner', None)\n"):
+            text = ("import unittest\nfrom unittest import mock\nfrom pionir import approvals\n"
+                    + TEST.replace("    def test_b(self):", "    def test_c(self):\n" + line
+                                   + "\n    def test_b(self):"))
+            with self.subTest(line=line):
+                self.assertTrue(self.refused(test, text), line)
+
+    def test_a_test_may_patch_an_ordinary_module_in_a_with(self) -> None:
+        text = ("import unittest\nfrom unittest import mock\n" + TEST.replace(
+            "    def test_b(self):",
+            "    def test_c(self):\n        with mock.patch('pionir.crew.etsy.maker.check', "
+            "lambda x: x):\n            self.assertEqual(1 + 1, 2)\n\n    def test_b(self):"))
+        self.assertEqual(self.refused("tests/test_rules.py", text), [])
+
+    def test_assigning_its_own_names_is_fine(self) -> None:
+        self.assertEqual(self.refused(RULE, "class C:\n    pass\n\n\nC.x = 1\nobj = C()\n"
+                                            "obj.y = 2\nd = dict(a=1)\no = object()\n"), [])
+
+
+class ClosureTests(unittest.TestCase):
+    """What protected code imports is protected too - computed from the real tree, so it can
+    never drift from it."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.files = {p.relative_to(SRC.parent).as_posix(): p.read_bytes()
+                     for p in SRC.rglob("*.py") if "__pycache__" not in p.parts}
+        cls.closure = guard.protected_closure(cls.files)
+
+    def test_modules_protected_code_imports_are_protected(self) -> None:
+        for path in ("src/pionir/crew/clock.py", "src/pionir/crew/net.py",
+                     "src/pionir/crew/fiverr/safehttp.py", "src/pionir/crew/claudedraft.py",
+                     "src/pionir/ports.py"):
+            with self.subTest(path=path):
+                self.assertIn(path, self.closure)
+                self.assertIsNotNone(guard.protected_why(path, self.closure))
+
+    def test_the_whole_closure_is_protected(self) -> None:
+        protected = {p for p in self.files if guard.protected_why(p, self.closure)}
+        for path in sorted(protected):
+            for mod in guard._imported_modules(path, self.files[path].decode("utf-8")):
+                dep = guard._path_for(mod, self.files)
+                if dep is not None:
+                    self.assertTrue(guard.protected_why(dep, self.closure)
+                                    or guard.allowed_why_not(dep), (path, dep))
+
+    def test_a_patch_to_such_a_module_is_refused_everywhere(self) -> None:
+        clock = "src/pionir/crew/clock.py"
+        patch = (f"diff --git a/{clock} b/{clock}\nindex 1111111..2222222 100644\n--- a/{clock}\n"
+                 f"+++ b/{clock}\n@@ -1 +1 @@\n-x\n+y\n")
+        self.assertTrue(any("is protected" in p for p in guard.patch_problems(
+            patch, protected=self.closure)))
+        self.assertTrue(guard.tree_problems([clock], self.files, {**self.files, clock: b"y = 1\n"}))
+
+    def test_how_much_is_left_to_patch(self) -> None:
+        left = sorted(p for p in self.files if p.startswith("src/")
+                      and not guard.protected_why(p, self.closure) and not guard.allowed_why_not(p))
+        # nearly nothing: every module the gate, the crew's wiring and the adapters reach is
+        # protected; such failures go to "needs a human"
+        self.assertLessEqual(len(left), 5, left)
+
+
 class CatalogueTests(_Case):
     def test_a_setting_may_change(self) -> None:
         base = self.repo.tree()

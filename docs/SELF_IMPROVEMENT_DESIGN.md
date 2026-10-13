@@ -6,7 +6,7 @@ reviews it (the night-build split, the night Claude cap and cheaper model); ever
 as an approval card and only his yes applies it; one pass a night, at most two proposals a night;
 Pionir only. It follows `IMPROVEMENT_GATE.md` and `FUSION_PLAN.md` Phase 3: propose, evaluate in
 isolation, check permissions and regressions, Ian approves the exact digest, the gate applies
-nothing on its own, a red apply is reverted at once, and an applied change can be undone.
+nothing on its own, nothing of the patch is ever run as Ian, and an applied change can be undone.
 
 Revised after an adversarial review (NO-GO on the first version): the patch is FROZEN before it is
 verified, the guard is an allowlist, verification cannot be gamed by import errors or tautologies,
@@ -18,11 +18,11 @@ while she is idle, and one lease keeps every user of the build sandbox apart.
 | state | who | what |
 |---|---|---|
 | `detected` | worker (no model) | a **cluster**: one worker + one normalised reason (digits -> `N`) seen `>= 5` times in 7 days and in the last 48 h; the same failure seen from two sources (a failed run and its lesson) is ONE cluster. If its own words live only in a PROTECTED file (e.g. `crew/etsy/rules.py`), it is reported as **needs a human** and nothing is cloned or run. |
-| `writing` | Daedalus (contained) | a fresh clone of `main` in the sandbox; `coding.daedalus_build_quiet` - like a night build it may sideline Moss's model, but ONLY while she is idle (no turn with Ian for 30 min, nobody typing - asked under the lease before anything is sidelined; active -> the night is skipped), and the lease ends with the job, only 05:45-06:30 and only when the night builds can no longer start a build. Its gate runs only `tests/test_regression_<id>.py`. |
+| `writing` | Daedalus (contained) | a fresh clone of `main` in the sandbox; `coding.daedalus_build_quiet` - like a night build it may sideline Moss's model, but ONLY while she is idle (no turn with Ian for 30 min, nobody typing - asked under the lease before anything is sidelined; active -> the night is skipped), and the lease ends with the job; its window is 05:45-07:30, a start any time the job still fits once the night builds are done (still busy at the last start: the night is skipped, saying so). Its gate runs only `tests/test_regression_<id>.py`. |
 | `verifying` | worker (contained, CPU) | the patch is read from the sandbox ONCE and FROZEN in `~/.pionir/improve/<id>/` (sha256 recorded). Every later step uses those bytes on TRUSTED trees: the owner's base in a private clone in the owner's temp folder, the frozen patch applied there. Guard first (below); then the regression test must fail **by an assertion** on base and pass with the change; then no test may fail with the change unless main fails it the same way (per test: `failure:X` / `error:X`). |
 | `reviewing` | Claude (one call, no tools) | the frozen diff + evidence + our results; only between 01:00 and noon (so it is charged to that night's cap). A rejection, a failed verification or a failed Daedalus attempt gets ONE repair; then `shelved`. |
 | `awaiting_owner` | Pionir gate | the frozen bytes re-hashed and re-guarded; `improve.apply {id, digest}` - digest = sha256 over (patch, base, tests) - parked on every call; the card shows the WHOLE diff (<= 6,000 chars). |
-| `applied` / `stale` / `denied` | Pionir, on Ian's yes | the bytes read once and applied: `main`, no tracked change, nothing of his (untracked or ignored) where the patch writes, base an ancestor of HEAD; `apply --cached`, the guard again on his index, ONE commit naming the id, targeted tests re-run (red -> reverted at once). Never a push or restart. |
+| `applied` / `stale` / `denied` | Pionir, on Ian's yes | the bytes read once and applied: `main`, no tracked change, nothing of his (untracked or ignored) where the patch writes, base an ancestor of HEAD; `apply --cached`, the guard again on his index, ONE commit naming the id; nothing of it is run as Ian (its tests ran contained, on these bytes). Never a push or restart. |
 | `undone` | Ian | `python -m pionir improve undo <id>` = `git revert` of that commit. |
 
 ## The guard (`selfimprove/guard.py`)
@@ -32,7 +32,14 @@ ALLOWLIST: Python modules under `src/pionir/` (not a new top-level one, never `_
 PROTECTED (listed with reasons, each tested): the approval gate and its surfaces, auth, money and
 spend rules, secrets handling, content and listing rules, the build sandbox and everything that
 runs in it, the GPU lease, CI, adapters, the crew's wiring, the test harness, dependency files, the
-self-improvement code and its tests, and every module that code imports (computed by a test).
+self-improvement code and its tests, and every module that code imports (computed by a test) -
+and, computed at run time from the tree itself, EVERY module any protected module imports,
+transitively (on 2026-10-13 that left 1 of 217 modules patchable: code fixes are effectively
+off, so most clusters are reported as needing a human; tests and catalogue settings remain).
+A changed file may also never reach into another module: no attribute assigned, deleted or
+augmented on an imported module (or an alias of one), no setattr/delattr, no namespace writes
+(`__dict__`, `vars()`, `globals()`, `sys.modules`), no reload, no patching in src; a test may
+patch only unprotected modules, inside a `with` or decorator (never `.start()`).
 Refused also: deletions, binaries, links, file modes, fewer real asserts in any test (a
 tautology is not one), removed tests, skip markers, test code touching the test machinery, any
 import of something Pionir does not import already (AST, anywhere in the file), any new

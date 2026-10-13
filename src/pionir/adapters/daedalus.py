@@ -336,9 +336,10 @@ class DaedalusAdapter:
                 ),
                 Capability(
                     name=BUILD_QUIET,
-                    description="The same contained build for the self-improvement worker, "
-                                "admitted only when it fits beside the voice's model: Moss's "
-                                "model is never sidelined for it",
+                    description="The same contained build for the self-improvement worker; it "
+                                "may sideline Moss's model only when she has been idle for 30 "
+                                "minutes (no turn with Ian, nobody typing), never mid-"
+                                "conversation, and hands the card back when the job ends",
                     risk=RiskLevel.PRIVILEGED,
                     required_permissions=frozenset({BUILD_PERMISSION}),
                     model=quiet,

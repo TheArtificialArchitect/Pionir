@@ -34,10 +34,10 @@ docs/SELF_IMPROVEMENT_DESIGN.md has the design; in order, each run:
    call -> ``awaiting_owner``.
 7. **Detect** once per night in its window and **start** at most ``per_night`` (2) candidates:
    a cluster whose own words live only in a protected file is reported as **needing a human**
-   and never written; a job starts only inside its GPU window (default 05:45-06:30, inside the
-   night window, finishing by 06:30), only when the night builds are done, ``rest_minutes``
-   after its own last job, and only as the QUIET build - admitted only when the coder fits
-   which may sideline Moss's model only while she is idle (no turn with Ian for 30 minutes,
+   and never written; a job starts only inside its GPU window (default 05:45-07:30, opening
+   in the night window; any time until it can no longer finish), only once the night builds are
+   done (still busy at the last start that fits: the night is skipped, saying so), ``rest_minutes``
+   after its own last job, and only as the QUIET build, which may sideline Moss's model only while she is idle (no turn with Ian for 30 minutes,
    nobody typing - Pionir asks under the lease, before anything is sidelined) and hands the
    card back the moment its job ends.
 
@@ -147,7 +147,7 @@ class SelfImprover:
     live = True
     record_what = "the self-improvement worker's ledger of every candidate it proposed"
 
-    def __init__(self, spec, *, window: str = "05:45-06:30", builds_window: str = "01:00-07:00",
+    def __init__(self, spec, *, window: str = "05:45-07:30", builds_window: str = "01:00-07:00",
                  builds_budget_minutes: int = 75, budget_minutes: int = 40, per_night: int = 2,
                  threshold: int = 5, lookback_days: int = 7, fresh_hours: int = 48,
                  amber_nights: int = 3, rest_minutes: int = 10, suite_timeout_minutes: int = 40,
@@ -164,9 +164,11 @@ class SelfImprover:
         self.note = spec.note
         self.window = Window.parse(window)
         self.builds_window = Window.parse(builds_window)
-        if not _minutes(self.window) <= _minutes(self.builds_window):
-            raise ValueError("window must lie inside the night window (builds_window): the GPU "
-                             "is used only at night, when Ian is asleep")
+        mine = self.window.start.hour * 60 + self.window.start.minute
+        if mine not in _minutes(self.builds_window) or len(_minutes(self.window)) > 4 * 60:
+            raise ValueError("window must open inside the night window (builds_window) and last "
+                             "at most 4 hours: the GPU is used only at night, and only when "
+                             "Moss has been idle")
         if not 10 <= int(builds_budget_minutes) <= 180:
             raise ValueError("builds_budget_minutes must be 10 to 180 (the night builds' own)")
         self.builds_budget = int(builds_budget_minutes) * 60
@@ -563,8 +565,10 @@ class SelfImprover:
             paths = guard.changed_paths(patch)
             local = {Path(p).stem for p in base if p.startswith("tests/") and p.count("/") == 1}
             known = guard.known_imports(base)
-            hard = guard.patch_problems(patch, local_modules=local, known_imports=known) + \
-                guard.tree_problems(paths, base, head, known=known)
+            closure = guard.protected_closure(base)
+            hard = guard.patch_problems(patch, local_modules=local, known_imports=known,
+                                        protected=closure) + \
+                guard.tree_problems(paths, base, head, known=known, protected=closure)
             if hard:
                 c["refusals"] = [_clip(r, 300) for r in hard[:12]]
                 self._failed(ctx, rec, c, hard, events, hard=True)
@@ -688,8 +692,9 @@ class SelfImprover:
         # once more, on exactly the bytes Ian will be asked about
         paths = guard.changed_paths(patch)
         known = guard.known_imports(base)
-        hard = guard.patch_problems(patch, known_imports=known) + \
-            guard.tree_problems(paths, base, head, known=known)
+        closure = guard.protected_closure(base)
+        hard = guard.patch_problems(patch, known_imports=known, protected=closure) + \
+            guard.tree_problems(paths, base, head, known=known, protected=closure)
         if hard:
             self._failed(ctx, rec, c, hard, events, hard=True)
             return
@@ -877,10 +882,24 @@ class SelfImprover:
         if rec.get("active"):
             return                                          # one job at a time
         night = self.window.current(ctx.now)
+        if night is None:
+            return                                          # its window only
+        tonight = rec["nights"].get(night.key)
         if not can_start(night, ctx.now, self.budget):
-            return                                          # its window only, and must fit
-        if self._builds_busy(ctx) or float(rec.get("rest_until") or 0) > ctx.now:
-            return                                          # the card is someone else's now
+            # the last start that fits has passed: if the night builds held the card until
+            # then, tonight is skipped - and said so
+            if tonight is not None and not tonight["started"] and tonight.get("builds_busy"):
+                tonight["why_none"] = (f"skipped: the night builds were still busy at "
+                                       f"{_hm(night.end - self.budget)} "
+                                       f"({tonight['builds_busy']})")
+            return
+        busy = self._builds_busy(ctx)
+        if busy:
+            if tonight is not None:
+                tonight["builds_busy"] = busy
+            return                                          # the card is the builds' first
+        if float(rec.get("rest_until") or 0) > ctx.now:
+            return                                          # Moss has the card for a while
         if (rec["nights"].get(night.key) or {}).get("gpu_skipped"):
             return                                          # Moss was active: tonight is skipped
         c = next((c for c in rec["candidates"].values() if c.get("state") == "writing"

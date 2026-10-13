@@ -425,15 +425,27 @@ class GalateaAdapter:
 MOSS_QUIET_SECONDS = 30 * 60
 
 
-def moss_busy_probe(adapter: Any, *, quiet_seconds: float = MOSS_QUIET_SECONDS):
+MOSS_DOWN_CONFIRM_SECONDS = 60.0
+MAX_MESSAGE_PAGES = 2000
+
+
+def moss_busy_probe(adapter: Any, *, quiet_seconds: float = MOSS_QUIET_SECONDS,
+                    down_confirm_seconds: float = MOSS_DOWN_CONFIRM_SECONDS,
+                    clock=time.time):
     """A probe for work that may sideline Moss's model at night (the self-improvement build):
     ``()`` -> None when she is idle - no turn to or from Ian for ``quiet_seconds``, neither of
-    them typing - or not running at all; else WHY she is not idle, in words. Anything it cannot
-    read counts as not idle (fail closed). Her last turn is read from ``/api/messages``, only
-    the rows after the last one it saw (the first call reads them all once)."""
+    them typing - or confirmed not running; else WHY she is not idle, in words. Fail closed:
+
+    - her last turn is the NEWEST row of ``/api/messages``: it is paged to the end (each page
+      after the last id seen), never taken from the first page alone (the oldest rows);
+    - an id that went BACKWARDS (her store was reset or replaced) is "not idle" until it has
+      been read again from the start;
+    - a refused connection counts as "not running" only when it was refused on two probes at
+      least ``down_confirm_seconds`` apart, with no answer between (not a restart blip);
+    - anything it cannot read is never idle."""
     from datetime import datetime
 
-    seen: dict[str, Any] = {"id": 0, "last": None}
+    seen: dict[str, Any] = {"id": 0, "last": None, "down_since": None}
 
     def stamp(text: Any) -> datetime | None:
         try:
@@ -442,21 +454,56 @@ def moss_busy_probe(adapter: Any, *, quiet_seconds: float = MOSS_QUIET_SECONDS):
             return None
         return value.replace(tzinfo=None) if value.tzinfo else value
 
+    def page(transport, after: int) -> list:
+        doc = transport.get(f"/api/messages?{urlencode({'after': after})}")
+        rows = doc.get("messages") if isinstance(doc, Mapping) else None
+        return [r for r in rows or [] if isinstance(r, Mapping) and isinstance(r.get("id"), int)]
+
+    def take(rows: list) -> None:
+        for row in rows:
+            seen["id"] = max(seen["id"], row["id"])
+            if row.get("role") in ("ian", "her"):
+                at = stamp(row.get("ts"))
+                if at is not None and (seen["last"] is None or at > seen["last"]):
+                    seen["last"] = at
+
     def probe() -> str | None:
         if adapter is None:
             return None                                     # no Moss on this machine
         transport = getattr(adapter, "_transport", None)
         try:
             state = transport.get("/api/state")
-            rows = transport.get(f"/api/messages?{urlencode({'after': seen['id']})}")
+            if seen["id"]:
+                # still the same store? the last row seen must still be there, with its id
+                check = page(transport, seen["id"] - 1)
+                if not check or check[0]["id"] != seen["id"]:
+                    seen.update(id=0, last=None)
+                    return ("Moss's message ids went backwards (her store was reset); she is "
+                            "not taken as idle until it has been read again")
+            for _ in range(MAX_MESSAGE_PAGES):
+                rows = page(transport, seen["id"])
+                if not rows or max(r["id"] for r in rows) <= seen["id"]:
+                    break
+                take(rows)
+            else:
+                return "Moss's messages could not be read to the end"
         except AdapterUnavailable as error:
             cause = error.__cause__
             reason = getattr(cause, "reason", cause)
             if isinstance(reason, ConnectionRefusedError):
-                return None                                 # she is not running
+                now = clock()
+                if seen["down_since"] is None:
+                    seen["down_since"] = now
+                if now - seen["down_since"] >= down_confirm_seconds:
+                    return None                             # confirmed: she is not running
+                return ("Moss is not answering (once so far); she is not taken as stopped "
+                        f"until that holds for {int(down_confirm_seconds)} s")
+            seen["down_since"] = None
             return f"Moss's state could not be read ({error})"
         except Exception as error:  # noqa: BLE001 - unknown is never idle
+            seen["down_since"] = None
             return f"Moss's state could not be read ({type(error).__name__})"
+        seen["down_since"] = None
         if not isinstance(state, Mapping):
             return "Moss's state could not be read"
         situation = str(state.get("situation") or "")
@@ -464,14 +511,6 @@ def moss_busy_probe(adapter: Any, *, quiet_seconds: float = MOSS_QUIET_SECONDS):
             return "Moss is mid-conversation (someone is typing)"
         if "mid-conversation" in situation:
             return "Moss is mid-conversation"
-        for row in (rows.get("messages") if isinstance(rows, Mapping) else None) or []:
-            if not isinstance(row, Mapping) or not isinstance(row.get("id"), int):
-                continue
-            seen["id"] = max(seen["id"], row["id"])
-            if row.get("role") in ("ian", "her"):
-                at = stamp(row.get("ts"))
-                if at is not None and (seen["last"] is None or at > seen["last"]):
-                    seen["last"] = at
         now = stamp(state.get("now"))
         if now is None:
             return "Moss's clock could not be read"
