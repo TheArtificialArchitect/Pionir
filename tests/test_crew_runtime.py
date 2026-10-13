@@ -7,8 +7,10 @@ the crew is paused, a stale request served late or dropped without a word, or a
 foreground run that does not stop cleanly.
 """
 
+import os
 import threading
 import unittest
+from unittest import mock
 
 from crew_support import FakeTime, temp_dir
 from test_crew_fakes import FakeHttp, FakePionir, catalogue, done, make_crew
@@ -113,9 +115,14 @@ class ForegroundRunTests(unittest.TestCase):
             stop = threading.Event()
             lines: list = []
             timer = threading.Timer(0.5, stop.set)
+            # The API builder's readiness reads the machine's real build sandbox unless told
+            # otherwise; once that record carried node it probed the firewall through PowerShell
+            # (~2 s) and ate this whole half second (2026-10-12). Point it inside the temp dir.
+            no_sandbox = {"PIONIR_DAEDALUS_SANDBOX": os.path.join(root, "no-sandbox")}
             timer.start()
             try:
-                self.assertEqual(run(crew, stop=stop, out=lines.append, monitor=False), 0)
+                with mock.patch.dict(os.environ, no_sandbox):
+                    self.assertEqual(run(crew, stop=stop, out=lines.append, monitor=False), 0)
             finally:
                 timer.cancel()
             text = "\n".join(lines)
