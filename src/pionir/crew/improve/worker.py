@@ -819,6 +819,13 @@ class SelfImprover:
                                        f"occurrences since {label}")
                     continue
                 cl = now_cl
+            # a guard, not a reset: it must still happen on the RUNNING code (a fix committed
+            # but not yet running would otherwise be proposed again)
+            started = float(ctx.crew_started_at or 0)
+            if started and cl.last_seen <= started:
+                skipped[cl.key] = (f"held: not seen on the running code (none since the crew "
+                                   f"last started at {detect.iso(started)})")
+                continue
             ev = cl.evidence(self.lookback_days)
             ev["targets"] = where["targets"]
             ev["counted_since"] = label
@@ -838,12 +845,11 @@ class SelfImprover:
                             window=f"last {self.lookback_days} days")]))
 
     def _current_since(self, ctx: WorkContext, targets: list) -> tuple:
-        """(epoch, words): the later of the crew's own start (code changes take effect then)
-        and the newest commit on main that touched one of the cluster's source files (the
-        catalogue, listed for every crew worker, is not one: any setting change would hide
-        every cluster). Sightings before it happened on code that may since be fixed."""
-        best = (float(ctx.crew_started_at or 0), "the crew last started at "
-                f"{detect.iso(ctx.crew_started_at or 0)}")
+        """(epoch, words): the newest commit on main that touched one of the cluster's source
+        files (the catalogue, listed for every crew worker, is not one: any setting change would
+        hide every cluster). Sightings before it happened on code that may since be fixed. A
+        restart is NOT a reset - it changes no code (see the running-code guard instead)."""
+        best = (0.0, "the start of the lookback")
         files = [t for t in targets if t != "src/pionir/crew/catalogue.json"]
         if files and ctx.pionir_repo is not None:
             got = self.last_commit(ctx.pionir_repo, files)

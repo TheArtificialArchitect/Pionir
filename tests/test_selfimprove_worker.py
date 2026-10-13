@@ -640,13 +640,23 @@ class CurrentCodeTests(_Case):
     def test_without_a_fix_both_stand(self) -> None:
         self.assertEqual(len(self.night()["eligible"]), 2)
 
-    def test_occurrences_before_the_crew_started_do_not_count(self) -> None:
-        self.crew_started = at(5, 3)                        # restarted on new code at 03:00
+    def test_a_restart_alone_does_not_reset_the_count(self) -> None:
+        self.crew_started = at(5, 3)                        # restarted at 03:00, same code
+        night = self.night()
+        [medical] = night["eligible"]                       # seen at 04:00 too: still happening
+        self.assertEqual(medical["count"], 12)              # every occurrence still counts
+
+    def test_a_cluster_not_seen_since_the_last_start_is_held(self) -> None:
+        self.crew_started = at(5, 3)
+        night = self.night()
+        title = [k for k in night["skipped"] if "this is N" in k]
+        self.assertIn("not seen on the running code", night["skipped"][title[0]])
+        self.crew_started = at(5, 4, 30)                    # nothing at all since 04:30
+        self.state.joinpath("builds.improve.json").unlink()
         night = self.night()
         self.assertEqual(night["eligible"], [])
-        self.assertTrue(all("since the crew last started" in w
+        self.assertTrue(all("not seen on the running code" in w
                             for w in night["skipped"].values()))
-        self.assertEqual(self.pionir.builds(), [])
 
 
 class GpuTests(_Case):
