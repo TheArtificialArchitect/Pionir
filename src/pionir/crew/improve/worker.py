@@ -205,6 +205,7 @@ class SelfImprover:
         self.load_sandbox = lambda root: build_sandbox.load_setup(root)
         self.auth_compat = compat_from_environment
         self.run_suite = isandbox.run_suite
+        self.last_commit = isandbox.last_commit
         self.git_run = None                     # None: subprocess.run
         self._setup = None
 
@@ -805,8 +806,22 @@ class SelfImprover:
                 needs_human.append({"worker": cl.worker, "reason": _clip(cl.reason, 160),
                                     "count": cl.count, "why": where["needs_human"]})
                 continue
+            # still happening on the CURRENT code? only what happened after the crew last
+            # started and after the newest commit to its files counts
+            cut, label = self._current_since(ctx, where["targets"])
+            if cut > cl.first_seen:
+                again = detect.merge_duplicates(detect.cluster(
+                    [s for s in sightings if s.at > cut], threshold=self.threshold,
+                    since=max(since, cut)))
+                now_cl = next((a for a in again if ({a.key, *a.also} & keys)), None)
+                if now_cl is None:
+                    skipped[cl.key] = (f"may already be fixed: fewer than {self.threshold} "
+                                       f"occurrences since {label}")
+                    continue
+                cl = now_cl
             ev = cl.evidence(self.lookback_days)
             ev["targets"] = where["targets"]
+            ev["counted_since"] = label
             eligible.append(ev)
         rec["nights"][night.key] = {"start": night.start, "end": night.end,
                                     "detected_at": ctx.now, "clusters": len(clusters),
@@ -821,6 +836,21 @@ class SelfImprover:
                      "count": e["count"]} for e in eligible[:3]]},
             figures=[Figure(len(clusters), "count", "recurring failures found",
                             window=f"last {self.lookback_days} days")]))
+
+    def _current_since(self, ctx: WorkContext, targets: list) -> tuple:
+        """(epoch, words): the later of the crew's own start (code changes take effect then)
+        and the newest commit on main that touched one of the cluster's source files (the
+        catalogue, listed for every crew worker, is not one: any setting change would hide
+        every cluster). Sightings before it happened on code that may since be fixed."""
+        best = (float(ctx.crew_started_at or 0), "the crew last started at "
+                f"{detect.iso(ctx.crew_started_at or 0)}")
+        files = [t for t in targets if t != "src/pionir/crew/catalogue.json"]
+        if files and ctx.pionir_repo is not None:
+            got = self.last_commit(ctx.pionir_repo, files)
+            if got is not None and got[0] > best[0]:
+                best = (float(got[0]), f"commit {got[1]} touched {', '.join(files[:2])} at "
+                                       f"{detect.iso(got[0])}")
+        return best
 
     def _sightings(self, ctx: WorkContext, since: float) -> list:
         out: list = []

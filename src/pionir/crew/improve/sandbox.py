@@ -214,6 +214,18 @@ def trusted_trees(owner_repo, base: str, patch: bytes, *, run=subprocess.run) ->
     return base_files, head_files, stat
 
 
+def last_commit(repo, paths: list, *, run=subprocess.run) -> tuple | None:
+    """(commit time, short id) of the newest commit on the owner's ``main`` that touched any of
+    ``paths`` - read only - or None."""
+    try:
+        out = str(run_git(["log", "-1", "--format=%ct %h", "main", "--", *paths], repo,
+                          run=run)).strip()
+        ct, sha = out.split()
+        return int(ct), sha
+    except (GitError, OSError, ValueError):
+        return None
+
+
 def write_tree(files: dict, dest: Path) -> None:
     for rel, data in files.items():
         path = Path(dest) / rel

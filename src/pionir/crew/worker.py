@@ -186,6 +186,8 @@ class WorkContext:
     improve_dir: Path | None = None
     cortex_path: Path | None = None
     crew_log: Path | None = None
+    # when this crew process started: what ran before it ran on older code
+    crew_started_at: float | None = None
 
 
 @runtime_checkable

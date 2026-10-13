@@ -185,7 +185,8 @@ class Crew:
                            pionir_repo=getattr(self.cfg, "pionir_repo", None),
                            improve_dir=getattr(self.cfg, "improve_dir", None),
                            cortex_path=getattr(self.cfg, "cortex_path", None),
-                           crew_log=self.cfg.state_dir / "crew.log")
+                           crew_log=self.cfg.state_dir / "crew.log",
+                           crew_started_at=self.started_at)
 
     def _words(self, worker, purpose: str, system: str, user: str, schema: dict) -> Result:
         """The ONLY way a worker reaches a model: the shared brain, JSON-schema output,

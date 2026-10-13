@@ -15,6 +15,7 @@ fail by an ASSERTION, the per-test baseline, the one repair, NOT SET UP, and the
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
@@ -55,10 +56,15 @@ def at(day: int, hour: int, minute: int = 0) -> float:
     return datetime(2026, 10, day, hour, minute).timestamp()
 
 
+COMMIT_DATE = {"date": "2026-10-01T00:00:00"}       # the stand-in repo's commits, by default
+
+
 def git(cwd, *args) -> str:
+    env = {**os.environ, "GIT_COMMITTER_DATE": COMMIT_DATE["date"],
+           "GIT_AUTHOR_DATE": COMMIT_DATE["date"]}
     return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid",
                            "-c", "core.autocrlf=false", *args], cwd=cwd, check=True,
-                          capture_output=True, text=True).stdout.strip()
+                          capture_output=True, text=True, env=env).stdout.strip()
 
 
 def write(repo: Path, files: dict) -> None:
@@ -75,7 +81,7 @@ def commit(repo: Path, files: dict, message="change") -> str:
     return git(repo, "rev-parse", "HEAD")
 
 
-CHECKER = (f'"""Etsy listing checks (a stand-in)."""\n\n\ndef check(label):\n'
+CHECKER = (f'"""Etsy listing checks (a stand-in) for etsy.digital."""\n\n\ndef check(label):\n'
            f'    if "medical" in label:\n        return "{CHECK}"\n    return None\n')
 REPO = {
     "src/pionir/__init__.py": "",
@@ -234,7 +240,8 @@ class _Case(unittest.TestCase):
                                                           if r["observed_at"] > since],
                            failed_runs=lambda since: [], pionir_repo=self.repo,
                            improve_dir=self.improve, crew_log=None, cortex_path=None,
-                           approvals_path=None)
+                           approvals_path=None,
+                           crew_started_at=getattr(self, "crew_started", None))
 
     def run_at(self, now, ok=True):
         result = self.worker.run(self.ctx(now))
@@ -602,6 +609,43 @@ class FreshnessTests(_Case):
         self.assertEqual(night["clusters"], 2)
         self.assertEqual(night["eligible"], [])
         self.assertTrue(all("may already be fixed" in why for why in night["skipped"].values()))
+        self.assertEqual(self.pionir.builds(), [])
+
+
+class CurrentCodeTests(_Case):
+    """A cluster counts only what happened on the CURRENT code: after the crew last started and
+    after the newest commit to its files."""
+
+    def tearDown(self) -> None:
+        COMMIT_DATE["date"] = "2026-10-01T00:00:00"
+        super().tearDown()
+
+    def night(self) -> dict:
+        self.run_at(at(5, 5, 46))
+        return self.record()["nights"]["2026-10-05"]
+
+    def test_a_fixing_commit_drops_what_happened_before_it(self) -> None:
+        # the title rows are 07:00-16:00 on the 4th; the medical rows 17:00 on the 4th to 04:00
+        COMMIT_DATE["date"] = "2026-10-04T23:00:00"
+        commit(self.repo, {MAKER: CHECKER + "# tightened\n"}, "fix the titles")
+        night = self.night()
+        keys = {e["worker"] + e["reason"]: e for e in night["eligible"]}
+        title = [k for k in night["skipped"] if "this is N" in k]
+        self.assertTrue(title and "may already be fixed" in night["skipped"][title[0]])
+        self.assertIn("since commit", night["skipped"][title[0]])
+        [medical] = keys.values()                           # still happening after the fix
+        self.assertEqual(medical["count"], 5)            # 00:00-04:00 on the 5th
+        self.assertIn("commit", medical["counted_since"])
+
+    def test_without_a_fix_both_stand(self) -> None:
+        self.assertEqual(len(self.night()["eligible"]), 2)
+
+    def test_occurrences_before_the_crew_started_do_not_count(self) -> None:
+        self.crew_started = at(5, 3)                        # restarted on new code at 03:00
+        night = self.night()
+        self.assertEqual(night["eligible"], [])
+        self.assertTrue(all("since the crew last started" in w
+                            for w in night["skipped"].values()))
         self.assertEqual(self.pionir.builds(), [])
 
 
