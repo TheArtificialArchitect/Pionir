@@ -218,6 +218,11 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
                 )
             )
         )
+    daedalus = runtime.adapters.get("daedalus")
+    if daedalus is not None and hasattr(daedalus, "moss_busy"):
+        # the quiet build (self-improvement) may sideline Moss's model only while she is idle
+        from .adapters.galatea import moss_busy_probe
+        daedalus.moss_busy = moss_busy_probe(runtime.adapters.get("galatea"))
     if configured.melete_url is not None:
         runtime.register(
             MeleteAdapter(

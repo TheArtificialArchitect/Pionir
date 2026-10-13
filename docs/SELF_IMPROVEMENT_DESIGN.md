@@ -10,15 +10,15 @@ nothing on its own, a red apply is reverted at once, and an applied change can b
 
 Revised after an adversarial review (NO-GO on the first version): the patch is FROZEN before it is
 verified, the guard is an allowlist, verification cannot be gamed by import errors or tautologies,
-the whole diff is on Ian's card, the GPU is used only at night without ever sidelining Moss's
-model, and one lease keeps every user of the build sandbox apart.
+the whole diff is on Ian's card, the GPU is used only at night and Moss's model is sidelined only
+while she is idle, and one lease keeps every user of the build sandbox apart.
 
 ## Pipeline (one candidate)
 
 | state | who | what |
 |---|---|---|
 | `detected` | worker (no model) | a **cluster**: one worker + one normalised reason (digits -> `N`) seen `>= 5` times in 7 days and in the last 48 h; the same failure seen from two sources (a failed run and its lesson) is ONE cluster. If its own words live only in a PROTECTED file (e.g. `crew/etsy/rules.py`), it is reported as **needs a human** and nothing is cloned or run. |
-| `writing` | Daedalus (contained) | a fresh clone of `main` in the sandbox; `coding.daedalus_build_quiet` - admitted only when the coder FITS beside Moss's model (never sidelined; otherwise the night is skipped), only 05:45-06:30 and only when the night builds can no longer start a build. Its gate runs only `tests/test_regression_<id>.py`. |
+| `writing` | Daedalus (contained) | a fresh clone of `main` in the sandbox; `coding.daedalus_build_quiet` - like a night build it may sideline Moss's model, but ONLY while she is idle (no turn with Ian for 30 min, nobody typing - asked under the lease before anything is sidelined; active -> the night is skipped), and the lease ends with the job, only 05:45-06:30 and only when the night builds can no longer start a build. Its gate runs only `tests/test_regression_<id>.py`. |
 | `verifying` | worker (contained, CPU) | the patch is read from the sandbox ONCE and FROZEN in `~/.pionir/improve/<id>/` (sha256 recorded). Every later step uses those bytes on TRUSTED trees: the owner's base in a private clone in the owner's temp folder, the frozen patch applied there. Guard first (below); then the regression test must fail **by an assertion** on base and pass with the change; then no test may fail with the change unless main fails it the same way (per test: `failure:X` / `error:X`). |
 | `reviewing` | Claude (one call, no tools) | the frozen diff + evidence + our results; only between 01:00 and noon (so it is charged to that night's cap). A rejection, a failed verification or a failed Daedalus attempt gets ONE repair; then `shelved`. |
 | `awaiting_owner` | Pionir gate | the frozen bytes re-hashed and re-guarded; `improve.apply {id, digest}` - digest = sha256 over (patch, base, tests) - parked on every call; the card shows the WHOLE diff (<= 6,000 chars). |

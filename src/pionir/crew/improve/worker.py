@@ -16,7 +16,7 @@ docs/SELF_IMPROVEMENT_DESIGN.md has the design; in order, each run:
    once): landed -> the patch is read ONCE from the sandbox and FROZEN in the owner-only improve
    folder (``verifying``); gate failed, timed out, lost, or "a pass but committed nothing new"
    -> the ONE repair, then ``shelved``; Daedalus or the sandbox busy -> waiting; the card not
-   free without sidelining Moss's model -> the night is skipped. None of those is an attempt.
+   Moss active (or the card not free) -> the night is skipped. None of those is an attempt.
 4. **Verify** the FROZEN bytes, one step a run, on TRUSTED trees (the owner's base and the
    frozen patch applied to it in the owner's own temporary folder - sandbox.trusted_trees): the
    hard refusals (selfimprove/guard.py, before any Claude call); the regression test FAILS ON
@@ -37,7 +37,9 @@ docs/SELF_IMPROVEMENT_DESIGN.md has the design; in order, each run:
    and never written; a job starts only inside its GPU window (default 05:45-06:30, inside the
    night window, finishing by 06:30), only when the night builds are done, ``rest_minutes``
    after its own last job, and only as the QUIET build - admitted only when the coder fits
-   beside Moss's model, which is never sidelined for it.
+   which may sideline Moss's model only while she is idle (no turn with Ian for 30 minutes,
+   nobody typing - Pionir asks under the lease, before anything is sidelined) and hands the
+   card back the moment its job ends.
 
 Every candidate and every state it passed through is in its record (``builds.improve.json``,
 the ledger ``python -m pionir improve status`` reads). Its pulse goes amber when it detected
@@ -68,7 +70,7 @@ from . import sandbox as isandbox
 
 APPLY = "improve.apply"
 # Pionir's names (adapters/daedalus.py; tests hold them equal): the QUIET build - admitted only
-# beside the voice's model - its cancel, and the one grant the crew holds for both.
+# while Moss is idle - its cancel, and the one grant the crew holds for both.
 BUILD = "coding.daedalus_build_quiet"
 CANCEL = "coding.daedalus_build_cancel"
 PERMISSION = "daedalus.build_sandbox"
@@ -411,9 +413,8 @@ class SelfImprover:
             self._failed(ctx, rec, c, [f"it did not finish in its {self.budget // 60}-minute "
                                        "budget and was stopped"], events)
         elif out.status == "failed" and out.error_type == "ResourceUnavailable":
-            # the card is not free without sidelining Moss's model: never - the night is skipped
-            self._wait(ctx, c, a, f"the GPU is not free without sidelining Moss's model "
-                       f"({_clip(out.error, 160)}); tonight is skipped", events)
+            # Moss is active (or the card is not free): she is never sidelined mid-conversation
+            self._wait(ctx, c, a, f"tonight is skipped: {_clip(out.error, 220)}", events)
             c["retry_after"] = self.window.next_start(
                 (self.window.current(ctx.now) or self.window.last_ended(ctx.now)).end)
             night = rec["nights"].get(a.get("night") or "")
@@ -881,7 +882,7 @@ class SelfImprover:
         if self._builds_busy(ctx) or float(rec.get("rest_until") or 0) > ctx.now:
             return                                          # the card is someone else's now
         if (rec["nights"].get(night.key) or {}).get("gpu_skipped"):
-            return                                          # not without sidelining Moss
+            return                                          # Moss was active: tonight is skipped
         c = next((c for c in rec["candidates"].values() if c.get("state") == "writing"
                   and float(c.get("retry_after") or 0) <= ctx.now), None)
         if c is None:

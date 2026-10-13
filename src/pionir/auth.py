@@ -101,7 +101,7 @@ SIGN_WINDOW = 30.0            # seconds a signed request may be off this server'
 # without parking. A grantable permission is scoped twice, here and in code only: to the
 # ONE client that may hold it, and to the capabilities it unlocks: ``coding.daedalus_build``
 # and its twin ``coding.daedalus_build_quiet`` (the self-improvement worker's, admitted only
-# beside the voice's model). Both reach nothing but a sandbox repo the crew made (adapters/daedalus.py),
+# only while Moss is idle). Both reach nothing but a sandbox repo the crew made (adapters/daedalus.py),
 # running as the contained ``pionir-builds`` user. No other permission is grantable, so every
 # other privileged action from every client still parks for the owner.
 PERMISSION_SCOPES: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {

@@ -419,3 +419,66 @@ class GalateaAdapter:
             ):
                 break
         return "\n\n".join(bubbles)
+
+
+# ---- is Moss in a conversation? -----------------------------------------------------------------
+MOSS_QUIET_SECONDS = 30 * 60
+
+
+def moss_busy_probe(adapter: Any, *, quiet_seconds: float = MOSS_QUIET_SECONDS):
+    """A probe for work that may sideline Moss's model at night (the self-improvement build):
+    ``()`` -> None when she is idle - no turn to or from Ian for ``quiet_seconds``, neither of
+    them typing - or not running at all; else WHY she is not idle, in words. Anything it cannot
+    read counts as not idle (fail closed). Her last turn is read from ``/api/messages``, only
+    the rows after the last one it saw (the first call reads them all once)."""
+    from datetime import datetime
+
+    seen: dict[str, Any] = {"id": 0, "last": None}
+
+    def stamp(text: Any) -> datetime | None:
+        try:
+            value = datetime.fromisoformat(str(text))
+        except (TypeError, ValueError):
+            return None
+        return value.replace(tzinfo=None) if value.tzinfo else value
+
+    def probe() -> str | None:
+        if adapter is None:
+            return None                                     # no Moss on this machine
+        transport = getattr(adapter, "_transport", None)
+        try:
+            state = transport.get("/api/state")
+            rows = transport.get(f"/api/messages?{urlencode({'after': seen['id']})}")
+        except AdapterUnavailable as error:
+            cause = error.__cause__
+            reason = getattr(cause, "reason", cause)
+            if isinstance(reason, ConnectionRefusedError):
+                return None                                 # she is not running
+            return f"Moss's state could not be read ({error})"
+        except Exception as error:  # noqa: BLE001 - unknown is never idle
+            return f"Moss's state could not be read ({type(error).__name__})"
+        if not isinstance(state, Mapping):
+            return "Moss's state could not be read"
+        situation = str(state.get("situation") or "")
+        if state.get("typing") is True or "he's typing" in situation:
+            return "Moss is mid-conversation (someone is typing)"
+        if "mid-conversation" in situation:
+            return "Moss is mid-conversation"
+        for row in (rows.get("messages") if isinstance(rows, Mapping) else None) or []:
+            if not isinstance(row, Mapping) or not isinstance(row.get("id"), int):
+                continue
+            seen["id"] = max(seen["id"], row["id"])
+            if row.get("role") in ("ian", "her"):
+                at = stamp(row.get("ts"))
+                if at is not None and (seen["last"] is None or at > seen["last"]):
+                    seen["last"] = at
+        now = stamp(state.get("now"))
+        if now is None:
+            return "Moss's clock could not be read"
+        if seen["last"] is not None and (now - seen["last"]).total_seconds() < quiet_seconds:
+            minutes = int((now - seen["last"]).total_seconds() // 60)
+            return (f"Moss talked with Ian {minutes} minute(s) ago (she must be quiet for "
+                    f"{int(quiet_seconds // 60)} minutes first)")
+        return None
+
+    return probe

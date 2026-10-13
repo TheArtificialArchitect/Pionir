@@ -63,7 +63,7 @@ from pionir.contracts import (
     Task,
     TaskResult,
 )
-from pionir.errors import AdapterProtocolError, AdapterUnavailable
+from pionir.errors import AdapterProtocolError, AdapterUnavailable, ResourceUnavailable
 # The sandbox rule lives with the safe-git code (a leaf module) so the crew can check it
 # without importing every adapter; it is re-exported here under its old names.
 from pionir.sandbox_git import (  # noqa: F401 - re-exported
@@ -76,9 +76,11 @@ from pionir.sandbox_git import (  # noqa: F401 - re-exported
 
 SOLVE = "coding.daedalus_solve"
 BUILD = "coding.daedalus_build"
-# The same contained build, for the self-improvement worker: its model may only take the card
-# when it FITS beside the voice's model - Moss's model is never sidelined for it (the scheduler
-# refuses with ResourceUnavailable instead, and the worker skips the night).
+# The same contained build, for the self-improvement worker. Like a night build it may sideline
+# Moss's model under the lease - but ONLY while she is idle (no turn to or from Ian for 30
+# minutes, nobody typing: ``moss_busy``), asked once the lease is held and BEFORE anything is
+# sidelined (``settle_for``). While she is active it is refused (ResourceUnavailable, saying why)
+# and the worker skips the night. The lease ends with the job, so her model comes back.
 BUILD_QUIET = "coding.daedalus_build_quiet"
 BUILDS = frozenset({BUILD, BUILD_QUIET})
 CANCEL = "coding.daedalus_build_cancel"
@@ -301,10 +303,13 @@ class DaedalusAdapter:
             requires_gpu=True,
             exclusive_card=True,
         )
-        # never displaces a protected model (the voice's): scheduler._make_room
+        # may sideline the voice's model, like a night build - only once settle_for says she is idle
         quiet = ModelRequirement(model_id=model.model_id,
                                  estimated_vram_mb=model.estimated_vram_mb,
-                                 context_vram_mb=0, requires_gpu=True, exclusive_card=False)
+                                 context_vram_mb=0, requires_gpu=True, exclusive_card=True)
+        # () -> None when Moss is idle, else why not; bootstrap wires the Galatea probe. Unset:
+        # fail closed - Moss's activity cannot be read, so the quiet build never sidelines her.
+        self.moss_busy = lambda: "Moss's activity is not wired to this adapter"
         self._manifest = AgentManifest(
             agent_id="daedalus",
             version="tech-support/daedalus",
@@ -347,6 +352,24 @@ class DaedalusAdapter:
                 ),
             ),
         )
+
+    def settle_for(self, task: Task):
+        """For the quiet build only: what the scheduler asks once the lease is held and before
+        anything is sidelined - Moss idle, or ResourceUnavailable naming why not. None for every
+        other capability (their lease works as before)."""
+        if task.capability != BUILD_QUIET:
+            return None
+
+        def settle() -> bool:
+            try:
+                why = self.moss_busy()
+            except Exception as error:  # noqa: BLE001 - unknown is never idle
+                why = f"Moss's activity could not be read ({type(error).__name__})"
+            if why:
+                raise ResourceUnavailable(f"{BUILD_QUIET}: not tonight - {why}; Moss's model is "
+                                          "never sidelined while she is active")
+            return True
+        return settle
 
     @property
     def manifest(self) -> AgentManifest:

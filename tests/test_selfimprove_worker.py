@@ -8,7 +8,7 @@ the clone the way its policy does. No model is called, nothing runs as another u
 Each test names the rule it holds; reverting the rule fails it: the Etsy fixture's clusters and
 duplicates, "needs a human" for a protected rule, dedupe and the stale rest, the nightly cap of
 2, the frozen patch (a rewritten sandbox changes nothing), the GPU (only after the night builds,
-never sidelining Moss, one job at a time, a rest between jobs), the sandbox lease, the shared
+Moss sidelined only while idle, one job at a time, a rest between jobs), the sandbox lease, the shared
 Claude cap and the review hours, the hard refusals before review, a regression test that must
 fail by an ASSERTION, the per-test baseline, the one repair, NOT SET UP, and the amber pulse.
 """
@@ -642,18 +642,19 @@ class GpuTests(_Case):
         self.assertEqual(len(self.pionir.builds()), 2)
         self.assertIn("A FIRST ATTEMPT WAS REFUSED", self.pionir.builds()[1].payload["intent"])
 
-    def test_a_card_not_free_without_sidelining_moss_skips_the_night(self) -> None:
+    def test_moss_active_skips_the_night_and_says_why(self) -> None:
         self.worker.budget = 600
         self.pionir.submit = lambda job: JobOutcome(
-            "failed", BUILD, error="qwen3-coder:30b needs 9000 MB VRAM; only 3000 MB free even "
-                                   "after sidelining what could be freed.",
+            "failed", BUILD, error="coding.daedalus_build_quiet: not tonight - Moss talked "
+                                   "with Ian 4 minute(s) ago (she must be quiet for 30 minutes "
+                                   "first); Moss's model is never sidelined while she is active",
             error_type="ResourceUnavailable")
         self.run_at(at(5, 5, 46))
         [c] = self.cands()
         self.assertEqual(c["state"], "writing")
         self.assertEqual(c["repairs"], 0)                         # never an attempt
         self.assertEqual(c["attempts"][-1]["outcome"], "not_started")
-        self.assertIn("sidelining Moss", c["waiting"])
+        self.assertIn("Moss talked with Ian 4 minute(s) ago", c["waiting"])
         for minute in (50, 56, 59):
             self.run_at(at(5, 5, minute))
         self.assertEqual(len(self.pionir.builds()), 1)           # tonight is skipped
@@ -680,9 +681,9 @@ class GpuTests(_Case):
         self.assertEqual(improve_worker.BUILD, daedalus_adapter.BUILD_QUIET)
         self.assertEqual(improve_worker.CANCEL, daedalus_adapter.CANCEL)
         self.assertEqual(improve_worker.PERMISSION, daedalus_adapter.BUILD_PERMISSION)
-        quiet = next(c for c in daedalus_adapter.DaedalusAdapter().manifest.capabilities
-                     if c.name == daedalus_adapter.BUILD_QUIET)
-        self.assertFalse(quiet.model.exclusive_card)              # never displaces Moss's model
+        adapter = daedalus_adapter.DaedalusAdapter()
+        self.assertIsNotNone(adapter.settle_for(
+            daedalus_adapter.Task(daedalus_adapter.BUILD_QUIET, {})))  # Moss asked first
 
 
 class SandboxLeaseTests(_Case):
