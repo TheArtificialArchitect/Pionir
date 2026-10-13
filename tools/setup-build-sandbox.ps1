@@ -240,10 +240,28 @@ if (Test-Path $PyExe) {
     $ErrorActionPreference = "Continue"      # a missing package is the expected answer here: PS 5.1 would turn its stderr into a terminating error under Stop
     # a real module FILE each: a package folder with no readable files imports as an empty
     # namespace package ("import fastapi" succeeds; "from fastapi import FastAPI" does not)
-    try { & $PyExe -I -c "import fastapi, uvicorn, requests, yaml, pytest; assert fastapi.FastAPI and pytest.__file__ and uvicorn.__file__ and yaml.__file__ and requests.__file__" *> $null; $ready = ($LASTEXITCODE -eq 0) }
+    # every pin in the requirements, at its pinned version - not a fixed handful of imports, or a
+    # package added to the pins later (pillow, openpyxl, tzdata on 2026-10-12) is never installed
+    $pinCheck = @'
+import sys, re, importlib.metadata as m
+bad = []
+for line in open(sys.argv[1], encoding='utf-8'):
+    x = re.match(r'([A-Za-z0-9_.-]+)==(\S+)', line.strip())
+    if not x:
+        continue
+    try:
+        if m.version(x.group(1)) != x.group(2):
+            bad.append(x.group(1))
+    except m.PackageNotFoundError:
+        bad.append(x.group(1))
+import fastapi, uvicorn, requests, yaml, pytest
+assert fastapi.FastAPI and pytest.__file__ and uvicorn.__file__ and yaml.__file__ and requests.__file__
+sys.exit(1 if bad else 0)
+'@
+    try { & $PyExe -I -c $pinCheck $Requirements *> $null; $ready = ($LASTEXITCODE -eq 0) }
     finally { $ErrorActionPreference = $eap }
 }
-if ($ready) { Had "$PyExe has Daedalus's server packages" } else {
+if ($ready) { Had "$PyExe has every pinned package at its pinned version" } else {
     Write-Host "    robocopy $PythonSource -> $PyDir (without its site-packages)" -ForegroundColor DarkGray
     & robocopy.exe $PythonSource $PyDir /MIR /NFL /NDL /NJH /NJS /NP /XD (Join-Path $PythonSource "Lib\site-packages") | Out-Null
     if ($LASTEXITCODE -ge 8) { Fail "robocopy exited $LASTEXITCODE" }
@@ -381,11 +399,31 @@ if (-not $NodeEnabled) {
     # read-only to pionir-builds: it may read and run the tools, never change them
     Run-Icacls @($NodeTools, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F",
         "*S-1-5-32-544:(OI)(CI)F", "*${OwnerSid}:(OI)(CI)RX", "*${UserSid}:(OI)(CI)RX")
-    # the write rights one by one: icacls W is FILE_GENERIC_WRITE, whose SYNCHRONIZE and
-    # READ_CONTROL, denied, beat the RX grant and make every file unopenable (EPERM) for node
+    # The write rights one by one, set through .NET, NOT icacls: icacls adds SYNCHRONIZE to
+    # every deny it writes (even "/deny (WD,AD,...)" came out 0x1d0156), and a denied
+    # SYNCHRONIZE beats the RX grant - every file open fails with EPERM for node and python
+    # (2026-10-12). .NET's FileSystemAccessRule leaves it out of a deny: 0xd0156.
     Run-Icacls @($NodeTools, "/remove:d", "*${UserSid}")
-    Run-Icacls @($NodeTools, "/deny", "*${UserSid}:(OI)(CI)(WD,AD,WEA,WA,D,DC,WDAC,WO)")
-    Did "${NodeTools}: $User may read and run it, and is denied every write"
+    $denyRights = [Security.AccessControl.FileSystemRights]('WriteData, AppendData, ' +
+        'WriteExtendedAttributes, WriteAttributes, Delete, DeleteSubdirectoriesAndFiles, ' +
+        'ChangePermissions, TakeOwnership')
+    $denySid = New-Object Security.Principal.SecurityIdentifier $UserSid
+    $denyRule = New-Object Security.AccessControl.FileSystemAccessRule($denySid, $denyRights,
+        'ContainerInherit, ObjectInherit', 'None', 'Deny')
+    $toolsAcl = Get-Acl -LiteralPath $NodeTools
+    $toolsAcl.AddAccessRule($denyRule)
+    Set-Acl -LiteralPath $NodeTools -AclObject $toolsAcl
+    $sample = $tsJs
+    foreach ($checked in @($NodeTools, $sample)) {
+        foreach ($ace in (Get-Acl -LiteralPath $checked).Access) {
+            if ($ace.AccessControlType -ne 'Deny') { continue }
+            if ($ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value -ne $UserSid) { continue }
+            if ([int]$ace.FileSystemRights -band 0x100000) {
+                Fail ("the deny for $User on $checked includes SYNCHRONIZE (0x{0:x}): node could open nothing" -f [int]$ace.FileSystemRights)
+            }
+        }
+    }
+    Did "${NodeTools}: $User may read and run it, and is denied every write (no SYNCHRONIZE in the deny)"
 }
 
 # ---- 4. the sandbox folder ------------------------------------------------------------------
@@ -678,10 +716,10 @@ try {
 } catch (e) { works.low = null; }
 try {
   works.tsc = cp.execFileSync(process.execPath, [t.nodetsc, '--version'], { encoding: 'utf8', timeout: 90000 }).trim();
-} catch (e) { works.tsc = null; }
+} catch (e) { works.tsc = 'failed: ' + String((e && (e.code || e.message)) || e).slice(0, 160); }
 try {
   works.vitest = cp.execFileSync(process.execPath, [t.nodevitest, '--version'], { encoding: 'utf8', timeout: 90000 }).trim();
-} catch (e) { works.vitest = null; }
+} catch (e) { works.vitest = 'failed: ' + String((e && (e.code || e.message)) || e).slice(0, 160); }
 let done = false;
 function finish() {
   if (done) return;

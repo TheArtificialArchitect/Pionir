@@ -110,10 +110,22 @@ class NodeSetupScriptTests(unittest.TestCase):
         # READ_CONTROL; denied, they beat the RX allow and node got EPERM opening tsc.js, so
         # the probe left node out of the record and every TypeScript build was refused. The
         # deny names the write rights one by one, never W/R/GW/GR, after removing old denies.
-        deny = '"/deny", "*${UserSid}:(OI)(CI)(WD,AD,WEA,WA,D,DC,WDAC,WO)"'
+        # 2026-10-12: and NOT through icacls, which adds SYNCHRONIZE to every deny it writes
+        # (the one-by-one icacls deny still came out 0x1d0156 and node still got EPERM): .NET's
+        # FileSystemAccessRule leaves it out, and the script fails if SYNCHRONIZE is there.
+        self.assertNotIn('"/deny"', grant)
+        named = grant.split("$denyRights")[1].split("$denySid")[0]
+        for right in ("WriteData", "AppendData", "WriteExtendedAttributes", "WriteAttributes",
+                      "Delete", "DeleteSubdirectoriesAndFiles", "ChangePermissions",
+                      "TakeOwnership"):
+            self.assertIn(right, named)
+        for broad in ("'Write'", "Write,", "FullControl", "Modify", "Synchronize"):
+            self.assertNotIn(broad, named)
+        deny = "FileSystemAccessRule($denySid, $denyRights,"
         self.assertIn(deny, grant)
-        self.assertNotIn("(W,", grant)
+        self.assertIn("'Deny')", grant)
         self.assertLess(grant.index('"/remove:d", "*${UserSid}"'), grant.index(deny))
+        self.assertIn("-band 0x100000", grant)            # refuses a deny carrying SYNCHRONIZE
         self.assertNotIn("*${UserSid}:(OI)(CI)F", grant)
         self.assertNotIn("*${UserSid}:(OI)(CI)M", grant)
 
