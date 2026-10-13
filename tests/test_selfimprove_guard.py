@@ -358,14 +358,51 @@ class ShapeTests(_Case):
         self.assertEqual(f.added[0], "        y = 1\u2028-        self.assertEqual(x, 2)")
 
 
+BYPASSES = (
+    # the first review's exploit
+    "from pionir import approvals, auth\nsetattr(auth, 'GRANTABLE_PERMISSIONS', frozenset({'x'}))\n"
+    "approvals.requires_owner = lambda *a, **k: False\n",
+    # the final review's bypasses
+    "from pionir import auth\nauth.PERMISSION_SCOPES['k'] = 'v'\n",
+    "from pionir import auth\nauth.PERMISSION_SCOPES.update({'k': 'v'})\n",
+    "from pionir.auth import DEFAULT_GRANTS\nDEFAULT_GRANTS['x'] = 1\n",
+    "import sys\nm = sys.modules.get('pionir.auth')\nm.X = 1\n",
+    "from pionir import auth\nif (m := auth):\n    m.X = 1\n",
+    "from pionir import auth\ndef f(m=auth):\n    m.X = 1\n",
+    "from pionir import auth\nfor m in [auth]:\n    m.X = 1\n",
+    "from pionir import auth\nwith auth as m:\n    m.X = 1\n",
+    "from pionir import auth\nms = [m for m in (auth,)]\nms[0].X = 1\n",
+    "from pionir import auth\na, b = auth, 1\na.X = 1\n",
+    "exec('from pionir import auth; auth.X = 1')\n",
+    "eval('1')\n",
+    "import operator\nfrom pionir import auth\noperator.setitem(auth.PERMISSION_SCOPES, 'k', 1)\n",
+    "import functools\nfrom pionir import auth\nfunctools.partial(setattr, auth)('X', 1)\n",
+    "from pionir import auth\nobject.__setattr__(auth, 'X', 1)\n",
+    "from pionir import auth\ntype(auth).__setattr__(auth, 'X', 1)\n",
+    "from pionir import auth\nauth.__dict__['X'] = 1\n",
+    "from pionir import auth\nvars(auth)['X'] = 1\n",
+    "globals()['x'] = 1\n",
+    "import importlib\nimportlib.reload(importlib)\n",
+    "import builtins\nbuiltins.open = None\n",
+    "name = 'X'\nx = getattr(object, name)\n",
+    "from pionir import auth\ndel auth.GRANTABLE_PERMISSIONS\n",
+    "from pionir import auth\nauth.GRANTABLE_PERMISSIONS |= {1}\n",
+    "from pionir import auth\nholder = [auth.PERMISSION_SCOPES]\nholder[0]['k'] = 1\n",
+    "from pionir import auth\ndef leak():\n    return auth.PERMISSION_SCOPES\nleak()['k'] = 1\n",
+    "from pionir import auth\nlist.append(auth.X, 1)\n",
+    "from unittest import mock\nmock.patch('pionir.auth.X', 1).start()\n",
+)
+
+
 class IndirectTests(_Case):
-    """A protected module changed from somewhere else: the reviewer's 3-line exploit and its
-    variants, from an allowlisted module and from a test."""
+    """A protected module changed from somewhere else: every bypass two reviews found, from an
+    allowlisted module - refused by structure (reflection, imports, taint), not by a list."""
 
     def setUp(self) -> None:
         super().setUp()
         self.repo.change({"src/pionir/approvals.py": "def requires_owner(*a):\n    return True\n",
-                          "src/pionir/auth.py": "GRANTABLE_PERMISSIONS = frozenset()\n"})
+                          "src/pionir/auth.py": "GRANTABLE_PERMISSIONS = frozenset()\n"
+                                                "PERMISSION_SCOPES = {}\nDEFAULT_GRANTS = {}\n"})
         self.base = self.repo.tree()
 
     def refused(self, path: str, text: str) -> list:
@@ -375,35 +412,26 @@ class IndirectTests(_Case):
         return problems
 
     def test_the_reviewers_exploit_is_refused(self) -> None:
-        problems = self.refused(RULE, (
-            "from pionir import approvals, auth\n"
-            "setattr(auth, 'GRANTABLE_PERMISSIONS', frozenset({'x'}))\n"
-            "approvals.requires_owner = lambda *a, **k: False\n"))
+        problems = self.refused(RULE, BYPASSES[0])
         self.assertTrue(any("setattr" in p for p in problems), problems)
-        self.assertTrue(any("attribute of an imported module" in p for p in problems), problems)
+        self.assertTrue(any("protected module" in p for p in problems), problems)
 
-    def test_every_other_way_into_another_module_is_refused(self) -> None:
-        for text in ("from pionir import auth\nm = auth\nm.GRANTABLE_PERMISSIONS = 1\n",
-                     "import pionir.auth\npionir.auth.GRANTABLE_PERMISSIONS = 1\n",
-                     "from pionir import auth\ndel auth.GRANTABLE_PERMISSIONS\n",
-                     "from pionir import auth\nauth.GRANTABLE_PERMISSIONS |= {1}\n",
-                     "import sys\nsys.modules['pionir.auth'] = object()\n",
-                     "from pionir import auth\nvars(auth)['GRANTABLE_PERMISSIONS'] = 1\n",
-                     "from pionir import auth\nauth.__dict__['X'] = 1\n",
-                     "import importlib\nfrom pionir import auth\nimportlib.reload(auth)\n",
-                     "from unittest import mock\nmock.patch('pionir.auth.X', 1).start()\n"):
+    def test_every_bypass_the_reviews_found_is_refused(self) -> None:
+        for text in BYPASSES:
             with self.subTest(text=text):
                 self.assertTrue(self.refused(RULE, text), text)
+
+    def test_the_same_from_a_test_is_refused(self) -> None:
+        for text in BYPASSES[1:6]:
+            with self.subTest(text=text):
+                self.assertTrue(self.refused("tests/test_rules.py", TEST + text), text)
 
     def test_a_test_may_not_patch_a_protected_module(self) -> None:
         test = "tests/test_rules.py"
         for line in ("        with mock.patch('pionir.approvals.requires_owner', lambda: 0):\n"
                      "            pass\n",
-                     "        with mock.patch.object(approvals, 'requires_owner', lambda: 0):\n"
-                     "            pass\n",
-                     "        mock.patch('pionir.crew.etsy.maker.check').start()\n",
-                     "        setattr(approvals, 'requires_owner', None)\n"):
-            text = ("import unittest\nfrom unittest import mock\nfrom pionir import approvals\n"
+                     "        mock.patch('pionir.crew.etsy.maker.check').start()\n"):
+            text = ("import unittest\nfrom unittest import mock\n"
                     + TEST.replace("    def test_b(self):", "    def test_c(self):\n" + line
                                    + "\n    def test_b(self):"))
             with self.subTest(line=line):
@@ -416,14 +444,57 @@ class IndirectTests(_Case):
             "lambda x: x):\n            self.assertEqual(1 + 1, 2)\n\n    def test_b(self):"))
         self.assertEqual(self.refused("tests/test_rules.py", text), [])
 
-    def test_assigning_its_own_names_is_fine(self) -> None:
-        self.assertEqual(self.refused(RULE, "class C:\n    pass\n\n\nC.x = 1\nobj = C()\n"
-                                            "obj.y = 2\nd = dict(a=1)\no = object()\n"), [])
+    def test_ordinary_code_is_fine(self) -> None:
+        self.assertEqual(self.refused(RULE, (
+            "import re\n\n\nclass C:\n    pass\n\n\nC.x = 1\nobj = C()\nobj.y = 2\n"
+            "d = dict(a=1)\nd['b'] = 2\nd.update(c=3)\no = object()\nmodules = [1]\n"
+            "pat = re.compile('x')\nv = getattr(obj, 'y', None)\n")), [])
+
+    def test_adding_an_import_of_a_protected_module_is_refused(self) -> None:
+        problems = self.refused(RULE, "from pionir.auth import DEFAULT_GRANTS\n"
+                                      "n = len(DEFAULT_GRANTS.keys())\n")
+        self.assertTrue(any("imports from a protected module" in p for p in problems), problems)
+
+    def test_taint_alone_refuses_every_write_through_an_import_already_there(self) -> None:
+        head = "from pionir import auth\nfrom pionir.auth import DEFAULT_GRANTS\n"
+        self.repo.change({RULE: head})
+        base = self.repo.tree()
+        cases = {
+            "store-attr": "auth.PERMISSION_SCOPES['k'] = 'v'\n",
+            "store-name": "DEFAULT_GRANTS['x'] = 1\n",
+            "mutate": "auth.PERMISSION_SCOPES.update({'k': 'v'})\n",
+            "walrus": "if (m := auth):\n    m.X = 1\n",
+            "default": "def f(m=auth):\n    m.X = 1\n",
+            "for": "for m in auth.ITEMS:\n    m.x = 1\n",
+            "with": "with auth as m:\n    m.X = 1\n",
+            "unpack": "a, b = auth, 1\na.X = 1\n",
+            "comprehension": "[m.update({}) for m in auth.ITEMS]\n",
+            "augassign": "auth.GRANTABLE_PERMISSIONS |= {1}\n",
+            "del": "del auth.GRANTABLE_PERMISSIONS\n",
+            "container": "holder = [auth.PERMISSION_SCOPES]\n",
+            "return": "def leak():\n    return auth.PERMISSION_SCOPES\n",
+            "argument": "print(auth.PERMISSION_SCOPES)\n",
+        }
+        for kind, line in cases.items():
+            with self.subTest(kind=kind):
+                self.repo.change({RULE: head + line})
+                problems = guard.tree_problems([RULE], base, self.repo.tree())
+                self.assertTrue(problems, kind)
+                self.assertFalse(any("reflective" in p or "imports" in p for p in problems))
+        self.repo.change({RULE: head + "n = auth.helper(1)\nx = auth.CONST + 1\n"})
+        self.assertEqual(guard.tree_problems([RULE], base, self.repo.tree()), [])  # read, call
+
+    def test_existing_code_is_not_judged_again(self) -> None:
+        old = BYPASSES[1]
+        self.repo.change({RULE: old})
+        base = self.repo.tree()
+        self.repo.change({RULE: old + "y = 2\n"})
+        self.assertEqual(guard.tree_problems([RULE], base, self.repo.tree()), [])
 
 
 class ClosureTests(unittest.TestCase):
-    """What the SECURITY CORE imports is protected too - computed from the real tree, so it can
-    never drift from it; the other protected files are protected as files only."""
+    """What protected code imports is protected too - computed from the real tree, so it can
+    never drift from it."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -438,19 +509,25 @@ class ClosureTests(unittest.TestCase):
                      "src/pionir/scheduler.py", "src/pionir/crew/gpu.py", "src/pionir/runtime.py",
                      "src/pionir/secretscrub.py", "src/pionir/economy/ledger.py",
                      "src/pionir/selfimprove/guard.py", "src/pionir/crew/improve/worker.py",
-                     "src/pionir/adapters/improve.py", "src/pionir/workapi.py"):
+                     "src/pionir/adapters/improve.py", "src/pionir/workapi.py",
+                     "src/pionir/adapters/etsy.py", "src/pionir/crew/builds/worker.py",
+                     "src/pionir/crew/runtime.py", "src/pionir/crew/workers.py",
+                     "src/pionir/crew/leader.py", "src/pionir/crew/fiverr/desk.py",
+                     "src/pionir/crew/marketplaces/paths.py", "src/pionir/crew/pool.py",
+                     "src/pionir/crew/vitals.py", "src/pionir/crew/clock.py",
+                     "src/pionir/crew/products.py"):
             with self.subTest(path=path):
                 self.assertTrue(guard.in_core(path))
                 self.assertIsNotNone(guard.protected_why(path, self.closure))
 
-    def test_what_the_core_imports_is_protected(self) -> None:
+    def test_what_protected_code_loads_is_protected(self) -> None:
         for path in ("src/pionir/crew/net.py", "src/pionir/ports.py", "src/pionir/crew/finder.py",
-                     "src/pionir/crew/blog.py", "src/pionir/atomic.py"):
+                     "src/pionir/crew/blog.py", "src/pionir/crew/etsy/maker.py"):
             with self.subTest(path=path):
-                self.assertIn(path, self.closure)
+                self.assertIsNotNone(guard.protected_why(path, self.closure))
 
     def test_the_whole_closure_is_protected(self) -> None:
-        reached = [p for p in self.files if guard.in_core(p)] + sorted(self.closure)
+        reached = [p for p in self.files if guard.protected_why(p)] + sorted(self.closure)
         for path in reached:
             for mod in guard._imported_modules(path, self.files[path].decode("utf-8"),
                                                lazy=guard.in_core(path)):
@@ -467,15 +544,33 @@ class ClosureTests(unittest.TestCase):
             patch, protected=self.closure)))
         self.assertTrue(guard.tree_problems([net], self.files, {**self.files, net: b"y = 1\n"}))
 
-    def test_a_content_rule_is_protected_but_not_what_it_imports(self) -> None:
-        self.assertIsNotNone(guard.protected_why("src/pionir/crew/etsy/rules.py"))
-        self.assertFalse(guard.in_core("src/pionir/crew/etsy/rules.py"))
-        self.assertIsNone(guard.protected_why("src/pionir/crew/etsy/maker.py", self.closure))
-
-    def test_enough_is_left_to_fix(self) -> None:
+    def test_what_is_left_to_fix(self) -> None:
         left = sorted(p for p in self.files if p.startswith("src/")
                       and not guard.protected_why(p, self.closure) and not guard.allowed_why_not(p))
-        self.assertGreaterEqual(len(left), 30, left)
+        self.assertEqual(left, ["src/pionir/crew/__main__.py", "src/pionir/crew/claudedraft.py",
+                                "src/pionir/doctor_fix.py", "src/pionir/memory_health.py",
+                                "src/pionir/video/fetch.py", "src/pionir/video/sponsor.py"])
+
+
+class FrozenTablesTests(unittest.TestCase):
+    """Defense in depth at the source: the grant, scope, spend and payout tables cannot be
+    changed at run time by anything that reaches them."""
+
+    def test_the_security_tables_are_immutable(self) -> None:
+        from pionir import auth, workapi
+        from pionir.crew import direction
+        from pionir.economy import collector, payouts
+        for name, table in (("PERMISSION_SCOPES", auth.PERMISSION_SCOPES),
+                            ("DEFAULT_GRANTS", auth.DEFAULT_GRANTS),
+                            ("RESOURCES", direction.RESOURCES),
+                            ("APPROVAL_CAPABILITIES", collector.APPROVAL_CAPABILITIES),
+                            ("PAYOUTS", payouts.PAYOUTS),
+                            ("PAYOUTS[build_staged]", payouts.PAYOUTS["build_staged"]),
+                            ("ROUTES", workapi.ROUTES)):
+            with self.subTest(name=name), self.assertRaises(TypeError):
+                table["x"] = 1
+        with self.assertRaises(AttributeError):
+            auth.GRANTABLE_PERMISSIONS.add("x")
 
 
 class CatalogueTests(_Case):

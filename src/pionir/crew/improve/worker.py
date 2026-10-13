@@ -34,7 +34,7 @@ docs/SELF_IMPROVEMENT_DESIGN.md has the design; in order, each run:
    call -> ``awaiting_owner``.
 7. **Detect** once per night in its window and **start** at most ``per_night`` (2) candidates:
    a cluster whose own words live only in a protected file is reported as **needing a human**
-   and never written; a job starts only inside its GPU window (default 05:45-07:30, opening
+   and never written; a job starts only inside its GPU window (default 05:45-07:00, opening
    in the night window; any time until it can no longer finish), only once the night builds are
    done (still busy at the last start that fits: the night is skipped, saying so), ``rest_minutes``
    after its own last job, and only as the QUIET build, which may sideline Moss's model only while she is idle (no turn with Ian for 30 minutes,
@@ -81,6 +81,7 @@ DAY = 86400.0
 DENIED_COOLDOWN = 30 * DAY
 SHELVED_COOLDOWN = 14 * DAY
 STALE_COOLDOWN = 3 * DAY
+AFTER_FIX = 2                    # sightings after a commit to its files that keep it
 REVIEW_HOURS = (1, 12)           # reviews between 01:00 and noon: one night's Claude cap
 REVIEW_ATTEMPTS = 3
 REVIEW_RETRY = 1800.0
@@ -147,7 +148,7 @@ class SelfImprover:
     live = True
     record_what = "the self-improvement worker's ledger of every candidate it proposed"
 
-    def __init__(self, spec, *, window: str = "05:45-07:30", builds_window: str = "01:00-07:00",
+    def __init__(self, spec, *, window: str = "05:45-07:00", builds_window: str = "01:00-07:00",
                  builds_budget_minutes: int = 75, budget_minutes: int = 40, per_night: int = 2,
                  threshold: int = 5, lookback_days: int = 7, fresh_hours: int = 48,
                  amber_nights: int = 3, rest_minutes: int = 10, suite_timeout_minutes: int = 40,
@@ -810,12 +811,14 @@ class SelfImprover:
             # started and after the newest commit to its files counts
             cut, label = self._current_since(ctx, where["targets"])
             if cut > cl.first_seen:
+                # it recurred often enough before; after a commit to its files, AFTER_FIX
+                # sightings show the change did not fix it
                 again = detect.merge_duplicates(detect.cluster(
-                    [s for s in sightings if s.at > cut], threshold=self.threshold,
+                    [s for s in sightings if s.at > cut], threshold=AFTER_FIX,
                     since=max(since, cut)))
                 now_cl = next((a for a in again if ({a.key, *a.also} & keys)), None)
                 if now_cl is None:
-                    skipped[cl.key] = (f"may already be fixed: fewer than {self.threshold} "
+                    skipped[cl.key] = (f"may already be fixed: fewer than {AFTER_FIX} "
                                        f"occurrences since {label}")
                     continue
                 cl = now_cl

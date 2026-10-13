@@ -9,6 +9,8 @@ UNKNOWN - never zero - and pays nothing, while the other sources still pay.
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
+from types import MappingProxyType
 import json
 import logging
 import time
@@ -22,13 +24,13 @@ from .payouts import Event, RefusalLog, pay
 log = logging.getLogger("pionir.economy")
 
 # capability of an approved action -> (payout kind, account that did the work)
-APPROVAL_CAPABILITIES: dict[str, tuple[str, str]] = {
+APPROVAL_CAPABILITIES: Mapping[str, tuple[str, str]] = MappingProxyType({
     "content.publish": ("post_approved", "posting.blog"),
     "content.crosspost_devto": ("post_approved", "posting.devto"),
     "content.newsletter_send": ("post_approved", "posting.newsletter"),
     "social.instagram_post": ("post_approved", "posting.instagram"),
     "product.gumroad_publish": ("product_published", "products.shelf"),
-}
+})
 FIVERR_ACCOUNT = "fiverr.desk"
 BUILDS_ACCOUNT = "builds.daedalus"
 API_BUILDER_ACCOUNT = "products.api_builder"

@@ -83,6 +83,8 @@ BUILD = "coding.daedalus_build"
 # and the worker skips the night. The lease ends with the job, so her model comes back.
 BUILD_QUIET = "coding.daedalus_build_quiet"
 BUILDS = frozenset({BUILD, BUILD_QUIET})
+# While a quiet build runs, Moss is asked again this often; any turn or typing cancels it.
+MOSS_WATCH_SECONDS = 60.0
 CANCEL = "coding.daedalus_build_cancel"
 SOLVE_PERMISSION = "daedalus.solve"
 BUILD_PERMISSION = "daedalus.build_sandbox"
@@ -353,6 +355,10 @@ class DaedalusAdapter:
                 ),
             ),
         )
+
+    def _watch_for(self, task: Task):
+        """What a running build asks every minute: Moss's activity, for the quiet build only."""
+        return self.moss_busy if task.capability == BUILD_QUIET else None
 
     def settle_for(self, task: Task):
         """For the quiet build only: what the scheduler asks once the lease is held and before
@@ -638,7 +644,8 @@ class DaedalusAdapter:
                 self._cancel(client, job_id)
                 raise AdapterUnavailable(f"build {build_id} was cancelled")
             detail = self._await_job(client, job_id, min(float(budget), left),
-                                     grace=self.settings.cancel_grace_seconds)
+                                     grace=self.settings.cancel_grace_seconds,
+                                     watch=self._watch_for(task))
             return self._result(task, detail, job_id=job_id)
         finally:
             with self._lock:
@@ -682,14 +689,19 @@ class DaedalusAdapter:
         return job
 
     def _await_job(self, client, job_id: str, timeout: float, *,
-                   grace: float = 0.0) -> Mapping[str, Any]:
+                   grace: float = 0.0, watch=None) -> Mapping[str, Any]:
         """Poll the job until it finishes. A few failed polls in a row are tolerated. Any
         other way out - the deadline, Daedalus gone for good, an error, an interrupt -
         cancels the job and waits for it to stop before this returns or raises. A deadline
         raises AdapterTimeout saying how far the job got, from what Daedalus reported once
-        it stopped, so a timeout is never a bare "it was too slow"."""
+        it stopped, so a timeout is never a bare "it was too slow".
+
+        ``watch`` (the quiet build only): asked every ``MOSS_WATCH_SECONDS``; the moment it
+        names a reason - Ian and Moss talking, someone typing - the job is cancelled and
+        ResourceUnavailable says why, so the lease ends and her model comes back at once."""
 
         deadline = self._monotonic() + timeout
+        next_watch = self._monotonic() + MOSS_WATCH_SECONDS
         failures = 0
         finished = False
         timed_out = False
@@ -715,6 +727,15 @@ class DaedalusAdapter:
                 if self._monotonic() >= deadline:
                     timed_out = True
                     break
+                if watch is not None and self._monotonic() >= next_watch:
+                    next_watch = self._monotonic() + MOSS_WATCH_SECONDS
+                    try:
+                        why = watch()
+                    except Exception as error:  # noqa: BLE001 - unknown is never idle
+                        why = f"Moss's activity could not be read ({type(error).__name__})"
+                    if why:
+                        raise ResourceUnavailable(
+                            f"{BUILD_QUIET}: cancelled - {why}; the card goes back to Moss")
                 self._sleep(self.settings.poll_interval_seconds)
         finally:
             if not finished:

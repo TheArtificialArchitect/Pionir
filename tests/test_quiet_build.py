@@ -164,6 +164,42 @@ class MossProbeTests(unittest.TestCase):
             settle()
 
 
+class WatchTests(unittest.TestCase):
+    """While the quiet build runs, Moss is asked again every minute; any turn cancels it."""
+
+    def adapter(self, answers, finish_after=10_000):
+        adapter = DaedalusAdapter()
+        clock = [0.0]
+        self.cancelled: list = []
+        adapter._monotonic = lambda: clock[0]
+        adapter._sleep = lambda s: clock.__setitem__(0, clock[0] + 30.0)
+        adapter._poll = lambda client, job_id: {"state": "done" if clock[0] >= finish_after
+                                                else "running"}
+        adapter._cancel = lambda client, job_id: self.cancelled.append(job_id)
+        adapter.moss_busy = lambda: answers.pop(0) if answers else None
+        self.clock = clock
+        return adapter
+
+    def test_a_turn_with_ian_cancels_the_build_and_says_why(self) -> None:
+        adapter = self.adapter([None, None, "Moss talked with Ian 0 minute(s) ago"])
+        with self.assertRaises(ResourceUnavailable) as caught:
+            adapter._await_job(None, "job-1", 3600.0, watch=adapter.moss_busy)
+        self.assertIn("Moss talked with Ian", str(caught.exception))
+        self.assertEqual(self.cancelled, ["job-1"])
+        self.assertLessEqual(self.clock[0], 4 * 60)              # within about a minute
+
+    def test_only_the_quiet_build_is_watched(self) -> None:
+        adapter = DaedalusAdapter()
+        self.assertIs(adapter._watch_for(Task(BUILD_QUIET, {})), adapter.moss_busy)
+        self.assertIsNone(adapter._watch_for(Task(BUILD, {})))
+
+    def test_a_quiet_moss_lets_it_finish(self) -> None:
+        adapter = self.adapter([], finish_after=300)
+        self.assertEqual(adapter._await_job(None, "job-2", 3600.0, watch=adapter.moss_busy),
+                         {"state": "done"})
+        self.assertEqual(self.cancelled, [])
+
+
 class SidelineTests(unittest.TestCase):
     def setUp(self) -> None:
         self._t = tempfile.TemporaryDirectory()

@@ -18,7 +18,7 @@ while she is idle, and one lease keeps every user of the build sandbox apart.
 | state | who | what |
 |---|---|---|
 | `detected` | worker (no model) | a **cluster**: one worker + one normalised reason (digits -> `N`) seen `>= 5` times in 7 days and in the last 48 h; the same failure seen from two sources (a failed run and its lesson) is ONE cluster. If its own words live only in a PROTECTED file (e.g. `crew/etsy/rules.py`), it is reported as **needs a human** and nothing is cloned or run. |
-| `writing` | Daedalus (contained) | a fresh clone of `main` in the sandbox; `coding.daedalus_build_quiet` - like a night build it may sideline Moss's model, but ONLY while she is idle (no turn with Ian for 30 min, nobody typing - asked under the lease before anything is sidelined; active -> the night is skipped), and the lease ends with the job; its window is 05:45-07:30, a start any time the job still fits once the night builds are done (still busy at the last start: the night is skipped, saying so). Its gate runs only `tests/test_regression_<id>.py`. |
+| `writing` | Daedalus (contained) | a fresh clone of `main` in the sandbox; `coding.daedalus_build_quiet` - like a night build it may sideline Moss's model, but ONLY while she is idle (no turn with Ian for 30 min, nobody typing - asked under the lease before anything is sidelined; active -> the night is skipped), and the lease ends with the job; its window is 05:45-07:00 (Moss is re-asked every minute; any turn cancels the build), a start any time the job still fits once the night builds are done (still busy at the last start: the night is skipped, saying so). Its gate runs only `tests/test_regression_<id>.py`. |
 | `verifying` | worker (contained, CPU) | the patch is read from the sandbox ONCE and FROZEN in `~/.pionir/improve/<id>/` (sha256 recorded). Every later step uses those bytes on TRUSTED trees: the owner's base in a private clone in the owner's temp folder, the frozen patch applied there. Guard first (below); then the regression test must fail **by an assertion** on base and pass with the change; then no test may fail with the change unless main fails it the same way (per test: `failure:X` / `error:X`). |
 | `reviewing` | Claude (one call, no tools) | the frozen diff + evidence + our results; only between 01:00 and noon (so it is charged to that night's cap). A rejection, a failed verification or a failed Daedalus attempt gets ONE repair; then `shelved`. |
 | `awaiting_owner` | Pionir gate | the frozen bytes re-hashed and re-guarded; `improve.apply {id, digest}` - digest = sha256 over (patch, base, tests) - parked on every call; the card shows the WHOLE diff (<= 6,000 chars). |
@@ -33,17 +33,22 @@ PROTECTED (listed with reasons, each tested): the approval gate and its surfaces
 spend rules, secrets handling, content and listing rules, the build sandbox and everything that
 runs in it, the GPU lease, CI, adapters, the crew's wiring, the test harness, dependency files, the
 self-improvement code and its tests, and every module that code imports (computed by a test) -
-and, computed at run time from the tree itself, every module the SECURITY CORE imports,
-transitively (`guard.CORE`: the approval gate and cards, auth, money/spend/Claude caps,
-secrets handling, the build sandbox, the GPU lease, the executive, and the self-improvement
-code). Other protected files (content and listing rules, settings, wiring) are protected as
-files only. On 2026-10-13: 49 of 217 modules patchable (the Etsy, Fiverr, marketplace,
-newsletter, product and results workers among them); the live Etsy "medical" clusters need a
-human (etsy/rules.py), the title-length and Printify clusters are patchable.
-A changed file may also never reach into another module: no attribute assigned, deleted or
-augmented on an imported module (or an alias of one), no setattr/delattr, no namespace writes
-(`__dict__`, `vars()`, `globals()`, `sys.modules`), no reload, no patching in src; a test may
-patch only unprotected modules, inside a `with` or decorator (never `.start()`).
+and, computed at run time from the tree itself, every module any protected file LOADS, and
+every module the SECURITY CORE imports at all (`guard.CORE`: the approval gate and cards,
+auth, money/spend/Claude caps, secrets, the build sandbox, the GPU lease, the executive, the
+adapters, the night builds, the crew's runtime/workers/leader/pool/vitals/clock/products and
+the self-improvement code). On 2026-10-13 that leaves 6 of 217 modules patchable
+(`crew/__main__.py`, `crew/claudedraft.py`, `doctor_fix.py`, `memory_health.py`,
+`video/fetch.py`, `video/sponsor.py`): most clusters are reported as needing a human.
+A changed file (src or tests) may never reach into another module - structurally, over the
+added code: no reflective or dynamic primitive at all (exec/eval/compile, `__import__`,
+importlib, set/del/getattr with a computed name, vars/globals/locals, `__dict__`/`__class__`/
+dunder setters, `sys.modules`, operator setters, builtins); no NEW import of a protected module
+or of a name from one; and TAINT - a name bound from a protected module, through assignment,
+walrus, for/with/comprehension targets, unpacking and defaults, may only be read and called:
+no store, del, augmented assignment, mutating method, and no passing it to a call, returning
+it or putting it in a container. Tests patch only unprotected modules, in a `with` or
+decorator. At the source, the grant, scope, spend and payout tables are immutable.
 Refused also: deletions, binaries, links, file modes, fewer real asserts in any test (a
 tautology is not one), removed tests, skip markers, test code touching the test machinery, any
 import of something Pionir does not import already (AST, anywhere in the file), any new

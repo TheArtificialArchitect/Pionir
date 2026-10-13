@@ -25,6 +25,7 @@ successful write (metadata only: which route, which ids - never a note or an amo
 
 from __future__ import annotations
 
+from types import MappingProxyType
 import json
 import re
 import sqlite3
@@ -41,25 +42,25 @@ MAX_BODY = 16_384
 MAX_QUERY_VALUE = 64
 _JOB_REF = re.compile(r"[^\x00-\x1f]{1,120}")
 
-_STATUS = {"bad_input": 400, "too_long": 400, "looks_like_task": 400, "not_found": 404,
+_STATUS = MappingProxyType({"bad_input": 400, "too_long": 400, "looks_like_task": 400, "not_found": 404,
            "overlap": 409, "already_open": 409, "other_timer_open": 409, "not_open": 409,
-           "stale_timer": 409, "conflict": 409, "limit": 409}
+           "stale_timer": 409, "conflict": 409, "limit": 409})
 
-_GET = {
-    "/api/work/summary": set(), "/api/work/jobs": set(),
-    "/api/work/sessions": {"job", "from", "to", "limit", "deleted"},
-    "/api/work/log": {"job", "kind", "from", "to", "limit"},
-}
-_POST = {
-    "/api/work/timer/start": {"job", "note", "allow_concurrent"},
-    "/api/work/timer/stop": {"job", "end", "note"},
-    "/api/work/session": {"id", "job", "start", "end", "note"},
-    "/api/work/log": {"job", "kind", "text", "amount_cents", "ts"},
-    "/api/work/job": {"id", "name", "kind", "hourly_rate_cents", "currency", "set_aside_pct",
-                      "active"},
-}
-_DELETE = {"/api/work/session": {"id"}, "/api/work/log": {"id"}}
-ROUTES = {"GET": _GET, "POST": _POST, "DELETE": _DELETE}
+_GET = MappingProxyType({
+    "/api/work/summary": frozenset(), "/api/work/jobs": frozenset(),
+    "/api/work/sessions": frozenset({"job", "from", "to", "limit", "deleted"}),
+    "/api/work/log": frozenset({"job", "kind", "from", "to", "limit"}),
+})
+_POST = MappingProxyType({
+    "/api/work/timer/start": frozenset({"job", "note", "allow_concurrent"}),
+    "/api/work/timer/stop": frozenset({"job", "end", "note"}),
+    "/api/work/session": frozenset({"id", "job", "start", "end", "note"}),
+    "/api/work/log": frozenset({"job", "kind", "text", "amount_cents", "ts"}),
+    "/api/work/job": frozenset({"id", "name", "kind", "hourly_rate_cents", "currency", "set_aside_pct",
+                      "active"}),
+})
+_DELETE = MappingProxyType({"/api/work/session": frozenset({"id"}), "/api/work/log": frozenset({"id"})})
+ROUTES = MappingProxyType({"GET": _GET, "POST": _POST, "DELETE": _DELETE})
 
 
 class BadRequest(ValueError):

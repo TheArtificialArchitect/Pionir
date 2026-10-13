@@ -445,7 +445,7 @@ class PipelineTests(_Case):
         self.assertIn(CHECK, job.payload["intent"])
         self.assertIn(prompts.regression_file(c["id"]), job.payload["intent"])
         self.assertIn(MAKER, job.payload["intent"])
-        self.assertLessEqual(job.payload["not_after"], at(5, 7, 30))       # done by 07:30
+        self.assertLessEqual(job.payload["not_after"], at(5, 7, 0))       # done by 07:30
         self.daedalus()
         self.through_review()
         [c] = self.cands()
@@ -637,6 +637,16 @@ class CurrentCodeTests(_Case):
         self.assertEqual(medical["count"], 5)            # 00:00-04:00 on the 5th
         self.assertIn("commit", medical["counted_since"])
 
+    def test_two_occurrences_after_a_fix_keep_it_one_does_not(self) -> None:
+        COMMIT_DATE["date"] = "2026-10-05T02:30:00"         # medical seen at 03:00 and 04:00
+        commit(self.repo, {MAKER: CHECKER + "# tried\n"}, "a fix that did not work")
+        [medical] = self.night()["eligible"]
+        self.assertEqual(medical["count"], 2)
+        self.state.joinpath("builds.improve.json").unlink()
+        COMMIT_DATE["date"] = "2026-10-05T03:30:00"         # only the 04:00 one is after
+        commit(self.repo, {MAKER: CHECKER + "# tried again\n"}, "another")
+        self.assertEqual(self.night()["eligible"], [])
+
     def test_without_a_fix_both_stand(self) -> None:
         self.assertEqual(len(self.night()["eligible"]), 2)
 
@@ -667,9 +677,9 @@ class GpuTests(_Case):
         self.run_at(at(5, 5, 46))                      # it no longer does: the builds are done
         self.assertEqual(len(self.pionir.builds()), 1)
 
-    def test_nothing_starts_outside_its_window_or_when_it_cannot_finish_by_0730(self) -> None:
+    def test_nothing_starts_outside_its_window_or_when_it_cannot_finish_by_0700(self) -> None:
         self.run_at(at(5, 7, 45))
-        self.run_at(at(5, 7, 0))                       # 07:00 + 40 min is past 07:30
+        self.run_at(at(5, 6, 30))                      # 06:30 + 40 min is past 07:00
         self.assertEqual(self.pionir.builds(), [])
 
     def test_a_typical_night_starts_once_the_builds_finish(self) -> None:
@@ -686,19 +696,19 @@ class GpuTests(_Case):
                           encoding="utf-8")
         self.run_at(at(5, 6, 15))
         self.assertEqual(len(self.pionir.builds()), 1)
-        self.assertLessEqual(self.pionir.builds()[0].payload["not_after"], at(5, 7, 30))
+        self.assertLessEqual(self.pionir.builds()[0].payload["not_after"], at(5, 7, 0))
 
     def test_builds_busy_past_the_last_start_skip_the_night_saying_so(self) -> None:
         self.state.mkdir(parents=True)
         (self.state / "builds.daedalus.json").write_text(json.dumps(
             {"active": {"slug": "tool", "task_id": "t-9"}}), encoding="utf-8")
         t = at(5, 5, 45)
-        while t <= at(5, 7, 20):
+        while t <= at(5, 6, 55):
             self.run_at(t)
             t += 300
         self.assertEqual(self.pionir.builds(), [])
         why = self.record()["nights"]["2026-10-05"]["why_none"]
-        self.assertIn("night builds were still busy at 06:50", why)
+        self.assertIn("night builds were still busy at 06:20", why)
 
     def test_a_night_build_in_flight_or_waiting_keeps_the_card(self) -> None:
         self.state.mkdir(parents=True)
@@ -1032,7 +1042,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(w.division, "builds")
         self.assertEqual(w.per_night, 2)
         self.assertEqual(w.threshold, 5)
-        self.assertEqual(w.window.describe(), "05:45-07:30 local time")
+        self.assertEqual(w.window.describe(), "05:45-07:00 local time")
 
 
 if __name__ == "__main__":

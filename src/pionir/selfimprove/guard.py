@@ -225,6 +225,8 @@ def protected_why(path: str, extra: dict | None = None) -> str | None:
     for pattern, why in PROTECTED:
         if _match(p, pattern):
             return why
+    if in_core(p):
+        return "the security core (what the gate, its money, its secrets and its sandbox run)"
     if extra:
         return extra.get(p)
     return None
@@ -312,7 +314,10 @@ CORE: tuple = (
     "src/pionir/shared_gpu.py", "src/pionir/scheduler.py", "src/pionir/crew/gpu.py",
     "src/pionir/ollama_gate.py",
     "src/pionir/runtime.py", "src/pionir/registry.py", "src/pionir/reliability.py",
-    "src/pionir/adapters/daedalus.py",
+    "src/pionir/adapters/**", "src/pionir/crew/builds/**", "src/pionir/crew/runtime.py",
+    "src/pionir/crew/workers.py", "src/pionir/crew/leader.py", "src/pionir/crew/fiverr/desk.py",
+    "src/pionir/crew/marketplaces/paths.py", "src/pionir/crew/pool.py", "src/pionir/crew/vitals.py",
+    "src/pionir/crew/clock.py", "src/pionir/crew/products.py",
     "src/pionir/selfimprove/**", "src/pionir/crew/improve/**", "src/pionir/adapters/improve.py",
     "src/pionir/improvecli.py", "src/pionir/improvement.py",
 )
@@ -323,11 +328,12 @@ def in_core(path: str) -> bool:
 
 
 def protected_closure(files: dict) -> dict:
-    """{path: why} for every Pionir module the SECURITY CORE imports, transitively: changing
-    one of those changes what the core runs, so it is protected too. A core file counts every
-    import (inside its functions too: they run); a module it pulls in counts the imports that
-    run when it is imported. ``files``: the repo's tree (path -> bytes or text)."""
-    start = [p for p in files if p.endswith(".py") and p.startswith("src/") and in_core(p)]
+    """{path: why} for every Pionir module a protected module imports, transitively: changing
+    one of those changes what protected code runs, so it is protected too. Every protected file
+    counts the imports that run when it is LOADED; a SECURITY CORE file counts every import
+    (inside its functions too: they run). ``files``: the repo's tree (path -> bytes or text)."""
+    start = [p for p in files if p.endswith(".py") and p.startswith("src/") and
+             protected_why(p)]
     seen = set(start)
     todo = [(p, p) for p in start]
     out: dict = {}
@@ -338,13 +344,35 @@ def protected_closure(files: dict) -> dict:
             if dep is None or dep in seen:
                 continue
             seen.add(dep)
-            out[dep] = f"imported by the security core ({root})"
+            out[dep] = f"imported by protected code ({root})"
             todo.append((dep, root))
     return out
 
 
 # ---- changing a protected module from somewhere else -----------------------------------------
-_PATCH_FORMS = frozenset({"object", "dict", "multiple"})
+# Structural, not a list of tricks. Over a changed Python file (src or tests), counted against the
+# file before the change so only ADDED code is judged:
+#  a. no reflective or dynamic primitive at all (``REFLECTIVE``; ``getattr`` only with a literal
+#     name on something that is not another module's; ``type()`` never on such a thing);
+#  b. no NEW import of a protected module, or of a name from one;
+#  c. TAINT: a name bound from a protected module (or from an expression rooted at one) is
+#     tainted, through assignment, walrus, for/with/comprehension targets, unpacking and default
+#     arguments. On a tainted root, code may only READ attributes and CALL them: no store, del or
+#     augmented assignment, no mutating method (``MUTATORS``), and no tainted object (not a call
+#     result) passed to a call, returned, yielded or put in a container;
+#  d. a test patches only unprotected modules, inside a ``with`` or decorator (never ``.start()``).
+REFLECTIVE = frozenset({
+    "exec", "eval", "compile", "__import__", "importlib", "import_module", "reload", "setattr",
+    "delattr", "vars", "globals", "locals", "__dict__", "__class__", "__setattr__",
+    "__delattr__", "__setitem__", "__delitem__", "__getattribute__", "__globals__", "__code__",
+    "__closure__", "__subclasses__", "__mro__", "__bases__", "builtins", "__builtins__",
+    "setitem", "delitem", "attrgetter", "methodcaller", "modules", "__loader__", "__spec__",
+})
+MUTATORS = frozenset({
+    "update", "append", "extend", "add", "insert", "pop", "popitem", "remove", "discard", "clear",
+    "setdefault", "sort", "reverse", "__setitem__", "__delitem__", "__setattr__", "__delattr__",
+    "difference_update", "intersection_update", "symmetric_difference_update", "write",
+})
 
 
 def _is_patcher(node) -> bool:
@@ -358,7 +386,7 @@ def _is_patcher(node) -> bool:
         owner_name = owner.attr if isinstance(owner, ast.Attribute) else owner.id if isinstance(
             owner, ast.Name) else ""
         return fn.attr.startswith("patch") or owner_name == "monkeypatch" or (
-            fn.attr in _PATCH_FORMS and owner_name.startswith("patch"))
+            fn.attr in ("object", "dict", "multiple") and owner_name.startswith("patch"))
     return False
 
 
@@ -368,114 +396,184 @@ def _call_name(node) -> str:
 
 
 def _root(node):
-    while isinstance(node, (ast.Attribute, ast.Subscript)):
+    """The name an expression is rooted at through attributes, subscripts and stars - None for
+    a call's result or anything computed."""
+    while isinstance(node, (ast.Attribute, ast.Subscript, ast.Starred)):
         node = node.value
     return node.id if isinstance(node, ast.Name) else None
 
 
-def _mutations(source: str, *, test: bool, is_protected) -> dict | None:
-    """Counts of every way the file could change ANOTHER module: an attribute assigned,
-    deleted or augmented on an imported name (or an alias of one), setattr/delattr, a write
-    to a namespace (``__dict__``, ``vars()``, ``globals()``, ``sys.modules``), a reload, and
-    patching - which a test may do only through ``unittest.mock`` and never on a protected
-    module. None when it does not parse."""
+def _names(target) -> set:
+    return {n.id for n in ast.walk(target) if isinstance(n, ast.Name)}
+
+
+def _carries(expr, tainted: set) -> bool:
+    """Whether ``expr`` holds a tainted object itself (not only a call's result)."""
+    todo = [expr]
+    while todo:
+        node = todo.pop()
+        if isinstance(node, ast.Call):
+            continue                    # what a call returns is not the module's object
+        if isinstance(node, ast.Name) and node.id in tainted:
+            return True
+        todo.extend(ast.iter_child_nodes(node))
+    return False
+
+
+def _reach(source: str, *, path: str, module_protected) -> dict | None:
+    """Counts of every way the file could reach into ANOTHER (protected) module - the rules
+    above. None when it does not parse."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return None
-    imported, origin = set(), {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for a in node.names:
-                imported.add((a.asname or a.name).split(".")[0])
-                origin[a.asname or a.name.split(".")[0]] = \
-                    a.name if a.asname else a.name.split(".")[0]
-        elif isinstance(node, ast.ImportFrom):
-            for a in node.names:
-                imported.add(a.asname or a.name)
-                origin[a.asname or a.name] = f"{node.module or ''}.{a.name}"
-    for _ in range(3):                  # aliases: m = auth; m.X = ...
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and isinstance(node.value, (ast.Name, ast.Attribute)) \
-                    and _root(node.value) in imported:
-                imported |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    test = path.startswith("tests/")
+    name = module_name_of(path) or ""
+    package = name if path.endswith("__init__.py") else name.rsplit(".", 1)[0]
     counts: dict = {}
 
     def bump(kind: str) -> None:
         counts[kind] = counts.get(kind, 0) + 1
 
-    def target(t) -> None:
-        if isinstance(t, (ast.Tuple, ast.List)):
-            for e in t.elts:
-                target(e)
-            return
-        if isinstance(t, ast.Attribute) and _root(t) in imported:
-            bump("assigns or deletes an attribute of an imported module")
-        if isinstance(t, ast.Subscript):
-            inner = t.value
-            if (isinstance(inner, ast.Attribute) and inner.attr in ("__dict__", "modules")) or \
-                    (isinstance(inner, ast.Call) and _call_name(inner) in ("vars", "globals")):
-                bump("writes a module's namespace")
+    tainted: set = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] in REFLECTIVE or a.name in REFLECTIVE:
+                    bump(f"uses a reflective primitive ({a.name})")
+                if module_protected(a.name):
+                    bump(f"imports a protected module ({a.name})")
+                    tainted.add(a.asname or a.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                up = package.split(".")
+                mod = ".".join(up[:len(up) - node.level + 1] + ([node.module] if node.module
+                                                                 else []))
+            else:
+                mod = node.module or ""
+            if mod.split(".")[0] in REFLECTIVE:
+                bump(f"uses a reflective primitive ({mod})")
+            for a in node.names:
+                if a.name in REFLECTIVE:
+                    bump(f"uses a reflective primitive ({a.name})")
+                full = f"{mod}.{a.name}"
+                if module_protected(full):
+                    bump(f"imports from a protected module ({full})")
+                    tainted.add(a.asname or a.name)
+    # taint flows through every binding, to a fixed point
+    for _ in range(8):
+        before = len(tainted)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign) and _carries(node.value, tainted):
+                for t in node.targets:
+                    tainted |= _names(t)
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None \
+                    and _carries(node.value, tainted):
+                tainted |= _names(node.target)
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)) and \
+                    _carries(node.iter, tainted):
+                tainted |= _names(node.target)
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    if item.optional_vars is not None and _carries(item.context_expr, tainted):
+                        tainted |= _names(item.optional_vars)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                args = node.args
+                positional = args.posonlyargs + args.args
+                for arg, default in zip(positional[len(positional) - len(args.defaults):],
+                                        args.defaults):
+                    if _carries(default, tainted):
+                        tainted.add(arg.arg)
+                for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+                    if default is not None and _carries(default, tainted):
+                        tainted.add(arg.arg)
+        if len(tainted) == before:
+            break
+
+    def store(target) -> None:
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for e in target.elts:
+                store(e)
+        elif isinstance(target, (ast.Attribute, ast.Subscript, ast.Starred)) and \
+                _root(target) in tainted:
+            bump("stores into or deletes from a protected module's data")
 
     for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in REFLECTIVE and node.id != "modules":
+            bump(f"uses a reflective primitive ({node.id})")
+        elif isinstance(node, ast.Attribute) and node.attr in REFLECTIVE and \
+                node.attr != "compile":                     # re.compile is not compile()
+            bump(f"uses a reflective primitive ({node.attr})")
         if isinstance(node, ast.Assign):
             for t in node.targets:
-                target(t)
+                store(t)
         elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
-            target(node.target)
+            store(node.target)
         elif isinstance(node, ast.Delete):
             for t in node.targets:
-                target(t)
-        elif isinstance(node, ast.Attribute) and node.attr == "__dict__" and not test:
-            bump("reaches into a namespace (__dict__)")
+                store(t)
+        elif isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)) and \
+                node.value is not None and _carries(node.value, tainted):
+            bump("hands out a protected module's object")
+        elif isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict)) and any(
+                _carries(e, tainted) for e in ast.iter_child_nodes(node)
+                if not isinstance(e, ast.expr_context)):
+            bump("puts a protected module's object in a container")
         elif isinstance(node, ast.Call):
-            name = _call_name(node)
+            fn = node.func
+            call = _call_name(node)
+            if isinstance(fn, ast.Attribute) and _root(fn) in tainted and (
+                    fn.attr in MUTATORS or (fn.attr.startswith("__i") and fn.attr.endswith("__"))):
+                bump(f"mutates a protected module's data (.{fn.attr})")
+            for arg in [*node.args, *[k.value for k in node.keywords]]:
+                if _carries(arg, tainted):
+                    bump("passes a protected module's object to a call")
             first = node.args[0] if node.args else None
-            if name in ("setattr", "delattr"):
-                if not test or (first is not None and _root(first) in imported):
-                    bump("calls setattr/delattr on another object")
-            elif name == "reload":
-                bump("reloads a module")
-            elif name in ("vars", "globals") and not test:
-                bump("reads a namespace to change it (vars/globals)")
+            if call == "getattr":
+                literal = len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
+                if not literal or (first is not None and _carries(first, tainted)):
+                    bump("uses getattr with a computed name or on a protected module")
+            elif call == "type" and len(node.args) == 1 and _carries(first, tainted):
+                bump("calls type() on a protected module's object")
             elif _is_patcher(node):
                 if not test:
                     bump("patches another module")
                 elif isinstance(first, ast.Constant) and isinstance(first.value, str) and \
-                        first.value.startswith("pionir"):
-                    if is_protected(first.value.split(":")[0]):
-                        bump("patches a protected module")
-                elif first is not None and _root(first) in origin and \
-                        is_protected(origin[_root(first)]):
+                        module_protected(first.value.split(":")[0]):
                     bump("patches a protected module")
-            elif name == "start" and isinstance(node.func, ast.Attribute) and \
-                    isinstance(node.func.value, ast.Call) and \
-                    _call_name(node.func.value).startswith("patch"):
+            elif call == "start" and isinstance(fn, ast.Attribute) and \
+                    isinstance(fn.value, ast.Call) and _is_patcher(fn.value):
                 bump("starts a patcher outside a with/decorator scope")
     return counts
 
 
 def indirect_problems(path: str, old, new, *, protected=None, files=()) -> list:
-    """What a changed Python file would do to OTHER modules (``_mutations``), counted against
-    the file before the change - any new way is refused."""
-    test = path.startswith("tests/")
+    """What a changed Python file would do to OTHER modules (``_reach``), counted against the
+    file before the change - any new way is refused."""
     extra = protected or {}
 
-    def is_protected(dotted: str) -> bool:
+    def module_protected(dotted: str) -> bool:
         """Whether the module that owns ``dotted`` (a module, or an attribute of one) is
-        protected: the longest prefix that is a module of the tree is the one checked."""
+        protected - or is a package's ``__init__`` (``import pionir`` reaches everything)."""
         mod = dotted
-        while mod and "." in mod:
-            dep = _path_for(mod, files)
+        while mod and (mod.startswith("pionir.") or mod == "pionir"):
+            dep = _path_for(mod, files) if files else None
+            if dep is None and not files:
+                dep = "src/" + mod.replace(".", "/") + ".py"
+                if protected_why(dep, extra):
+                    return True
+                dep = None
             if dep is not None:
-                return bool(protected_why(dep, extra))
+                return bool(protected_why(dep, extra)) or dep.endswith("__init__.py")
+            if "." not in mod:
+                return False
             mod = mod.rpartition(".")[0]
         return False
 
-    after = _mutations(_text(new), test=test, is_protected=is_protected)
+    after = _reach(_text(new), path=path, module_protected=module_protected)
     if after is None:
         return []
-    before = _mutations(_text(old), test=test, is_protected=is_protected) if old else {}
+    before = _reach(_text(old), path=path, module_protected=module_protected) if old else {}
     before = before or {}
     return [f"{path} {kind}: a change here never reaches into another module"
             for kind, n in sorted(after.items()) if n > before.get(kind, 0)]

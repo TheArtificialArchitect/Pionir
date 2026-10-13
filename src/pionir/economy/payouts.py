@@ -11,6 +11,7 @@ separate from the approval / money gate: nothing here is consulted by it.
 """
 from __future__ import annotations
 
+from types import MappingProxyType
 import json
 import logging
 import time
@@ -24,14 +25,14 @@ from .ledger import ACCOUNT_RE, Ledger, LedgerBroken, LedgerError, Row
 
 log = logging.getLogger("pionir.economy")
 
-PAYOUTS: dict[str, dict[str, int]] = {
-    "build_staged": {"base": 25},
-    "post_approved": {"base": 10, "excellence": 5},
-    "order_delivered": {"base": 30},
-    "product_published": {"base": 40, "excellence": 10},
+PAYOUTS = MappingProxyType({
+    "build_staged": MappingProxyType({"base": 25}),
+    "post_approved": MappingProxyType({"base": 10, "excellence": 5}),
+    "order_delivered": MappingProxyType({"base": 30}),
+    "product_published": MappingProxyType({"base": 40, "excellence": 10}),
     # scales with the cents newly received, capped per payout: 1 Bolt per $1, at most 100
-    "revenue_received": {"base": 0, "cents_per_bolt": 100, "max": 100},
-}
+    "revenue_received": MappingProxyType({"base": 0, "cents_per_bolt": 100, "max": 100}),
+})
 
 DAILY_CAP_PER_ACCOUNT = 100
 DAILY_CAP_GLOBAL = 500
