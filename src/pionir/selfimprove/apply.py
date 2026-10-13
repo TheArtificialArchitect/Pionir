@@ -4,11 +4,14 @@ Run ONLY on Ian's yes (``improve.apply``, parked on every call) and by Ian himse
 (``python -m pionir improve undo <id>``). Never a push, a restart, a force or a reset of his
 work:
 
-- **apply**: the repo must be on ``main`` with no change to a tracked file, and the candidate's
-  base commit must be HEAD or an ancestor of it. The patch is checked against the INDEX
-  (``git apply --check --cached``: the repo's line endings are left to git), applied there,
-  committed as ONE commit whose message names the candidate, and the changed files are then
-  written out from that commit. Main moved so that it no longer applies cleanly -> **stale**
+- **apply**: exactly the bytes the caller read and hashed once (written to a private temporary
+  file). The guard runs first on the diff. The repo must be on ``main`` with no change to a
+  tracked file, nothing of Ian's (an untracked or ignored file, a change) where the patch
+  writes, and the candidate's base commit must be HEAD or an ancestor of it. The patch is checked
+  against the INDEX (``git apply --check --cached``: the repo's line endings are left to git),
+  applied there, the guard runs AGAIN on the trees in his index (asserts per test, imports, the
+  catalogue), and only then is it committed as ONE commit whose message names the candidate and
+  are the changed files written out from that commit. Main moved so that it no longer applies cleanly -> **stale**
   ("will re-propose"), nothing touched. The candidate's targeted tests then run in the repo; red
   -> the commit is reverted at once (FUSION_PLAN Phase 3: restore the incumbent on failure).
 - **undo**: ``git revert`` of exactly the commit that applied it, only on a clean ``main`` that
@@ -26,7 +29,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import runner
-from .guard import changed_paths
+from .guard import parse_patch, patch_problems, tree_problems
 
 GIT_TIMEOUT = 120
 TEST_TIMEOUT = 900.0
@@ -87,12 +90,19 @@ def repo_state(repo: Path, git: Git) -> str | None:
     return None
 
 
-def apply_patch(repo, patch_file, cid: str, base: str, *, title: str, tests: list,
-                approval: str = "", git: Git = real_git, run: Run = real_run,
+def apply_patch(repo, patch: bytes, cid: str, base: str, *, title: str, tests: list,
+                approval: str = "", known=frozenset(), git: Git = real_git, run: Run = real_run,
                 python: str = sys.executable, test_timeout: float = TEST_TIMEOUT) -> dict:
     """``{"applied": True, "commit", "tests", ...}``, ``{"applied": False, "stale": True,
-    "why"}`` or ``{"applied": False, "error"}``. See the module docstring."""
-    repo, patch_file = Path(repo), Path(patch_file)
+    "why"}`` or ``{"applied": False, "error"}``. ``patch`` is the exact bytes Ian approved (the
+    caller read and hashed them once); they are written to a private temporary file and only
+    that file is applied. See the module docstring."""
+    repo = Path(repo)
+    text = patch.decode("utf-8", "replace")
+    problems = patch_problems(text, known_imports=known)
+    if problems:
+        return {"applied": False, "error": "the protected list refuses it: "
+                                           + "; ".join(problems[:4])}
     why = repo_state(repo, git)
     if why:
         return {"applied": False, "stale": True, "why": why + "; will re-propose"}
@@ -105,15 +115,46 @@ def apply_patch(repo, patch_file, cid: str, base: str, *, title: str, tests: lis
         return {"applied": False, "stale": True,
                 "why": f"main no longer contains its base {base[:10]} (history moved); "
                        "will re-propose"}
-    rc, out = git(["apply", "--check", "--cached", str(patch_file)], repo)
-    if rc != 0:
-        return {"applied": False, "stale": True,
-                "why": f"main moved and the patch no longer applies cleanly "
-                       f"({_clip(out, 200)}); stale, will re-propose"}
-    rc, out = git(["apply", "--cached", str(patch_file)], repo)
+    changes = parse_patch(text)
+    paths = [f.path for f in changes]
+    for f in changes:
+        # nothing of Ian's in the way: no untracked or changed file where the patch writes,
+        # and no file at all (ignored ones included) where it adds one
+        if f.status == "added" and (repo / f.path).exists():
+            return {"applied": False, "stale": True,
+                    "why": f"{f.path} already exists in {repo} (untracked or ignored); "
+                           "nothing is written over it; will re-propose"}
+        rc, out = git(["status", "--porcelain", "--untracked-files=all", "--", f.path], repo)
+        if rc != 0 or out.strip():
+            return {"applied": False, "stale": True,
+                    "why": f"{f.path} has changes of yours in {repo}; nothing is written over "
+                           "them; will re-propose"}
+    with tempfile.TemporaryDirectory(prefix="pionir-improve-") as tmp:
+        patch_file = Path(tmp) / "patch.diff"
+        patch_file.write_bytes(patch)
+        rc, out = git(["apply", "--check", "--cached", str(patch_file)], repo)
+        if rc != 0:
+            return {"applied": False, "stale": True,
+                    "why": f"main moved and the patch no longer applies cleanly "
+                           f"({_clip(out, 200)}); stale, will re-propose"}
+        rc, out = git(["apply", "--cached", str(patch_file)], repo)
     if rc != 0:
         git(["reset", "-q"], repo)
         return {"applied": False, "error": f"git apply failed: {_clip(out, 200)}"}
+    # the guard once more, on the trees as they now are in Ian's own index
+    before, after = {}, {}
+    for path in paths:
+        rc, out = git(["show", f"HEAD:{path}"], repo)
+        if rc == 0:
+            before[path] = out.encode("utf-8")
+        rc, out = git(["show", f":{path}"], repo)
+        if rc == 0:
+            after[path] = out.encode("utf-8")
+    problems = tree_problems(paths, before, after, known=known)
+    if problems:
+        git(["reset", "-q"], repo)               # the index back to HEAD; nothing else touched
+        return {"applied": False, "error": "the protected list refuses it: "
+                                           + "; ".join(problems[:4])}
     message = (f"Self-improvement {cid}: {_clip(title, 100)}\n\n"
                f"Candidate {cid}, proposed by the crew's builds.improve worker (Daedalus "
                f"wrote it, Claude reviewed it) and approved by Ian"
@@ -125,7 +166,6 @@ def apply_patch(repo, patch_file, cid: str, base: str, *, title: str, tests: lis
         return {"applied": False, "error": f"git commit failed: {_clip(out, 200)}"}
     rc, commit = git(["rev-parse", "HEAD"], repo)
     commit = commit.strip()
-    paths = changed_paths(patch_file.read_text(encoding="utf-8", errors="replace"))
     if paths:
         git(["checkout", "HEAD", "--", *paths], repo)
     result = {"applied": True, "commit": commit, "paths": paths}

@@ -147,6 +147,12 @@ def run_step(step: Step, *, setup, spawner=None, clock: Callable[[], str] = _now
     from pionir import build_sandbox as bs
 
     argv = [str(setup.python) if step.argv[0] == "python" else step.argv[0], *step.argv[1:]]
+    lease = bs.SandboxLease(setup, "the video tutorial runner")
+    try:
+        lease.acquire()                 # never reap under another user of the sandbox
+    except (bs.SandboxBusy, OSError) as exc:
+        raise TutorialError(f"step {step.id!r} did not run: {exc}; try again when it is "
+                            "free") from exc
     work = Path(setup.runs_dir) / f"tutorial-{secrets.token_hex(6)}"
     try:
         product = work / "product"
@@ -174,6 +180,7 @@ def run_step(step: Step, *, setup, spawner=None, clock: Callable[[], str] = _now
                 pass
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        lease.release()
     return _evidence(step, done.returncode, done.timed_out, done.stdout, SANDBOX_RUNNER, _now)
 
 

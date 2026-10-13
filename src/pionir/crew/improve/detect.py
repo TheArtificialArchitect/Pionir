@@ -102,6 +102,7 @@ class Cluster:
     last_seen: float
     samples: list = field(default_factory=list)
     example: str = ""       # one reason in its own words (targets are found from it)
+    also: list = field(default_factory=list)    # keys of the same failure seen elsewhere
 
     @property
     def key(self) -> str:
@@ -117,7 +118,8 @@ class Cluster:
                 "count": self.count, "window_days": days,
                 "first_seen": iso(self.first_seen), "last_seen": iso(self.last_seen),
                 "first_seen_at": self.first_seen, "last_seen_at": self.last_seen,
-                "samples": [_clip(s, 300) for s in self.samples[:MAX_SAMPLES]]}
+                "samples": [_clip(s, 300) for s in self.samples[:MAX_SAMPLES]],
+                "also": list(self.also)}
 
 
 def cluster(sightings, *, threshold: int, since: float) -> list:
@@ -341,32 +343,88 @@ def _fragments(raw: str) -> list:
     return frags[:4]
 
 
-def find_targets(repo, c: Cluster, *, limit: int = 4) -> list:
-    """The source files that hold this reason's own words (the check that says it) or name
-    the worker - read from the owner's repo, never protected ones - and the catalogue, where a
-    crew worker's settings live."""
+def locate(repo, c: Cluster, *, limit: int = 4) -> dict:
+    """Where a fix would go, read from the owner's repo: ``targets`` - the unprotected source
+    files that hold this reason's own words (the check that says it) or name the worker, and
+    the catalogue where a crew worker's settings live - and ``protected`` - the PROTECTED files
+    that hold its words. When the words are found only in protected files (the Etsy listing
+    rules, the content check...), no agent may fix it: ``needs_human`` says so before anything
+    is cloned or written."""
     root = Path(repo) / "src" / "pionir" if repo else None
     if root is None or not root.is_dir():
-        return []
+        return {"targets": [], "protected": [], "needs_human": None}
     frags = _fragments(c.example)
-    scored = []
+    scored, guarded = [], []
     for path in sorted(root.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
         rel = path.relative_to(Path(repo)).as_posix()
-        if protected_why(rel):
-            continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        score = sum(3 for f in frags if f in text) + (1 if c.worker in text else 0)
+        words = sum(3 for f in frags if f in text)
+        if protected_why(rel):
+            if words:
+                guarded.append(rel)
+            continue
+        score = words + (1 if c.worker in text else 0)
         if score:
-            scored.append((-score, rel))
-    found = [rel for _score, rel in sorted(scored)[:limit]]
+            scored.append((-score, -words, rel))
+    ranked = sorted(scored)
+    found = [rel for _score, _words, rel in ranked[:limit]]
+    worded = [rel for _score, words, rel in ranked if words]
+    needs = None
+    if guarded and not worded:
+        needs = (f"needs a human: it touches a protected rule ({', '.join(guarded[:3])} - "
+                 f"{protected_why(guarded[0])})")
     if c.source in ("outputs", "runs", "vitals") and "." in c.worker:
         found.append("src/pionir/crew/catalogue.json")
-    return found
+    return {"targets": found, "protected": guarded[:4], "needs_human": needs}
+
+
+def find_targets(repo, c: Cluster, *, limit: int = 4) -> list:
+    return locate(repo, c, limit=limit)["targets"]
+
+
+def _agent(c: Cluster) -> str:
+    """What a cluster is about, as one word: a lesson's agent ("printify" of "printify ·
+    ..."), else the worker's last part."""
+    return c.worker.split(".")[0].lower()
+
+
+def _same_failure(a: Cluster, b: Cluster) -> bool:
+    """Two clusters that are one failure seen twice: the same worker with one reason inside
+    the other ("committed nothing" / "committed nothing new"), or a lesson about an agent and a
+    worker's own record naming that agent over the same days (the Printify catalog failure is
+    both a failed run of etsy.pod and a recurring lesson)."""
+    overlap = a.first_seen <= b.last_seen and b.first_seen <= a.last_seen
+    if a.worker == b.worker and (a.reason in b.reason or b.reason in a.reason):
+        return True
+    for lesson, other in ((a, b), (b, a)):
+        if lesson.source == "lessons" and other.source != "lessons" and overlap:
+            agent = _agent(lesson)
+            if agent and agent != "lessons" and (agent in other.reason or
+                                                 agent in other.worker.lower()):
+                return True
+    return False
+
+
+def merge_duplicates(clusters: list) -> list:
+    """One cluster per failure: a duplicate (``_same_failure``) is folded into the cluster
+    seen most - the count is the larger of the two (the same events, not more of them), the
+    first and last sightings the widest, and its key kept in ``also`` so dedupe sees both."""
+    out: list = []
+    for c in sorted(clusters, key=lambda c: (-c.count, -c.last_seen, c.key)):
+        into = next((k for k in out if _same_failure(k, c)), None)
+        if into is None:
+            c.also = []
+            out.append(c)
+            continue
+        into.first_seen = min(into.first_seen, c.first_seen)
+        into.last_seen = max(into.last_seen, c.last_seen)
+        into.also.append(c.key)
+    return out
 
 
 def hypothesis(c: Cluster, targets: list, days: int) -> str:

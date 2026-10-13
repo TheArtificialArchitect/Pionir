@@ -13,7 +13,6 @@ from __future__ import annotations
 import io
 import json
 import subprocess
-import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -32,9 +31,9 @@ CID = "imp-20261012-ab12"
 REG = "tests/test_regression_imp_20261012_ab12.py"
 RULES = "def check(label):\n    if 'medical' in label:\n        return 'a claim'\n    return None\n"
 FIXED = "def check(label):\n    return None\n"
-REGRESSION = ("import unittest\n\nfrom pionir.crew.etsy import rules\n\n\n"
+REGRESSION = ("import unittest\n\nfrom pionir.crew.etsy import maker\n\n\n"
               "class T(unittest.TestCase):\n    def test_it(self):\n"
-              "        self.assertIsNone(rules.check('medical'))\n")
+              "        self.assertIsNone(maker.check('medical'))\n")
 
 
 def git(cwd, *args) -> str:
@@ -68,14 +67,14 @@ class _Case(unittest.TestCase):
         self.base = commit(self.repo, {"src/pionir/__init__.py": "",
                                        "src/pionir/crew/__init__.py": "",
                                        "src/pionir/crew/etsy/__init__.py": "",
-                                       "src/pionir/crew/etsy/rules.py": RULES,
+                                       "src/pionir/crew/etsy/maker.py": RULES,
                                        "README.md": "Pionir\n"}, "seed")
         self.improve = root / "improve"
-        self.patch = self.make_patch({"src/pionir/crew/etsy/rules.py": FIXED, REG: REGRESSION})
+        self.patch = self.make_patch({"src/pionir/crew/etsy/maker.py": FIXED, REG: REGRESSION})
         self.ran: list = []
         self.tests_pass = True
         self.adapter = ImproveAdapter(ImproveSettings(self.repo, self.improve), run=self.fake_run)
-        self.sha = self.card()
+        self.digest = self.card()
 
     def tearDown(self) -> None:
         self._t.cleanup()
@@ -88,8 +87,10 @@ class _Case(unittest.TestCase):
                                "--full-index", "--no-color", self.base, head], cwd=clone,
                               check=True, capture_output=True, text=True).stdout
 
-    def card(self, patch=None) -> str:
-        return store.write_patch(self.improve, CID, patch or self.patch, {
+    def card(self, patch=None, **extra) -> str:
+        data = (patch or self.patch).encode("utf-8")
+        store.freeze(self.improve, CID, data.decode("utf-8"))
+        return store.write_card(self.improve, CID, data, {**extra,
             "title": "etsy.digital: stop the medical false alarm", "base": self.base,
             "tests": [REG], "evidence": {"worker": "etsy.digital", "count": 12,
                                          "first_seen": "2026-10-05 01:00",
@@ -98,17 +99,19 @@ class _Case(unittest.TestCase):
                                          "samples": ["one", "two", "three"]},
             "hypothesis": "a false alarm", "verdict": {"approved": True,
                                                        "summary": "It stops the false alarm."},
-            "verification": "failed without, passed with", "diff_stat": "2 files changed"})
+            "verification": "failed without, passed with", "diff_stat": "2 files changed",
+            **extra})
 
     def fake_run(self, argv, cwd, timeout):
         self.ran.append(argv[7:])
         out = Path(argv[6])
-        out.write_text(json.dumps({"ran": 1, "failed": [] if self.tests_pass else ["x.T.t"],
+        out.write_text(json.dumps({"ran": 1, "outcomes": {} if self.tests_pass else
+                                   {"x.T.t": "failure:AssertionError"},
                                    "skipped": 0, "ok": self.tests_pass}), encoding="utf-8")
         return (0 if self.tests_pass else 1), "", False
 
     def task(self, **payload) -> Task:
-        return Task(APPLY, payload or {"id": CID, "patch_sha256": self.sha},
+        return Task(APPLY, payload or {"id": CID, "digest": self.digest},
                     frozenset({APPLY}))
 
     def head(self) -> str:
@@ -130,6 +133,7 @@ class CapabilityTests(_Case):
     def test_the_card_shows_evidence_diff_verdict_and_undo(self) -> None:
         context = self.adapter.park_context(self.task())
         self.assertIn("-        return 'a claim'", context["diff"])
+        self.assertEqual(context["diff"], self.patch)          # the WHOLE diff, on the card
         self.assertEqual(context["undo"], f"python -m pionir improve undo {CID}")
         text = render_request({"id": "ap1", "capability": APPLY, "payload": dict(self.task().payload),
                                "summary": "apply it", "requester": "crew",
@@ -145,11 +149,32 @@ class CapabilityTests(_Case):
         with self.assertRaises(AdapterProtocolError):
             self.adapter.validate(self.task())
         with self.assertRaises(AdapterProtocolError):
-            self.adapter.validate(self.task(id=CID, patch_sha256=self.sha, extra="x"))
+            self.adapter.validate(self.task(id=CID, digest=self.digest, extra="x"))
+
+    def test_the_base_or_the_tests_changed_after_the_card_is_refused(self) -> None:
+        card = store.folder(self.improve, CID) / store.CARD
+        for key, value in (("tests", ["tests/test_other.py"]), ("base", "f" * 40)):
+            doc = json.loads(card.read_text(encoding="utf-8"))
+            good = doc[key]
+            doc[key] = value
+            card.write_text(json.dumps(doc), encoding="utf-8")
+            with self.subTest(key=key), self.assertRaises(AdapterProtocolError):
+                self.adapter.validate(self.task())
+            doc[key] = good
+            card.write_text(json.dumps(doc), encoding="utf-8")
+        self.adapter.validate(self.task())
+
+    def test_a_patch_too_big_for_ians_card_is_refused(self) -> None:
+        big = self.make_patch({"src/pionir/crew/etsy/maker.py": FIXED + "".join(
+            f"X{i} = '{'y' * 60}'\n" for i in range(120))})
+        self.digest = self.card(big)
+        with self.assertRaises(AdapterProtocolError) as caught:
+            self.adapter.validate(self.task())
+        self.assertIn("Ian's card", str(caught.exception))
 
     def test_the_protected_list_is_checked_again_here(self) -> None:
         bad = self.make_patch({"src/pionir/approvals.py": "# relaxed\n"})
-        self.sha = self.card(bad)
+        self.digest = self.card(bad)
         with self.assertRaises(AdapterProtocolError) as caught:
             self.adapter.validate(self.task())
         self.assertIn("protected", str(caught.exception))
@@ -166,7 +191,7 @@ class ApplyTests(_Case):
         self.assertIn(f"python -m pionir improve undo {CID}",
                       git(self.repo, "log", "-1", "--format=%B"))
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
-        self.assertEqual((self.repo / "src/pionir/crew/etsy/rules.py").read_text(
+        self.assertEqual((self.repo / "src/pionir/crew/etsy/maker.py").read_text(
             encoding="utf-8").replace("\r\n", "\n"), FIXED)
         self.assertEqual(self.ran, [["test_regression_imp_20261012_ab12"]])
         self.assertEqual(self.outcome()["commit"], self.head())
@@ -185,7 +210,7 @@ class ApplyTests(_Case):
         self.assertTrue(result.output["applied"])
 
     def test_main_moved_and_no_longer_applies_is_stale_and_untouched(self) -> None:
-        moved = commit(self.repo, {"src/pionir/crew/etsy/rules.py": RULES.replace(
+        moved = commit(self.repo, {"src/pionir/crew/etsy/maker.py": RULES.replace(
             "a claim", "a claim the shop could be held to")})
         result = self.adapter.execute(self.task())
         self.assertTrue(result.output["ok"])
@@ -207,6 +232,41 @@ class ApplyTests(_Case):
         self.assertIn("no longer contains its base", result.output["why"])
         self.assertEqual(self.head(), rewritten)
 
+    def test_an_untracked_file_where_the_patch_writes_is_never_clobbered(self) -> None:
+        (self.repo / REG).parent.mkdir(parents=True, exist_ok=True)
+        (self.repo / REG).write_text("# Ian's own scratch test\n", encoding="utf-8")
+        result = self.adapter.execute(self.task())
+        self.assertFalse(result.output["applied"])
+        self.assertIn("already exists", result.output["why"])
+        self.assertEqual((self.repo / REG).read_text(encoding="utf-8"),
+                         "# Ian's own scratch test\n")
+        self.assertEqual(self.head(), self.base)
+
+    def test_exactly_the_bytes_read_once_are_applied(self) -> None:
+        from pionir.selfimprove import apply as applier
+        other = self.make_patch({"src/pionir/crew/etsy/maker.py": FIXED.replace(
+            "None", "'other'"), REG: REGRESSION})
+        done = applier.apply_patch(self.repo, other.encode("utf-8"), CID, self.base,
+                                   title="t", tests=[REG], run=self.fake_run)
+        self.assertTrue(done["applied"], done)
+        self.assertIn("'other'", git(self.repo, "show", "HEAD:src/pionir/crew/etsy/maker.py"))
+
+    def test_the_guard_runs_again_on_the_trees_in_ians_index(self) -> None:
+        commit(self.repo, {"tests/test_maker.py": "import unittest\n\n\nclass T(unittest.TestCase):"
+                                                  "\n    def test_a(self):\n        x = 1\n"
+                                                  "        self.assertEqual(x, 1)\n"})
+        self.base = self.head()
+        weak = self.make_patch({"tests/test_maker.py": "import unittest\n\n\nclass T(unittest."
+                                                      "TestCase):\n    def test_a(self):\n"
+                                                      "        x = 1\n        self.assertEqual(1, 1)\n"})
+        from pionir.selfimprove import apply as applier
+        done = applier.apply_patch(self.repo, weak.encode("utf-8"), CID, self.base, title="t",
+                                   tests=[], run=self.fake_run)
+        self.assertFalse(done["applied"])
+        self.assertIn("real assert", done["error"])
+        self.assertEqual(self.head(), self.base)
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+
     def test_a_dirty_main_or_another_branch_is_never_applied_over(self) -> None:
         (self.repo / "README.md").write_text("Ian's own edit\n", encoding="utf-8")
         result = self.adapter.execute(self.task())
@@ -227,7 +287,7 @@ class ApplyTests(_Case):
         self.assertTrue(result.output["applied"])
         self.assertTrue(result.output["reverted"])
         self.assertEqual(git(self.repo, "rev-list", "--count", f"{self.base}..HEAD"), "2")
-        self.assertEqual((self.repo / "src/pionir/crew/etsy/rules.py").read_text(
+        self.assertEqual((self.repo / "src/pionir/crew/etsy/maker.py").read_text(
             encoding="utf-8").replace("\r\n", "\n"), RULES)
         self.assertEqual(git(self.repo, "status", "--porcelain"), "")
 
@@ -245,9 +305,9 @@ class CliTests(_Case):
                               out=out)
         self.assertEqual(code, 0, out.getvalue())
         self.assertIn("Undone", out.getvalue())
-        self.assertIn(f"Revert", git(self.repo, "log", "-1", "--format=%s"))
+        self.assertIn("Revert", git(self.repo, "log", "-1", "--format=%s"))
         self.assertEqual(git(self.repo, "rev-parse", "HEAD~1"), applied)
-        self.assertEqual((self.repo / "src/pionir/crew/etsy/rules.py").read_text(
+        self.assertEqual((self.repo / "src/pionir/crew/etsy/maker.py").read_text(
             encoding="utf-8").replace("\r\n", "\n"), RULES)
         self.assertTrue(store.read_json(store.folder(self.improve, CID) / store.UNDONE)["undone"])
         # twice is harmless
@@ -268,7 +328,11 @@ class CliTests(_Case):
         ledger = store.ledger_path(self.root / "state" / "crew")
         store.write_json(ledger, {"counts": {"proposals": 1}, "amber": None, "candidates": {
             CID: {"id": CID, "state": "awaiting_owner", "created_at": 1.0, "why": "waiting",
-                  "evidence": {"worker": "etsy.digital", "reason": "labels[N]: medical"}}}})
+                  "evidence": {"worker": "etsy.digital", "reason": "labels[N]: medical"}}},
+            "nights": {"2026-10-12": {"needs_human": [{
+                "worker": "etsy.digital", "reason": "title: N-N characters", "count": 10,
+                "why": "needs a human: it touches a protected rule (src/pionir/crew/etsy/"
+                       "rules.py)"}]}}})
         self.adapter.execute(self.task())
         out = io.StringIO()
         self.assertEqual(improvecli.run(Namespace(improve_command="status"), self.settings(),
@@ -278,6 +342,7 @@ class CliTests(_Case):
         self.assertIn(CID, text)
         self.assertIn("applied", text)                     # folded in from outcome.json
         self.assertIn("etsy.digital", text)
+        self.assertIn("NEEDS A HUMAN: etsy.digital: title: N-N characters (10x)", text)
 
     def test_the_cli_parses_improve_commands(self) -> None:
         from pionir.cli import _parser

@@ -8,12 +8,33 @@ in a diff or a log line can close its section or pose as our instructions, and o
 """
 from __future__ import annotations
 
+import json
 import secrets
 
-from pionir.selfimprove.guard import MAX_FILES, MAX_LINES, PROTECTED
+from pionir.selfimprove.guard import MAX_CHARS, MAX_FILES, MAX_LINES, PROTECTED
 
-from ..blog import _clip
-from ..leader import parse_json_object
+
+def _clip(text, n: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= n else text[:n - 3] + "..."
+
+
+def parse_json_object(text: str) -> dict | None:
+    """The first JSON object in an answer, or None (as the crew's leaders read one)."""
+    text = (text or "").strip()
+    try:
+        v = json.loads(text)
+        return v if isinstance(v, dict) else None
+    except ValueError:
+        pass
+    a, b = text.find("{"), text.rfind("}")
+    if a == -1 or b <= a:
+        return None
+    try:
+        v = json.loads(text[a:b + 1])
+        return v if isinstance(v, dict) else None
+    except ValueError:
+        return None
 
 MAX_PROMPT_CHARS = 58_000
 REVIEW_CHECKS = ("fixes_the_evidence", "regression_test_reproduces_it",
@@ -37,7 +58,7 @@ def verify_command(cid: str) -> str:
 def intent(cand: dict, repo: str, *, repair: list = (), room: int = 7800) -> str:
     ev = cand["evidence"]
     test = regression_file(cand["id"])
-    protected = "; ".join(sorted({p for p, _why in PROTECTED}))
+    protected = "; ".join(sorted({p for p, _why in PROTECTED if p.endswith(".py")}))[:1800]
     lines = [
         f"This repository ({repo}) is a copy of Pionir, the owner's orchestration system "
         "(Python, src/pionir, unittest tests in tests/). Fix ONE recurring failure, found in "
@@ -63,13 +84,21 @@ def intent(cand: dict, repo: str, *, repair: list = (), room: int = 7800) -> str
         f"3. Run it: {verify_command(cand['id'])}",
         "",
         "Rules (a patch that breaks one is refused unread):",
-        f"- at most {MAX_FILES} files and {MAX_LINES} changed lines in all",
+        f"- at most {MAX_FILES} files, {MAX_LINES} changed lines and {MAX_CHARS} characters of "
+        "diff in all: the owner reads the whole diff on his phone",
+        "- change only Python modules under src/pionir (never an __init__.py, never a new "
+        "module directly in src/pionir) and tests/test_*.py",
+        "- the new test must FAIL BY AN ASSERTION on the old code (not by an import error), "
+        "and never touch the test machinery (results, loaders, runners, sys.argv, "
+        "monkeypatching unittest)",
         "- never delete or rename a file, never remove or weaken an assert or a test, never add "
         "a skip or expectedFailure marker",
         "- no new dependency: the standard library and Pionir's own code only",
         "- no network, no secrets, no machine paths or names in tests",
-        f"- never touch these (the approval gate, auth, money, secrets, the sandbox, CI and the "
-        f"self-improvement code): {protected}",
+        "- never touch a PROTECTED file (the approval gate, auth, money, secrets, content "
+        "rules, the sandbox, the GPU lease, CI and the self-improvement code - the whole list "
+        "is PROTECTED in src/pionir/selfimprove/guard.py; these are among them): "
+        f"{protected}",
     ]
     if repair:
         lines += ["", "A FIRST ATTEMPT WAS REFUSED. Fix every problem below, keep what works:",

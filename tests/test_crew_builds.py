@@ -282,6 +282,21 @@ class _Case(unittest.TestCase):
         return tid
 
 
+class SandboxBusyTests(_Case):
+    def test_a_busy_sandbox_is_waiting_never_a_rejection(self) -> None:
+        # another user holds the sandbox's lease (a Daedalus build, the self-improvement run,
+        # the video tutorial): the review waits; nothing is rejected or repaired for it
+        self.suite = SuiteRun(False, 0, "x", "the tests could not start contained (the build "
+                                             "sandbox is busy: the video tutorial runner)",
+                              busy=True)
+        self.build_night()
+        p = self.product_state("exif-strip")
+        self.assertEqual(p["state"], "built")
+        self.assertIn("busy", p["waiting"])
+        self.assertEqual(p.get("reviews") or [], [])
+        self.assertEqual(self.prompts, [])
+
+
 class WindowTests(unittest.TestCase):
     def test_the_default_window_is_one_to_seven_local(self) -> None:
         w = Window.parse("01:00-07:00")

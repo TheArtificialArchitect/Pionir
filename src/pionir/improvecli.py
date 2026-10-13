@@ -82,6 +82,11 @@ def status(settings: PionirSettings, out: TextIO) -> int:
           f"shelved: {int(counts.get('shelved') or 0)}", file=out)
     if ledger.get("amber"):
         print(f"AMBER: {ledger['amber']}", file=out)
+    nights = ledger.get("nights") if isinstance(ledger.get("nights"), dict) else {}
+    last = nights[max(nights)] if nights else {}
+    for human in (last.get("needs_human") or [])[:5] if isinstance(last, dict) else []:
+        print(f"NEEDS A HUMAN: {human.get('worker')}: {str(human.get('reason'))[:90]} "
+              f"({human.get('count')}x) - {str(human.get('why'))[:160]}", file=out)
     cands = sorted((c for c in (ledger.get("candidates") or {}).values() if isinstance(c, dict)),
                    key=lambda c: float(c.get("created_at") or 0), reverse=True)
     if not cands:

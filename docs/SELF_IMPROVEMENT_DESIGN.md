@@ -3,54 +3,52 @@
 Ian's decisions (2026-10-12, final): it changes the bots' settings, prompts, check rules and code -
 always as a diff to the Pionir repo, never weights or training; Daedalus writes the patch and Claude
 reviews it (the night-build split, the night Claude cap and cheaper model); every change reaches Ian
-as an approval card and only his yes applies it; one pass a night after the build window, at most two
-proposals a night; Pionir only. It follows `IMPROVEMENT_GATE.md` and `FUSION_PLAN.md` Phase 3:
-propose, evaluate in isolation, check permissions and regressions, Ian approves the exact digest,
-the gate applies nothing on its own, and an applied change can be undone.
+as an approval card and only his yes applies it; one pass a night, at most two proposals a night;
+Pionir only. It follows `IMPROVEMENT_GATE.md` and `FUSION_PLAN.md` Phase 3: propose, evaluate in
+isolation, check permissions and regressions, Ian approves the exact digest, the gate applies
+nothing on its own, a red apply is reverted at once, and an applied change can be undone.
+
+Revised after an adversarial review (NO-GO on the first version): the patch is FROZEN before it is
+verified, the guard is an allowlist, verification cannot be gamed by import errors or tautologies,
+the whole diff is on Ian's card, the GPU is used only at night without ever sidelining Moss's
+model, and one lease keeps every user of the build sandbox apart.
 
 ## Pipeline (one candidate)
 
 | state | who | what |
 |---|---|---|
-| `detected` | worker (no model) | a **cluster**: one worker + one normalised reason (digits -> `N`, case and spaces folded) seen `>= threshold` (5) times in `lookback_days` (7) - with count, first/last seen, 3 sample lines, a templated hypothesis and target files (the source files that contain the reason's own words). |
-| `writing` | Daedalus (contained, GPU lease) | a FRESH clone of Pionir's `main` HEAD inside the sandbox workspace (`<sandbox>\pionir-imp-...`, marked, no remote, canonical config - `sandbox_repo_problem` passes). The intent carries the evidence, the protected list and the rule: add `tests/test_regression_<id>.py` reproducing the failure. Its gate runs only that file. |
-| `verifying` | worker (contained, CPU) | **hard refusals first** (`selfimprove/guard.py`): protected paths, deleted/renamed tests, net-removed asserts, added skip markers, new dependencies, binary/link changes, size cap. Then, as `pionir-builds` in a job object: the regression test FAILS on base + test, PASSES on the change; the full suite on the change has no failure the base suite does not have (the base run is cached per base commit). |
-| `reviewing` | Claude (one call, no tools) | diff + evidence + our results; a JSON verdict, approved only with every check true. A rejection (or a failed verification, or a failed Daedalus attempt) gets ONE Daedalus repair with the reasons, re-checked and re-reviewed; then `shelved`. Budget spent = waiting, never approval. |
-| `awaiting_owner` | Pionir gate | `improve.apply` parked (PRIVILEGED, every call, never batched): evidence, diff (excerpt + full file path), verdict, undo command; payload = `{id, patch_sha256}`. |
-| `applied` / `stale` / `denied` | Pionir, on Ian's yes only | main clean (tracked files), on `main`, base an ancestor of HEAD, `git apply --check` clean -> ONE commit naming the id, targeted tests re-run; red -> reverted automatically (`undone`). Moved and not applying -> `stale, will re-propose`. Never pushes, never restarts. |
+| `detected` | worker (no model) | a **cluster**: one worker + one normalised reason (digits -> `N`) seen `>= 5` times in 7 days and in the last 48 h; the same failure seen from two sources (a failed run and its lesson) is ONE cluster. If its own words live only in a PROTECTED file (e.g. `crew/etsy/rules.py`), it is reported as **needs a human** and nothing is cloned or run. |
+| `writing` | Daedalus (contained) | a fresh clone of `main` in the sandbox; `coding.daedalus_build_quiet` - admitted only when the coder FITS beside Moss's model (never sidelined; otherwise the night is skipped), only 05:45-06:30 and only when the night builds can no longer start a build. Its gate runs only `tests/test_regression_<id>.py`. |
+| `verifying` | worker (contained, CPU) | the patch is read from the sandbox ONCE and FROZEN in `~/.pionir/improve/<id>/` (sha256 recorded). Every later step uses those bytes on TRUSTED trees: the owner's base in a private clone in the owner's temp folder, the frozen patch applied there. Guard first (below); then the regression test must fail **by an assertion** on base and pass with the change; then no test may fail with the change unless main fails it the same way (per test: `failure:X` / `error:X`). |
+| `reviewing` | Claude (one call, no tools) | the frozen diff + evidence + our results; only between 01:00 and noon (so it is charged to that night's cap). A rejection, a failed verification or a failed Daedalus attempt gets ONE repair; then `shelved`. |
+| `awaiting_owner` | Pionir gate | the frozen bytes re-hashed and re-guarded; `improve.apply {id, digest}` - digest = sha256 over (patch, base, tests) - parked on every call; the card shows the WHOLE diff (<= 6,000 chars). |
+| `applied` / `stale` / `denied` | Pionir, on Ian's yes | the bytes read once and applied: `main`, no tracked change, nothing of his (untracked or ignored) where the patch writes, base an ancestor of HEAD; `apply --cached`, the guard again on his index, ONE commit naming the id, targeted tests re-run (red -> reverted at once). Never a push or restart. |
 | `undone` | Ian | `python -m pionir improve undo <id>` = `git revert` of that commit. |
 
-## Sources (read-only)
+## The guard (`selfimprove/guard.py`)
 
-crew.db `outputs` rows whose kind ends in `blocked/rejected/shelved/not_listed/attempt_failed/
-review_failed` (their `reasons`), crew.db `runs` errors, the `VITALS:` lines of `crew.log`,
-`builds.daedalus.json` failed attempts and rejected reviews, Ian's denials in the approvals queue
-(not `expired`/`interrupted`), and recurring lessons in the shared `lessons` namespace. Its own
-worker and its own capability are never evidence, and neither is what no patch fixes: NOT
-CONFIGURED, a placeholder, the shared model not answering, a GPU/circuit "not a fault", or a
-VITALS "is stale" line that only echoes failed runs already counted. A dry run on the live data
-(2026-10-12) found the Etsy title (10) and `('medical')` (8+8) clusters and the night builds'
-"committed nothing new" (6).
+ALLOWLIST: Python modules under `src/pionir/` (not a new top-level one, never `__init__.py`,
+`*customize.py`, `bootstrap.py`, `.git*`) and `tests/test_*.py`, plus the catalogue's settings.
+PROTECTED (listed with reasons, each tested): the approval gate and its surfaces, auth, money and
+spend rules, secrets handling, content and listing rules, the build sandbox and everything that
+runs in it, the GPU lease, CI, adapters, the crew's wiring, the test harness, dependency files, the
+self-improvement code and its tests, and every module that code imports (computed by a test).
+Refused also: deletions, binaries, links, file modes, fewer real asserts in any test (a
+tautology is not one), removed tests, skip markers, test code touching the test machinery, any
+import of something Pionir does not import already (AST, anywhere in the file), any new
+`__import__`/`import_module`, and more than 8 files / 400 lines / 6,000 characters.
 
-## Dedupe and caps
+## One user of the sandbox at a time
 
-A cluster is never proposed while one of it is open; not for 30 days after `denied`/`undone`;
-not for 14 days after `shelved` or an expired card; `stale` may come back the next night; after
-`applied` only with `threshold` NEW sightings since; and never one not seen for `fresh_hours`
-(48) - it may already be fixed by hand. At most `per_night` (2) candidates start per
-night. A new Daedalus job starts only inside its window (default 07:00-11:00, after the build
-window 01:00-07:00 ends), never while the build window is open or `builds.daedalus` has a job in
-flight, and `rest_minutes` after its own last job (the card is Moss's again in between).
+`build_sandbox.SandboxLease`: a cross-process lock held by a build Daedalus for its whole life,
+the night builds' and the API builder's contained checks, this worker's runs and the video
+tutorial runner. Whoever finds it held waits (never a failure) and never reaps.
 
-## Visible, not inert
+## Dedupe, caps, visibility
 
-Its tally row says counts and states; `pulse()` raises a VITALS **NO OUTPUT** (amber) when it
-detected clusters on `amber_nights` (3) nights in a row and proposed none, naming why.
-`python -m pionir improve status` lists every candidate and state. Without the sandbox (the
-Python part of `tools\setup-build-sandbox.ps1`; node is NOT needed) or with
-`PIONIR_AUTH_COMPAT` on, it says NOT SET UP and runs nothing.
-
-## Protected (no agent promotes changes to its own gate)
-
-Listed in `selfimprove/guard.py` (`PROTECTED`), tested one by one, enforced twice: by the worker
-before review and again by the `improve.apply` adapter before parking and before applying.
+Never proposed again while open; 30 days after `denied`/`undone`; 14 after `shelved` or an
+unanswered card; 3 nights after `stale`; after `applied` only with 5 NEW sightings. At most 2
+candidates start a night. The tally lists open candidates and clusters needing a human; the pulse
+goes amber (VITALS **NO OUTPUT**) after 3 nights with clusters and no proposal, saying why.
+`python -m pionir improve status` lists every candidate. Without the sandbox (Python part only;
+node not needed) or with `PIONIR_AUTH_COMPAT` on: NOT SET UP, nothing runs.

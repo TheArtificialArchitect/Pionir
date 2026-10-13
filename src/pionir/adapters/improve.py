@@ -4,18 +4,20 @@ The crew's ``builds.improve`` worker (crew/improve) finds a failure that keeps r
 Daedalus write a fix in the build sandbox, verifies it there and has Claude review it. What it
 then asks for is this capability - PRIVILEGED with ``requires_approval=True``, so it is parked on
 EVERY call, never batched into the digest, and never routed from a sentence. Its card shows the
-evidence, the diff (an excerpt, and where the full file is), Claude's verdict and the undo command.
+evidence, the WHOLE diff (the guard caps a patch at what fits on Ian's phone), Claude's verdict,
+how it was verified, and the undo command.
 
-The payload is ``{"id", "patch_sha256"}`` and nothing else: the patch is read from THIS process's
-own improve folder (``<improve_dir>/<id>/patch.diff``) and must hash to exactly what the card
-showed - a patch changed after the card is refused, never applied. The protected list
-(selfimprove/guard.py) is checked again here, before parking and before applying: the worker's
-word that it passed is not taken.
+The payload is ``{"id", "digest"}`` and nothing else. The patch, its base commit and its tests
+are read ONCE from THIS process's own improve folder (selfimprove/store.py: the owner's
+profile) and must hash to exactly the digest the card showed - a patch, base or test list
+changed after the card is refused, never applied - and those same bytes are what is applied.
+The guard (selfimprove/guard.py) runs again here, before parking and before applying, and once
+more on the trees in Ian's own index: the worker's word that it passed is not taken.
 
 On the yes: selfimprove/apply.py - one commit on a clean ``main`` that still contains the base,
-its targeted tests re-run (red -> reverted at once), or "stale, will re-propose" when main moved
-and it no longer applies. Never a push, never a restart. The outcome is written to
-``<id>/outcome.json`` for the worker and for ``python -m pionir improve status``.
+its targeted tests re-run (red -> reverted at once), or "stale, will re-propose". Never a push,
+never a restart. The outcome is written to ``<id>/outcome.json`` for the worker and for
+``python -m pionir improve status``.
 """
 from __future__ import annotations
 
@@ -31,8 +33,7 @@ from pionir.selfimprove import apply as applier
 from pionir.selfimprove import guard, store
 
 APPLY = "improve.apply"
-PAYLOAD_KEYS = frozenset({"id", "patch_sha256"})
-EXCERPT_CHARS = 6000
+PAYLOAD_KEYS = frozenset({"id", "digest"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,6 +60,19 @@ def local_modules(repo: Path) -> frozenset:
         return frozenset(p.stem for p in (Path(repo) / "tests").glob("*.py"))
     except OSError:
         return frozenset()
+
+
+def repo_imports(repo: Path) -> frozenset:
+    """Every top-level name Pionir's own modules import (read from the owner's repo)."""
+    files = {}
+    root = Path(repo) / "src" / "pionir"
+    try:
+        for path in root.rglob("*.py"):
+            if "__pycache__" not in path.parts:
+                files[path.relative_to(repo).as_posix()] = path.read_bytes()
+    except OSError:
+        return frozenset()
+    return guard.known_imports(files) | local_modules(repo)
 
 
 class ImproveAdapter:
@@ -101,55 +115,53 @@ class ImproveAdapter:
 
     # ---- the request ----------------------------------------------------------------------
     def _checked(self, task: Task) -> tuple:
-        """``(id, patch, card)`` - or AdapterProtocolError: a payload that is not exactly
-        ``{id, patch_sha256}``, a missing patch, a patch that changed since the card, or one
-        the protected list refuses."""
+        """``(id, patch bytes, card, known imports)`` - read once - or AdapterProtocolError: a
+        payload that is not exactly ``{id, digest}``, a missing patch, a patch, base or test
+        list that changed since the card, or a patch the guard refuses."""
         if task.capability != APPLY:
             raise AdapterProtocolError(f"improve has no capability {task.capability!r}")
         payload = task.payload
         if not isinstance(payload, Mapping) or set(payload) != PAYLOAD_KEYS:
             raise AdapterProtocolError(f"{APPLY} refused by Pionir - the payload is exactly "
-                                       "{id, patch_sha256}")
+                                       "{id, digest}")
         try:
             cid = store.check_id(payload.get("id"))
-            patch, digest, card = store.read_patch(self.settings.improve_dir, cid)
+            data, card, digest = store.read_candidate(self.settings.improve_dir, cid)
         except store.StoreError as exc:
             raise AdapterProtocolError(f"{APPLY} refused by Pionir - {exc}") from exc
-        if payload.get("patch_sha256") != digest or card.get("patch_sha256") != digest:
-            raise AdapterProtocolError(f"{APPLY} refused by Pionir - the patch for {cid} is not "
-                                       "the one the card showed (its sha256 differs)")
-        if not isinstance(card.get("base"), str) or len(card["base"]) < 40:
+        if payload.get("digest") != digest:
+            raise AdapterProtocolError(f"{APPLY} refused by Pionir - {cid}'s patch, base or "
+                                       "tests are not the ones the card showed (its digest "
+                                       "differs)")
+        if len(card["base"]) < 40:
             raise AdapterProtocolError(f"{APPLY} refused by Pionir - {cid}'s card names no "
                                        "base commit")
-        problems = guard.patch_problems(patch, local_modules=local_modules(
-            self.settings.pionir_repo))
+        known = repo_imports(self.settings.pionir_repo)
+        problems = guard.patch_problems(data.decode("utf-8", "replace"), known_imports=known)
         if problems:
             raise AdapterProtocolError(f"{APPLY} refused by Pionir - the protected list "
                                        f"refuses it: {'; '.join(problems[:4])}")
-        return cid, patch, card
+        return cid, data, card, known
 
     def validate(self, task: Task) -> None:
         self._checked(task)
 
     def park_context(self, task: Task) -> dict[str, Any] | None:
-        """What Ian's card shows: the evidence, the hypothesis, the diff, Claude's verdict, the
-        verification and the undo command - read from the worker's card file, the diff from
-        the patch itself. Never blocks parking."""
+        """What Ian's card shows: the evidence, the hypothesis, the WHOLE diff, Claude's verdict,
+        the verification and the undo command. Never blocks parking."""
         if task.capability != APPLY:
             return None
-        cid, patch, card = self._checked(task)
-        diff_file = store.folder(self.settings.improve_dir, cid) / store.PATCH
-        excerpt = patch if len(patch) <= EXCERPT_CHARS else (
-            patch[:EXCERPT_CHARS] + f"\n... ({len(patch) - EXCERPT_CHARS:,} more characters: "
-                                    f"the full diff is {diff_file})")
+        cid, data, card, _known = self._checked(task)
         return {"id": cid, "title": str(card.get("title") or "")[:160],
                 "evidence": card.get("evidence") if isinstance(card.get("evidence"), dict)
                 else {}, "hypothesis": str(card.get("hypothesis") or "")[:800],
                 "verdict": card.get("verdict") if isinstance(card.get("verdict"), dict) else {},
                 "verification": str(card.get("verification") or "")[:600],
                 "diff_stat": str(card.get("diff_stat") or "")[:1200],
-                "diff": excerpt, "diff_file": str(diff_file),
-                "base": card.get("base"), "repo": str(self.settings.pionir_repo),
+                "diff": data.decode("utf-8", "replace"),
+                "diff_file": str(store.folder(self.settings.improve_dir, cid) / store.PATCH),
+                "base": card.get("base"), "tests": list(card.get("tests") or []),
+                "repo": str(self.settings.pionir_repo),
                 "undo": f"python -m pionir improve undo {cid}",
                 "runs": "one commit on main of the Pionir repo (if main is clean and still "
                         "contains its base), then its targeted tests; red is reverted at once. "
@@ -157,15 +169,13 @@ class ImproveAdapter:
 
     # ---- the call ---------------------------------------------------------------------------
     def execute(self, task: Task) -> TaskResult:
-        cid, _patch, card = self._checked(task)
-        where = store.folder(self.settings.improve_dir, cid)
+        cid, data, card, known = self._checked(task)
         done = applier.apply_patch(
-            self.settings.pionir_repo, where / store.PATCH, cid, card["base"],
+            self.settings.pionir_repo, data, cid, card["base"],
             title=str(card.get("title") or cid), tests=[str(t) for t in card.get("tests") or []],
-            approval=str(task.task_id), git=self._git, run=self._run)
-        outcome = {**done, "id": cid, "at": self._clock(),
-                   "patch_sha256": task.payload["patch_sha256"]}
-        store.write_json(where / store.OUTCOME, outcome)
+            approval=str(task.task_id), known=known, git=self._git, run=self._run)
+        outcome = {**done, "id": cid, "at": self._clock(), "digest": task.payload["digest"]}
+        store.write_json(store.folder(self.settings.improve_dir, cid) / store.OUTCOME, outcome)
         ok = done.get("applied") is True or done.get("stale") is True
         output = {"ok": ok, **outcome}
         if not ok:

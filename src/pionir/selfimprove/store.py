@@ -1,15 +1,22 @@
 """Where each self-improvement candidate's files live, and who writes which.
 
-One folder per candidate, ``<improve_dir>/<id>/`` (``~/.pionir/improve`` by default), and ONE
-writer per file, so two processes never race on one:
+One folder per candidate, ``<improve_dir>/<id>/`` (``~/.pionir/improve`` by default: the owner's
+profile, which the sandbox user cannot read or write), and ONE writer per file, so two
+processes never race on one:
 
-- ``patch.diff`` and ``card.json`` - the crew's ``builds.improve`` worker, before it asks Ian;
+- ``patch.diff`` - the crew's ``builds.improve`` worker, ONCE: the patch is FROZEN here the
+  moment it passes the guard, and from then on everything - the verification, Claude's review,
+  the card and the apply - uses exactly these bytes (``read_frozen`` checks their sha256 against
+  the one recorded when it was frozen). Nothing is ever re-read from the sandbox repo, which
+  code under test could have rewritten;
+- ``card.json`` - the same worker, before it asks Ian: the evidence, the verdict, and the
+  ``digest`` his approval names - one sha256 over the patch's bytes, the base commit and the
+  targeted tests, so none of the three can change after the card;
 - ``outcome.json`` - Pionir's ``improve.apply``, after Ian's yes (applied, stale or reverted);
 - ``undone.json`` - ``python -m pionir improve undo <id>``, run by Ian.
 
-The candidate ledger itself (every state a candidate passed through) is the worker's own record,
-``<crew state>/workers/builds.improve.json``; only the worker writes it, and it folds the two
-outcome files in on its next run. ``python -m pionir improve status`` reads all of it.
+The candidate ledger itself is the worker's own record (``<crew state>/workers/
+builds.improve.json``); only the worker writes it. ``python -m pionir improve status`` reads it.
 """
 from __future__ import annotations
 
@@ -49,6 +56,14 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def digest(patch: bytes, base: str, tests) -> str:
+    """What Ian approves: the patch's bytes, the commit it applies to and the tests that are
+    re-run after it - one sha256 over all three."""
+    doc = {"patch_sha256": sha256(patch), "base": str(base),
+           "tests": sorted(str(t) for t in tests or [])}
+    return sha256(json.dumps(doc, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
 def write_json(path: Path, doc: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -65,31 +80,52 @@ def read_json(path: Path) -> dict | None:
     return doc if isinstance(doc, dict) else None
 
 
-def write_patch(improve_dir, cid: str, patch: str, card: dict) -> str:
-    """The patch and its card, written for Pionir; returns the patch's sha256 (what Ian's
-    approval names)."""
+def freeze(improve_dir, cid: str, patch: str) -> str:
+    """Freeze the patch: its bytes written once, its sha256 returned (the worker records it)."""
     where = folder(improve_dir, cid)
     where.mkdir(parents=True, exist_ok=True)
     data = patch.encode("utf-8")
     tmp = where / (PATCH + ".tmp")
     tmp.write_bytes(data)
     atomic.replace(tmp, where / PATCH)
-    digest = sha256(data)
-    write_json(where / CARD, {**card, "id": cid, "patch_sha256": digest})
-    return digest
+    return sha256(data)
 
 
-def read_patch(improve_dir, cid: str) -> tuple:
-    """``(patch text, sha256, card)``; StoreError when it is missing or unreadable."""
+def read_frozen(improve_dir, cid: str, want_sha: str) -> bytes:
+    """The frozen patch's bytes - StoreError unless they hash to ``want_sha``."""
+    try:
+        data = (folder(improve_dir, cid) / PATCH).read_bytes()
+    except OSError as exc:
+        raise StoreError(f"no frozen patch for {cid}") from exc
+    if sha256(data) != want_sha:
+        raise StoreError(f"the frozen patch of {cid} changed since it was frozen (sha256 "
+                         "differs); it is never used")
+    return data
+
+
+def write_card(improve_dir, cid: str, patch: bytes, card: dict) -> str:
+    """The card for Ian, naming the digest of exactly (patch, base, tests); returns it."""
+    d = digest(patch, card["base"], card.get("tests"))
+    write_json(folder(improve_dir, cid) / CARD,
+               {**card, "id": cid, "patch_sha256": sha256(patch), "digest": d})
+    return d
+
+
+def read_candidate(improve_dir, cid: str) -> tuple:
+    """``(patch bytes, card, digest)`` - read ONCE, the digest recomputed from those bytes and
+    the card's own base and tests; StoreError when anything is missing or does not match."""
     where = folder(improve_dir, cid)
     try:
         data = (where / PATCH).read_bytes()
     except OSError as exc:
         raise StoreError(f"no patch for {cid} in {where}") from exc
     card = read_json(where / CARD)
-    if card is None or card.get("id") != cid:
+    if card is None or card.get("id") != cid or not isinstance(card.get("base"), str):
         raise StoreError(f"no readable card for {cid} in {where}")
-    return data.decode("utf-8", "replace"), sha256(data), card
+    d = digest(data, card["base"], card.get("tests"))
+    if card.get("patch_sha256") != sha256(data) or card.get("digest") != d:
+        raise StoreError(f"{cid}'s patch, base or tests changed after its card was written")
+    return data, card, d
 
 
 def ledger_path(crew_state_dir) -> Path:

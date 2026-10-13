@@ -99,12 +99,14 @@ SIGN_WINDOW = 30.0            # seconds a signed request may be off this server'
 
 # The one narrow pre-grant: the crew's Builds division may run Daedalus in its SANDBOX
 # without parking. A grantable permission is scoped twice, here and in code only: to the
-# ONE client that may hold it, and to the ONE capability it unlocks. ``coding.daedalus_build``
-# itself reaches nothing but a sandbox repo the Builds worker made (adapters/daedalus.py),
+# ONE client that may hold it, and to the capabilities it unlocks: ``coding.daedalus_build``
+# and its twin ``coding.daedalus_build_quiet`` (the self-improvement worker's, admitted only
+# beside the voice's model). Both reach nothing but a sandbox repo the crew made (adapters/daedalus.py),
 # running as the contained ``pionir-builds`` user. No other permission is grantable, so every
 # other privileged action from every client still parks for the owner.
 PERMISSION_SCOPES: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
-    "daedalus.build_sandbox": (frozenset({"crew"}), frozenset({"coding.daedalus_build"})),
+    "daedalus.build_sandbox": (frozenset({"crew"}), frozenset({"coding.daedalus_build",
+                                                           "coding.daedalus_build_quiet"})),
 }
 GRANTABLE_PERMISSIONS: frozenset[str] = frozenset(PERMISSION_SCOPES)
 

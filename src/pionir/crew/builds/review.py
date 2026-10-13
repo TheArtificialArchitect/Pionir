@@ -105,6 +105,7 @@ class SuiteRun:
     command: str
     tail: str
     timed_out: bool = False
+    busy: bool = False                  # another user had the sandbox: not run, try again
 
 
 # ``python -I -S``: isolated (no PYTHON* variables, no user site, no current folder on the
@@ -135,6 +136,12 @@ def run_tests(files: dict, language: str, *, setup, timeout: float = TEST_TIMEOU
 
     argv = suite_argv(language, str(setup.python))
     shown = "python -I -S -m unittest discover -s tests (no site-packages)"
+    lease = bs.SandboxLease(setup, "the night builds' contained test run")
+    try:
+        lease.acquire()                 # never reap under another user of the sandbox
+    except (bs.SandboxBusy, OSError) as exc:
+        return SuiteRun(False, 0, shown, f"the tests could not start contained ({exc})",
+                        busy=True)
     work = Path(setup.runs_dir) / f"run-{secrets.token_hex(6)}"
     try:
         work.mkdir(parents=True)
@@ -159,6 +166,7 @@ def run_tests(files: dict, language: str, *, setup, timeout: float = TEST_TIMEOU
                 pass                        # the next start refuses while any survives
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        lease.release()
     if done.timed_out:
         return SuiteRun(False, 0, shown, f"the tests did not finish within {timeout:.0f} s "
                                          "(every process they started was killed)",

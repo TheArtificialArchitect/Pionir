@@ -1,40 +1,51 @@
-"""A candidate's sandbox: a fresh clone of Pionir's ``main`` for Daedalus, read back safely,
-and the contained test runs that verify what it wrote.
+"""A candidate's sandbox: a fresh clone of Pionir's ``main`` for Daedalus, the one read of what
+Daedalus wrote, the TRUSTED trees everything is judged on, and the contained test runs.
 
 **The clone** (``clone``) is made directly inside the sandbox workspace as
 ``<sandbox>\\pionir-<id>`` exactly the way the night builds make a product's repo: refused if
 the folder exists or the workspace is a link, ``git clone --no-hardlinks --single-branch`` of
-the owner's ``main`` (no tags, no other branch), its remote removed, ``.git/config`` rewritten
-to canonical content (pionir/sandbox_git.py), marked with ``.git/pionir-sandbox.json`` and
-proved with the very rule Pionir's ``coding.daedalus_build`` enforces (``sandbox_repo_problem``:
-a clone with a remote is refused there). The owner's repo is only read.
+the owner's ``main``, its remote removed, ``.git/config`` rewritten to canonical content
+(pionir/sandbox_git.py), marked, and proved with the very rule Pionir's build capability
+enforces (``sandbox_repo_problem``). The owner's repo is only read.
 
-**Reading it back**: after Daedalus, the sandbox repo is untrusted (generated code ran in it), so
-the owner's side only ever READS objects, through ``builds/sandbox.git`` (``prepare`` first):
-``export`` takes every file committed at a commit with ONE ``cat-file --batch`` (no checkout, no
-filter, no hook), and ``diff`` is ``diff-tree -p --no-renames --binary --full-index`` (plumbing:
-no diff driver, no textconv) - the exact bytes Claude reviews and Ian approves.
+**What Daedalus wrote is read ONCE** (``diff``: plumbing, ``diff-tree -p``, after ``prepare``)
+and the worker FREEZES those bytes in the owner-only improve folder at once. The sandbox repo is
+never read again: code under test runs as the sandbox user, which can write that repo's objects.
 
-**The test runs** (``run_suite``) are contained like the night builds' own test run: as the
-``pionir-builds`` user, with the sandbox's interpreter, in a kill-on-close job object, output to
-files, the whole tree killed at the timeout; the tree is written to a fresh folder under the
-sandbox's runs folder and removed afterwards. Python only - node is never needed here.
+**The trusted trees** (``trusted_trees``): the base is read from a private clone of the OWNER's
+repo in the owner's own temporary folder (which the sandbox user cannot reach), and the change is
+that base with the frozen patch applied (``read-tree`` + ``apply --cached`` + ``write-tree`` in
+that clone). The guard, the tests, Claude and Ian all see exactly the frozen bytes on exactly the
+owner's base.
+
+**The test runs** (``run_suite``) are contained like the night builds' own: as the
+``pionir-builds`` user, the sandbox's interpreter, a kill-on-close job object, output to files,
+the whole tree killed at the timeout - and only while this worker holds the sandbox's one lease
+(``build_sandbox.SandboxLease``): someone else using the sandbox is ``busy`` (wait), never a
+reap under them. Python only - node is never needed here.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from pionir import build_sandbox as bs
-from pionir.adapters.daedalus import SANDBOX_MARKER, sandbox_repo_problem
-from pionir.sandbox_git import GitError, is_reparse, prepare, run_git, sanitize
+from pionir.sandbox_git import (
+    SANDBOX_MARKER,
+    GitError,
+    is_reparse,
+    prepare,
+    run_git,
+    sandbox_repo_problem,
+    sanitize,
+)
 from pionir.selfimprove import runner
-
-from ..builds.sandbox import SandboxError, _path_problem, git, head
 
 MAX_FILES = 4000
 MAX_FILE_BYTES = 5_000_000
@@ -42,6 +53,24 @@ MAX_TOTAL_BYTES = 80_000_000
 CLONE_TIMEOUT = 300
 SUITE_PROCESSES = 16
 SUITE_MEMORY_MB = 4096
+_SAFE_PART = re.compile(r"[A-Za-z0-9_.@+-][A-Za-z0-9_.@+ -]{0,120}")
+_SHA = re.compile(r"[0-9a-f]{40,64}")
+
+
+class SandboxError(RuntimeError):
+    pass
+
+
+def git(args: list, cwd, *, run=subprocess.run, text: bool = True, stdin: bytes | None = None,
+        timeout: float = 120, sandboxed: bool = True):
+    """One git command the safe way (pionir/sandbox_git.py); in a sandbox repo only after its
+    ``.git`` has been rewritten to canonical content. SandboxError on any failure."""
+    try:
+        if sandboxed:
+            prepare(cwd)
+        return run_git(args, cwd, run=run, timeout=timeout, text=text, stdin=stdin)
+    except (GitError, OSError) as exc:
+        raise SandboxError(str(exc)) from exc
 
 
 def slug_for(cid: str) -> str:
@@ -49,17 +78,24 @@ def slug_for(cid: str) -> str:
     return f"pionir-{cid}"
 
 
-def owner_head(repo, *, run=subprocess.run) -> str:
-    """The owner's ``main`` HEAD, read only."""
-    try:
-        out = run_git(["rev-parse", "--verify", "--quiet", "refs/heads/main^{commit}"], repo,
-                      run=run)
-    except GitError as exc:
-        raise SandboxError(f"the Pionir repo at {repo} has no main branch ({exc})") from exc
-    sha = str(out).strip()
-    if len(sha) < 40:
-        raise SandboxError(f"the Pionir repo at {repo} has no main branch")
-    return sha
+def head(repo, *, run=subprocess.run) -> str:
+    out = str(git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], repo, run=run)).strip()
+    if not _SHA.fullmatch(out):
+        raise SandboxError("HEAD is not a commit")
+    return out
+
+
+def built_commit(repo, base: str, commit: str, *, run=subprocess.run) -> str:
+    """The full id of a commit Daedalus reports on a branch of its own - only if it exists and
+    descends from the base. Never checked out or merged."""
+    if not re.fullmatch(r"[0-9a-f]{7,64}", commit or ""):
+        raise SandboxError("not a commit id")
+    full = str(git(["rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}"], repo,
+                   run=run)).strip()
+    if not _SHA.fullmatch(full):
+        raise SandboxError(f"{commit} is not a commit in the sandbox")
+    git(["merge-base", "--is-ancestor", base, full], repo, run=run)
+    return full
 
 
 def clone(root, cid: str, source, *, marker: dict, run=subprocess.run) -> tuple:
@@ -90,10 +126,19 @@ def clone(root, cid: str, source, *, marker: dict, run=subprocess.run) -> tuple:
     return str(repo), head(repo, run=run)
 
 
-def export(repo, rev: str, *, run=subprocess.run) -> dict:
+def _path_problem(rel: str) -> str | None:
+    parts = rel.split("/")
+    if rel.startswith("/") or "\\" in rel or ":" in rel or any(
+            p in ("", ".", "..") or not _SAFE_PART.fullmatch(p) for p in parts):
+        return f"{rel[:80]!r} is not a plain relative path"
+    return None
+
+
+def export(repo, rev: str, *, run=subprocess.run, sandboxed: bool = True) -> dict:
     """Every file committed at ``rev`` (path -> bytes), read from its objects with one
     ``cat-file --batch``; a link, a submodule, an odd path or an oversized tree is refused."""
-    raw = git(["ls-tree", "-r", "-z", "--full-tree", rev], repo, run=run, text=False)
+    raw = git(["ls-tree", "-r", "-z", "--full-tree", rev], repo, run=run, text=False,
+              sandboxed=sandboxed)
     entries = []
     for item in bytes(raw).split(b"\x00"):
         if not item:
@@ -114,12 +159,8 @@ def export(repo, rev: str, *, run=subprocess.run) -> dict:
         raise SandboxError(f"more than {MAX_FILES} files are committed")
     if not entries:
         return {}
-    try:
-        prepare(repo)                       # the repo's .git is canonical before git reads it
-        batch = run_git(["cat-file", "--batch"], repo, run=run, text=False,
-                        stdin="".join(f"{sha}\n" for _rel, sha in entries).encode("ascii"))
-    except (GitError, OSError) as exc:
-        raise SandboxError(f"git cat-file --batch could not be run ({exc})") from exc
+    batch = git(["cat-file", "--batch"], repo, run=run, text=False, sandboxed=sandboxed,
+                stdin="".join(f"{sha}\n" for _rel, sha in entries).encode("ascii"))
     data, files, at, total = bytes(batch), {}, 0, 0
     for rel, sha in entries:
         nl = data.find(b"\n", at)
@@ -138,16 +179,39 @@ def export(repo, rev: str, *, run=subprocess.run) -> dict:
 
 
 def diff(repo, base: str, rev: str, *, run=subprocess.run) -> str:
-    """The patch from ``base`` to ``rev``, as git applies it (plumbing only)."""
+    """The patch from ``base`` to ``rev`` in the sandbox repo, as git applies it - read ONCE,
+    then frozen by the worker."""
     out = git(["diff-tree", "-p", "--no-renames", "--no-ext-diff", "--no-textconv", "--binary",
                "--full-index", "--no-color", base, rev], repo, run=run, text=False)
     return bytes(out).decode("utf-8", "replace")
 
 
-def diff_stat(repo, base: str, rev: str, *, run=subprocess.run) -> str:
-    out = git(["diff-tree", "-r", "--no-renames", "--stat=100", "--no-color", base, rev], repo,
-              run=run)
-    return str(out).strip()[:1500]
+def trusted_trees(owner_repo, base: str, patch: bytes, *, run=subprocess.run) -> tuple:
+    """``(base files, changed files, diff stat)`` built from the OWNER's repo at ``base`` and
+    the frozen ``patch`` - in a private clone in the owner's temporary folder, never the
+    sandbox. SandboxError when main no longer holds the base or the patch does not apply."""
+    with tempfile.TemporaryDirectory(prefix="pionir-improve-") as tmp:
+        where = Path(tmp)
+        try:
+            run_git(["clone", "-q", "--no-hardlinks", "--no-checkout", "--no-tags",
+                     "--single-branch", "--branch", "main", str(Path(owner_repo).resolve()),
+                     "c"], where, run=run, timeout=CLONE_TIMEOUT)
+        except (GitError, OSError) as exc:
+            raise SandboxError(f"the owner's repo could not be read ({exc})") from exc
+        c = where / "c"
+        (where / "patch.diff").write_bytes(patch)
+        base_files = export(c, base, run=run, sandboxed=False)
+        git(["read-tree", base], c, run=run, sandboxed=False)
+        try:
+            git(["apply", "--cached", str(where / "patch.diff")], c, run=run, sandboxed=False)
+        except SandboxError as exc:
+            raise SandboxError(f"the frozen patch does not apply to main's {base[:10]} "
+                               f"({exc})") from exc
+        tree = str(git(["write-tree"], c, run=run, sandboxed=False)).strip()
+        head_files = export(c, tree, run=run, sandboxed=False)
+        stat = str(git(["diff-tree", "-r", "--stat=100", "--no-color", base, tree], c, run=run,
+                       sandboxed=False)).strip()[:1500]
+    return base_files, head_files, stat
 
 
 def write_tree(files: dict, dest: Path) -> None:
@@ -159,9 +223,14 @@ def write_tree(files: dict, dest: Path) -> None:
 
 def run_suite(files: dict, *, setup, timeout: float, modules=(), spawner=None
               ) -> runner.SuiteResult:
-    """``modules`` of the tree ``files`` (or, with none, its whole suite), contained: as the
-    ``pionir-builds`` user, the sandbox's interpreter, a job object, a timeout that kills the
-    whole tree. The folder is removed afterwards, whatever happened."""
+    """``modules`` of the tree ``files`` (or, with none, its whole suite), contained - only
+    while holding the sandbox's lease (``busy`` when someone else has it: nothing reaped, nothing
+    run). The folder is removed afterwards, whatever happened."""
+    lease = bs.SandboxLease(setup, "the self-improvement worker's test run")
+    try:
+        lease.acquire()
+    except (bs.SandboxBusy, OSError) as exc:
+        return runner.SuiteResult(False, tail=str(exc), busy=True)
     work = Path(setup.runs_dir) / f"improve-{secrets.token_hex(6)}"
     try:
         work.mkdir(parents=True)
@@ -191,3 +260,4 @@ def run_suite(files: dict, *, setup, timeout: float, modules=(), spawner=None
                                   tail=f"{done.stdout}\n{done.stderr}".strip()[-1500:])
     finally:
         shutil.rmtree(work, ignore_errors=True)
+        lease.release()

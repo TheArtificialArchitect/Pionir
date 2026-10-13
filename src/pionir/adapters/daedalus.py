@@ -64,18 +64,26 @@ from pionir.contracts import (
     TaskResult,
 )
 from pionir.errors import AdapterProtocolError, AdapterUnavailable
-from pionir.sandbox_git import is_reparse
+# The sandbox rule lives with the safe-git code (a leaf module) so the crew can check it
+# without importing every adapter; it is re-exported here under its old names.
+from pionir.sandbox_git import (  # noqa: F401 - re-exported
+    DEFAULT_SANDBOX_ROOT,
+    SANDBOX_MARKER,
+    SANDBOX_SLUG,
+    is_reparse,
+    sandbox_repo_problem,
+)
 
 SOLVE = "coding.daedalus_solve"
 BUILD = "coding.daedalus_build"
+# The same contained build, for the self-improvement worker: its model may only take the card
+# when it FITS beside the voice's model - Moss's model is never sidelined for it (the scheduler
+# refuses with ResourceUnavailable instead, and the worker skips the night).
+BUILD_QUIET = "coding.daedalus_build_quiet"
+BUILDS = frozenset({BUILD, BUILD_QUIET})
 CANCEL = "coding.daedalus_build_cancel"
 SOLVE_PERMISSION = "daedalus.solve"
 BUILD_PERMISSION = "daedalus.build_sandbox"
-DEFAULT_SANDBOX_ROOT = r"C:\src\daedalus-work"
-# Written by the Builds worker into a sandbox repo's .git folder when it creates it; a repo
-# without it was not made by the worker and is never built in.
-SANDBOX_MARKER = "pionir-sandbox.json"
-SANDBOX_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{2,39}")
 BUILD_FIELDS = frozenset({"intent", "repo", "verify", "context", "budget_seconds", "not_after",
                           "build_id"})
 BUILD_ID = re.compile(r"[a-z0-9][a-z0-9-]{7,63}")
@@ -90,8 +98,6 @@ FINISHED_STATES = frozenset({"done", "error", "cancelled"})
 _JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # The summary fields a job's detail carries at its top level (jobs.py Job.summary).
 _SUMMARY_FIELDS = ("passed", "landed", "stage_failed", "branch", "commit", "files")
-_REMOTE = re.compile(r"(?im)^\s*\[\s*remote\b")
-_WORKTREE_KEY = re.compile(r"(?im)^\s*worktree\s*=")
 
 
 class AdapterTimeout(AdapterUnavailable):
@@ -133,78 +139,6 @@ def _how_far(last: Mapping[str, Any] | None, stopped: Mapping[str, Any] | None) 
         parts.append(f"{events} events logged")
     where = "after the cancel" if stopped else "at the last look (it had not stopped yet)"
     return f"{where.capitalize()}: " + (", ".join(parts) if parts else "no detail") + "."
-
-
-def sandbox_repo_problem(repo: Any, root: str | os.PathLike) -> str | None:
-    """Why ``repo`` is not a sandbox repo the Builds worker may build in, or None.
-
-    A sandbox repo is EXACTLY ``<root>\\<slug>``: an absolute path with no ``.`` or ``..``
-    part, not a UNC or device path, whose parent is the sandbox root (compared
-    case-insensitively on Windows, so another drive or another folder is refused), whose
-    name is a slug, which is neither a link nor a junction and resolves to itself (so
-    nothing inside the workspace can point outside it), and which holds a real ``.git``
-    folder (not a ``.git`` file: that is a linked worktree of some other repo) carrying the
-    worker's marker for this slug, with no remote and no ``core.worktree`` redirect - a
-    clone of a live repo, whatever its folder is called, is refused. The root itself must
-    exist and must not be a link. Fail closed: anything that cannot be checked is a
-    reason."""
-
-    if not isinstance(repo, str) or not repo.strip():
-        return ("no repo was given - Daedalus would fall back to its own repository, "
-                "which is never built in")
-    raw = repo.strip()
-    if raw.startswith(("\\\\", "//")):
-        return f"{raw[:80]!r} is a UNC or device path, not a sandbox repo"
-    if any(ch in raw for ch in "~%$\x00"):
-        return f"{raw[:80]!r} has a character that could expand to another path"
-    if any(part in (".", "..") for part in re.split(r"[\\/]+", raw)):
-        return f"{raw[:80]!r} has a '.' or '..' part"
-    if not os.path.isabs(raw) or not re.match(r"^[A-Za-z]:[\\/]|^/", raw):
-        return f"{raw[:80]!r} is not an absolute path"
-    root_abs = os.path.abspath(os.fspath(root))
-    try:
-        root_real = os.path.realpath(root_abs, strict=True)
-    except OSError:
-        return f"the sandbox workspace {root_abs} does not exist"
-    if is_reparse(root_abs) or os.path.normcase(root_real) != os.path.normcase(root_abs):
-        return f"the sandbox workspace {root_abs} is itself a link or junction"
-    repo_abs = os.path.abspath(raw)
-    parent, name = os.path.split(repo_abs)
-    if os.path.normcase(parent) != os.path.normcase(root_abs):
-        return (f"{repo_abs[:120]} is not directly inside the sandbox workspace "
-                f"{root_abs}")
-    if not SANDBOX_SLUG.fullmatch(name):
-        return f"{name[:60]!r} is not a sandbox repo's name (a slug: a-z, 0-9 and -)"
-    path = Path(repo_abs)
-    if is_reparse(path):
-        return f"{repo_abs[:120]} is a link or junction"
-    try:
-        real = os.path.realpath(repo_abs, strict=True)
-    except OSError:
-        return f"{repo_abs[:120]} does not exist"
-    if os.path.normcase(real) != os.path.normcase(repo_abs):
-        return f"{repo_abs[:120]} resolves somewhere else"
-    if not path.is_dir():
-        return f"{repo_abs[:120]} is not a folder"
-    git = path / ".git"
-    if is_reparse(git) or not git.is_dir():
-        return (f"{repo_abs[:120]} has no .git folder of its own (a linked worktree or "
-                "not a repository)")
-    if (git / "commondir").exists():
-        return f"{repo_abs[:120]} is a linked worktree of another repository"
-    try:
-        marker = json.loads((git / SANDBOX_MARKER).read_text(encoding="utf-8"))
-        config = (git / "config").read_text(encoding="utf-8", errors="replace")
-    except (OSError, ValueError):
-        return (f"{repo_abs[:120]} is not a sandbox repo (no readable marker: only a repo "
-                "the Builds worker created is built in)")
-    if not isinstance(marker, dict) or marker.get("slug") != name:
-        return f"{repo_abs[:120]}'s sandbox marker does not name this repo"
-    if _REMOTE.search(config):
-        return f"{repo_abs[:120]} has a remote: it is a clone, not a sandbox"
-    if _WORKTREE_KEY.search(config):
-        return f"{repo_abs[:120]} redirects its work tree elsewhere (core.worktree)"
-    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,6 +301,10 @@ class DaedalusAdapter:
             requires_gpu=True,
             exclusive_card=True,
         )
+        # never displaces a protected model (the voice's): scheduler._make_room
+        quiet = ModelRequirement(model_id=model.model_id,
+                                 estimated_vram_mb=model.estimated_vram_mb,
+                                 context_vram_mb=0, requires_gpu=True, exclusive_card=False)
         self._manifest = AgentManifest(
             agent_id="daedalus",
             version="tech-support/daedalus",
@@ -389,6 +327,16 @@ class DaedalusAdapter:
                     risk=RiskLevel.PRIVILEGED,
                     required_permissions=frozenset({BUILD_PERMISSION}),
                     model=model,
+                    routable=False,
+                ),
+                Capability(
+                    name=BUILD_QUIET,
+                    description="The same contained build for the self-improvement worker, "
+                                "admitted only when it fits beside the voice's model: Moss's "
+                                "model is never sidelined for it",
+                    risk=RiskLevel.PRIVILEGED,
+                    required_permissions=frozenset({BUILD_PERMISSION}),
+                    model=quiet,
                     routable=False,
                 ),
                 Capability(
@@ -490,7 +438,7 @@ class DaedalusAdapter:
         if task.capability == CANCEL:
             self._build_id(payload, only=True)
             return
-        if task.capability == BUILD:
+        if task.capability in BUILDS:
             self._intent(payload)
             self._build_budget(payload)
             return
@@ -548,7 +496,7 @@ class DaedalusAdapter:
         if task.capability == CANCEL:
             return self._cancel_build(task)
         self._cancel_leftovers()
-        if task.capability == BUILD:
+        if task.capability in BUILDS:
             return self._build(task)
         payload = task.payload
         request: dict[str, Any] = {"intent": self._intent(payload)}
@@ -814,10 +762,10 @@ class DaedalusAdapter:
             for key in _SUMMARY_FIELDS:
                 if output.get(key) is None and document.get(key) is not None:
                     output[key] = document[key]
-        if task.capability == BUILD:
+        if task.capability in BUILDS:
             output.pop("steps", None)           # large, and nothing downstream reads them
         commit = str(output.get("commit") or "").strip()
-        evidence: list[str] = ["daedalus:build" if task.capability == BUILD else "daedalus:solve"]
+        evidence: list[str] = ["daedalus:build" if task.capability in BUILDS else "daedalus:solve"]
         if job_id is not None:
             evidence.append(f"daedalus:job:{job_id}")
         if commit:

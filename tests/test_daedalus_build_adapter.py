@@ -286,7 +286,7 @@ class SandboxRuleTests(_Case):
         live = self.tmp / "live-repo"
         subprocess.run(["git", "init", "-q", str(live)], check=True)
         _winapi.CreateJunction(str(live), str(self.root / "linked-repo"))
-        with mock.patch("pionir.adapters.daedalus.is_reparse", return_value=False):
+        with mock.patch("pionir.sandbox_git.is_reparse", return_value=False):  # the rule lives there
             problem = sandbox_repo_problem(str(self.root / "linked-repo"), str(self.root))
         self.assertIn("resolves somewhere else", problem)
 

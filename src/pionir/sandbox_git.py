@@ -22,11 +22,14 @@ into OTHER repos' objects. So:
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 from pathlib import Path
+from typing import Any
 
 GIT_TIMEOUT = 60
 SAFE_ARGS = ("-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false",
@@ -49,6 +52,17 @@ _REMOVED = ("config.worktree", "commondir", "gitdir", "info/attributes",
 
 class GitError(RuntimeError):
     pass
+
+
+# The Builds division's sandbox workspace and the rule for a repo the crew may have Daedalus
+# build in (moved here from adapters/daedalus.py, which re-exports them).
+DEFAULT_SANDBOX_ROOT = r"C:\src\daedalus-work"
+# Written by the Builds worker into a sandbox repo's .git folder when it creates it; a repo
+# without it was not made by the worker and is never built in.
+SANDBOX_MARKER = "pionir-sandbox.json"
+SANDBOX_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{2,39}")
+_REMOTE = re.compile(r"(?im)^\s*\[\s*remote\b")
+_WORKTREE_KEY = re.compile(r"(?im)^\s*worktree\s*=")
 
 
 def is_reparse(path) -> bool:
@@ -149,3 +163,75 @@ def verify(repo, *, run=subprocess.run) -> None:
     want = [(k, v) for k, v in CANONICAL_ENTRIES]
     if sorted(local) != sorted(want):
         raise GitError("the repo's git config is not the canonical one after rewriting it")
+
+
+def sandbox_repo_problem(repo: Any, root: str | os.PathLike) -> str | None:
+    """Why ``repo`` is not a sandbox repo the Builds worker may build in, or None.
+
+    A sandbox repo is EXACTLY ``<root>\\<slug>``: an absolute path with no ``.`` or ``..``
+    part, not a UNC or device path, whose parent is the sandbox root (compared
+    case-insensitively on Windows, so another drive or another folder is refused), whose
+    name is a slug, which is neither a link nor a junction and resolves to itself (so
+    nothing inside the workspace can point outside it), and which holds a real ``.git``
+    folder (not a ``.git`` file: that is a linked worktree of some other repo) carrying the
+    worker's marker for this slug, with no remote and no ``core.worktree`` redirect - a
+    clone of a live repo, whatever its folder is called, is refused. The root itself must
+    exist and must not be a link. Fail closed: anything that cannot be checked is a
+    reason."""
+
+    if not isinstance(repo, str) or not repo.strip():
+        return ("no repo was given - Daedalus would fall back to its own repository, "
+                "which is never built in")
+    raw = repo.strip()
+    if raw.startswith(("\\\\", "//")):
+        return f"{raw[:80]!r} is a UNC or device path, not a sandbox repo"
+    if any(ch in raw for ch in "~%$\x00"):
+        return f"{raw[:80]!r} has a character that could expand to another path"
+    if any(part in (".", "..") for part in re.split(r"[\\/]+", raw)):
+        return f"{raw[:80]!r} has a '.' or '..' part"
+    if not os.path.isabs(raw) or not re.match(r"^[A-Za-z]:[\\/]|^/", raw):
+        return f"{raw[:80]!r} is not an absolute path"
+    root_abs = os.path.abspath(os.fspath(root))
+    try:
+        root_real = os.path.realpath(root_abs, strict=True)
+    except OSError:
+        return f"the sandbox workspace {root_abs} does not exist"
+    if is_reparse(root_abs) or os.path.normcase(root_real) != os.path.normcase(root_abs):
+        return f"the sandbox workspace {root_abs} is itself a link or junction"
+    repo_abs = os.path.abspath(raw)
+    parent, name = os.path.split(repo_abs)
+    if os.path.normcase(parent) != os.path.normcase(root_abs):
+        return (f"{repo_abs[:120]} is not directly inside the sandbox workspace "
+                f"{root_abs}")
+    if not SANDBOX_SLUG.fullmatch(name):
+        return f"{name[:60]!r} is not a sandbox repo's name (a slug: a-z, 0-9 and -)"
+    path = Path(repo_abs)
+    if is_reparse(path):
+        return f"{repo_abs[:120]} is a link or junction"
+    try:
+        real = os.path.realpath(repo_abs, strict=True)
+    except OSError:
+        return f"{repo_abs[:120]} does not exist"
+    if os.path.normcase(real) != os.path.normcase(repo_abs):
+        return f"{repo_abs[:120]} resolves somewhere else"
+    if not path.is_dir():
+        return f"{repo_abs[:120]} is not a folder"
+    git = path / ".git"
+    if is_reparse(git) or not git.is_dir():
+        return (f"{repo_abs[:120]} has no .git folder of its own (a linked worktree or "
+                "not a repository)")
+    if (git / "commondir").exists():
+        return f"{repo_abs[:120]} is a linked worktree of another repository"
+    try:
+        marker = json.loads((git / SANDBOX_MARKER).read_text(encoding="utf-8"))
+        config = (git / "config").read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return (f"{repo_abs[:120]} is not a sandbox repo (no readable marker: only a repo "
+                "the Builds worker created is built in)")
+    if not isinstance(marker, dict) or marker.get("slug") != name:
+        return f"{repo_abs[:120]}'s sandbox marker does not name this repo"
+    if _REMOTE.search(config):
+        return f"{repo_abs[:120]} has a remote: it is a clone, not a sandbox"
+    if _WORKTREE_KEY.search(config):
+        return f"{repo_abs[:120]} redirects its work tree elsewhere (core.worktree)"
+    return None
