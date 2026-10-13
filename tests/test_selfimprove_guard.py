@@ -422,8 +422,8 @@ class IndirectTests(_Case):
 
 
 class ClosureTests(unittest.TestCase):
-    """What protected code imports is protected too - computed from the real tree, so it can
-    never drift from it."""
+    """What the SECURITY CORE imports is protected too - computed from the real tree, so it can
+    never drift from it; the other protected files are protected as files only."""
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -431,37 +431,51 @@ class ClosureTests(unittest.TestCase):
                      for p in SRC.rglob("*.py") if "__pycache__" not in p.parts}
         cls.closure = guard.protected_closure(cls.files)
 
-    def test_modules_protected_code_imports_are_protected(self) -> None:
-        for path in ("src/pionir/crew/clock.py", "src/pionir/crew/net.py",
-                     "src/pionir/crew/fiverr/safehttp.py", "src/pionir/crew/claudedraft.py",
-                     "src/pionir/ports.py"):
+    def test_the_core_holds_the_security_code(self) -> None:
+        for path in ("src/pionir/approvals.py", "src/pionir/discord_gate.py",
+                     "src/pionir/auth.py", "src/pionir/build_sandbox.py",
+                     "src/pionir/sandbox_git.py", "src/pionir/crew/escalation.py",
+                     "src/pionir/scheduler.py", "src/pionir/crew/gpu.py", "src/pionir/runtime.py",
+                     "src/pionir/secretscrub.py", "src/pionir/economy/ledger.py",
+                     "src/pionir/selfimprove/guard.py", "src/pionir/crew/improve/worker.py",
+                     "src/pionir/adapters/improve.py", "src/pionir/workapi.py"):
             with self.subTest(path=path):
-                self.assertIn(path, self.closure)
+                self.assertTrue(guard.in_core(path))
                 self.assertIsNotNone(guard.protected_why(path, self.closure))
 
+    def test_what_the_core_imports_is_protected(self) -> None:
+        for path in ("src/pionir/crew/net.py", "src/pionir/ports.py", "src/pionir/crew/finder.py",
+                     "src/pionir/crew/blog.py", "src/pionir/atomic.py"):
+            with self.subTest(path=path):
+                self.assertIn(path, self.closure)
+
     def test_the_whole_closure_is_protected(self) -> None:
-        protected = {p for p in self.files if guard.protected_why(p, self.closure)}
-        for path in sorted(protected):
-            for mod in guard._imported_modules(path, self.files[path].decode("utf-8")):
+        reached = [p for p in self.files if guard.in_core(p)] + sorted(self.closure)
+        for path in reached:
+            for mod in guard._imported_modules(path, self.files[path].decode("utf-8"),
+                                               lazy=guard.in_core(path)):
                 dep = guard._path_for(mod, self.files)
                 if dep is not None:
                     self.assertTrue(guard.protected_why(dep, self.closure)
                                     or guard.allowed_why_not(dep), (path, dep))
 
     def test_a_patch_to_such_a_module_is_refused_everywhere(self) -> None:
-        clock = "src/pionir/crew/clock.py"
-        patch = (f"diff --git a/{clock} b/{clock}\nindex 1111111..2222222 100644\n--- a/{clock}\n"
-                 f"+++ b/{clock}\n@@ -1 +1 @@\n-x\n+y\n")
+        net = "src/pionir/crew/net.py"
+        patch = (f"diff --git a/{net} b/{net}\nindex 1111111..2222222 100644\n--- a/{net}\n"
+                 f"+++ b/{net}\n@@ -1 +1 @@\n-x\n+y\n")
         self.assertTrue(any("is protected" in p for p in guard.patch_problems(
             patch, protected=self.closure)))
-        self.assertTrue(guard.tree_problems([clock], self.files, {**self.files, clock: b"y = 1\n"}))
+        self.assertTrue(guard.tree_problems([net], self.files, {**self.files, net: b"y = 1\n"}))
 
-    def test_how_much_is_left_to_patch(self) -> None:
+    def test_a_content_rule_is_protected_but_not_what_it_imports(self) -> None:
+        self.assertIsNotNone(guard.protected_why("src/pionir/crew/etsy/rules.py"))
+        self.assertFalse(guard.in_core("src/pionir/crew/etsy/rules.py"))
+        self.assertIsNone(guard.protected_why("src/pionir/crew/etsy/maker.py", self.closure))
+
+    def test_enough_is_left_to_fix(self) -> None:
         left = sorted(p for p in self.files if p.startswith("src/")
                       and not guard.protected_why(p, self.closure) and not guard.allowed_why_not(p))
-        # nearly nothing: every module the gate, the crew's wiring and the adapters reach is
-        # protected; such failures go to "needs a human"
-        self.assertLessEqual(len(left), 5, left)
+        self.assertGreaterEqual(len(left), 30, left)
 
 
 class CatalogueTests(_Case):

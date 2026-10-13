@@ -249,8 +249,23 @@ def _path_for(module: str, files) -> str | None:
     return None
 
 
-def _imported_modules(path: str, source: str) -> set:
-    """Every pionir module ``path`` imports - at the top or inside a function - and the
+def _import_nodes(tree, lazy: bool):
+    """The import statements of a module: all of them (``lazy``), or only those that run when
+    it is imported (not inside a function body)."""
+    if lazy:
+        yield from ast.walk(tree)
+        return
+    todo = list(ast.iter_child_nodes(tree))
+    while todo:
+        node = todo.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        yield node
+        todo.extend(ast.iter_child_nodes(node))
+
+
+def _imported_modules(path: str, source: str, *, lazy: bool = True) -> set:
+    """Every pionir module ``path`` imports - with ``lazy``, inside functions too - and the
     packages on the way."""
     try:
         tree = ast.parse(source)
@@ -259,7 +274,7 @@ def _imported_modules(path: str, source: str) -> set:
     name = module_name_of(path) or ""
     package = name if path.endswith("__init__.py") else name.rsplit(".", 1)[0]
     found: set = set()
-    for node in ast.walk(tree):
+    for node in _import_nodes(tree, lazy):
         if isinstance(node, ast.Import):
             found |= {a.name for a in node.names}
         elif isinstance(node, ast.ImportFrom):
@@ -279,22 +294,51 @@ def _imported_modules(path: str, source: str) -> set:
     return out
 
 
+# The SECURITY CORE: the code whose behaviour IS the protection - the approval gate and its
+# cards, auth, money and spend rules (the Claude caps), secrets handling, the build sandbox, the
+# GPU lease, the executive that enforces permissions, and the self-improvement code itself.
+# Everything these import, transitively, is protected too (``protected_closure``). The other
+# protected files (content and listing rules, settings, wiring, scripts) are protected as FILES
+# only - and no changed module may reach into any of them (``indirect_problems``).
+CORE: tuple = (
+    "src/pionir/approvals.py", "src/pionir/batching.py", "src/pionir/discord_gate.py",
+    "src/pionir/contracts.py", "src/pionir/server.py",
+    "src/pionir/auth.py", "src/pionir/bridge_auth.py", "src/pionir/signin.py",
+    "src/pionir/economy/**", "src/pionir/crew/bolts.py", "src/pionir/crew/budget.py",
+    "src/pionir/crew/escalation.py", "src/pionir/crew/direction.py", "src/pionir/workapi.py",
+    "src/pionir/worklog.py",
+    "src/pionir/secretscrub.py", "src/pionir/crew/fiverr/checks.py",
+    "src/pionir/build_sandbox.py", "src/pionir/sandbox_git.py", "src/pionir/crew/builds/sandbox.py",
+    "src/pionir/shared_gpu.py", "src/pionir/scheduler.py", "src/pionir/crew/gpu.py",
+    "src/pionir/ollama_gate.py",
+    "src/pionir/runtime.py", "src/pionir/registry.py", "src/pionir/reliability.py",
+    "src/pionir/adapters/daedalus.py",
+    "src/pionir/selfimprove/**", "src/pionir/crew/improve/**", "src/pionir/adapters/improve.py",
+    "src/pionir/improvecli.py", "src/pionir/improvement.py",
+)
+
+
+def in_core(path: str) -> bool:
+    return any(_match(path, pattern) for pattern in CORE)
+
+
 def protected_closure(files: dict) -> dict:
-    """{path: why} for every Pionir module a PROTECTED module imports, transitively: changing
-    one of those changes what the protected code runs, so it is protected too. ``files``: the
-    repo's tree (path -> bytes or text)."""
-    start = [p for p in files if p.endswith(".py") and p.startswith("src/") and protected_why(p)]
+    """{path: why} for every Pionir module the SECURITY CORE imports, transitively: changing
+    one of those changes what the core runs, so it is protected too. A core file counts every
+    import (inside its functions too: they run); a module it pulls in counts the imports that
+    run when it is imported. ``files``: the repo's tree (path -> bytes or text)."""
+    start = [p for p in files if p.endswith(".py") and p.startswith("src/") and in_core(p)]
     seen = set(start)
     todo = [(p, p) for p in start]
     out: dict = {}
     while todo:
         path, root = todo.pop()
-        for mod in _imported_modules(path, _text(files[path])):
+        for mod in _imported_modules(path, _text(files[path]), lazy=in_core(path)):
             dep = _path_for(mod, files)
             if dep is None or dep in seen:
                 continue
             seen.add(dep)
-            out[dep] = f"imported by protected code ({root})"
+            out[dep] = f"imported by the security core ({root})"
             todo.append((dep, root))
     return out
 

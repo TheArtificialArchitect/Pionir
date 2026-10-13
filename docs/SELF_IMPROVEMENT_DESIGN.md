@@ -33,9 +33,13 @@ PROTECTED (listed with reasons, each tested): the approval gate and its surfaces
 spend rules, secrets handling, content and listing rules, the build sandbox and everything that
 runs in it, the GPU lease, CI, adapters, the crew's wiring, the test harness, dependency files, the
 self-improvement code and its tests, and every module that code imports (computed by a test) -
-and, computed at run time from the tree itself, EVERY module any protected module imports,
-transitively (on 2026-10-13 that left 1 of 217 modules patchable: code fixes are effectively
-off, so most clusters are reported as needing a human; tests and catalogue settings remain).
+and, computed at run time from the tree itself, every module the SECURITY CORE imports,
+transitively (`guard.CORE`: the approval gate and cards, auth, money/spend/Claude caps,
+secrets handling, the build sandbox, the GPU lease, the executive, and the self-improvement
+code). Other protected files (content and listing rules, settings, wiring) are protected as
+files only. On 2026-10-13: 49 of 217 modules patchable (the Etsy, Fiverr, marketplace,
+newsletter, product and results workers among them); the live Etsy "medical" clusters need a
+human (etsy/rules.py), the title-length and Printify clusters are patchable.
 A changed file may also never reach into another module: no attribute assigned, deleted or
 augmented on an imported module (or an alias of one), no setattr/delattr, no namespace writes
 (`__dict__`, `vars()`, `globals()`, `sys.modules`), no reload, no patching in src; a test may
