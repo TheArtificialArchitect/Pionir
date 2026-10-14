@@ -391,6 +391,18 @@ BYPASSES = (
     "from pionir import auth\ndef leak():\n    return auth.PERMISSION_SCOPES\nleak()['k'] = 1\n",
     "from pionir import auth\nlist.append(auth.X, 1)\n",
     "from unittest import mock\nmock.patch('pionir.auth.X', 1).start()\n",
+    # the third review's: refused because the file names a protected module at all
+    "from pionir.auth import DEFAULT_GRANTS\nholder = (lambda: DEFAULT_GRANTS)()\nholder['x'] = 1\n",
+    "from pionir import auth\nclass C:\n    m = auth\nC.m.X = 1\n",
+    "from pionir import auth\nm = auth if True else None\nm.X = 1\n",
+    "from pionir.approvals import requires_owner\ndef deco(f):\n    return requires_owner\n"
+    "@deco\ndef g():\n    pass\ng.__kwdefaults__ = {}\n",
+    "from pionir import auth\nmatch auth:\n    case m:\n        m.X = 1\n",
+    "from dataclasses import dataclass, field\nfrom pionir.auth import DEFAULT_GRANTS\n"
+    "@dataclass\nclass C:\n    g: dict = field(default_factory=lambda: DEFAULT_GRANTS)\n"
+    "C().g['x'] = 1\n",
+    "def f():\n    try:\n        from pionir import auth\n    except ImportError:\n        return\n"
+    "    return (lambda: auth)()\n",
 )
 
 
@@ -479,13 +491,33 @@ class IndirectTests(_Case):
             with self.subTest(kind=kind):
                 self.repo.change({RULE: head + line})
                 problems = guard.tree_problems([RULE], base, self.repo.tree())
-                self.assertTrue(problems, kind)
-                self.assertFalse(any("reflective" in p or "imports" in p for p in problems))
-        self.repo.change({RULE: head + "n = auth.helper(1)\nx = auth.CONST + 1\n"})
-        self.assertEqual(guard.tree_problems([RULE], base, self.repo.tree()), [])  # read, call
+                self.assertTrue(any("never reaches into another module" in p
+                                    for p in problems), (kind, problems))
+
+    def test_a_protected_import_already_in_the_file_still_refuses_it(self) -> None:
+        # by construction: the WHOLE file a patch leaves may not name a protected module,
+        # whatever was there before - so no taint trick has anything to start from
+        head = "from pionir import auth\nfrom pionir.auth import DEFAULT_GRANTS\n"
+        self.repo.change({RULE: head})
+        base = self.repo.tree()
+        for line in ("n = 1\n", BYPASSES[-1], BYPASSES[-3], BYPASSES[-6]):
+            with self.subTest(line=line):
+                self.repo.change({RULE: head + line})
+                problems = guard.tree_problems([RULE], base, self.repo.tree())
+                self.assertTrue(any("anywhere in it" in p for p in problems), problems)
+
+    def test_a_test_imports_only_stdlib_deps_and_patchable_modules(self) -> None:
+        for line, ok in (("import json\nimport pytest\n", True),
+                         ("from pionir.crew.etsy import maker\n", True),
+                         ("from pionir import auth\n", False),
+                         ("import support\n", False),
+                         ("import requests\n", False)):
+            with self.subTest(line=line):
+                problems = self.refused("tests/test_rules.py", line + TEST)
+                self.assertEqual(not problems, ok, problems)
 
     def test_existing_code_is_not_judged_again(self) -> None:
-        old = BYPASSES[1]
+        old = "def leak(x):\n    return [x]\n"
         self.repo.change({RULE: old})
         base = self.repo.tree()
         self.repo.change({RULE: old + "y = 2\n"})
@@ -550,6 +582,19 @@ class ClosureTests(unittest.TestCase):
         self.assertEqual(left, ["src/pionir/crew/__main__.py", "src/pionir/crew/claudedraft.py",
                                 "src/pionir/doctor_fix.py", "src/pionir/memory_health.py",
                                 "src/pionir/video/fetch.py", "src/pionir/video/sponsor.py"])
+
+    def test_none_of_those_survive_the_whole_file_import_rule(self) -> None:
+        # the honest patchable count is 0: every file not protected as a file still imports a
+        # protected name, so the whole-file rule refuses a patch to it. Soundness by
+        # construction - nothing a patch leaves can even name protected code - costs us every
+        # patch target here, because the protected closure already reaches these modules' imports.
+        left = sorted(p for p in self.files if p.startswith("src/")
+                      and not guard.protected_why(p, self.closure) and not guard.allowed_why_not(p))
+        for path in left:
+            head = {**self.files, path: self.files[path] + b"\n_marker = 1\n"}
+            problems = guard.tree_problems([path], self.files, head, protected=self.closure)
+            with self.subTest(path=path):
+                self.assertTrue(any("anywhere in it" in p for p in problems), (path, problems))
 
 
 class FrozenTablesTests(unittest.TestCase):

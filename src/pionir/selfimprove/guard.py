@@ -573,10 +573,48 @@ def indirect_problems(path: str, old, new, *, protected=None, files=()) -> list:
     after = _reach(_text(new), path=path, module_protected=module_protected)
     if after is None:
         return []
+    reasons = whole_file_problems(path, _text(new), module_protected=module_protected)
     before = _reach(_text(old), path=path, module_protected=module_protected) if old else {}
     before = before or {}
-    return [f"{path} {kind}: a change here never reaches into another module"
-            for kind, n in sorted(after.items()) if n > before.get(kind, 0)]
+    return reasons + [f"{path} {kind}: a change here never reaches into another module"
+                      for kind, n in sorted(after.items()) if n > before.get(kind, 0)
+                      and not kind.startswith(WHOLE_FILE_KINDS)]
+
+
+# The guarantee, by construction: a file a patch leaves behind - ALL of it, not only what the
+# patch added - imports nothing protected (at any level: module, function, class, branch, try)
+# and uses no reflective or dynamic primitive. Code that cannot name a protected module cannot
+# change one. A test file imports only the standard library, Pionir's declared dependencies and
+# patchable modules.
+WHOLE_FILE_KINDS = ("uses a reflective primitive", "imports a protected module",
+                    "imports from a protected module", "uses getattr")
+
+
+def whole_file_problems(path: str, source: str, *, module_protected) -> list:
+    """Every reason the WHOLE file is not one a patch may leave: a protected import anywhere in
+    it, a reflective or dynamic primitive anywhere in it, and - for a test - any import that is
+    not the standard library, a declared dependency or a patchable Pionir module."""
+    counts = _reach(source, path=path, module_protected=module_protected)
+    if counts is None:
+        return [f"{path} does not parse as Python"]
+    reasons = [f"{path} {kind}: a patchable file never does, anywhere in it"
+               for kind in sorted(counts) if kind.startswith(WHOLE_FILE_KINDS)]
+    if path.startswith("tests/"):
+        allowed = set(sys.stdlib_module_names) | DECLARED | {"__future__"}
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            names = [a.name for a in node.names] if isinstance(node, ast.Import) else \
+                [f"{node.module}.{a.name}" for a in node.names] \
+                if isinstance(node, ast.ImportFrom) and not node.level and node.module \
+                else ["(relative)"] if isinstance(node, ast.ImportFrom) else []
+            for name in names:
+                top = name.split(".")[0]
+                if top in allowed or top == "pionir":  # a protected one is refused above
+                    continue
+                reasons.append(f"{path} imports {name!r}: a test a patch leaves imports only "
+                               "the standard library, declared dependencies and patchable "
+                               "modules")
+    return reasons
 
 
 def allowed_why_not(path: str, status: str = "modified") -> str | None:
