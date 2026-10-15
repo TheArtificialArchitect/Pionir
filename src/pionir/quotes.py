@@ -74,6 +74,9 @@ QUOTABLE = ("quote_requested", "quoted")
 CLOSED = ("paid", "in_progress", "delivered", "declined", "refunded", "balance_due",
           "balance_paid")
 CARD_RETENTION = timedelta(days=60)
+# How often the open cards' orders are re-read from Scrooge, so a card whose order closed
+# without a reply to it (declined, refunded, paid some other way) is closed too.
+RECONCILE_SECONDS = 600.0
 ORDER_TRIES = 5              # a reply whose order cannot be read is retried this many times
 MAX_PAGES = 5                # at most this many pages of 100 channel messages per poll
 STORE_NAME = "quote-cards.json"
@@ -360,6 +363,9 @@ class QuoteReplies:
         self.every = every
         self._clock = clock
         self._last = -float("inf")
+        # the first look at the open cards' orders is RECONCILE_SECONDS after start, not at
+        # once: a reply (and only a reply) is what makes a poll read an order right away
+        self._reconciled = clock()
 
     # ---- one poll ----------------------------------------------------------------------
     def tick(self, call: Call, owner: str | None, channel: str) -> None:
@@ -376,6 +382,11 @@ class QuoteReplies:
         if now - self._last < self.every:
             return
         self._last = now
+        if now - self._reconciled >= RECONCILE_SECONDS:
+            self._reconciled = now
+            cards = self.reconcile(cards)
+            if not cards:
+                return
         ids = [int(m) for c in cards.values() for m in c.get("message_ids") or []
                if _SNOWFLAKE.fullmatch(str(m))]
         if not ids:
@@ -389,7 +400,7 @@ class QuoteReplies:
                                and _SNOWFLAKE.fullmatch(str(m.get("id")))),
                               key=lambda m: int(m["id"])) if isinstance(got, list) else []
             for message in messages:
-                self._consider(call, owner, channel, message)
+                self.consider(call, owner, channel, message)
             if messages:
                 # Re-reading a page after a crash is harmless: each reply is claimed by id.
                 cursor = str(messages[-1]["id"])
@@ -399,7 +410,31 @@ class QuoteReplies:
         self._retry(call, channel)
         self._prune()
 
-    def _consider(self, call: Call, owner: str, channel: str, message: dict[str, Any]) -> None:
+    def reconcile(self, cards: dict[str, Any]) -> dict[str, Any]:
+        """Close every open card whose order can no longer be quoted, and return the cards
+        still open. A card used to close only when a reply to it found its order closed:
+        an order declined (or paid, or refunded) with no further reply left its card open
+        for good. An order that cannot be read now is left as it is and asked again."""
+        still = dict(cards)
+        for order_id in list(cards):
+            try:
+                order = self._get_order(order_id)
+            except Exception as error:  # noqa: BLE001 - asked again on the next pass
+                _log.warning("quotes: order %s could not be read to check its card: %s: %s",
+                             order_id, type(error).__name__, str(error)[:200])
+                continue
+            status = (order or {}).get("status")
+            if order is None or status in CLOSED:
+                self._close(order_id, status=f"order_{status or 'gone'}")
+                still.pop(order_id, None)
+                _log.info("quotes: the card for %s closed: its order is %s", order_id,
+                          status or "gone")
+        return still
+
+    def consider(self, call: Call, owner: str, channel: str, message: dict[str, Any]) -> None:
+        """One channel message: if it is the owner's reply to an open card, claim it and act
+        on it. The Approval Desk hands its typed replies in here too (PionirApp.desk_reply),
+        so a reply is read one way whichever surface it came from."""
         # (the reply record carries who wrote it: client.quote checks it is the owner)
         ref = (message.get("message_reference") or {}).get("message_id")
         if ref is None:
@@ -481,7 +516,7 @@ class QuoteReplies:
             shown = "not found" if order is None else f"now `{status}`"
             self._set(order_id, reply_id, state="refused", why=f"order {shown}")
             if order is None or status in CLOSED:
-                self._close(order_id)
+                self._close(order_id, status=f"order_{status or 'gone'}")
             self._answer(call, channel, reply_id,
                          f"⛔ Order `{order_id}` is {shown}, so it can't be quoted. "
                          "Nothing was sent.")
@@ -530,9 +565,10 @@ class QuoteReplies:
                 if r.get("state") == "claimed" and card.get("open"):
                     self._handle(call, channel, order_id, reply_id)
 
-    def _close(self, order_id: str) -> None:
+    def _close(self, order_id: str, *, status: str = "closed") -> None:
         def change(d: dict[str, Any]) -> None:
             d["cards"][order_id]["open"] = False
+            d["cards"][order_id]["status"] = status
             d["cards"][order_id]["closed_at"] = _now().isoformat()
         self.store.update(change)
 

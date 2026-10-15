@@ -38,6 +38,7 @@ _log = logging.getLogger(__name__)
 FIELDS = frozenset({"order_id", "package", "brief"})
 MAX_BRIEF = 6000
 IN_FLIGHT = timedelta(minutes=2)
+PREVIEW_MAX = 4000
 _ORDER_ID = re.compile(r"[0-9a-f]{12}")
 _FENCE = "```"
 
@@ -185,8 +186,9 @@ class QuoteCardAdapter:
 
         def settle(doc: dict[str, Any]) -> None:
             if ids:
+                # the brief's head, for the Approval Desk (pionir/desk.py) to show
                 doc["cards"][oid].update(message_ids=ids, open=True, posted_at=now.isoformat(),
-                                         package=package)
+                                         package=package, preview=brief[:PREVIEW_MAX])
                 doc["cards"][oid].pop("reserved_at", None)
             else:
                 doc["cards"].pop(oid, None)       # not posted: nothing to answer, try again

@@ -69,6 +69,10 @@ PROTECTED: tuple = (
     ("src/pionir/reliability.py", "the approval gate (the circuit breakers)"),
     ("src/pionir/audit.py", "the approval gate (the audit ledger)"),
     ("src/pionir/desktop.py", "the approval gate (the desktop's approve/deny)"),
+    ("src/pionir/desk.py", "the approval gate (the Approval Desk: which items may be "
+                           "approved as a group, and card expiry)"),
+    ("src/pionir/money.py", "the approval gate (the one reading of an approval's money, "
+                            "shared by the Discord card and the desk)"),
     ("src/pionir/web/**", "the approval gate (the dashboard)"),
     ("src/pionir/adapters/**", "Pionir's actuators: what each one does and parks for approval"),
     ("src/pionir/bootstrap.py", "what Pionir registers and how"),

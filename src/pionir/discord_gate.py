@@ -115,6 +115,7 @@ from .adapters.testimonials import PUBLISH_TESTIMONIAL as CLIENT_TESTIMONIAL
 # Etsy streams: their cards' lines and previews live with their adapters
 from .adapters import etsy as etsy_cards
 from .adapters import printify as printify_cards
+from . import money as _money
 from .batching import DigestSettings, answer_request, local_now, read_request
 from .fiverr import FiverrReplies
 from .fiverr import store_for as fiverr_store_for
@@ -150,16 +151,10 @@ _FENCE = "```"
 _CONFIG_NAME = "config.json"
 _STATE_NAME = "gate.json"
 
-# Payload keys that carry an amount of money. A producer that spends money says
-# so with one of these (a number, a string, or {"amount": ..., "currency": ...}),
-# optionally with a sibling "currency"; ``spends_money: true`` with no amount is
-# shown as an unstated amount, never as nothing.
-MONEY_KEYS = ("spend", "amount", "cost", "price", "charge")
-# Capability words that suggest money moves even when no amount was supplied.
-MONEY_WORDS = frozenset({
-    "buy", "purchase", "pay", "payment", "payout", "spend", "checkout", "charge",
-    "order", "subscribe", "subscription", "invoice", "refund", "transfer",
-})
+# The money keys and words live with the one reading of them (pionir/money.py), which the
+# Approval Desk shares: re-exported here, where they have always been imported from.
+MONEY_KEYS = _money.MONEY_KEYS
+MONEY_WORDS = _money.MONEY_WORDS
 
 
 # ---------------------------------------------------------------- settings
@@ -442,19 +437,7 @@ def _fence_safe(text: str) -> str:
 
 
 def _format_amount(value: Any, currency: Any) -> str | None:
-    if isinstance(value, Mapping):
-        return _format_amount(value.get("amount", value.get("value")),
-                              value.get("currency", currency))
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, (int, float)):
-        text = f"{value:,.2f}"
-    else:
-        text = str(value).strip()
-        if not text:
-            return None
-    cur = str(currency).strip().upper() if currency else ""
-    return f"{text} {cur}" if cur else f"{text} (currency not stated)"
+    return _money.format_amount(value, currency)
 
 
 def money_line(row: Mapping[str, Any], *,
@@ -467,32 +450,18 @@ def money_line(row: Mapping[str, Any], *,
     (a new listing's own sale price, pionir/batching.py) - every other money field still
     counts."""
 
-    payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
-    for source in (row, payload):
-        currency = source.get("currency")
-        for key in MONEY_KEYS:
-            if key in source and key not in allowed:
-                amount = _format_amount(source[key], currency)
-                if amount:
-                    return f"💸 **SPENDS MONEY: {_escape(amount)}**"
-    for source in (row, payload):
-        for key, value in source.items():
-            if not isinstance(key, str) or key in allowed:
-                continue
-            name = key.lower()
-            if name.endswith("_cents") and isinstance(value, (int, float)) \
-                    and not isinstance(value, bool):
-                amount = _format_amount(value / 100, source.get("currency"))
-                return (f"💸 **MONEY INVOLVED: {_escape(str(amount))} "
-                        f"(`{_fence_safe(key)}`)**")
-            if (name == "currency" or name.endswith("_currency")) and value:
-                return (f"💸 **MAY INVOLVE MONEY - a currency is named "
-                        f"(`{_fence_safe(key)}`), amount not stated. Do not approve blind.**")
-    flagged = bool(row.get("spends_money") or payload.get("spends_money"))
-    words = set(re.split(r"[^a-z]+", str(row.get("capability", "")).lower()))
-    if flagged or words & MONEY_WORDS:
-        return "💸 **MAY SPEND MONEY - AMOUNT NOT STATED. Do not approve blind.**"
-    return None
+    found = _money.find_money(row, allowed=allowed)
+    if found is None:
+        return None
+    if found.kind == "amount":
+        return f"💸 **SPENDS MONEY: {_escape(str(found.text))}**"
+    if found.kind == "cents":
+        return (f"💸 **MONEY INVOLVED: {_escape(str(found.text))} "
+                f"(`{_fence_safe(str(found.key))}`)**")
+    if found.kind == "currency":
+        return (f"💸 **MAY INVOLVE MONEY - a currency is named "
+                f"(`{_fence_safe(str(found.key))}`), amount not stated. Do not approve blind.**")
+    return "💸 **MAY SPEND MONEY - AMOUNT NOT STATED. Do not approve blind.**"
 
 
 def _command(payload: Mapping[str, Any]) -> str | None:
@@ -1619,8 +1588,12 @@ class DiscordGate:
         builds: FiverrReplies | None = None,
         digest: DigestSettings | None = None,
         clock: Callable[[], datetime] | None = None,
+        desk_tick: Callable[[], None] | None = None,
     ) -> None:
         self.settings = settings
+        # The Approval Desk's housekeeping (pionir/desk.py): stale reply cards parked, and
+        # the weekly "still waiting on you" note. It rate-limits itself and never raises.
+        self._desk_tick = desk_tick
         # The daily digest of batched (routine public) approvals: when, and for how long
         # an item may wait. ``clock`` is local, tz-aware wall time (tests fake it).
         self._digest = digest or DigestSettings.from_environment(settings.state_root)
@@ -1708,6 +1681,8 @@ class DiscordGate:
             kwargs["builds"] = build_replies(settings.state_root)
         if isinstance(getattr(app, "digest", None), DigestSettings):
             kwargs.setdefault("digest", app.digest)   # the same settings that batch at enqueue
+        if callable(getattr(app, "desk_tick", None)):
+            kwargs.setdefault("desk_tick", app.desk_tick)
         return cls(settings, approvals=app.approvals, approve=app.approve, deny=app.deny,
                    **kwargs)
 
@@ -1957,6 +1932,8 @@ class DiscordGate:
                 continue
             self._guard(approval_id, lambda a=approval_id, e=entry: self._follow(a, e))
         self._guard("digest", self._digest_tick)
+        if self._desk_tick is not None:
+            self._desk_tick()
         self._prune()
 
     def _guard(self, approval_id: str, work: Callable[[], None]) -> None:

@@ -83,6 +83,7 @@ MAX_ATTACH_TOTAL = 9_500_000         # a bot's message may carry about 10 MB in 
 MAX_EVENTS = 200
 MAX_RESPONSE_BYTES = 4_000_000
 IN_FLIGHT = timedelta(minutes=2)
+PREVIEW_MAX = 4000
 _KEY = re.compile(r"[A-Za-z0-9:._-]{3,120}")
 _REF = re.compile(r"[A-Za-z0-9_-]{1,40}")
 _EVENT_ID = re.compile(r"[A-Za-z0-9_.:-]{1,80}")
@@ -436,8 +437,10 @@ class FiverrAdapter:
 
         def settle(doc: dict) -> None:
             if ids:
+                # its title and text's head, for the Approval Desk (pionir/desk.py)
                 doc["cards"][key].update(message_ids=ids, open=card["replies"],
-                                         posted_at=now.isoformat())
+                                         posted_at=now.isoformat(), title=card["title"],
+                                         preview=card["body"][:PREVIEW_MAX])
                 doc["cards"][key].pop("reserved_at", None)
             else:
                 doc["cards"].pop(key, None)
