@@ -167,6 +167,92 @@ class AbstentionTests(_Case):
         self.assertIn("nothing_new_since_s", entry)
 
 
+class IdleBackoffTests(_Case):
+    """idle_report_backoff_seconds: a leader on an idle book (same worker health, same
+    figures, same goal) stops burning a local-model call every run to re-report 'still 0
+    orders' / 'still up'. It reports the moment something material changes, and otherwise
+    only once per the backoff window as a heartbeat. Reverting it (idle_backoff = 0) makes
+    the leader report on every fresh idle probe again - which is what these tests forbid."""
+
+    def _leader(self, crew, *, backoff: int, ask=None, clock=None) -> Leader:
+        ld = Leader("alpha", crew.registry, crew.store, ask=ask or FakeAsk(),
+                    escalator=crew.escalator, model="gemma3:12b", clock=clock or time.time)
+        ld.idle_backoff = backoff
+        return ld
+
+    def _record(self, crew, t: float, value: int = 1200) -> None:
+        """A fresh real revenue reading of ``value`` at time ``t`` - an idle re-reading when
+        the value is unchanged, a real change when it is not."""
+        w = crew.registry.require("alpha.ledger")
+        crew.store.record_attempt(
+            worker_id="alpha.ledger", division="alpha", started_at=t, finished_at=t,
+            error=None, outputs=[make_output(
+                w, valid_at=t, observed_at=t, payload={},
+                figures=[{"value": value, "unit": "usd_cents", "measures": "revenue"}],
+                provenance={"source": "real"})])
+
+    def test_an_unchanged_idle_book_skips_the_model_call(self) -> None:
+        crew = self.crew()
+        clock = [1000.0]
+        self._record(crew, 999)
+        ask = FakeAsk()
+        lead = self._leader(crew, backoff=10 ** 9, ask=ask, clock=lambda: clock[0])
+        self.assertIsInstance(lead.run().value, Report)          # first run reports
+        self.assertEqual(len(ask.calls), 1)
+        clock[0] = 2000.0
+        self._record(crew, 1999)                                 # a fresh BUT identical reading
+        quiet = lead.run().value
+        self.assertIsInstance(quiet, Abstention)                 # new output, nothing material
+        self.assertFalse(quiet.blocking)
+        self.assertIn("nothing material changed", quiet.reason)
+        self.assertEqual(len(ask.calls), 1)                      # the model was NOT called again
+
+    def test_a_real_change_reports_at_once_within_the_window(self) -> None:
+        crew = self.crew()
+        clock = [1000.0]
+        self._record(crew, 999)
+        ask = FakeAsk(script=[reply(), reply(
+            summary="Revenue is $90.00 so far this month, recorded by the ledger.",
+            figures=[{"value": 9000, "unit": "usd_cents", "measures": "revenue"}])])
+        lead = self._leader(crew, backoff=10 ** 9, ask=ask, clock=lambda: clock[0])
+        lead.run()                                               # reports $12
+        self.assertEqual(len(ask.calls), 1)
+        clock[0] = 1100.0
+        self._record(crew, 1099, value=9000)                     # a real change, inside the window
+        self.assertIsInstance(lead.run().value, Report)
+        self.assertEqual(len(ask.calls), 2)                      # the change was reported
+
+    def test_the_heartbeat_lets_one_report_through_after_the_window(self) -> None:
+        crew = self.crew()
+        clock = [1000.0]
+        self._record(crew, 999)
+        ask = FakeAsk()
+        lead = self._leader(crew, backoff=600, ask=ask, clock=lambda: clock[0])
+        lead.run()                                               # reports at t=1000
+        clock[0] = 1500.0
+        self._record(crew, 1499)                                 # idle, 500s < 600 window
+        self.assertIsInstance(lead.run().value, Abstention)
+        self.assertEqual(len(ask.calls), 1)
+        clock[0] = 2000.0
+        self._record(crew, 1999)                                 # idle, but 1000s >= 600 heartbeat
+        self.assertIsInstance(lead.run().value, Report)
+        self.assertEqual(len(ask.calls), 2)
+
+    def test_backoff_off_reports_every_fresh_idle_probe(self) -> None:
+        # the reverted behaviour: with the backoff off, an identical fresh reading still
+        # costs a model call - exactly the waste the fix removes.
+        crew = self.crew()
+        clock = [1000.0]
+        self._record(crew, 999)
+        ask = FakeAsk()
+        lead = self._leader(crew, backoff=0, ask=ask, clock=lambda: clock[0])
+        lead.run()
+        clock[0] = 2000.0
+        self._record(crew, 1999)
+        self.assertIsInstance(lead.run().value, Report)
+        self.assertEqual(len(ask.calls), 2)
+
+
 class ReportTests(_Case):
     def test_a_report_is_distilled_by_the_local_brain_in_distiller_style(self) -> None:
         post = FakeOllama(reply=reply())
