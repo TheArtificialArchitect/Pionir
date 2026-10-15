@@ -81,6 +81,24 @@ class CleanDraftTests(unittest.TestCase):
         self.assertEqual(cc.check(with_body(
             "```\ncurl https://api.dokaz.net/v1/email/verify\n```")), [])
 
+    def test_our_own_product_and_channel_names_pass(self) -> None:
+        # live 2026-10-13..14: the newsletter was blocked on 'Instagram' and 'Barcodes',
+        # the Instagram worker repeatedly on 'Barcode' - the company's OWN product and
+        # channel names. Naming a channel we publish on, or a product we sell, is not a PII
+        # leak (rule 7 guards other people's names, not our own brands).
+        body = ("Our Barcode API turns a product code into a Barcode, or many Barcodes at "
+                "once. We share tips on Instagram and Etsy, sell on Fiverr and list on "
+                "RapidAPI, with demos on YouTube.")
+        self.assertEqual(cc.check(with_body(body)), [])
+        # a Title-Case Instagram headline ("...Simple Creation") must also pass
+        self.assertEqual(cc.unknown_names(
+            [("headline", "Product Label Fundamentals: Simple Barcode Creation")],
+            headings=frozenset({"headline"})), [])
+        # SAFETY, unchanged: an internal system name still blocks, and so does a person's
+        reasons = cc.check(with_body(body + " Built on Pionir. Ask Marcus Hale."))
+        self.assertTrue(any("Pionir" in r for r in reasons), reasons)
+        self.assertTrue(any("Marcus" in r for r in reasons), reasons)
+
 
 class RenderableTests(unittest.TestCase):
     """Markdown the site's renderer does not draw is published as literal text."""
