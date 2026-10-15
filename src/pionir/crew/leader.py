@@ -341,6 +341,18 @@ class Leader:
         self.model = model
         self._clock = clock
         self.cadence_seconds = self.spec.leader_cadence_seconds
+        # Idle backoff (catalogue: idle_report_backoff_seconds; 0 = off). While the division's
+        # MATERIAL state is unchanged - same worker health, same recorded figures, same goal
+        # (salient_state) - the leader abstains without a model call, and reports only the
+        # moment something changes or once per this window as a heartbeat. It stops the 20:1
+        # overhead the 2026-10 review found: leaders spending hundreds of local-model calls
+        # re-reporting "still 0 orders" / "still $0" / "still up" on empty, idle books, while
+        # the drafting workers (blog, Etsy, Instagram) made a few dozen. The real monitoring is
+        # the worker (e.g. watch.health), which keeps probing at its own cadence regardless; a
+        # real change (an order, revenue, a flip to down) changes salient_state and reports at
+        # once. Reversible: set the catalogue value to 0 to restore every-run reporting.
+        self.idle_backoff = self.spec.idle_report_backoff_seconds
+        self._state_key = f"leader_report_state:{self.division}"
         # (division, worker id) -> {"worker", "queued", "why"?}: runtime.Crew.leader_rerun.
         # None: the leader cannot ask for a run, and its schema lets it name no worker.
         self.rerun = rerun
@@ -377,7 +389,43 @@ class Leader:
         if brief.last_considered is not None and not brief.new_outputs:
             return Abstention(self.division, "nothing new since the last report",
                               blocking=False)
+        quiet = self._idle_abstention(brief)
+        if quiet is not None:
+            return quiet
         return None
+
+    def _idle_abstention(self, brief) -> Abstention | None:
+        """When idle backoff is on and the division's material state has not changed since the
+        last report, abstain WITHOUT a model call - but let a report through once per the
+        backoff window so Moss still hears the division is alive. The workers kept running and
+        recording; only the leader's re-report of the same facts is skipped. salient_state is
+        the same digest the leader already trusts to decide a repeat escalation is pointless
+        (the contracts leader once asked Claude 115 times about the same zero orders)."""
+        if self.idle_backoff <= 0 or brief.last_considered is None:
+            return None
+        try:
+            last = self.store.get(self._state_key)
+        except Exception as exc:  # noqa: BLE001 - a missing/failed read just means report
+            log.warning("%s: could not read its report state: %s", self.leader_id, exc)
+            return None
+        if not isinstance(last, dict) or last.get("state") != salient_state(brief):
+            return None             # never reported yet, or something material changed
+        if self._clock() - float(last.get("t") or 0) >= self.idle_backoff:
+            return None             # the heartbeat is due: let one report through
+        return Abstention(
+            self.division, "nothing material changed since the last report (same worker "
+            "health, figures and goal); idle backoff skipped the model call", blocking=False)
+
+    def _remember_report_state(self, brief) -> None:
+        """Pin the material state and time of a report just written, so the next idle run can
+        tell nothing changed. Never fatal: a leader that cannot remember just reports again."""
+        if self.idle_backoff <= 0:
+            return
+        try:
+            self.store.set(self._state_key,
+                           {"state": salient_state(brief), "t": self._clock()})
+        except Exception as exc:  # noqa: BLE001 - the report still went up
+            log.warning("%s: could not remember its report state: %s", self.leader_id, exc)
 
     # ---- one run ---------------------------------------------------------------
     def run(self) -> Result:
@@ -449,6 +497,7 @@ class Leader:
                     stamp=brief.stamp, headline=report.headline, summary=report.summary,
                     attention=report.attention, figures=report.figures,
                     routine=report.routine, provenance=provenance, escalation=escalation)
+                self._remember_report_state(brief)
                 return Ok(replace(report, escalation=escalation, provenance=provenance)), 1
             failures.append((kind, reasons))
             log.warning("%s: attempt %d refused (%s): %s", self.leader_id, attempt, kind,
@@ -505,6 +554,7 @@ class Leader:
             division=self.division, written_at=now, status="report", stamp=brief.stamp,
             headline=report.headline, summary=report.summary, attention=report.attention,
             figures=report.figures, routine=(), reason=reason, provenance=prov)
+        self._remember_report_state(brief)
         log.warning("%s: the model's report failed its checks (%s); sent the figures only: %s",
                     self.leader_id, ", ".join(kinds), reason[:300])
         last = next((k for k, _r in reversed(failures) if k != ErrorKind.NO_WORDS),

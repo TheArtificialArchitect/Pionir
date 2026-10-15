@@ -23,7 +23,7 @@ CATALOGUE_PATH = Path(__file__).with_name("catalogue.json")
 
 _TOP = frozenset({"_how", "providers", "known_names", "divisions"})
 _DIVISION = frozenset({"id", "title", "leader_cadence_seconds", "workers", "brief_quota",
-                       "entities", "leader_notes", "_note"})
+                       "entities", "leader_notes", "idle_report_backoff_seconds", "_note"})
 _WORKER = frozenset({"name", "impl", "kind", "cadence_seconds", "provider", "stage",
                      "entities", "note", "params", "uses", "_note"})
 
@@ -57,6 +57,15 @@ class DivisionSpec:
     brief_quota: dict = field(default_factory=dict)
     entities: tuple = ()
     leader_notes: str = ""      # division-specific rules added to its leader's instructions
+    # How long a leader stays quiet (no model call) while its division's MATERIAL state is
+    # unchanged - same worker health, same recorded figures, same goal (leader.salient_state).
+    # 0 (the default) keeps the old behaviour: a leader reports every time its workers record
+    # anything new, even an idle probe that says the same thing ("still 0 orders", "still up").
+    # A positive value backs that off: the leader reports the moment something material
+    # changes, and otherwise only once per this many seconds as a liveness heartbeat. The real
+    # monitoring is the WORKER, which keeps running at its own cadence regardless; this only
+    # dedups the leader's reports to Moss. See leader.Leader.consider.
+    idle_report_backoff_seconds: int = 0
 
 
 def _unknown(where: str, d: dict, allowed: frozenset) -> None:
@@ -85,6 +94,13 @@ def _uses(where: str, v) -> tuple:
 def _positive_int(where: str, v) -> int:
     if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
         raise ValueError(f"{where} must be a positive whole number of seconds, not {v!r}")
+    return v
+
+
+def _non_negative_int(where: str, v) -> int:
+    """A count of seconds where 0 means 'off' (e.g. idle_report_backoff_seconds)."""
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        raise ValueError(f"{where} must be a whole number of seconds >= 0, not {v!r}")
     return v
 
 
@@ -224,7 +240,10 @@ def build_registry(catalogue: dict, impls: Mapping | None = None) -> Registry:
                                                  d.get("leader_cadence_seconds", 3600)),
             worker_ids=tuple(ids), brief_quota=dict(quota),
             entities=tuple(d.get("entities") or ()),
-            leader_notes=str(d.get("leader_notes") or "").strip()))
+            leader_notes=str(d.get("leader_notes") or "").strip(),
+            idle_report_backoff_seconds=_non_negative_int(
+                f"{did}.idle_report_backoff_seconds",
+                d.get("idle_report_backoff_seconds", 0))))
     return Registry(divisions, workers, providers, catalogue.get("known_names") or (), uses)
 
 
