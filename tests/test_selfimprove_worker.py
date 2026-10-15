@@ -423,7 +423,10 @@ class DetectTests(unittest.TestCase):
             where = detect.locate(repo, c)
             self.assertIn("needs a human", where["needs_human"])
             self.assertIn("src/pionir/crew/etsy/rules.py", where["needs_human"])
-            self.assertNotIn("src/pionir/crew/etsy/rules.py", where["targets"])
+            # apply-by-hand: the protected file that holds the rule is now a DRAFT target, so
+            # Daedalus writes the fix against it (Ian applies it himself)
+            self.assertIn("src/pionir/crew/etsy/rules.py", where["targets"])
+            self.assertIn("src/pionir/crew/etsy/rules.py", where["protected"])
 
 
 class PipelineTests(_Case):
@@ -498,17 +501,46 @@ class PipelineTests(_Case):
         self.assertEqual(self.cands()[0]["state"], "undone")
         self.assertEqual(self.record()["counts"]["applied"], 1)
 
-    def test_a_cluster_only_a_protected_rule_could_fix_needs_a_human(self) -> None:
+    def test_a_fix_in_protected_code_is_drafted_for_ian_to_apply_by_hand(self) -> None:
+        # Daedalus's draft touches a PROTECTED file (the approval gate): the guard does not
+        # shelve it - it becomes an apply-by-hand DRAFT (the bot commits nothing). The regression
+        # test and fix in the patchable maker still verify as usual.
+        self.answers.append(approve())
+        self.run_at(at(5, 5, 46))
+        self.daedalus(files={"src/pionir/approvals.py":
+                             '"""The approval gate."""\n# a drafted touch, Ian applies it\n'})
+        self.through_review()
+        [c] = self.cands()
+        self.assertEqual(c["state"], "drafted", c.get("why"))
+        self.assertTrue(c["manual"])
+        self.assertTrue(any("approvals.py is protected" in r for r in c["refusals"]), c["refusals"])
+        self.assertEqual([h["state"] for h in c["history"]],
+                         ["detected", "writing", "verifying", "reviewing", "drafted"])
+        [ask] = self.pionir.applies()                          # a card was still parked for him
+        self.assertEqual(set(ask.payload), {"id", "digest"})
+        _data, card, _digest = store.read_candidate(self.improve, c["id"])
+        self.assertTrue(card["manual"])
+        self.assertEqual(self.record()["counts"]["drafts"], 1)
+        self.assertEqual(self.record()["counts"]["proposals"], 1)
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), self.main)   # Ian's repo untouched
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+
+    def test_a_cluster_whose_fix_is_in_a_protected_rule_is_still_eligible(self) -> None:
+        # the a-priori signal: the words live only in the protected rules file, so the worker
+        # drafts a fix against it (it is NOT skipped), telling Daedalus it may edit that file
         git(self.repo, "rm", "-q", MAKER)
         commit(self.repo, {"src/pionir/crew/etsy/rules.py": CHECKER}, "rules")
         self.rows = [r for r in self.rows if "medical" in str(r["payload"])]
         self.run_at(at(5, 5, 46))
         night = self.record()["nights"]["2026-10-05"]
-        self.assertEqual(night["eligible"], [])
-        [human] = night["needs_human"]
-        self.assertIn("protected rule", human["why"])
-        self.assertEqual(self.pionir.builds(), [])                 # no Daedalus run burnt
-        self.assertEqual(list(self.sandbox.iterdir()), [])          # nothing cloned
+        [ev] = night["eligible"]
+        self.assertTrue(ev["manual"])
+        self.assertIn("src/pionir/crew/etsy/rules.py", ev["targets"])
+        [c] = self.cands()
+        self.assertTrue(c["manual"])
+        [job] = self.pionir.builds()                            # a draft job DID start
+        self.assertIn("applies BY HAND", job.payload["intent"])
+        self.assertIn("src/pionir/crew/etsy/rules.py", job.payload["intent"])
 
 
 class FrozenPatchTests(_Case):
@@ -862,13 +894,19 @@ class ClaudeTests(_Case):
 
 
 class RefusalTests(_Case):
-    def test_a_protected_file_is_refused_before_any_review_and_never_repaired(self) -> None:
+    def test_a_protected_edit_with_any_other_refusal_is_still_shelved(self) -> None:
+        # the apply-by-hand relaxation is ONLY for a patch whose SOLE refusal is editing
+        # protected code. A protected edit together with a weakened test is a bad patch: shelved
+        # before any review, never drafted and never repaired.
         self.run_at(at(5, 5, 46))
-        self.daedalus({"src/pionir/approvals.py": '"""The approval gate - relaxed."""\n'})
+        self.daedalus({"src/pionir/approvals.py": '"""The approval gate - relaxed."""\n',
+                       "tests/test_rules.py": REPO["tests/test_rules.py"].replace(
+                           "self.assertTrue(maker.check('medical'))", "self.assertTrue(True)")})
         self.through_review()
         [c] = self.cands()
         self.assertEqual(c["state"], "shelved")
-        self.assertIn("approval gate", c["why"])
+        self.assertFalse(c.get("manual"))
+        self.assertIn("real assert", c["why"])
         self.assertEqual(self.prompts, [])
         self.assertEqual(len(self.pionir.builds()), 1)
         self.assertEqual(self.suites, [])

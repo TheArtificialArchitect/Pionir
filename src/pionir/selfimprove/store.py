@@ -34,7 +34,7 @@ OUTCOME = "outcome.json"
 UNDONE = "undone.json"
 LEDGER_NAME = "builds.improve.json"
 STATES = ("detected", "writing", "verifying", "reviewing", "awaiting_owner", "applied",
-          "denied", "shelved", "stale", "undone")
+          "drafted", "denied", "shelved", "stale", "undone")
 OPEN = frozenset({"detected", "writing", "verifying", "reviewing", "awaiting_owner"})
 
 

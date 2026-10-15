@@ -172,12 +172,34 @@ class CapabilityTests(_Case):
             self.adapter.validate(self.task())
         self.assertIn("Ian's card", str(caught.exception))
 
-    def test_the_protected_list_is_checked_again_here(self) -> None:
-        bad = self.make_patch({"src/pionir/approvals.py": "# relaxed\n"})
+    def test_a_protected_only_patch_is_an_apply_by_hand_draft_not_a_refusal(self) -> None:
+        # editing protected code is no longer refused here: it is a DRAFT Ian applies by hand.
+        # validate passes, the card is marked manual with paste-ready steps, and execute commits
+        # NOTHING.
+        draft = self.make_patch({"src/pionir/approvals.py": "# relaxed\n", REG: REGRESSION})
+        self.digest = self.card(draft, manual=True)
+        self.adapter.validate(self.task())                       # does not raise
+        ctx = self.adapter.park_context(self.task())
+        self.assertTrue(ctx["manual"])
+        self.assertTrue(ctx["apply_by_hand"])
+        self.assertIn("git apply", " ".join(ctx["manual_steps"]))
+        self.assertIn("committed by the bot", ctx["runs"])
+        result = self.adapter.execute(self.task())
+        self.assertTrue(result.output["ok"])
+        self.assertTrue(result.output["manual"])
+        self.assertFalse(result.output["applied"])
+        self.assertEqual(self.head(), self.base)                 # the repo is never touched
+        self.assertEqual(git(self.repo, "status", "--porcelain"), "")
+        self.assertTrue(self.outcome()["manual"])
+
+    def test_a_non_protected_refusal_is_still_refused_here(self) -> None:
+        # the apply-by-hand relaxation is only for a protected-ONLY patch: a new dependency in a
+        # patchable file is still refused before anything parks or runs.
+        bad = self.make_patch({"src/pionir/crew/etsy/maker.py": "import no_such_dep\n" + FIXED})
         self.digest = self.card(bad)
         with self.assertRaises(AdapterProtocolError) as caught:
             self.adapter.validate(self.task())
-        self.assertIn("protected", str(caught.exception))
+        self.assertIn("refuses it", str(caught.exception))
 
 
 class ApplyTests(_Case):

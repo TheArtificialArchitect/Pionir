@@ -2,8 +2,14 @@
 
 It finds a failure that keeps recurring identically in Pionir's own records, has Daedalus write
 a fix with a regression test in the build sandbox, FREEZES the patch, checks and verifies those
-frozen bytes, has Claude review them once, and asks Ian. It NEVER applies anything itself:
-Pionir's ``improve.apply`` does, on his yes only (selfimprove/apply.py).
+frozen bytes, has Claude review them once, and shows Ian a card. It NEVER applies anything
+itself. Two outcomes, decided by the guard on the frozen diff:
+
+- the fix touches only PATCHABLE code -> an ``improve.apply`` card; on Ian's yes, Pionir applies
+  it as one commit (selfimprove/apply.py). (While nothing is patchable this path is dead.)
+- the fix touches PROTECTED code (today, every real fix) -> a DRAFT card marked "apply by hand":
+  the same evidence, verified diff and Claude verdict, plus paste-ready apply/undo steps. The bot
+  commits NOTHING - approving it only acknowledges it; Ian applies it himself.
 docs/SELF_IMPROVEMENT_DESIGN.md has the design; in order, each run:
 
 1. **What Ian decided** (always, even with the sandbox gone): a parked card that was denied ->
@@ -33,8 +39,9 @@ docs/SELF_IMPROVEMENT_DESIGN.md has the design; in order, each run:
    of (patch, base, tests), then ``improve.apply`` ``{id, digest}`` - parked by Pionir on every
    call -> ``awaiting_owner``.
 7. **Detect** once per night in its window and **start** at most ``per_night`` (2) candidates:
-   a cluster whose own words live only in a protected file is reported as **needing a human**
-   and never written; a job starts only inside its GPU window (default 05:45-07:00, opening
+   a cluster whose fix lives only in a protected file is drafted all the same - Daedalus writes
+   it against those protected files in the sandbox, and it becomes an apply-by-hand card (above),
+   never an auto-apply; a job starts only inside its GPU window (default 05:45-07:00, opening
    in the night window; any time until it can no longer finish), only once the night builds are
    done (still busy at the last start that fits: the night is skipped, saying so), ``rest_minutes``
    after its own last job, and only as the QUIET build, which may sideline Moss's model only while she is idle (no turn with Ian for 30 minutes,
@@ -80,6 +87,7 @@ NEIGHBOUR_BUSY = ("queued", "building", "built", "repair")
 DAY = 86400.0
 DENIED_COOLDOWN = 30 * DAY
 SHELVED_COOLDOWN = 14 * DAY
+DRAFTED_COOLDOWN = 14 * DAY        # a fix drafted for Ian to apply by hand: not re-drafted nightly
 STALE_COOLDOWN = 3 * DAY
 AFTER_FIX = 2                    # sightings after a commit to its files that keep it
 REVIEW_HOURS = (1, 12)           # reviews between 01:00 and noon: one night's Claude cap
@@ -90,7 +98,7 @@ RETRY_AFTER = 900.0
 LOST_AFTER = 1200.0
 KEEP_NIGHTS = 30
 KEEP_BASELINES = 3
-TERMINAL = frozenset({"applied", "denied", "shelved", "stale", "undone"})
+TERMINAL = frozenset({"applied", "drafted", "denied", "shelved", "stale", "undone"})
 PASSING_TYPES = frozenset({"AdapterUnavailable", "AdapterAuthenticationError", "CircuitOpen",
                            "BodyDeferred"})
 _PASSING = re.compile(r"(?i)\b(?:unavailable|timed out|timeout|circuit (?:is )?open|"
@@ -347,7 +355,10 @@ class SelfImprover:
                              f"({_clip(out.error, 200)}); will re-propose", events)
 
     def _settle_outcome(self, ctx, rec, c: dict, outcome: dict, events: list) -> None:
-        if outcome.get("applied") and outcome.get("reverted"):
+        if outcome.get("manual"):
+            self._to(ctx, rec, c, "drafted", "a fix was drafted and shown to you to apply by "
+                     "hand; the bot did not commit it", events)
+        elif outcome.get("applied") and outcome.get("reverted"):
             c["applied_commit"] = outcome.get("commit")
             self._count(rec, "applied")
             self._to(ctx, rec, c, "undone", str(outcome.get("why") or "reverted at once: its "
@@ -571,10 +582,17 @@ class SelfImprover:
             hard = guard.patch_problems(patch, local_modules=local, known_imports=known,
                                         protected=closure) + \
                 guard.tree_problems(paths, base, head, known=known, protected=closure)
-            if hard:
+            # The guard decides the MODE, not whether to shelve: a patch whose only refusal is
+            # that it edits protected files is a DRAFT for Ian to apply by hand (it still verifies
+            # and is reviewed). Any other refusal (size, reflection, a weakened test, a patchable
+            # file reaching protected code) is a bad patch, shelved or repaired as before.
+            c["manual"] = guard.only_protected_files(hard)
+            if hard and not c["manual"]:
                 c["refusals"] = [_clip(r, 300) for r in hard[:12]]
                 self._failed(ctx, rec, c, hard, events, hard=True)
                 return
+            if c["manual"]:
+                c["refusals"] = [_clip(r, 300) for r in hard[:12]]
             want = prompts.regression_file(c["id"])
             if want not in head or base.get(want) is not None:
                 self._failed(ctx, rec, c, [f"it did not add the regression test {want}"],
@@ -697,9 +715,13 @@ class SelfImprover:
         closure = guard.protected_closure(base)
         hard = guard.patch_problems(patch, known_imports=known, protected=closure) + \
             guard.tree_problems(paths, base, head, known=known, protected=closure)
-        if hard:
+        # protected-only -> a draft Ian applies by hand; any other refusal -> shelved (as before)
+        c["manual"] = guard.only_protected_files(hard)
+        if hard and not c["manual"]:
             self._failed(ctx, rec, c, hard, events, hard=True)
             return
+        if c["manual"]:
+            c["refusals"] = [_clip(r, 300) for r in hard[:12]]
         self._submit(ctx, rec, c, data, stat, events)
 
     def _ask_claude(self, ctx, rec, c, patch: str, events) -> dict | None:
@@ -747,17 +769,27 @@ class SelfImprover:
                 "verdict": {k: c["verdict"].get(k) for k in
                             ("approved", "summary", "reasons", "checks")},
                 "verification": c.get("verification"), "diff_stat": stat,
-                "base": c["base"], "tests": tests, "targets": c.get("targets")}
+                "base": c["base"], "tests": tests, "targets": c.get("targets"),
+                # a draft that touches protected code: the card is informational, apply-by-hand,
+                # and the bot will not commit it. refusals say exactly what makes it so.
+                "manual": bool(c.get("manual")), "refusals": c.get("refusals") or []}
         c["digest"] = store.write_card(ctx.improve_dir, c["id"], data, card)
-        out = ctx.job(Job(APPLY, {"id": c["id"], "digest": c["digest"]},
-                          what=f"ask the owner to apply self-improvement {c['id']}: "
-                               f"{_clip(c['title'], 80)}"))
+        manual = bool(c.get("manual"))
+        what = (f"show the owner a self-improvement {c['id']} to apply BY HAND (the bot will not "
+                f"commit it): {_clip(c['title'], 80)}" if manual else
+                f"ask the owner to apply self-improvement {c['id']}: {_clip(c['title'], 80)}")
+        out = ctx.job(Job(APPLY, {"id": c["id"], "digest": c["digest"]}, what=what))
         why = out.error or f"Pionir said {out.status}"
         if out.status == "pending_approval":
             c.update(approval_id=out.approval_id, waiting=None)
             self._count(rec, "proposals")
-            self._to(ctx, rec, c, "awaiting_owner", f"waiting for Ian's yes (approval "
-                     f"{out.approval_id})", events)
+            if manual:
+                self._count(rec, "drafts")
+                self._to(ctx, rec, c, "drafted", "a fix is drafted and shown to Ian to apply by "
+                         f"hand (approval {out.approval_id}); the bot will not commit it", events)
+            else:
+                self._to(ctx, rec, c, "awaiting_owner", f"waiting for Ian's yes (approval "
+                         f"{out.approval_id})", events)
         elif out.status == "done":
             log.error("%s: %s ran WITHOUT the owner's approval; it must be approval-gated",
                       self.worker_id, APPLY)
@@ -802,11 +834,9 @@ class SelfImprover:
                     skipped[cl.key] = "a fix for it was applied and it has not recurred enough"
                     continue
             where = detect.locate(ctx.pionir_repo, cl)
-            if where["needs_human"]:
-                skipped[cl.key] = where["needs_human"]
-                needs_human.append({"worker": cl.worker, "reason": _clip(cl.reason, 160),
-                                    "count": cl.count, "why": where["needs_human"]})
-                continue
+            # A cluster whose fix lives only in protected code is NO LONGER skipped: the bot
+            # drafts a fix for it too and shows Ian the diff to apply BY HAND (it never commits
+            # protected code). where["needs_human"] now only flags that the card is apply-by-hand.
             # still happening on the CURRENT code? only what happened after the crew last
             # started and after the newest commit to its files counts
             cut, label = self._current_since(ctx, where["targets"])
@@ -832,6 +862,9 @@ class SelfImprover:
             ev = cl.evidence(self.lookback_days)
             ev["targets"] = where["targets"]
             ev["counted_since"] = label
+            ev["manual"] = bool(where["needs_human"])      # the fix is in protected code
+            ev["manual_why"] = where["needs_human"] or ""
+            ev["protected"] = where["protected"]
             eligible.append(ev)
         rec["nights"][night.key] = {"start": night.start, "end": night.end,
                                     "detected_at": ctx.now, "clusters": len(clusters),
@@ -891,6 +924,9 @@ class SelfImprover:
                 return f"{c['id']} was {state} {int((now - ended) // DAY)} day(s) ago (30-day rest)"
             if (state == "shelved" or c.get("expired")) and now - ended < SHELVED_COOLDOWN:
                 return f"{c['id']} was {'unanswered' if c.get('expired') else 'shelved'} " \
+                       f"{int((now - ended) // DAY)} day(s) ago (14-day rest)"
+            if state == "drafted" and now - ended < DRAFTED_COOLDOWN:
+                return f"{c['id']} was drafted for you to apply by hand " \
                        f"{int((now - ended) // DAY)} day(s) ago (14-day rest)"
             if state == "stale" and now - ended < STALE_COOLDOWN:
                 return f"{c['id']} went stale {int((now - ended) // DAY)} day(s) ago " \
@@ -982,6 +1018,9 @@ class SelfImprover:
              "night": night.key, "created_at": ctx.now, "evidence": ev, "targets": targets,
              "hypothesis": detect.hypothesis(cl, targets, self.lookback_days),
              "title": _clip(f"{ev['worker']}: stop \"{ev['example']}\" recurring", 140),
+             # a-priori: the fix is in protected code, so draft it for Ian to apply by hand. The
+             # guard confirms this after the draft lands (_verify_step sets it authoritatively).
+             "manual": bool(ev.get("manual")),
              "attempts": [], "repairs": 0, "history": [], "state": "detected"}
         rec["candidates"][cid] = c
         tonight["started"].append(cid)
@@ -1008,7 +1047,10 @@ class SelfImprover:
         n = len(c["attempts"]) + 1
         build_id = f"{isandbox.slug_for(c['id'])}-{n}-{secrets.token_hex(4)}"
         payload = {"intent": prompts.intent(c, c["repo"], repair=c.get("repair_reasons") or []
-                                            if kind == "repair" else ()),
+                                            if kind == "repair" else (),
+                                            manual=bool(c.get("manual")),
+                                            protected_targets=c.get("evidence", {}).get(
+                                                "protected") or []),
                    "repo": c["repo"], "verify": prompts.verify_command(c["id"]),
                    "budget_seconds": self.budget, "not_after": deadline, "build_id": build_id}
         a = {"n": n, "kind": kind, "submitted_at": ctx.now, "not_after": deadline,
@@ -1094,6 +1136,9 @@ class SelfImprover:
 
         figures = [Figure(int(counts.get("proposals") or 0), "count",
                           "self-improvements proposed to the owner", window="all_time"),
+                   Figure(int(counts.get("drafts") or 0), "count",
+                          "self-improvements drafted for the owner to apply by hand",
+                          window="all_time"),
                    Figure(int(counts.get("applied") or 0), "count",
                           "self-improvements applied", window="all_time"),
                    Figure(n(*store.OPEN), "count", "self-improvements in progress", window="now"),

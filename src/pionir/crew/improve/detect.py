@@ -381,6 +381,9 @@ def locate(repo, c: Cluster, *, limit: int = 4) -> dict:
     if guarded and not worded:
         needs = (f"needs a human: it touches a protected rule ({', '.join(guarded[:3])} - "
                  f"{protected_why(guarded[0], extra) or allowed_why_not(guarded[0])})")
+        # a person applies the fix by hand, so the DRAFT may edit the protected files that hold
+        # the rule: they become the targets Daedalus writes against
+        found = guarded[:limit] + [f for f in found if f not in guarded]
     if c.source in ("outputs", "runs", "vitals") and "." in c.worker:
         found.append("src/pionir/crew/catalogue.json")
     return {"targets": found, "protected": guarded[:4], "needs_human": needs}

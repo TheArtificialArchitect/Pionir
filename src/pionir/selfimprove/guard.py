@@ -973,3 +973,17 @@ def tree_problems(changed: list, base: dict, head: dict, *, known=frozenset(),
 
 def changed_paths(text: str) -> list:
     return [f.path for f in parse_patch(text or "")]
+
+
+PROTECTED_FILE_PROBLEM = " is protected ("
+
+
+def only_protected_files(reasons) -> bool:
+    """True when every refusal (and there is at least one) is 'a protected file is edited'. That
+    is the ONE thing a human-applied DRAFT may do that the bot's own apply never will: touch
+    protected code, because a person - not the bot - commits it. Every other refusal (size, a
+    reflective primitive, a new dependency, a weakened or deleted test, the catalogue's wiring, a
+    PATCHABLE file reaching protected code through the whole-file import rule) disqualifies even a
+    draft, so it is still shelved or repaired."""
+    reasons = list(reasons)
+    return bool(reasons) and all(PROTECTED_FILE_PROBLEM in r for r in reasons)

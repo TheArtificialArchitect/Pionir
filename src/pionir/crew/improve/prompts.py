@@ -55,10 +55,22 @@ def verify_command(cid: str) -> str:
             f"'{module}')); sys.exit(0 if r.wasSuccessful() and r.testsRun else 1)\"")
 
 
-def intent(cand: dict, repo: str, *, repair: list = (), room: int = 7800) -> str:
+def intent(cand: dict, repo: str, *, repair: list = (), room: int = 7800, manual: bool = False,
+           protected_targets: list = ()) -> str:
     ev = cand["evidence"]
     test = regression_file(cand["id"])
     protected = "; ".join(sorted({p for p, _why in PROTECTED if p.endswith(".py")}))[:1800]
+    # In MANUAL (draft-for-human) mode the fix lives in protected code, which the owner will apply
+    # BY HAND: Daedalus may edit exactly those protected files, and the bot never commits it.
+    protected_rule = (
+        "- this is a DRAFT the owner applies BY HAND (the bot never commits it): you MAY edit "
+        f"ONLY these protected files, which hold the rule: {', '.join(protected_targets) or 'the'}"
+        "; keep every protection that is right, and touch no OTHER protected file"
+        if manual else
+        "- never touch a PROTECTED file (the approval gate, auth, money, secrets, content "
+        "rules, the sandbox, the GPU lease, CI and the self-improvement code - the whole list "
+        "is PROTECTED in src/pionir/selfimprove/guard.py; these are among them): "
+        f"{protected}")
     lines = [
         f"This repository ({repo}) is a copy of Pionir, the owner's orchestration system "
         "(Python, src/pionir, unittest tests in tests/). Fix ONE recurring failure, found in "
@@ -95,10 +107,7 @@ def intent(cand: dict, repo: str, *, repair: list = (), room: int = 7800) -> str
         "a skip or expectedFailure marker",
         "- no new dependency: the standard library and Pionir's own code only",
         "- no network, no secrets, no machine paths or names in tests",
-        "- never touch a PROTECTED file (the approval gate, auth, money, secrets, content "
-        "rules, the sandbox, the GPU lease, CI and the self-improvement code - the whole list "
-        "is PROTECTED in src/pionir/selfimprove/guard.py; these are among them): "
-        f"{protected}",
+        protected_rule,
     ]
     if repair:
         lines += ["", "A FIRST ATTEMPT WAS REFUSED. Fix every problem below, keep what works:",

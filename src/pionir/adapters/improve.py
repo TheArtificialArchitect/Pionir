@@ -120,9 +120,12 @@ class ImproveAdapter:
 
     # ---- the request ----------------------------------------------------------------------
     def _checked(self, task: Task) -> tuple:
-        """``(id, patch bytes, card, known imports)`` - read once - or AdapterProtocolError: a
-        payload that is not exactly ``{id, digest}``, a missing patch, a patch, base or test
-        list that changed since the card, or a patch the guard refuses."""
+        """``(id, patch bytes, card, (known, closure, files), manual)`` - read once - or
+        AdapterProtocolError: a payload that is not exactly ``{id, digest}``, a missing patch, a
+        patch/base/tests changed since the card, or a patch the guard refuses for any reason
+        OTHER than that it edits protected files. ``manual`` is True when the ONLY refusal is
+        that it touches protected code: then it is a DRAFT the owner applies by hand - parked for
+        him to read, never applied by the bot (``execute`` commits nothing)."""
         if task.capability != APPLY:
             raise AdapterProtocolError(f"improve has no capability {task.capability!r}")
         payload = task.payload
@@ -146,10 +149,11 @@ class ImproveAdapter:
         closure = guard.protected_closure(files)
         problems = guard.patch_problems(data.decode("utf-8", "replace"), known_imports=known,
                                         protected=closure)
-        if problems:
+        manual = guard.only_protected_files(problems)
+        if problems and not manual:
             raise AdapterProtocolError(f"{APPLY} refused by Pionir - the protected list "
                                        f"refuses it: {'; '.join(problems[:4])}")
-        return cid, data, card, (known, closure, files)
+        return cid, data, card, (known, closure, files), manual
 
     def validate(self, task: Task) -> None:
         self._checked(task)
@@ -159,25 +163,57 @@ class ImproveAdapter:
         the verification and the undo command. Never blocks parking."""
         if task.capability != APPLY:
             return None
-        cid, data, card, _known = self._checked(task)
-        return {"id": cid, "title": str(card.get("title") or "")[:160],
-                "evidence": card.get("evidence") if isinstance(card.get("evidence"), dict)
-                else {}, "hypothesis": str(card.get("hypothesis") or "")[:800],
-                "verdict": card.get("verdict") if isinstance(card.get("verdict"), dict) else {},
-                "verification": str(card.get("verification") or "")[:600],
-                "diff_stat": str(card.get("diff_stat") or "")[:1200],
-                "diff": data.decode("utf-8", "replace"),
-                "diff_file": str(store.folder(self.settings.improve_dir, cid) / store.PATCH),
-                "base": card.get("base"), "tests": list(card.get("tests") or []),
-                "repo": str(self.settings.pionir_repo),
-                "undo": f"python -m pionir improve undo {cid}",
-                "runs": "one commit on main of the Pionir repo (if main is clean and still "
-                        "contains its base), nothing of it is run as you (its tests ran contained in the sandbox). "
-                        "Nothing is pushed or restarted."}
+        cid, data, card, _known, manual = self._checked(task)
+        manual = manual or bool(card.get("manual"))
+        diff_file = str(store.folder(self.settings.improve_dir, cid) / store.PATCH)
+        repo = str(self.settings.pionir_repo)
+        tests = [str(t) for t in card.get("tests") or []]
+        context = {"id": cid, "title": str(card.get("title") or "")[:160],
+                   "evidence": card.get("evidence") if isinstance(card.get("evidence"), dict)
+                   else {}, "hypothesis": str(card.get("hypothesis") or "")[:800],
+                   "verdict": card.get("verdict") if isinstance(card.get("verdict"), dict)
+                   else {}, "verification": str(card.get("verification") or "")[:600],
+                   "diff_stat": str(card.get("diff_stat") or "")[:1200],
+                   "diff": data.decode("utf-8", "replace"), "diff_file": diff_file,
+                   "base": card.get("base"), "tests": tests, "repo": repo, "manual": manual}
+        if not manual:
+            context.update(
+                undo=f"python -m pionir improve undo {cid}",
+                runs="one commit on main of the Pionir repo (if main is clean and still "
+                     "contains its base), nothing of it is run as you (its tests ran contained "
+                     "in the sandbox). Nothing is pushed or restarted.")
+            return context
+        # Apply by hand: the fix touches protected code, so the bot will NOT commit it. The card
+        # is informational - it shows exactly the diff that was verified and reviewed, and the
+        # paste-ready steps to apply and undo it yourself.
+        test_arg = " ".join(tests) or "the targeted tests"
+        context.update(
+            apply_by_hand=True,
+            refusals=[str(r)[:300] for r in card.get("refusals") or []],
+            manual_steps=[f'cd "{repo}"',
+                          f'git apply "{diff_file}"',
+                          f"python -m pytest -q {test_arg}"],
+            undo=(f'to undo before you commit: cd "{repo}" && git checkout -- .  '
+                  "(or git stash); after you commit it: git revert <the commit>"),
+            runs="NOTHING runs and NOTHING is committed by the bot. This is a DRAFT to apply by "
+                 "hand: the fix is in protected code, so only you commit it. The diff below is "
+                 "exactly what was verified in the sandbox and reviewed.")
+        return context
 
     # ---- the call ---------------------------------------------------------------------------
     def execute(self, task: Task) -> TaskResult:
-        cid, data, card, (known, closure, files) = self._checked(task)
+        cid, data, card, (known, closure, files), manual = self._checked(task)
+        if manual or bool(card.get("manual")):
+            # A draft that touches protected code is NEVER applied by the bot - the owner applies
+            # it by hand. Approving the card only acknowledges that he has seen it.
+            outcome = {"applied": False, "manual": True, "acknowledged": True, "id": cid,
+                       "at": self._clock(), "digest": task.payload["digest"]}
+            store.write_json(store.folder(self.settings.improve_dir, cid) / store.OUTCOME,
+                             outcome)
+            return TaskResult(task_id=task.task_id, agent_id=self.manifest.agent_id,
+                              output={"ok": True, **outcome,
+                                      "note": "a draft to apply by hand; the bot committed "
+                                              "nothing"}, evidence=(f"improve:id:{cid}",))
         done = applier.apply_patch(
             self.settings.pionir_repo, data, cid, card["base"],
             title=str(card.get("title") or cid), tests=[str(t) for t in card.get("tests") or []],

@@ -77,8 +77,9 @@ def status(settings: PionirSettings, out: TextIO) -> int:
               file=out)
         return 0
     counts = ledger.get("counts") if isinstance(ledger.get("counts"), dict) else {}
-    print(f"Proposals made: {int(counts.get('proposals') or 0)}  applied: "
-          f"{int(counts.get('applied') or 0)}  denied: {int(counts.get('denied') or 0)}  "
+    print(f"Proposals made: {int(counts.get('proposals') or 0)}  drafted (apply by hand): "
+          f"{int(counts.get('drafts') or 0)}  applied: {int(counts.get('applied') or 0)}  "
+          f"denied: {int(counts.get('denied') or 0)}  "
           f"shelved: {int(counts.get('shelved') or 0)}", file=out)
     if ledger.get("amber"):
         print(f"AMBER: {ledger['amber']}", file=out)
