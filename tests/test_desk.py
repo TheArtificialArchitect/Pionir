@@ -250,7 +250,7 @@ class ExpiryTests(_DeskCase):
                  **self.builds.read()["cards"]}
         self.assertEqual({k for k, c in cards.items() if c.get("status") == PARKED},
                          {"gig:data:v2", ORDER})
-        self.assertFalse(cards["gig:data:v2"]["open"])
+        self.assertTrue(cards["gig:data:v2"]["open"])      # parked, never deaf
         self.assertTrue(cards["gig:data:v1"]["open"])            # answered: left alone
         self.assertTrue(cards["builds:night:2026-10-01"]["open"])  # news: never "parked"
         self.assertTrue(cards["builds:backlog:x:0"]["open"])
@@ -367,7 +367,8 @@ class DeskReplyTests(_Gate):
                          ["error"]["type"], "Forbidden")
         self.assertEqual(self.app.desk_reply("quote:ffffffffffff", "$350", approver="phone")
                          ["error"]["type"], "NotFound")
-        self.app.desk.dismiss(f"quote:{ORDER}")
+        QuoteCardStore.for_state_root(self.state).update(
+            lambda d: d["cards"][ORDER].update(open=False, status="order_declined"))
         self.assertEqual(self.app.desk_reply(f"quote:{ORDER}", "$350", approver="phone")
                          ["error"]["type"], "Closed")
         self.app.gate = None
@@ -377,6 +378,44 @@ class DeskReplyTests(_Gate):
     def test_the_gate_runs_the_desk_housekeeping(self) -> None:
         self.assertEqual(DiscordGate.for_app(self.app, self.settings())._desk_tick,
                          self.app.desk_tick)
+
+
+class LateReplyTests(_DeskCase):
+    """A parked card is off the desk, never deaf: Ian's late words are always recorded."""
+
+    def _discord_reply(self, key: str, text: str) -> str:
+        from pionir.fiverr import FiverrReplies
+
+        card = self.fiverr.read()["cards"][key]
+        reply_id = str(next(_SNOW))
+        FiverrReplies(self.fiverr).consider(
+            lambda *_a, **_k: {"id": "1"}, OWNER_ID, "chan",
+            {"id": reply_id, "author": {"id": OWNER_ID}, "content": text,
+             "message_reference": {"message_id": card["message_ids"][0]}})
+        return reply_id
+
+    def test_a_late_reply_on_a_parked_card_is_recorded_and_un_parks_it(self) -> None:
+        _card(self.fiverr, "idea:codes:v1", kind="idea", days=8)
+        self.assertEqual(self.desk.sweep(), ["fiverr:idea:codes:v1"])
+        self.assertEqual(self.desk.view()["counts"]["reply"], 0)
+        reply_id = self._discord_reply("idea:codes:v1", "redraft")
+        card = self.fiverr.read()["cards"]["idea:codes:v1"]
+        self.assertEqual(card["replies"][reply_id]["state"], "recorded")
+        # what ideas.py reads: the owner's late reply counts
+        from pionir.fiverr import owner_replies
+        self.assertEqual([r["text"] for r in owner_replies(self.fiverr, OWNER_ID, "idea")],
+                         ["redraft"])
+        # answered now: not parked (not in the weekly note), not on the desk, not re-parked
+        self.assertEqual(self.desk.parked_unlisted(), [])
+        self.assertEqual(self.desk.view()["items"], [])
+        self.assertEqual(self.desk.sweep(), [])
+
+    def test_a_dismissed_card_still_hears_a_late_reply(self) -> None:
+        _card(self.fiverr, "gig:data:v2", kind="gig", days=1)
+        self.desk.dismiss("fiverr:gig:data:v2")
+        reply_id = self._discord_reply("gig:data:v2", "price 10 20 30")
+        self.assertEqual(self.fiverr.read()["cards"]["gig:data:v2"]["replies"][reply_id]
+                         ["state"], "recorded")
 
 
 class QuoteCardClosesTests(_Gate):

@@ -17,13 +17,15 @@ into one list the dashboard serves at ``GET /api/desk``. Every item is in one LA
 pionir/money.py) that touches no client. A reply card is never bulk.
 
 **A card nobody answers is parked, not kept open forever.** A reply card with no answer
-after ``PIONIR_CARD_STALE_DAYS`` (7) is closed as ``parked_no_answer``; once a week the
+after ``PIONIR_CARD_STALE_DAYS`` (7) is parked as ``parked_no_answer`` - off the open
+count, never deaf: a late reply still counts and un-parks it; once a week the
 cards parked since the last time are listed in ONE "still waiting on you" note through
 ``owner.notify`` (never an approval card). Both ride the Discord gate's poll
 (``Desk.tick``); nothing here schedules anything.
 
 The card records stay owned by their producers (quotes.py, fiverr.py, adapters/builds.py):
-the desk only adds ``status``/``closed_at``/``archived_at`` marks to them, and a reply
+the desk only adds ``status``/``closed_at``/``archived_at`` marks to them (and never
+closes one: a parked card still takes a late reply), and a reply
 typed on the desk goes through the very recorder a Discord reply goes through
 (PionirApp.desk_reply), so the two can never parse a reply differently.
 """
@@ -226,6 +228,28 @@ def card_lane(source: str, card: Mapping[str, Any]) -> str:
     return "reply" if card.get("open") or card.get("status") else "fyi"
 
 
+def is_parked(card: Mapping[str, Any]) -> bool:
+    """Parked (by the expiry or the owner) and nothing said on it since. Parking only takes a
+    card off the desk's open count and the stale clock: the card stays OPEN for its recorder,
+    so a late Discord reply is still recorded and acted on exactly as on any open card - and
+    a reply newer than the parking un-parks it here."""
+    if card.get("status") != PARKED:
+        return False
+    since = _parse(card.get("closed_at"))
+    replies = card.get("replies") if isinstance(card.get("replies"), Mapping) else {}
+    return not any(isinstance(r, Mapping) and since is not None
+                   and (_parse(r.get("at")) or since) > since for r in replies.values())
+
+
+def _last_said(card: Mapping[str, Any]) -> datetime | None:
+    """When the card last moved: posted, or the newest reply to it (the stale clock)."""
+    stamps = [_parse(card.get("posted_at"))]
+    replies = card.get("replies") if isinstance(card.get("replies"), Mapping) else {}
+    stamps += [_parse(r.get("at")) for r in replies.values() if isinstance(r, Mapping)]
+    found = [t for t in stamps if t is not None]
+    return max(found) if found else None
+
+
 def answered(card: Mapping[str, Any]) -> bool:
     replies = card.get("replies") if isinstance(card.get("replies"), Mapping) else {}
     return any(isinstance(r, Mapping) and r.get("state") in ANSWERED for r in replies.values())
@@ -316,7 +340,8 @@ class Desk:
                 if not isinstance(card, Mapping) or not card.get("message_ids"):
                     continue                     # still being posted, or never posted
                 lane = card_lane(source, card)
-                if lane == "reply" and not (card.get("open") and not answered(card)):
+                if lane == "reply" and not (card.get("open") and not answered(card)
+                                            and not is_parked(card)):
                     continue                     # answered, closed or parked: not waiting
                 if lane == "fyi":
                     posted = _parse(card.get("posted_at"))
@@ -362,7 +387,7 @@ class Desk:
 
     # ---- closing and archiving ----------------------------------------------------------
     def sweep(self) -> list[str]:
-        """Close every reply card left unanswered for ``stale_days`` as parked_no_answer.
+        """Park every reply card left unanswered for ``stale_days`` as parked_no_answer.
         Returns the desk ids it closed. Cheap (three small files), safe to run on every
         read; a card answered, closed or of an FYI kind is never touched."""
         cutoff = self._clock() - timedelta(days=self.stale_days)
@@ -381,7 +406,10 @@ class Desk:
                     card = doc["cards"].get(key)
                     if card is None or not self._stale(source, card, cutoff):
                         continue        # answered or closed since it was read
-                    card.update(open=False, status=PARKED, closed_at=now)
+                    # still open: a late reply is recorded and acted on as ever
+                    card.update(status=PARKED, closed_at=now)
+                    card.pop("dismissed_at", None)
+                    card.pop("listed_at", None)
                     done.append(f"{source}:{key}")
                 return done
 
@@ -395,15 +423,15 @@ class Desk:
     @staticmethod
     def _stale(source: str, card: Any, cutoff: datetime) -> bool:
         if not isinstance(card, Mapping) or not card.get("open") \
-                or card_lane(source, card) != "reply" or answered(card):
+                or card_lane(source, card) != "reply" or answered(card) or is_parked(card):
             return False
-        posted = _parse(card.get("posted_at"))
-        return posted is not None and posted < cutoff
+        last = _last_said(card)
+        return last is not None and last < cutoff
 
     def dismiss(self, desk_id: str) -> dict[str, Any]:
-        """Archive an FYI item, or close a waiting reply card as parked_no_answer (the
-        owner's own choice: it is not listed in the weekly note). An approval is answered
-        with deny, never dismissed."""
+        """Archive an FYI item, or park a waiting reply card as parked_no_answer (the
+        owner's own choice: it is not listed in the weekly note; like any parked card it
+        still takes a late reply). An approval is answered with deny, never dismissed."""
         source, key = split_id(desk_id)
         if source == "approval":
             return {"ok": False, "error": {"type": "NotDismissable",
@@ -419,11 +447,11 @@ class Desk:
                     return {"ok": True, "id": desk_id, "status": "archived", "already": True}
                 card["archived_at"] = now
                 return {"ok": True, "id": desk_id, "status": "archived"}
-            if not card.get("open"):
+            if not card.get("open") or is_parked(card):
                 status = card.get("status") or "closed"
                 return {"ok": False, "error": {"type": "AlreadyClosed",
                                                "message": f"already {status}"}}
-            card.update(open=False, status=PARKED, closed_at=now, dismissed_at=now)
+            card.update(status=PARKED, closed_at=now, dismissed_at=now)
             return {"ok": True, "id": desk_id, "status": PARKED}
 
         return self.stores[source].update(change)
@@ -450,7 +478,7 @@ class Desk:
         out = []
         for source, store in self.stores.items():
             for key, card in store.read()["cards"].items():
-                if isinstance(card, dict) and card.get("status") == PARKED \
+                if isinstance(card, dict) and is_parked(card) \
                         and not card.get("dismissed_at") and not card.get("listed_at"):
                     out.append((source, key, card))
         return sorted(out, key=lambda t: str(t[2].get("posted_at") or ""))
