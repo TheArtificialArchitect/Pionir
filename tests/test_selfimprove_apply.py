@@ -64,6 +64,11 @@ class _Case(unittest.TestCase):
         self.repo = root / "Pionir"
         self.repo.mkdir()
         git(self.repo, "init", "-q", "-b", "main")
+        # A real repo (C:\src\Pionir) has an author identity; a bare CI runner does not, so
+        # apply.py's own `git commit` fails there with "Author identity unknown". Give the temp
+        # repo a LOCAL identity so the production commit path is exercised on any machine.
+        git(self.repo, "config", "user.name", "t")
+        git(self.repo, "config", "user.email", "t@example.invalid")
         self.base = commit(self.repo, {"src/pionir/__init__.py": "",
                                        "src/pionir/crew/__init__.py": "",
                                        "src/pionir/crew/etsy/__init__.py": "",
