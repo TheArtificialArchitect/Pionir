@@ -310,6 +310,41 @@ class OneProductOnceTests(unittest.TestCase):
         self.assertEqual(set(off), {"budget", "habit", "debt"})   # a failure holds nothing
         self.assertNotIn("debt", kinds_off(items, 200 * day))     # a no rests, not forever
 
+    def test_an_unreachable_submit_that_never_landed_stops_holding_its_kind(self) -> None:
+        """2026-10-15 drift: a submit that never reached Pionir is 'unreachable' - retried
+        3x, then it sat in HOLDS_KIND forever, so that kind was never offered again even
+        though nothing was ever listed or parked. On exhaustion it must settle to a terminal
+        state that frees the kind."""
+        import json
+        import tempfile
+        import time
+        from pathlib import Path
+
+        from pionir.crew.registry import WorkerSpec
+        from pionir.crew.worker import WorkContext
+
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            state.mkdir()
+            spec = WorkerSpec(worker_id="etsy.digital", name="digital", division="etsy",
+                              impl="etsy_digital", kind="etsy", cadence_seconds=3600,
+                              provider="none", entities=("Etsy",))
+            maker = DigitalMaker(spec, stage_dir=tmp, daily_cap=1)
+            stuck = {"kind": "budget", "status": "unreachable", "tries": 3,
+                     "slug": "budget-tracker-spreadsheet-abc123",
+                     "keyword": "budget tracker spreadsheet", "payload": {}}
+            (state / "etsy.digital.json").write_text(json.dumps(
+                {"items": [stuck], "counts": {}, "made": {}, "blocked": {}}), encoding="utf-8")
+            # the kind is held while the item is still 'unreachable'
+            self.assertIn("budget", kinds_off([dict(stuck)], time.time()))
+            # one run with no credentials: it still settles the stuck item before bailing
+            ctx = WorkContext(now=time.time(), http=None, secrets_dir=Path(tmp) / "secrets",
+                              state_dir=state)
+            maker.run(ctx)
+            rec = json.loads((state / "etsy.digital.json").read_text(encoding="utf-8"))
+            self.assertEqual(rec["items"][0]["status"], "failed")
+            self.assertNotIn("budget", kinds_off(rec["items"], time.time()))
+
     def test_a_long_title_keeps_its_leading_phrases(self) -> None:
         long = "Monthly Budget Planner Spreadsheet | " + " | ".join(
             f"Expense Tracker Template {i}" for i in range(10))

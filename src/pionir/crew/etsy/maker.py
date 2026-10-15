@@ -260,10 +260,18 @@ class DigitalMaker(_Base):
     # ---- making one new listing ---------------------------------------------------------
     def _make_one(self, ctx: WorkContext, record: Record, events: list):
         rec = record.doc
-        # a submission that never reached Pionir is retried before anything new is made
+        # a submission that never reached Pionir is retried before anything new is made.
+        # once the retry budget is spent it never reached the owner and nothing was listed,
+        # so settle it to a terminal state that frees its kind - left as "unreachable" it
+        # holds the kind forever (HOLDS_KIND) while nothing is actually waiting on anyone.
         for item in rec["items"]:
-            if item.get("status") == "unreachable" and item.get("tries", 0) < RETRY_UNREACHABLE:
+            if item.get("status") != "unreachable":
+                continue
+            if item.get("tries", 0) < RETRY_UNREACHABLE:
                 return self._submit(ctx, record, item, item["payload"], events)
+            self._settle(ctx, record, item, "failed",
+                         f"Pionir unreachable after {RETRY_UNREACHABLE} tries; never parked",
+                         events)
         if record.made_today(ctx.now) >= self.daily_cap:
             return f"the daily cap of {self.daily_cap} is reached"
         problem = self.readiness(ctx.secrets_dir)
