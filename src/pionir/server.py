@@ -67,6 +67,9 @@ from .batching import (
 from .adapters.galatea import GLASS_KEY_FILE, read_key
 from .signin import NotGalatea, SigninCodes, galatea_ticket
 from .bootstrap import PionirRuntime
+from .desk import LANES as DESK_LANES
+from .desk import Desk, bulk_ok
+from .desk import split_id as desk_split_id
 from .cli import _capabilities, _doctor, _jsonable
 from .posting_health import posting_health
 from .contracts import ModelRequirement, RiskLevel, Task, outcome_ok
@@ -388,6 +391,8 @@ class PionirApp:
         self._consolidating: set[str] = set()
         self._consolidating_lock = threading.Lock()
         self._consolidation_thread: threading.Thread | None = None
+        # The Approval Desk (pionir/desk.py), built on first use.
+        self._desk: Desk | None = None
 
     # ---- the work log: the owner's hours and pay -----------------------------
     def worklog(self) -> Any:
@@ -1387,6 +1392,167 @@ class PionirApp:
             return {"ok": True, "status": "denied", "approval_id": approval_id}
         return {"ok": False, "error": {"type": "AlreadyResolved", "message": "not pending"}}
 
+    def approve_group(self, ids: Any, *, approver: str | None = None) -> dict[str, Any]:
+        """Approve several routine items at once - each through ``approve`` (its own claim,
+        its own run, the can't-approve-what-you-parked rule). All or nothing up front: if
+        ANY id is not pending, or not ``bulk_ok`` (money of any kind, or a client), nothing
+        is approved (``Conflict``). Money and clients are always one at a time."""
+        if approver is not None and approver not in APPROVERS:
+            return {"ok": False, "error": {"type": "Forbidden",
+                                           "message": f"{approver} does not approve"}}
+        if not isinstance(ids, list) or not ids or len(ids) > 100 \
+                or not all(isinstance(i, str) and i.strip() for i in ids):
+            return {"ok": False, "error": {"type": "BadRequest",
+                                           "message": "ids: a list of 1-100 approval ids"}}
+        wanted = list(dict.fromkeys(i.strip().removeprefix("approval:") for i in ids))
+        refused = []
+        for approval_id in wanted:
+            row = self.approvals.get(approval_id)
+            if row is None or row.get("status") != "pending":
+                refused.append({"id": approval_id, "why": "not pending" if row else "not found"})
+            elif not bulk_ok(row):
+                refused.append({"id": approval_id, "why": "money or a client: approve it on "
+                                                          "its own"})
+            elif approver is not None:
+                own = self._approver_refusal(approval_id, approver)
+                if own is not None:
+                    return own
+        if refused:
+            return {"ok": False, "error": {"type": "Conflict",
+                                           "message": "nothing was approved: "
+                                           + "; ".join(f"{r['id']} {r['why']}" for r in refused),
+                                           "refused": refused}}
+        results = [self.approve(approval_id, approver=approver) for approval_id in wanted]
+        return {"ok": all(r.get("ok") is True for r in results), "results": results}
+
+    # ---- the Approval Desk: everything waiting on the owner, in one list ---------------
+    @property
+    def desk(self) -> Desk:
+        """Built on first use (pionir/desk.py). An approval's preview is the Discord card's
+        own text when the gate runs here, so the two surfaces show the same words."""
+        if self._desk is None:
+            self._desk = Desk(self.runtime.settings.state_root, self.approvals,
+                              render=self._desk_render)
+        return self._desk
+
+    def _desk_render(self, row: Mapping[str, Any]) -> str:
+        gate = self.gate
+        if gate is not None and callable(getattr(gate, "_render", None)):
+            return gate._render(row, gate._delivery_preview(row))
+        from .discord_gate import render_request
+        return render_request(row, None)
+
+    def desk_view(self, *, lane: str | None = None, stream: str | None = None) -> dict[str, Any]:
+        return self.desk.view(lane=lane, stream=stream)
+
+    def desk_dismiss(self, desk_id: Any, *, approver: str | None = None) -> dict[str, Any]:
+        if approver is not None and approver not in APPROVERS:
+            return {"ok": False, "error": {"type": "Forbidden",
+                                           "message": f"{approver} does not answer the desk"}}
+        try:
+            return self.desk.dismiss(str(desk_id))
+        except ValueError as error:
+            return {"ok": False, "error": {"type": "BadRequest", "message": str(error)}}
+
+    def desk_reply(self, desk_id: Any, text: Any, *,
+                   approver: str | None = None) -> dict[str, Any]:
+        """The owner's reply typed on the desk, handed to the SAME recorder a Discord reply
+        to that card goes through (the gate's QuoteReplies / FiverrReplies ``consider``),
+        as his message replying to the card: same claim-by-id, same parsing, same result -
+        a price still only parks a client.quote for its own yes. Its answer, which Discord
+        would show under the reply, comes back here instead and is not posted."""
+        if approver is not None and approver not in APPROVERS:
+            return {"ok": False, "error": {"type": "Forbidden",
+                                           "message": f"{approver} does not answer the desk"}}
+        try:
+            source, key = desk_split_id(desk_id)
+        except ValueError as error:
+            return {"ok": False, "error": {"type": "BadRequest", "message": str(error)}}
+        if source == "approval":
+            return {"ok": False, "error": {"type": "BadRequest",
+                                           "message": "an approval is approved or denied"}}
+        if not isinstance(text, str) or not text.strip():
+            return {"ok": False, "error": {"type": "BadRequest", "message": "text is required"}}
+        gate = self.gate
+        recorder = getattr(gate, {"quote": "_quotes", "fiverr": "_fiverr",
+                                  "build": "_builds"}[source], None) if gate else None
+        owner = getattr(getattr(gate, "settings", None), "owner", None)
+        if recorder is None or not owner:
+            return {"ok": False, "error": {
+                "type": "Unavailable",
+                "message": "no reply recorder runs here (the Discord gate is off or has no "
+                           "owner configured), so no reply can count"}}
+        card = recorder.store.read()["cards"].get(key)
+        if not isinstance(card, Mapping) or not card.get("message_ids"):
+            return {"ok": False, "error": {"type": "NotFound", "message": "no such card"}}
+        if not card.get("open"):
+            return {"ok": False, "error": {"type": "Closed",
+                                           "message": f"the card is {card.get('status') or 'closed'}"
+                                                      " and takes no reply"}}
+        reply_id = _desk_snowflake()
+        message = {"id": reply_id, "author": {"id": str(owner)}, "content": text.strip(),
+                   "message_reference": {"message_id": str(card["message_ids"][0])}}
+        answers: list[str] = []
+
+        def call(method: str, path: str, body: Any = None, **_: Any) -> Any:
+            if method == "POST" and path.endswith("/messages") and isinstance(body, Mapping):
+                answers.append(str(body.get("content") or ""))
+                return {"id": _desk_snowflake()}
+            raise RuntimeError(f"the desk does not call Discord ({method} {path})")
+
+        # One at a time with the gate's poll: a reply it retries and this one never cross.
+        lock = getattr(gate, "_tick_lock", None)
+        if lock is not None and not lock.acquire(timeout=30):
+            return {"ok": False, "error": {"type": "Busy",
+                                           "message": "the Discord gate is mid-poll; try again"}}
+        try:
+            recorder.consider(call, str(owner), "desk", message)
+        finally:
+            if lock is not None:
+                lock.release()
+
+        def mark(doc: dict[str, Any]) -> Any:
+            got = doc["cards"].get(key, {}).get("replies", {}).get(reply_id)
+            if isinstance(got, dict):
+                got["via"] = "desk"
+                return dict(got)
+            return None
+
+        record = recorder.store.update(mark)
+        if record is None:
+            return {"ok": False, "error": {"type": "NotRecorded",
+                                           "message": "the reply was not taken"},
+                    "answer": "\n".join(answers)}
+        state = record.get("state")
+        out = {"ok": state in ("recorded", "submitted", "claimed"), "id": f"{source}:{key}",
+               "reply_id": reply_id, "state": state, "answer": "\n".join(answers)}
+        for field in ("why", "approval_id"):
+            if record.get(field):
+                out[field] = record[field]
+        return out
+
+    def desk_tick(self) -> None:
+        """The Discord gate's poll: close stale reply cards, and the weekly note."""
+        self.desk.tick(self._desk_notify)
+
+    def _desk_notify(self, title: str, body: str) -> bool:
+        out = self.run_task("owner.notify", {"title": title, "body_text": body,
+                                             "kind": "brief"}, wait=60.0)
+        result = out.get("result") if isinstance(out.get("result"), Mapping) else {}
+        if out.get("ok") is True and result.get("ok") is True:
+            return True
+        _log.warning("desk: owner.notify did not send the weekly note: %s",
+                     result.get("refused") or result.get("unavailable") or out.get("error")
+                     or out.get("status"))
+        return False
+
+
+def _desk_snowflake() -> str:
+    """A Discord-shaped id (ms since Discord's epoch, shifted, plus random bits) for a reply
+    typed on the desk: unique, ordered with real ones, and what quote_ref requires."""
+    ms = int(time.time() * 1000) - 1_420_070_400_000
+    return str((ms << 22) | int.from_bytes(os.urandom(3), "big") & 0x3FFFFF)
+
 
 def _ui_bytes() -> bytes:
     try:
@@ -1403,6 +1569,15 @@ def _hostname(header: str | None) -> str | None:
         return urlparse("//" + header.strip()).hostname
     except ValueError:
         return None
+
+
+# The desk's answers as HTTP: a refusal of who is asking is 403, a refused group is 409.
+_DESK_STATUS = {"Forbidden": 403, "SelfApproval": 403, "Conflict": 409, "BadRequest": 400,
+                "NotFound": 404, "NotDismissable": 400, "Unavailable": 503, "Busy": 503}
+
+
+def _desk_status(result: Mapping[str, Any]) -> int:
+    return _DESK_STATUS.get(_error_type(result) or "", 200)
 
 
 def _error_type(result: Mapping[str, Any]) -> str | None:
@@ -1428,6 +1603,10 @@ _POST_ROUTES = {
     "/api/approvals/approve": APPROVE,
     "/api/approvals/deny": APPROVE,
     "/api/approvals/digest": APPROVE,
+    "/api/approvals/approve_group": APPROVE,
+    # the Approval Desk's answers: the owner's surfaces only, like approve
+    "/api/desk/reply": APPROVE,
+    "/api/desk/dismiss": APPROVE,
 }
 
 
@@ -1583,6 +1762,14 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                     self._send(app.audit(min(max(n, 1), 500)))
                 elif route.path == "/api/approvals":
                     self._send(app.approvals_view())
+                elif route.path == "/api/desk":
+                    query = parse_qs(route.query)
+                    lane = (query.get("lane") or [""])[0].strip() or None
+                    stream = (query.get("stream") or [""])[0].strip() or None
+                    if lane is not None and lane not in DESK_LANES:
+                        self._send({"error": "lane: one of " + ", ".join(DESK_LANES)}, 400)
+                    else:
+                        self._send(app.desk_view(lane=lane, stream=stream))
                 elif route.path == "/api/economy":
                     self._send(app.economy_view())
                 elif route.path == "/api/proteus":
@@ -1828,6 +2015,15 @@ def _make_handler(app: PionirApp, *, bind_host: str = "127.0.0.1"):
                         self._send_job(result)
                 elif route.path == "/api/approvals/digest":
                     self._send(app.request_digest())
+                elif route.path == "/api/approvals/approve_group":
+                    result = app.approve_group(body.get("ids"), approver=client)
+                    self._send(result, _desk_status(result))
+                elif route.path == "/api/desk/reply":
+                    result = app.desk_reply(body.get("id"), body.get("text"), approver=client)
+                    self._send(result, _desk_status(result))
+                elif route.path == "/api/desk/dismiss":
+                    result = app.desk_dismiss(body.get("id"), approver=client)
+                    self._send(result, _desk_status(result))
                 else:
                     aid = str(body.get("id", "")).strip()
                     if not aid:

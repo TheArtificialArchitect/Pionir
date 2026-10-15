@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from pionir import atomic
+from pionir.desk import approval_fields, with_fields
 
 # A parked action is a question for Ian; a question nobody answered for a day is
 # stale, not still open. Expired rows are auto-denied (reason "expired") the next
@@ -62,6 +63,12 @@ class Approval:
     batch: bool = False            # waits for the owner's daily digest (pionir/batching.py)
     digest_date: str | None = None # the digest it is (or will next be) listed in, local date
     context: dict[str, Any] | None = None  # what its adapter found when it was parked
+    # The Approval Desk's fields (pionir/desk.py), computed as it is parked. A row parked
+    # before they existed has none on disk: pending()/get()/recent() derive them on read.
+    amount_cents: int | None = None   # the card's money reading, in cents (pionir/money.py)
+    stream: str = "other"             # etsy, instagram, blog, ..., client, other
+    client_facing: bool = False       # a client.* action
+    proximity: int = 3                # 0 client money, 1 sellable, 2 publishing, 3 other
 
 
 class ApprovalQueue:
@@ -156,6 +163,7 @@ class ApprovalQueue:
                 expires_at=(now + (expires_after or EXPIRES_AFTER)).isoformat(),
                 batch=bool(batch), digest_date=digest_date if batch else None,
                 context=dict(context) if context else None,
+                **approval_fields(capability, payload),
             )
             rows.append(asdict(approval))
             self._save(rows)
@@ -165,7 +173,7 @@ class ApprovalQueue:
         with self._lock:
             for row in self._load():
                 if row["id"] == approval_id:
-                    return row
+                    return with_fields(row)
         return None
 
     def pending(self) -> list[dict[str, Any]]:
@@ -173,7 +181,7 @@ class ApprovalQueue:
             rows = self._load()
             if self._sweep(rows):
                 self._save(rows)
-            return [r for r in rows if r["status"] == "pending"]
+            return [with_fields(r) for r in rows if r["status"] == "pending"]
 
     def note_digest(self, approval_ids: list[str], digest_date: str) -> int:
         """Record that these still-pending batched rows are listed in the digest of
@@ -213,7 +221,7 @@ class ApprovalQueue:
 
     def recent(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
-            return list(reversed(self._load()))[:limit]
+            return [with_fields(r) for r in reversed(self._load())][:limit]
 
     def claim(self, approval_id: str, *, task_id: str | None = None) -> dict[str, Any] | None:
         """Atomically move a pending action to ``running`` and return it, so

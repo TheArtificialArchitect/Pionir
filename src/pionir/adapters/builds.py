@@ -62,6 +62,7 @@ KINDS = tuple(HEADS)
 INBOX_KINDS = ("night", "backlog")
 MAX_BODY = 12000
 IN_FLIGHT = timedelta(minutes=2)
+PREVIEW_MAX = 4000
 _KEY = re.compile(r"[A-Za-z0-9:._-]{3,120}")
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 RECORDED = ("\U0001f4e5 Recorded. The Builds worker reads it on its next run (within minutes) "
@@ -239,8 +240,10 @@ class BuildCardAdapter:
 
         def settle(doc: dict) -> None:
             if ids:
+                # its title and text's head, for the Approval Desk (pionir/desk.py)
                 doc["cards"][key].update(message_ids=ids, open=card["replies"],
-                                         posted_at=now.isoformat())
+                                         posted_at=now.isoformat(), title=card["title"],
+                                         preview=card["body"][:PREVIEW_MAX])
                 doc["cards"][key].pop("reserved_at", None)
             else:
                 doc["cards"].pop(key, None)
