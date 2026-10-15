@@ -12,7 +12,16 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from . import benchmark, bridge_auth, bryofeed, recallcheck, routecheck, videocli, workcli
+from . import (
+    benchmark,
+    bridge_auth,
+    bryofeed,
+    improvecli,
+    recallcheck,
+    routecheck,
+    videocli,
+    workcli,
+)
 from .batching import DigestSettings, approval_level, batch_condition
 from .bootstrap import PionirRuntime, build_runtime
 from .config import PionirSettings
@@ -264,6 +273,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     workcli.add_parsers(commands)
     videocli.add_parsers(commands)
+    improvecli.add_parsers(commands)
     return parser
 
 
@@ -857,6 +867,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "work":
         # Its own database, opened directly: no runtime, no server, no network.
         return workcli.run(args, PionirSettings.from_environment())
+    if args.command == "improve":
+        # The self-improvement ledger and undo: files and git only - no runtime, no model.
+        return improvecli.run(args, PionirSettings.from_environment())
     if args.command == "video":
         # Builds files and parks at most one approval card; no server, no upload.
         try:

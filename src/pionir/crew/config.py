@@ -131,6 +131,14 @@ class CrewSettings:
     # reaches the owner's real files.
     economy_dir: Path | None = None
     approvals_path: Path | None = None
+    # Self-improvement (crew/improve): the Pionir repository its candidates are cloned from,
+    # the folder each candidate's patch and card are written to (Pionir's improve.apply reads
+    # the same folder), and the memory database whose shared ``lessons`` it reads. from_pionir
+    # sets all three from Pionir's settings; None here -> C:/src/Pionir, under state_dir, and
+    # no lessons - so a test crew never reaches the owner's real files.
+    pionir_repo: Path | None = None
+    improve_dir: Path | None = None
+    cortex_path: Path | None = None
 
     def __post_init__(self) -> None:
         if self.tick_seconds <= 0:
@@ -180,6 +188,10 @@ class CrewSettings:
         if self.approvals_path is None:
             object.__setattr__(self, "approvals_path",
                                Path(self.state_dir) / "approvals" / "queue.json")
+        if self.pionir_repo is None:
+            object.__setattr__(self, "pionir_repo", Path("C:/src/Pionir"))
+        if self.improve_dir is None:
+            object.__setattr__(self, "improve_dir", Path(self.state_dir) / "improve")
 
     @classmethod
     def from_pionir(cls, settings: PionirSettings, **overrides) -> CrewSettings:
@@ -189,6 +201,9 @@ class CrewSettings:
         overrides.setdefault("gpu_lock_path", settings.gpu_lock_path)
         overrides.setdefault("economy_dir", settings.economy_path)
         overrides.setdefault("approvals_path", settings.approvals_queue_path)
+        overrides.setdefault("pionir_repo", settings.pionir_repo_path)
+        overrides.setdefault("improve_dir", settings.improve_path)
+        overrides.setdefault("cortex_path", settings.cortex_path)
         from ..auth import token_path
         overrides.setdefault("pionir_token_file", token_path(settings.client_token_path, "crew"))
         if "digest" not in overrides:
@@ -256,6 +271,9 @@ class CrewSettings:
         d["economy_dir"] = str(self.economy_dir)
         d["approvals_path"] = str(self.approvals_path)
         d["builds_sandbox"] = str(self.builds_sandbox)
+        d["pionir_repo"] = str(self.pionir_repo)
+        d["improve_dir"] = str(self.improve_dir)
+        d["cortex_path"] = str(self.cortex_path) if self.cortex_path else None
         d["catalogue_path"] = str(self.catalogue_path) if self.catalogue_path else None
         d["affiliates"] = [p.public() for p in self.affiliates]
         digest = self.digest

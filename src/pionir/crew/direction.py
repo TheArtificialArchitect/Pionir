@@ -24,6 +24,7 @@ ceiling is the only limit.
 """
 from __future__ import annotations
 
+from types import MappingProxyType
 import json
 import math
 import time
@@ -33,10 +34,10 @@ from .figures import Figure
 from .log import log
 
 # The closed list of what Moss may allocate. Compute only - see the module docstring.
-RESOURCES = {
+RESOURCES = MappingProxyType({
     "model_calls": "calls per hour on the shared local brain (cfg.budget.calls_per_hour)",
     "claude_escalations": "Claude escalations per day via `claude -p` (cfg.claude_daily_cap)",
-}
+})
 
 ATTENTION = ("act", "watch", "none")
 MAX_GOAL_CHARS = 500

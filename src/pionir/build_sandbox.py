@@ -96,7 +96,7 @@ def default_record_path() -> Path:
 
 
 def default_sandbox_root() -> str:
-    from pionir.adapters.daedalus import DEFAULT_SANDBOX_ROOT
+    from pionir.sandbox_git import DEFAULT_SANDBOX_ROOT
     return DEFAULT_SANDBOX_ROOT
 
 
@@ -941,6 +941,138 @@ def run(argv: list, *, cwd, env: dict, out_dir: Path, timeout: float, limits: Jo
     return RunResult(None if timed_out else code, timed_out, tail(stdout), tail(stderr))
 
 
+# ---- one user of the sandbox at a time -----------------------------------------------------------
+# Everything that runs as the sandbox user starts by killing EVERY process that user has
+# (``reap``): a build Daedalus, the night builds' and the API builder's contained checks, the
+# self-improvement worker's test runs and the video tutorial runner. Two of them at once means
+# one kills the other mid-run. So each holds the sandbox's ONE lease for as long as it uses it -
+# a lock on a file in the sandbox root, across processes (the crew, Pionir, a CLI) and threads -
+# and whoever finds it held WAITS (``SandboxBusy``: never a failure, never a reap).
+LEASE_NAME = ".pionir-sandbox.lease"
+_HELD_HERE: dict = {}
+_HELD_LOCK = threading.Lock()
+
+
+class SandboxBusy(RuntimeError):
+    """The sandbox is in use by someone else right now (named): wait and try again."""
+
+
+def _lease_root(setup) -> Path | None:
+    root = getattr(setup, "sandbox_root", None)
+    if root is None and getattr(setup, "runs_dir", None) is not None:
+        root = Path(setup.runs_dir).parent
+    return Path(root) if root is not None else None
+
+
+def _try_file_lock(stream) -> bool:
+    stream.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _file_unlock(stream) -> None:
+    stream.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+class SandboxLease:
+    """The sandbox's one lease (see above). ``with SandboxLease(setup, "what"):`` - or
+    ``acquire()`` / ``release()`` around a longer use (a Daedalus build). Raises
+    ``SandboxBusy`` naming the holder when someone else has it."""
+
+    def __init__(self, setup, purpose: str) -> None:
+        root = _lease_root(setup)
+        self.path = root / LEASE_NAME if root is not None else None
+        self.purpose = str(purpose)[:200]
+        self._stream = None
+
+    @property
+    def held(self) -> bool:
+        return self._stream is not None
+
+    def _key(self) -> str:
+        return os.path.normcase(os.path.abspath(str(self.path)))
+
+    def holder(self) -> str:
+        try:
+            doc = json.loads(self.path.with_suffix(".json").read_text(encoding="utf-8"))
+            return f"{doc.get('purpose')} (pid {doc.get('pid')})"
+        except (OSError, ValueError, AttributeError):
+            return "another user of the sandbox"
+
+    def acquire(self) -> SandboxLease:
+        if self.path is None or self._stream is not None:
+            return self
+        with _HELD_LOCK:
+            key = self._key()
+            if key in _HELD_HERE:
+                raise SandboxBusy(f"the build sandbox is busy: {_HELD_HERE[key]}")
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            stream = self.path.open("a+b")
+            try:
+                if self.path.stat().st_size == 0:
+                    stream.write(b"\n")
+                    stream.flush()
+                if not _try_file_lock(stream):
+                    raise SandboxBusy(f"the build sandbox is busy: {self.holder()}")
+            except BaseException:
+                stream.close()
+                raise
+            self._stream = stream
+            _HELD_HERE[key] = self.purpose
+            try:
+                self.path.with_suffix(".json").write_text(json.dumps(
+                    {"purpose": self.purpose, "pid": os.getpid(), "since": time.time()}),
+                    encoding="utf-8")
+            except OSError:
+                pass
+        return self
+
+    def release(self) -> None:
+        with _HELD_LOCK:
+            stream, self._stream = self._stream, None
+            if stream is None:
+                return
+            _HELD_HERE.pop(self._key(), None)
+            try:
+                _file_unlock(stream)
+            except OSError:
+                pass
+            stream.close()
+
+    def __enter__(self) -> SandboxLease:
+        return self.acquire()
+
+    def __exit__(self, *exc) -> None:
+        self.release()
+
+
+def sandbox_busy(setup) -> str | None:
+    """Who holds the sandbox's lease now, or None when it is free (a look; nothing held)."""
+    lease = SandboxLease(setup, "a look")
+    try:
+        lease.acquire()
+    except SandboxBusy as exc:
+        return str(exc)
+    except OSError as exc:
+        return f"the sandbox's lease could not be read ({exc})"
+    lease.release()
+    return None
+
+
 # ---- the sandbox user's stray processes ----------------------------------------------------------
 def reap(setup: SandboxSetup, *, runner=None) -> list:
     """Kill EVERY process the sandbox user has - including one that left its job some other
@@ -1311,6 +1443,11 @@ def run_ts_checks(files: dict, *, setup, timeout: float = 240.0, spawner=None) -
     why = node_ready(setup)
     if why:
         return TsRun(False, 0, False, shown, not_started.format(why))
+    lease = SandboxLease(setup, "the API builder's contained tsc and vitest")
+    try:
+        lease.acquire()                     # never reap under another user of the sandbox
+    except (SandboxBusy, OSError) as exc:
+        return TsRun(False, 0, False, shown, not_started.format(exc))
     work = Path(setup.runs_dir) / f"run-{secrets.token_hex(6)}"
     steps: list = []
     try:
@@ -1357,6 +1494,7 @@ def run_ts_checks(files: dict, *, setup, timeout: float = 240.0, spawner=None) -
             remove_tree(work)
         except Exception:                   # noqa: BLE001
             pass
+        lease.release()
     results = dict(steps)
     for name, done in steps:
         if done.timed_out:
@@ -1527,6 +1665,7 @@ class BuildDaedalus:
         self.proc: Contained | None = None
         self.token: str | None = None
         self._timer: threading.Timer | None = None
+        self._lease: SandboxLease | None = None
 
     @property
     def base_url(self) -> str:
@@ -1583,13 +1722,24 @@ class BuildDaedalus:
         state inside it) and accepts ITS token. Returns the token. Raises SandboxError."""
         if self.proc is not None:
             raise SandboxError("the build Daedalus is already running")
-        # nothing of the sandbox user's may be running before a new build starts
-        self.setup.reap()
-        # ... and it is proven, as that user, to run Low and to read none of the secrets
-        self.setup.preflight()
-        if self._answers():
-            raise SandboxError(f"something already answers on 127.0.0.1:{self.port}; the "
-                               "build Daedalus is started only on a free port")
+        # the sandbox's one lease, held until ``stop``: nobody else reaps under this build,
+        # and it reaps under nobody else's run (SandboxBusy: the job waits, never fails)
+        self._lease = SandboxLease(self.setup, f"a Daedalus build on port {self.port}")
+        try:
+            self._lease.acquire()
+        except SandboxBusy as exc:
+            raise SandboxError(str(exc)) from exc
+        try:
+            # nothing of the sandbox user's may be running before a new build starts
+            self.setup.reap()
+            # ... and it is proven, as that user, to run Low and to read none of the secrets
+            self.setup.preflight()
+            if self._answers():
+                raise SandboxError(f"something already answers on 127.0.0.1:{self.port}; "
+                                   "the build Daedalus is started only on a free port")
+        except BaseException:
+            self._lease.release()
+            raise
         token = secrets.token_urlsafe(32)
         state = self.setup.state_dir
         logs = state / "logs"
@@ -1605,6 +1755,7 @@ class BuildDaedalus:
                 logon=self.setup.logon(), sid=self.setup.sid)
         except BaseException:
             self.gate.stop()
+            self._lease.release()
             raise
         delay = max(1.0, not_after - self._clock() + self.kill_grace)
         self._timer = threading.Timer(delay, self.stop)
@@ -1685,6 +1836,9 @@ class BuildDaedalus:
                 self.setup.reap()
             except (SandboxError, OSError):
                 pass            # reported, and refused, by the next start
+        lease, self._lease = self._lease, None
+        if lease is not None:
+            lease.release()             # only after its last reap: the sandbox is free again
 
 
 def info(setup: SandboxSetup | None) -> dict[str, Any]:

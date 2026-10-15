@@ -47,6 +47,7 @@ client is confirmed sending its token.
 
 from __future__ import annotations
 
+from types import MappingProxyType
 import hmac
 import json
 import logging
@@ -99,13 +100,15 @@ SIGN_WINDOW = 30.0            # seconds a signed request may be off this server'
 
 # The one narrow pre-grant: the crew's Builds division may run Daedalus in its SANDBOX
 # without parking. A grantable permission is scoped twice, here and in code only: to the
-# ONE client that may hold it, and to the ONE capability it unlocks. ``coding.daedalus_build``
-# itself reaches nothing but a sandbox repo the Builds worker made (adapters/daedalus.py),
+# ONE client that may hold it, and to the capabilities it unlocks: ``coding.daedalus_build``
+# and its twin ``coding.daedalus_build_quiet`` (the self-improvement worker's, admitted only
+# only while Moss is idle). Both reach nothing but a sandbox repo the crew made (adapters/daedalus.py),
 # running as the contained ``pionir-builds`` user. No other permission is grantable, so every
 # other privileged action from every client still parks for the owner.
-PERMISSION_SCOPES: Mapping[str, tuple[frozenset[str], frozenset[str]]] = {
-    "daedalus.build_sandbox": (frozenset({"crew"}), frozenset({"coding.daedalus_build"})),
-}
+PERMISSION_SCOPES: Mapping[str, tuple[frozenset[str], frozenset[str]]] = MappingProxyType({
+    "daedalus.build_sandbox": (frozenset({"crew"}), frozenset({"coding.daedalus_build",
+                                                           "coding.daedalus_build_quiet"})),
+})
 GRANTABLE_PERMISSIONS: frozenset[str] = frozenset(PERMISSION_SCOPES)
 
 
@@ -125,7 +128,7 @@ def scoped(permissions: Iterable[str], client: str, capability: str | None = Non
 
 COMPAT_ENV = "PIONIR_AUTH_COMPAT"
 TOKEN_DIR_ENV = "PIONIR_CLIENT_TOKEN_DIR"
-_OFF = {"0", "off", "false", "no"}
+_OFF = frozenset({"0", "off", "false", "no"})
 
 
 class Unauthenticated(PionirError):
@@ -160,7 +163,7 @@ class ClientGrant:
 # The code default: the same non-privileged set each client could reach before (every
 # non-privileged capability; privileged ones park, as they did for every caller that
 # sent no permission), bounded to the routes each actually uses.
-DEFAULT_GRANTS: Mapping[str, ClientGrant] = {
+DEFAULT_GRANTS: Mapping[str, ClientGrant] = MappingProxyType({
     # the crew's one privileged permission: Daedalus builds in the sandbox, nothing else
     "crew": ClientGrant(frozenset({TASK}), ("*",), frozenset({"daedalus.build_sandbox"})),
     "galatea": ClientGrant(frozenset({TASK, INTENT}), ("*",)),
@@ -169,7 +172,7 @@ DEFAULT_GRANTS: Mapping[str, ClientGrant] = {
     "phone": ClientGrant(frozenset({APPROVE}), ()),
     # the owner's console on this PC: what his dashboard may do (it replaces the browser)
     "desktop": ClientGrant(frozenset({TASK, INTENT, ROUTE, APPROVE}), ("*",)),
-}
+})
 # Served only while the compatibility window is open, and never anything privileged.
 ANONYMOUS_GRANT = ClientGrant(frozenset({TASK, INTENT, ROUTE}), ("*",))
 

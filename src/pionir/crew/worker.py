@@ -176,6 +176,18 @@ class WorkContext:
     economy_dir: Path | None = None
     approvals_path: Path | None = None
     outputs: Callable[..., list] | None = None
+    # Self-improvement (crew/improve): the crew store's read of its own FAILED runs, the Pionir
+    # repository a candidate is cloned from, the folder its patch and card go to, the memory
+    # database holding the shared lessons, and the crew's own log (its VITALS lines). All READ
+    # here except the improve folder. None: that worker cannot run.
+    failed_runs: Callable[..., list] | None = None
+    refusals: Callable[..., list] | None = None
+    pionir_repo: Path | None = None
+    improve_dir: Path | None = None
+    cortex_path: Path | None = None
+    crew_log: Path | None = None
+    # when this crew process started: what ran before it ran on older code
+    crew_started_at: float | None = None
 
 
 @runtime_checkable

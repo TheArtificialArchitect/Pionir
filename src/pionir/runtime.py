@@ -146,9 +146,14 @@ class Executive:
             # The purpose names the tenant as well as the model, so the lock's
             # holder record reads "daedalus: qwen3-coder:30b" to anyone who
             # honours it (the voice uses it to say who has the card).
+            # An adapter may say, per task, what must hold before the lease sidelines anything
+            # (the quiet build: Moss idle). Asked under the lease, before any eviction.
+            settle_for = getattr(adapter, "settle_for", None)
+            settle = settle_for(task) if callable(settle_for) else None
             lease_context = (
                 self.scheduler.acquire(
-                    model, purpose=f"{route.agent_id}: {model.model_id}"
+                    model, purpose=f"{route.agent_id}: {model.model_id}",
+                    **({"settle": settle} if settle is not None else {}),
                 )
                 if model is not None
                 else nullcontext()

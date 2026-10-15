@@ -568,6 +568,13 @@ class BuildsWorker(_Base):
         # then the product's tests, contained: as pionir-builds, in a job object
         suite = self.run_tests(tree.files, entry["language"], setup=self._setup,
                                timeout=self.test_timeout)
+        if getattr(suite, "busy", False):
+            # another user has the sandbox (a Daedalus build, the self-improvement run, the
+            # video tutorial): its run would be killed by ours - wait, never a rejection
+            p.update(waiting=_clip(suite.tail, 200), review_after=ctx.now + REVIEW_RETRY)
+            events.append(self._event(ctx, "build.checks_unavailable",
+                                      {"slug": p["slug"], "why": _clip(suite.tail, 160)}))
+            return
         base = {"at": ctx.now, "head": p["head"], "tests_ran": suite.ran,
                 "tests_passed": suite.passed}
         reasons = review.suite_problems(suite)

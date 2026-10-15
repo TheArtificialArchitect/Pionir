@@ -68,6 +68,7 @@ EXPECTED = {
     "crew.set_cadence": ("auto", None),
     "coding.daedalus_solve": ("card", None),
     "coding.daedalus_build": ("card", None),
+    "coding.daedalus_build_quiet": ("card", None),
     "coding.daedalus_build_cancel": ("auto", None),
     "builds.card": ("auto", None),
     "builds.inbox": ("auto", None),
@@ -88,6 +89,7 @@ EXPECTED = {
     "product.gumroad_unpublish": ("card", None),
     "product.gumroad_list": ("auto", None),
     "apibuild.verify": ("card", None),
+    "improve.apply": ("card", None),
     "video.youtube_upload": ("card", None),
     # Proteus (trading): brakes run at once; arming is money - its own card, every call.
     "proteus.status": ("auto", None),

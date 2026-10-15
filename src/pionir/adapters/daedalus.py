@@ -63,19 +63,31 @@ from pionir.contracts import (
     Task,
     TaskResult,
 )
-from pionir.errors import AdapterProtocolError, AdapterUnavailable
-from pionir.sandbox_git import is_reparse
+from pionir.errors import AdapterProtocolError, AdapterUnavailable, ResourceUnavailable
+# The sandbox rule lives with the safe-git code (a leaf module) so the crew can check it
+# without importing every adapter; it is re-exported here under its old names.
+from pionir.sandbox_git import (  # noqa: F401 - re-exported
+    DEFAULT_SANDBOX_ROOT,
+    SANDBOX_MARKER,
+    SANDBOX_SLUG,
+    is_reparse,
+    sandbox_repo_problem,
+)
 
 SOLVE = "coding.daedalus_solve"
 BUILD = "coding.daedalus_build"
+# The same contained build, for the self-improvement worker. Like a night build it may sideline
+# Moss's model under the lease - but ONLY while she is idle (no turn to or from Ian for 30
+# minutes, nobody typing: ``moss_busy``), asked once the lease is held and BEFORE anything is
+# sidelined (``settle_for``). While she is active it is refused (ResourceUnavailable, saying why)
+# and the worker skips the night. The lease ends with the job, so her model comes back.
+BUILD_QUIET = "coding.daedalus_build_quiet"
+BUILDS = frozenset({BUILD, BUILD_QUIET})
+# While a quiet build runs, Moss is asked again this often; any turn or typing cancels it.
+MOSS_WATCH_SECONDS = 60.0
 CANCEL = "coding.daedalus_build_cancel"
 SOLVE_PERMISSION = "daedalus.solve"
 BUILD_PERMISSION = "daedalus.build_sandbox"
-DEFAULT_SANDBOX_ROOT = r"C:\src\daedalus-work"
-# Written by the Builds worker into a sandbox repo's .git folder when it creates it; a repo
-# without it was not made by the worker and is never built in.
-SANDBOX_MARKER = "pionir-sandbox.json"
-SANDBOX_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{2,39}")
 BUILD_FIELDS = frozenset({"intent", "repo", "verify", "context", "budget_seconds", "not_after",
                           "build_id"})
 BUILD_ID = re.compile(r"[a-z0-9][a-z0-9-]{7,63}")
@@ -90,8 +102,6 @@ FINISHED_STATES = frozenset({"done", "error", "cancelled"})
 _JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 # The summary fields a job's detail carries at its top level (jobs.py Job.summary).
 _SUMMARY_FIELDS = ("passed", "landed", "stage_failed", "branch", "commit", "files")
-_REMOTE = re.compile(r"(?im)^\s*\[\s*remote\b")
-_WORKTREE_KEY = re.compile(r"(?im)^\s*worktree\s*=")
 
 
 class AdapterTimeout(AdapterUnavailable):
@@ -133,78 +143,6 @@ def _how_far(last: Mapping[str, Any] | None, stopped: Mapping[str, Any] | None) 
         parts.append(f"{events} events logged")
     where = "after the cancel" if stopped else "at the last look (it had not stopped yet)"
     return f"{where.capitalize()}: " + (", ".join(parts) if parts else "no detail") + "."
-
-
-def sandbox_repo_problem(repo: Any, root: str | os.PathLike) -> str | None:
-    """Why ``repo`` is not a sandbox repo the Builds worker may build in, or None.
-
-    A sandbox repo is EXACTLY ``<root>\\<slug>``: an absolute path with no ``.`` or ``..``
-    part, not a UNC or device path, whose parent is the sandbox root (compared
-    case-insensitively on Windows, so another drive or another folder is refused), whose
-    name is a slug, which is neither a link nor a junction and resolves to itself (so
-    nothing inside the workspace can point outside it), and which holds a real ``.git``
-    folder (not a ``.git`` file: that is a linked worktree of some other repo) carrying the
-    worker's marker for this slug, with no remote and no ``core.worktree`` redirect - a
-    clone of a live repo, whatever its folder is called, is refused. The root itself must
-    exist and must not be a link. Fail closed: anything that cannot be checked is a
-    reason."""
-
-    if not isinstance(repo, str) or not repo.strip():
-        return ("no repo was given - Daedalus would fall back to its own repository, "
-                "which is never built in")
-    raw = repo.strip()
-    if raw.startswith(("\\\\", "//")):
-        return f"{raw[:80]!r} is a UNC or device path, not a sandbox repo"
-    if any(ch in raw for ch in "~%$\x00"):
-        return f"{raw[:80]!r} has a character that could expand to another path"
-    if any(part in (".", "..") for part in re.split(r"[\\/]+", raw)):
-        return f"{raw[:80]!r} has a '.' or '..' part"
-    if not os.path.isabs(raw) or not re.match(r"^[A-Za-z]:[\\/]|^/", raw):
-        return f"{raw[:80]!r} is not an absolute path"
-    root_abs = os.path.abspath(os.fspath(root))
-    try:
-        root_real = os.path.realpath(root_abs, strict=True)
-    except OSError:
-        return f"the sandbox workspace {root_abs} does not exist"
-    if is_reparse(root_abs) or os.path.normcase(root_real) != os.path.normcase(root_abs):
-        return f"the sandbox workspace {root_abs} is itself a link or junction"
-    repo_abs = os.path.abspath(raw)
-    parent, name = os.path.split(repo_abs)
-    if os.path.normcase(parent) != os.path.normcase(root_abs):
-        return (f"{repo_abs[:120]} is not directly inside the sandbox workspace "
-                f"{root_abs}")
-    if not SANDBOX_SLUG.fullmatch(name):
-        return f"{name[:60]!r} is not a sandbox repo's name (a slug: a-z, 0-9 and -)"
-    path = Path(repo_abs)
-    if is_reparse(path):
-        return f"{repo_abs[:120]} is a link or junction"
-    try:
-        real = os.path.realpath(repo_abs, strict=True)
-    except OSError:
-        return f"{repo_abs[:120]} does not exist"
-    if os.path.normcase(real) != os.path.normcase(repo_abs):
-        return f"{repo_abs[:120]} resolves somewhere else"
-    if not path.is_dir():
-        return f"{repo_abs[:120]} is not a folder"
-    git = path / ".git"
-    if is_reparse(git) or not git.is_dir():
-        return (f"{repo_abs[:120]} has no .git folder of its own (a linked worktree or "
-                "not a repository)")
-    if (git / "commondir").exists():
-        return f"{repo_abs[:120]} is a linked worktree of another repository"
-    try:
-        marker = json.loads((git / SANDBOX_MARKER).read_text(encoding="utf-8"))
-        config = (git / "config").read_text(encoding="utf-8", errors="replace")
-    except (OSError, ValueError):
-        return (f"{repo_abs[:120]} is not a sandbox repo (no readable marker: only a repo "
-                "the Builds worker created is built in)")
-    if not isinstance(marker, dict) or marker.get("slug") != name:
-        return f"{repo_abs[:120]}'s sandbox marker does not name this repo"
-    if _REMOTE.search(config):
-        return f"{repo_abs[:120]} has a remote: it is a clone, not a sandbox"
-    if _WORKTREE_KEY.search(config):
-        return f"{repo_abs[:120]} redirects its work tree elsewhere (core.worktree)"
-    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -367,6 +305,13 @@ class DaedalusAdapter:
             requires_gpu=True,
             exclusive_card=True,
         )
+        # may sideline the voice's model, like a night build - only once settle_for says she is idle
+        quiet = ModelRequirement(model_id=model.model_id,
+                                 estimated_vram_mb=model.estimated_vram_mb,
+                                 context_vram_mb=0, requires_gpu=True, exclusive_card=True)
+        # () -> None when Moss is idle, else why not; bootstrap wires the Galatea probe. Unset:
+        # fail closed - Moss's activity cannot be read, so the quiet build never sidelines her.
+        self.moss_busy = lambda: "Moss's activity is not wired to this adapter"
         self._manifest = AgentManifest(
             agent_id="daedalus",
             version="tech-support/daedalus",
@@ -392,6 +337,17 @@ class DaedalusAdapter:
                     routable=False,
                 ),
                 Capability(
+                    name=BUILD_QUIET,
+                    description="The same contained build for the self-improvement worker; it "
+                                "may sideline Moss's model only when she has been idle for 30 "
+                                "minutes (no turn with Ian, nobody typing), never mid-"
+                                "conversation, and hands the card back when the job ends",
+                    risk=RiskLevel.PRIVILEGED,
+                    required_permissions=frozenset({BUILD_PERMISSION}),
+                    model=quiet,
+                    routable=False,
+                ),
+                Capability(
                     name=CANCEL,
                     description="Cancel a sandbox build by its id (it stops, or never starts)",
                     risk=RiskLevel.REVERSIBLE_WRITE,
@@ -399,6 +355,28 @@ class DaedalusAdapter:
                 ),
             ),
         )
+
+    def _watch_for(self, task: Task):
+        """What a running build asks every minute: Moss's activity, for the quiet build only."""
+        return self.moss_busy if task.capability == BUILD_QUIET else None
+
+    def settle_for(self, task: Task):
+        """For the quiet build only: what the scheduler asks once the lease is held and before
+        anything is sidelined - Moss idle, or ResourceUnavailable naming why not. None for every
+        other capability (their lease works as before)."""
+        if task.capability != BUILD_QUIET:
+            return None
+
+        def settle() -> bool:
+            try:
+                why = self.moss_busy()
+            except Exception as error:  # noqa: BLE001 - unknown is never idle
+                why = f"Moss's activity could not be read ({type(error).__name__})"
+            if why:
+                raise ResourceUnavailable(f"{BUILD_QUIET}: not tonight - {why}; Moss's model is "
+                                          "never sidelined while she is active")
+            return True
+        return settle
 
     @property
     def manifest(self) -> AgentManifest:
@@ -490,7 +468,7 @@ class DaedalusAdapter:
         if task.capability == CANCEL:
             self._build_id(payload, only=True)
             return
-        if task.capability == BUILD:
+        if task.capability in BUILDS:
             self._intent(payload)
             self._build_budget(payload)
             return
@@ -548,7 +526,7 @@ class DaedalusAdapter:
         if task.capability == CANCEL:
             return self._cancel_build(task)
         self._cancel_leftovers()
-        if task.capability == BUILD:
+        if task.capability in BUILDS:
             return self._build(task)
         payload = task.payload
         request: dict[str, Any] = {"intent": self._intent(payload)}
@@ -666,7 +644,8 @@ class DaedalusAdapter:
                 self._cancel(client, job_id)
                 raise AdapterUnavailable(f"build {build_id} was cancelled")
             detail = self._await_job(client, job_id, min(float(budget), left),
-                                     grace=self.settings.cancel_grace_seconds)
+                                     grace=self.settings.cancel_grace_seconds,
+                                     watch=self._watch_for(task))
             return self._result(task, detail, job_id=job_id)
         finally:
             with self._lock:
@@ -710,14 +689,19 @@ class DaedalusAdapter:
         return job
 
     def _await_job(self, client, job_id: str, timeout: float, *,
-                   grace: float = 0.0) -> Mapping[str, Any]:
+                   grace: float = 0.0, watch=None) -> Mapping[str, Any]:
         """Poll the job until it finishes. A few failed polls in a row are tolerated. Any
         other way out - the deadline, Daedalus gone for good, an error, an interrupt -
         cancels the job and waits for it to stop before this returns or raises. A deadline
         raises AdapterTimeout saying how far the job got, from what Daedalus reported once
-        it stopped, so a timeout is never a bare "it was too slow"."""
+        it stopped, so a timeout is never a bare "it was too slow".
+
+        ``watch`` (the quiet build only): asked every ``MOSS_WATCH_SECONDS``; the moment it
+        names a reason - Ian and Moss talking, someone typing - the job is cancelled and
+        ResourceUnavailable says why, so the lease ends and her model comes back at once."""
 
         deadline = self._monotonic() + timeout
+        next_watch = self._monotonic() + MOSS_WATCH_SECONDS
         failures = 0
         finished = False
         timed_out = False
@@ -743,6 +727,15 @@ class DaedalusAdapter:
                 if self._monotonic() >= deadline:
                     timed_out = True
                     break
+                if watch is not None and self._monotonic() >= next_watch:
+                    next_watch = self._monotonic() + MOSS_WATCH_SECONDS
+                    try:
+                        why = watch()
+                    except Exception as error:  # noqa: BLE001 - unknown is never idle
+                        why = f"Moss's activity could not be read ({type(error).__name__})"
+                    if why:
+                        raise ResourceUnavailable(
+                            f"{BUILD_QUIET}: cancelled - {why}; the card goes back to Moss")
                 self._sleep(self.settings.poll_interval_seconds)
         finally:
             if not finished:
@@ -814,10 +807,10 @@ class DaedalusAdapter:
             for key in _SUMMARY_FIELDS:
                 if output.get(key) is None and document.get(key) is not None:
                     output[key] = document[key]
-        if task.capability == BUILD:
+        if task.capability in BUILDS:
             output.pop("steps", None)           # large, and nothing downstream reads them
         commit = str(output.get("commit") or "").strip()
-        evidence: list[str] = ["daedalus:build" if task.capability == BUILD else "daedalus:solve"]
+        evidence: list[str] = ["daedalus:build" if task.capability in BUILDS else "daedalus:solve"]
         if job_id is not None:
             evidence.append(f"daedalus:job:{job_id}")
         if commit:
