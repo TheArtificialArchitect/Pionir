@@ -431,6 +431,7 @@ if ($Stop) {
     New-Item -ItemType Directory -Force (Split-Path $stopMarker) | Out-Null
     Set-Content -Path $stopMarker -Value (Get-Date -Format o) -Encoding UTF8
     Stop-Port $Port "dashboard" "dashboard"
+    Stop-Port 8798 "Galatea manager" "galatea-manage"
     Stop-Port 8799 "Galatea" "galatea"
     Stop-Port 8771 "Daedalus" "daedalus"
     Stop-Port 8770 "Melete" "melete"
@@ -517,16 +518,28 @@ if ((Claim-Port 'dashboard' $Port) -eq 'free') {
     $ports += $Port
 }
 
+# Moss's MANAGER: her taskmaster as a slim, model-free, always-on process - it reads
+# the crew, steers it, briefs and alerts, with chat off and no model. Own store (its
+# own 'manager' home), status on 8798. This is the always-on half; it steers the crew
+# 24/7 while her chat sleeps. Her CHAT is the separate, opt-in process below.
+$mgrState = Claim-Port 'galatea-manage' 8798
+if ($mgrState -ne 'free') { }
+elseif (Test-Path $galateaDir) {
+    $panes += ,(Pane-Cmd "Galatea manager :8798" $galateaDir "python -m galatea manage --manage-port 8798" "" 8798)
+    $ports += 8798
+} else { Write-Host "  ! Galatea not found at $galateaDir; skipping Moss's manager." -ForegroundColor Yellow }
+
 if ($Voice) {
-    # Galatea is opt-in: the default stack does not wake her, so clicking the stack
-    # never fires up her process. The desktop app's "Talk to Moss" button starts her
-    # on demand (and turns her chat on); closing the app stops her.
+    # Her CHAT is opt-in: the default stack does not wake it, so clicking the stack
+    # never fires up her model/card. The desktop app's "Talk to Moss" button starts it
+    # on demand (and turns her chat on); closing the app stops it. --no-taskmaster so
+    # the chat does not steer the crew - the manager above is the one voice to it.
     $galateaState = Claim-Port 'galatea' 8799
     if ($galateaState -ne 'free') { }
     elseif (Test-Path $galateaDir) {
         # --phone binds 0.0.0.0 so Ian can reach her from his phone over Tailscale;
         # her token gates every non-loopback request, so this fails closed.
-        $panes += ,(Pane-Cmd "Galatea :8799" $galateaDir "python -m galatea wake --port 8799 --no-browser --phone" "" 8799)
+        $panes += ,(Pane-Cmd "Galatea :8799" $galateaDir "python -m galatea wake --port 8799 --no-browser --phone --no-taskmaster" "" 8799)
         $ports += 8799
     } else { Write-Host "  ! Galatea not found at $galateaDir; skipping the voice." -ForegroundColor Yellow }
 }
