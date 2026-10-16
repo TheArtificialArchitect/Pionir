@@ -8,6 +8,8 @@
      "match": "-m\\s+pionir\\s+server", "probe": {"kind": "tcp"}},
     {"id": "galatea", "label": "Galatea (Moss)", "ports": [8799], "launchers": ["pionir.ps1", "desktop"], "reserved": true,
      "match": "galatea", "probe": {"kind": "http", "path": "/api/state"}},
+    {"id": "galatea-manage", "label": "Galatea manager (Moss's taskmaster)", "ports": [8798], "launchers": ["pionir.ps1", "desktop"], "reserved": true,
+     "match": "galatea\\s+manage", "probe": {"kind": "http", "path": "/health"}},
     {"id": "daedalus", "label": "Daedalus", "ports": [8771], "launchers": ["pionir.ps1", "desktop"], "reserved": true,
      "match": "daedalus", "probe": {"kind": "http", "path": "/health"}},
     {"id": "melete", "label": "Melete", "ports": [8770], "launchers": ["pionir.ps1", "desktop"], "reserved": true,
