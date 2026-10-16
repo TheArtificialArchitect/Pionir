@@ -3,7 +3,8 @@
 #
 #   .\pionir.ps1                 wake the whole stack in ONE window, a pane per bridge
 #   .\pionir.ps1 -Shortcut       put a "Pionir" launcher icon on the Desktop
-#   .\pionir.ps1 -NoVoice        don't wake Galatea
+#   .\pionir.ps1 -Voice          also wake Galatea (off by default; the desktop
+#                                app's "Talk to Moss" starts her on demand)
 #   .\pionir.ps1 -NoSpecialists  don't start Daedalus/Melete; reach whoever's already up
 #   .\pionir.ps1 -NoBryo         don't start Bryo, the observer organism
 #   .\pionir.ps1 -NoCrew         don't start the crew (workers, division leaders)
@@ -22,7 +23,8 @@
 # (rule 3) - Bryo used to run from a logon-triggered task, and this replaces it.
 param(
     [switch]$Shortcut,
-    [switch]$NoVoice,
+    [switch]$Voice,          # opt in to wake Galatea with the stack; off by default
+    [switch]$NoVoice,        # deprecated no-op: Galatea is off by default now (kept so old shortcuts don't error)
     [switch]$NoSpecialists,
     [switch]$NoBryo,
     [switch]$NoCrew,
@@ -515,7 +517,10 @@ if ((Claim-Port 'dashboard' $Port) -eq 'free') {
     $ports += $Port
 }
 
-if (-not $NoVoice) {
+if ($Voice) {
+    # Galatea is opt-in: the default stack does not wake her, so clicking the stack
+    # never fires up her process. The desktop app's "Talk to Moss" button starts her
+    # on demand (and turns her chat on); closing the app stops her.
     $galateaState = Claim-Port 'galatea' 8799
     if ($galateaState -ne 'free') { }
     elseif (Test-Path $galateaDir) {
