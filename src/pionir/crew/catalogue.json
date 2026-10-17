@@ -6,7 +6,7 @@
     "none": 0.0,
     "marketplaces": 3.0
   },
-  "known_names": ["Moss", "Pionir", "Claude", "Ian", "Scrooge", "Dokaz"],
+  "known_names": ["Moss", "Pionir", "Claude", "Ian", "Scrooge", "Dokaz", "Techne"],
   "divisions": [
     {
       "id": "treasury",
@@ -137,6 +137,21 @@
         {"name": "feedback", "impl": "feedback_desk", "uses": ["client.orders", "client.email", "client.testimonials", "client.testimonial_publish"], "kind": "feedback", "cadence_seconds": 900,
          "provider": "none", "entities": ["Dokaz"],
          "note": "one feedback request per delivered order (fixed template, 3+ days after delivery) and each consented testimonial proposed for /hire, every one for the owner's approval; no model"}
+      ]
+    },
+    {
+      "_note": "Techne is Scrooge's site-delivery pipeline; this division only watches it and nudges the owner. The approve/reject/go-live steps are the owner's and are never Pionir's.",
+      "id": "delivery",
+      "title": "Delivery",
+      "leader_cadence_seconds": 3600,
+      "idle_report_backoff_seconds": 21600,
+      "entities": ["Techne", "Scrooge"],
+      "leader_notes": "One worker: delivery.techne watches Scrooge's Techne site-delivery jobs (read-only, the client's brief and details redacted) and alerts the owner once when a job reaches preview_ready - a preview site is up and waiting for his APPROVAL on the Techne desk. A techne.preview_ready row is one such alert, with the job's id and its slug or domain; techne.not_alerted says the owner could not be reached (Discord down or the alert rate-limited) and it will be offered again next run. techne.tally holds the counts: jobs seen, jobs in preview_ready and alerts sent this run. This division NEVER moves a job, approves or rejects a preview, or takes a site live or down: those are the owner's, done on his Desk, and Pionir cannot take them (Scrooge refuses the ops token for every one). Never say a site is live, approved or taken down - this division only reports what Techne lists and that the owner was nudged. When the jobs could not be read, say they are UNKNOWN, never none.",
+      "brief_quota": {"techne.tally": 2, "techne.preview_ready": 5, "techne.not_alerted": 3},
+      "workers": [
+        {"name": "techne", "impl": "techne_watch", "uses": ["techne.jobs", "owner.notify"], "kind": "techne", "cadence_seconds": 300,
+         "provider": "dokaz", "entities": ["Techne", "Scrooge"],
+         "note": "watches Scrooge's Techne site-delivery jobs and alerts the owner once when a preview is ready for his approval; reads and notifies only, never moves a job"}
       ]
     },
     {

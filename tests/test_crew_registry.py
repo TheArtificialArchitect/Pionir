@@ -16,10 +16,11 @@ class DefaultCatalogueTests(unittest.TestCase):
     def test_the_initial_catalogue(self) -> None:
         reg = default_registry()
         self.assertEqual(reg.division_ids(),
-                         ("treasury", "watch", "posting", "contracts", "products", "fiverr",
-                          "builds", "etsy", "marketplaces"))
+                         ("treasury", "watch", "posting", "contracts", "delivery", "products",
+                          "fiverr", "builds", "etsy", "marketplaces"))
         self.assertEqual(reg.ids(), ("builds.daedalus", "builds.improve", "contracts.delivery",
                                      "contracts.feedback", "contracts.finder", "contracts.orders",
+                                     "delivery.techne",
                                      "etsy.digital", "etsy.pod", "etsy.scout", "fiverr.desk",
                                      "fiverr.gigs", "fiverr.ideas", "marketplaces.packager",
                                      "marketplaces.scout_apify", "marketplaces.watcher",
@@ -35,6 +36,7 @@ class DefaultCatalogueTests(unittest.TestCase):
         live = sorted(w.worker_id for w in reg.all() if w.live)
         self.assertEqual(live, ["builds.daedalus", "builds.improve",
                                 "contracts.delivery", "contracts.feedback", "contracts.finder", "contracts.orders",
+                                "delivery.techne",
                                 "etsy.digital", "etsy.pod", "etsy.scout",
                                 "fiverr.desk", "fiverr.gigs", "fiverr.ideas",
                                 "marketplaces.packager", "marketplaces.scout_apify",

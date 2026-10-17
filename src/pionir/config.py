@@ -271,6 +271,13 @@ class PionirSettings:
     # tools/setup-ops-token.ps1), read at call time: no network at boot. Registered only
     # when content_url is on; PIONIR_OPS_TOKEN_FILE points at another token file.
     ops_token_file: Path | None = None
+    # Techne (adapters/scrooge_techne.py): Scrooge's site-delivery jobs as a read capability
+    # (techne.jobs) plus one approval-gated doer action (techne.run), on the same content_url
+    # with the same ops token (no new secret). On by default when content_url is set; it
+    # reads the ops token at call time, so there is no network at boot. The crew's
+    # delivery.techne watcher reads these jobs and alerts the owner when a preview is ready.
+    # PIONIR_TECHNE_MONITOR=0 leaves the organ unregistered (and the watcher then idle).
+    techne_monitor: bool = True
     # Where the per-client bearer tokens for Pionir's own HTTP API live
     # (pionir-client-<client>.token, made on first start; see pionir/auth.py). None means
     # <state_root>/secrets - ~/.pionir/secrets on the live box, a temp dir in a test.
@@ -728,6 +735,8 @@ class PionirSettings:
                 if (os.environ.get("PIONIR_OPS_TOKEN_FILE") or "").strip()
                 else None
             ),
+            techne_monitor=(os.environ.get("PIONIR_TECHNE_MONITOR", "1").strip().lower()
+                            not in {"0", "off", "false", "no"}),
             client_token_dir=(
                 Path(os.environ["PIONIR_CLIENT_TOKEN_DIR"]).expanduser()
                 if (os.environ.get("PIONIR_CLIENT_TOKEN_DIR") or "").strip()

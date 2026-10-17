@@ -56,6 +56,10 @@ EXPECTED = {
     "content.crosspost_devto": ("digest", None),
     # an email to the whole newsletter list: its own card, never the digest
     "content.newsletter_send": ("card", None),
+    # Scrooge's Techne site-delivery stream: read the jobs (PII-redacted) freely; every
+    # doer action parks on its own card, like client.email.
+    "techne.jobs": ("auto", None),
+    "techne.run": ("card", None),
     "crew.digest": ("auto", None),
     "crew.divisions": ("auto", None),
     "crew.compute": ("auto", None),

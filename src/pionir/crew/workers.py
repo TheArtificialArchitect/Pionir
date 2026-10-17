@@ -486,6 +486,14 @@ def marketplace_packager(spec, **params):
     return PackagerWorker(spec, **params)
 
 
+def techne_watch(spec, **params):
+    """REAL. ``delivery.techne`` (techne.py): reads Scrooge's Techne site-delivery jobs
+    (``techne.jobs``, PII-redacted) and alerts the owner once (``owner.notify``) when a
+    preview is ready for his approval. Reads and notifies only - never moves a job."""
+    from .techne import TechneWatchWorker
+    return TechneWatchWorker(spec, **params)
+
+
 def marketplace_watcher(spec, **params):
     """REAL. ``marketplaces.watcher`` (marketplaces/watcher.py): the published products' runs,
     users and ratings, read only, and the division's report."""
@@ -506,6 +514,7 @@ IMPLS = {
     "newsletter_sender": newsletter_sender,
     "order_desk": order_desk,
     "delivery_desk": delivery_desk,
+    "techne_watch": techne_watch,
     "finder": finder,
     "feedback_desk": feedback_desk,
     "product_shelf": product_shelf,

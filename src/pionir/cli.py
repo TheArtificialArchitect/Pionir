@@ -313,6 +313,11 @@ def _doctor(runtime: PionirRuntime) -> dict[str, Any]:
             "status": "not_configured",
             "message": "set PIONIR_GALATEA_URL to wire in the voice",
         }
+    if "scrooge" not in runtime.adapters:
+        specialists["scrooge"] = {
+            "status": "not_configured",
+            "message": "PIONIR_CONTENT_URL is off, or PIONIR_TECHNE_MONITOR=0",
+        }
     if "daedalus" not in runtime.adapters:
         specialists["daedalus"] = {
             "status": "not_configured",

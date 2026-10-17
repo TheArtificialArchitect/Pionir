@@ -41,6 +41,7 @@ from .adapters.apibuild import ApiBuildAdapter, apibuild_settings
 from .adapters.improve import ImproveAdapter, improve_settings
 from .adapters.video import VideoAdapter, video_settings
 from .adapters.clients import client_settings
+from .adapters.scrooge_techne import ScroogeTechneAdapter, scrooge_techne_settings
 from .adapters.galatea import resolve_served_model
 from .adapters.products import product_settings
 from .audit import JsonlAuditSink
@@ -268,6 +269,12 @@ def build_runtime(settings: PionirSettings | None = None) -> PionirRuntime:
         # park for approval; a delivery's zip is scanned for every secret Pionir is
         # configured with.
         runtime.register(ClientAdapter(client_settings(configured)))
+        if configured.techne_monitor:
+            # Techne's site-delivery jobs on the same Scrooge with the same ops token (read
+            # when a techne.* task runs; no network at boot). techne.jobs reads them PII-
+            # redacted; techne.run always parks for approval, and only the doer actions are
+            # reachable - every admin step stays the owner's (Scrooge 403s the ops token).
+            runtime.register(ScroogeTechneAdapter(scrooge_techne_settings(configured)))
         # Client testimonials on the same Scrooge: read with the ops token, put live on /hire
         # with the publish token. client.testimonial_publish always parks for approval.
         from .adapters.testimonials import TestimonialAdapter
