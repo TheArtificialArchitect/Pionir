@@ -33,7 +33,7 @@ SRC = ROOT / "src" / "pionir"
 # The numbers Ian named, and the ids that must own them. A change here is a deliberate change
 # to the estate's ports, made in ports.json, pionir.ps1 and Pionir Desktop together.
 EXPECTED = {
-    "dashboard": [8780], "ollama-gate": [8774], "galatea": [8799], "daedalus": [8771],
+    "dashboard": [8780], "ollama-gate": [8774], "galatea": [8799], "galatea-manage": [8798], "daedalus": [8771],
     "melete": [8770], "crew": [8782], "peter": [8790], "tunnel": [18000, 18001, 18002],
     "ollama": [11434], "bryo-viewer": [8787], "hemera": [8788], "probability": [8791],
     "hearth": [8801], "proteus-relay": [8792],
@@ -158,7 +158,7 @@ class CodeAgreesWithRegistryTests(unittest.TestCase):
         text = PS1.read_text(encoding="utf-8-sig")
         claims = re.findall(r"Claim-Port '([\w-]+)' (\$Port|\d+)", text)
         self.assertEqual({i for i, _ in claims},
-                         {"dashboard", "galatea", "daedalus", "melete", "crew", "peter"})
+                         {"dashboard", "galatea", "galatea-manage", "daedalus", "melete", "crew", "peter"})
         for sid, port in claims:
             wanted = 8780 if port == "$Port" else int(port)
             self.assertIn(wanted, self.by_id[sid], sid)
@@ -166,7 +166,7 @@ class CodeAgreesWithRegistryTests(unittest.TestCase):
     def test_stop_stops_each_service_by_its_registered_port(self) -> None:
         text = PS1.read_text(encoding="utf-8-sig")
         stops = re.findall(r'Stop-Port (\$Port|\d+) "[^"]+" "([\w-]+)"', text)
-        self.assertEqual({i for _, i in stops}, {"dashboard", "galatea", "daedalus", "melete", "crew"})
+        self.assertEqual({i for _, i in stops}, {"dashboard", "galatea", "galatea-manage", "daedalus", "melete", "crew"})
         for port, sid in stops:
             self.assertIn(8780 if port == "$Port" else int(port), self.by_id[sid], sid)
 
